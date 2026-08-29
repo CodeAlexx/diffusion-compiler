@@ -5,6 +5,7 @@
 *.md
 !/README.md
 !/docs/OPTIMIZER.md
+!/docs/PHASE2_READINESS.md
 *.log
 *.safetensors
 *.ckpt

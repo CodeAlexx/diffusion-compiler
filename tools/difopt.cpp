@@ -2,6 +2,7 @@
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/opt/bindings.hpp"
+#include "dif/weights/bundle.hpp"
 #include "dif/opt/plan.hpp"
 #include "dif/opt/search.hpp"
 #include "dif/runtime/executor.hpp"
@@ -87,7 +88,9 @@ void usage() {
       "  --attention-implementation 1|2\n"
       "  --streamed-constants\n"
       "\n"
-      "bindings (exactly one):\n"
+      "bindings (a sealed bundle and/or explicit tensors, or a fixture):\n"
+      "  --weight-bundle FILE.difbind sealed checkpoint bindings\n"
+      "  --verify-shards              re-digest every bundle shard on load\n"
       "  --bind ID=FILE [--bind ...]  bind inputs and constants from tensors\n"
       "  --synthetic-bindings SEED    deterministic experiment fixture\n"
       "\n"
@@ -125,6 +128,8 @@ int main(int argc, char **argv) {
     bool build_h3 = false;
     std::optional<std::uint64_t> synthetic_seed;
     std::vector<std::pair<std::uint32_t, std::filesystem::path>> bindings;
+    std::filesystem::path weight_bundle;
+    bool verify_shards = false;
     std::string backend = "cpu";
     dif::frontend::H3DenoiserConfig h3;
     h3.video_tokens = 2;
@@ -203,6 +208,10 @@ int main(int argc, char **argv) {
         h3.streamed_constants = true;
       else if (option == "--bind")
         bindings.push_back(binding(value()));
+      else if (option == "--weight-bundle")
+        weight_bundle = value();
+      else if (option == "--verify-shards")
+        verify_shards = true;
       else if (option == "--synthetic-bindings")
         synthetic_seed = number(value(), "binding seed");
       else if (option == "--objective") {
@@ -286,10 +295,18 @@ int main(int argc, char **argv) {
       usage();
       return 2;
     }
-    if (bindings.empty() == !synthetic_seed.has_value()) {
+    // A sealed bundle and explicit tensors compose: the bundle carries the
+    // checkpoint constants and --bind supplies captured inputs on top. The
+    // synthetic fixture is the alternative to both, never a supplement to
+    // either, so a real run can never silently fall back to invented values.
+    const bool explicit_bindings = !bindings.empty() || !weight_bundle.empty();
+    if (explicit_bindings == synthetic_seed.has_value()) {
       usage();
       return 2;
     }
+    if (!weight_bundle.empty() && !verify_shards)
+      std::cerr << "difopt: warning: binding " << weight_bundle
+                << " without --verify-shards\n";
 
     dif::opt::RewriteContext base;
     base.program = build_h3 ? dif::frontend::make_h3_denoiser(h3)
@@ -299,8 +316,23 @@ int main(int argc, char **argv) {
       base.bindings =
           dif::opt::synthesize_bindings(base.program, *synthetic_seed);
     } else {
+      if (!weight_bundle.empty()) {
+        const auto bundle = dif::weights::read_weight_bundle(weight_bundle);
+        // Fails when the bundle was sealed against a different program, so a
+        // checkpoint can never be bound to a graph it does not describe.
+        dif::weights::verify_weight_bundle(bundle, base.program, verify_shards);
+        base.bindings =
+            dif::weights::load_weight_bundle(bundle, base.program, verify_shards);
+        std::cout << "BUNDLE path=" << weight_bundle.string()
+                  << " shards=" << bundle.shards.size()
+                  << " bindings=" << bundle.bindings.size()
+                  << " index=" << dif::hex_digest(bundle.index_fingerprint)
+                  << "\n";
+      }
+      // Explicit tensors are layered last so a captured input overrides a
+      // bundle entry rather than being silently dropped.
       for (const auto &[id, path] : bindings)
-        base.bindings.emplace(id, dif::runtime::read_tensor(path));
+        base.bindings.insert_or_assign(id, dif::runtime::read_tensor(path));
     }
 
     std::cout << "BASE program=" << dif::opt::program_fingerprint(base.program)

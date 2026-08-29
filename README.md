@@ -141,6 +141,13 @@ The design, the transformation vocabulary, and every measured result are in
 [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md), including the controls used and the
 cases where no improvement is claimed.
 
+`difopt` binds a sealed checkpoint with `--weight-bundle FILE.difbind`
+(`--verify-shards` re-digests every shard). A bundle and explicit `--bind`
+tensors compose; `--synthetic-bindings` is the alternative to both and never a
+supplement, so a real run cannot silently fall back to invented values.
+[`docs/PHASE2_READINESS.md`](docs/PHASE2_READINESS.md) records the state of the
+real-checkpoint proving run.
+
 ### Pipeline profiling
 
 `difrun --profile-pipeline` instruments the actual timed CUDA execution. It
