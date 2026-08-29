@@ -1,0 +1,816 @@
+#include "dif/ir/verify.hpp"
+
+#include "dif/support/error.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace dif::ir {
+namespace {
+
+bool valid_dtype(DType dtype) {
+  return dtype == DType::F32 || dtype == DType::BF16 || dtype == DType::F16 ||
+         dtype == DType::I8 || dtype == DType::I32;
+}
+
+bool supported_float(DType dtype) {
+  return dtype == DType::F32 || dtype == DType::BF16 || dtype == DType::F16;
+}
+
+bool valid_opcode(Opcode opcode) {
+  return opcode >= Opcode::Add && opcode <= Opcode::AdamWUpdate;
+}
+
+bool valid_attr_key(AttrKey key) {
+  return key >= AttrKey::Epsilon && key <= AttrKey::WeightDecay;
+}
+
+bool valid_attr_kind(AttrKind kind) {
+  return kind >= AttrKind::U64 && kind <= AttrKind::Bool;
+}
+
+void expect_counts(const Operation &op, std::size_t inputs, std::size_t outputs) {
+  if (op.inputs.size() != inputs || op.outputs.size() != outputs) {
+    fail("DiffIR op " + std::to_string(op.id) + " (" +
+         std::string(opcode_name(op.opcode)) + ") has invalid arity");
+  }
+}
+
+void same_shape_dtype(const TensorDesc &a, const TensorDesc &b,
+                      const Operation &op) {
+  if (a.dtype != b.dtype || a.dims != b.dims)
+    fail("DiffIR op " + std::to_string(op.id) + " requires equal shape/dtype");
+}
+
+const TensorDesc &tensor_or_fail(const Program &program, std::uint32_t id,
+                                 const Operation &op) {
+  const auto *tensor = program.tensor(id);
+  if (!tensor)
+    fail("DiffIR op " + std::to_string(op.id) + " references missing tensor " +
+         std::to_string(id));
+  return *tensor;
+}
+
+void verify_attrs(const Operation &op) {
+  std::unordered_set<std::uint32_t> keys;
+  for (const auto &attr : op.attributes) {
+    if (!valid_attr_key(attr.key) || !valid_attr_kind(attr.kind))
+      fail("DiffIR op has unknown attribute key or kind");
+    if (!keys.insert(static_cast<std::uint32_t>(attr.key)).second)
+      fail("DiffIR op has duplicate attribute key");
+    if (attr.kind == AttrKind::Bool && attr.bits > 1U)
+      fail("DiffIR bool attribute is not zero or one");
+    if (attr.kind == AttrKind::F64 && !std::isfinite(std::bit_cast<double>(attr.bits)))
+      fail("DiffIR floating attribute is non-finite");
+  }
+}
+
+void verify_operation(const Program &program, const Operation &op) {
+  verify_attrs(op);
+  if (op.opcode == Opcode::Barrier) {
+    expect_counts(op, 0, 0);
+    return;
+  }
+
+  if (op.opcode == Opcode::Add || op.opcode == Opcode::Multiply) {
+    expect_counts(op, 2, 1);
+    const auto &a = tensor_or_fail(program, op.inputs[0], op);
+    const auto &b = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(a, b, op);
+    same_shape_dtype(a, out, op);
+    if (!supported_float(a.dtype))
+      fail("elementwise semantics admit f32, bf16, or f16");
+    return;
+  }
+
+  if (op.opcode == Opcode::AffineLastDim) {
+    if ((op.inputs.size() != 2U && op.inputs.size() != 3U) ||
+        op.outputs.size() != 1U)
+      fail("affine_last_dim expects input, scale, optional bias, and one "
+           "output");
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &scale = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        scale.dtype != input.dtype || scale.dims.size() != 1U ||
+        scale.dims[0] != input.dims.back())
+      fail("affine_last_dim requires float input/output and scale matching "
+           "the final dimension");
+    if (op.inputs.size() == 3U) {
+      const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+      if (bias.dtype != input.dtype || bias.dims != scale.dims)
+        fail("affine_last_dim bias must match its scale");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::LayerNorm) {
+    expect_counts(op, 3, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        weight.dtype != input.dtype || weight.dims.size() != 1U ||
+        weight.dims[0] != input.dims.back() || bias.dtype != input.dtype ||
+        bias.dims != weight.dims)
+      fail("layer_norm requires float input/output and affine vectors "
+           "matching the final dimension");
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("layer_norm epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("layer_norm block size must be a power of two in [32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::Clamp) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    const auto lower = op.f64(AttrKey::Lower,
+                              -std::numeric_limits<double>::infinity());
+    const auto upper = op.f64(AttrKey::Upper,
+                              std::numeric_limits<double>::infinity());
+    if (!supported_float(input.dtype) || !(lower <= upper))
+      fail("clamp requires float input/output and lower <= upper");
+    return;
+  }
+
+  if (op.opcode == Opcode::MseLoss) {
+    expect_counts(op, 2, 1);
+    const auto &prediction = tensor_or_fail(program, op.inputs[0], op);
+    const auto &target = tensor_or_fail(program, op.inputs[1], op);
+    const auto &loss = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(prediction, target, op);
+    if (prediction.dtype != DType::F32 || loss.dtype != DType::F32 ||
+        loss.dims != std::vector<std::uint64_t>{1U})
+      fail("mse_loss requires equal F32 inputs and F32[1] output");
+    return;
+  }
+
+  if (op.opcode == Opcode::MseLossBackward) {
+    expect_counts(op, 3, 1);
+    const auto &prediction = tensor_or_fail(program, op.inputs[0], op);
+    const auto &target = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_loss = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_prediction = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(prediction, target, op);
+    same_shape_dtype(prediction, grad_prediction, op);
+    if (prediction.dtype != DType::F32 || grad_loss.dtype != DType::F32 ||
+        grad_loss.dims != std::vector<std::uint64_t>{1U})
+      fail("mse_loss_backward requires F32 tensors and F32[1] grad_loss");
+    return;
+  }
+
+  if (op.opcode == Opcode::LinearBackwardInput) {
+    expect_counts(op, 2, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    if (grad_output.dtype != DType::F32 || weight.dtype != DType::F32 ||
+        grad_input.dtype != DType::F32 || grad_output.dims.empty() ||
+        grad_input.dims.empty() || weight.dims.size() != 2U ||
+        grad_output.dims.size() != grad_input.dims.size() ||
+        !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
+                    grad_input.dims.begin()) ||
+        grad_output.dims.back() != weight.dims[0] ||
+        grad_input.dims.back() != weight.dims[1])
+      fail("linear_backward_input has incompatible F32 shapes");
+    return;
+  }
+
+  if (op.opcode == Opcode::LinearBackwardWeight) {
+    expect_counts(op, 2, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_weight = tensor_or_fail(program, op.outputs[0], op);
+    if (grad_output.dtype != DType::F32 || input.dtype != DType::F32 ||
+        grad_weight.dtype != DType::F32 || grad_output.dims.empty() ||
+        input.dims.empty() || grad_weight.dims.size() != 2U ||
+        grad_output.dims.size() != input.dims.size() ||
+        !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
+                    input.dims.begin()) ||
+        grad_weight.dims[0] != grad_output.dims.back() ||
+        grad_weight.dims[1] != input.dims.back())
+      fail("linear_backward_weight has incompatible F32 shapes");
+    return;
+  }
+
+  if (op.opcode == Opcode::BiasBackward) {
+    expect_counts(op, 1, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_bias = tensor_or_fail(program, op.outputs[0], op);
+    if (grad_output.dtype != DType::F32 || grad_output.dims.empty() ||
+        grad_bias.dtype != DType::F32 || grad_bias.dims.size() != 1U ||
+        grad_bias.dims[0] != grad_output.dims.back())
+      fail("bias_backward requires F32 output gradient and matching vector");
+    return;
+  }
+
+  if (op.opcode == Opcode::SiLUBackward) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    if (input.dtype != DType::F32)
+      fail("silu_backward currently requires F32 tensors");
+    return;
+  }
+
+  if (op.opcode == Opcode::AdamWUpdate) {
+    expect_counts(op, 5, 3);
+    const auto &parameter = tensor_or_fail(program, op.inputs[0], op);
+    const auto &gradient = tensor_or_fail(program, op.inputs[1], op);
+    const auto &first = tensor_or_fail(program, op.inputs[2], op);
+    const auto &second = tensor_or_fail(program, op.inputs[3], op);
+    const auto &step = tensor_or_fail(program, op.inputs[4], op);
+    const auto &updated = tensor_or_fail(program, op.outputs[0], op);
+    const auto &updated_first = tensor_or_fail(program, op.outputs[1], op);
+    const auto &updated_second = tensor_or_fail(program, op.outputs[2], op);
+    same_shape_dtype(parameter, gradient, op);
+    same_shape_dtype(parameter, first, op);
+    same_shape_dtype(parameter, second, op);
+    same_shape_dtype(parameter, updated, op);
+    same_shape_dtype(parameter, updated_first, op);
+    same_shape_dtype(parameter, updated_second, op);
+    const auto learning_rate = op.f64(AttrKey::LearningRate, 1.0e-3);
+    const auto beta1 = op.f64(AttrKey::Beta1, 0.9);
+    const auto beta2 = op.f64(AttrKey::Beta2, 0.999);
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-8);
+    const auto weight_decay = op.f64(AttrKey::WeightDecay, 0.0);
+    if (parameter.dtype != DType::F32 || step.dtype != DType::I32 ||
+        step.dims != std::vector<std::uint64_t>{1U} ||
+        !(learning_rate > 0.0) || beta1 < 0.0 || beta1 >= 1.0 ||
+        beta2 < 0.0 || beta2 >= 1.0 || !(epsilon > 0.0) ||
+        weight_decay < 0.0)
+      fail("adamw_update has invalid F32 state, step, or hyperparameters");
+    return;
+  }
+
+  if (op.opcode == Opcode::SiLU) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype))
+      fail("silu semantics admit f32, bf16, or f16");
+    return;
+  }
+
+  if (op.opcode == Opcode::RmsNorm) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        weight.dtype != input.dtype || weight.dims.size() != 1U ||
+        weight.dims[0] != input.dims.back())
+      fail("rms_norm requires float input/output and weight matching the "
+           "final dimension");
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("rms_norm epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("rms_norm block size must be a power of two in [32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::Fill) {
+    expect_counts(op, 0, 1);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(out.dtype))
+      fail("fill semantics admit f32, bf16, or f16 output");
+    return;
+  }
+
+  if (op.opcode == Opcode::GatherRows) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &indices = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || input.dims.size() < 2U ||
+        indices.dtype != DType::I32 || indices.dims.size() != 1U ||
+        out.dtype != input.dtype || out.dims.size() != input.dims.size() ||
+        out.dims[0] != indices.dims[0] ||
+        !std::equal(input.dims.begin() + 1, input.dims.end(),
+                    out.dims.begin() + 1))
+      fail("gather_rows requires float [S,...], i32 [M], and float [M,...]");
+    return;
+  }
+
+  if (op.opcode == Opcode::IndexedUpdateRows) {
+    expect_counts(op, 3, 1);
+    const auto &base = tensor_or_fail(program, op.inputs[0], op);
+    const auto &updates = tensor_or_fail(program, op.inputs[1], op);
+    const auto &map = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(base, out, op);
+    if (!supported_float(base.dtype) || base.dims.size() < 2U ||
+        updates.dtype != base.dtype || updates.dims.size() != base.dims.size() ||
+        map.dtype != DType::I32 || map.dims.size() != 1U ||
+        map.dims[0] != base.dims[0] ||
+        !std::equal(base.dims.begin() + 1, base.dims.end(),
+                    updates.dims.begin() + 1))
+      fail("indexed_update_rows requires base/output [S,...], updates [M,...], "
+           "and destination map i32 [S]");
+    return;
+  }
+
+  if (op.opcode == Opcode::Cast) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || !supported_float(out.dtype) ||
+        input.dtype == out.dtype || input.dims != out.dims)
+      fail("cast requires equal-shaped tensors with distinct float dtypes");
+    return;
+  }
+
+  if (op.opcode == Opcode::SelectRowChunks) {
+    if (op.inputs.size() != 2U || op.outputs.empty() ||
+        op.outputs.size() > 8U)
+      fail("select_row_chunks expects values, indices, and one or more outputs");
+    const auto &values = tensor_or_fail(program, op.inputs[0], op);
+    const auto &indices = tensor_or_fail(program, op.inputs[1], op);
+    const auto &first = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(values.dtype) || values.dims.size() != 2U ||
+        indices.dtype != DType::I32 || indices.dims.size() != 1U ||
+        first.dtype != values.dtype || first.dims.size() != 2U ||
+        first.dims[0] != indices.dims[0] ||
+        values.dims[1] != op.outputs.size() * first.dims[1])
+      fail("select_row_chunks requires float [T,C*H], i32 [S], and C float "
+           "outputs [S,H]");
+    for (const auto output : op.outputs)
+      same_shape_dtype(first, tensor_or_fail(program, output, op), op);
+    return;
+  }
+
+  if (op.opcode == Opcode::SinusoidalTimestep) {
+    expect_counts(op, 1, 1);
+    const auto &timesteps = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (timesteps.dtype != DType::F32 || timesteps.dims.size() != 1U ||
+        out.dtype != DType::F32 || out.dims.size() != 2U ||
+        out.dims[0] != timesteps.dims[0] || out.dims[1] < 2U)
+      fail("sinusoidal_timestep requires f32 [N] and f32 [N,D] with D>=2");
+    const auto half = out.dims[1] / 2U;
+    const auto shift = op.f64(AttrKey::DownscaleFreqShift, 1.0);
+    const auto scale = op.f64(AttrKey::Scale, 1.0);
+    const auto max_period = op.f64(AttrKey::MaxPeriod, 10000.0);
+    if (!(static_cast<double>(half) > shift) || !(max_period > 0.0) ||
+        !std::isfinite(scale))
+      fail("sinusoidal_timestep requires half_dim>downscale shift, positive "
+           "max period, and finite scale");
+    return;
+  }
+
+  if (op.opcode == Opcode::RotaryPosition) {
+    expect_counts(op, 2, 2);
+    const auto &positions = tensor_or_fail(program, op.inputs[0], op);
+    const auto &inv_freq = tensor_or_fail(program, op.inputs[1], op);
+    const auto &cosine = tensor_or_fail(program, op.outputs[0], op);
+    const auto &sine = tensor_or_fail(program, op.outputs[1], op);
+    if (positions.dtype != DType::F32 || positions.dims.size() != 2U ||
+        inv_freq.dtype != DType::F32 || inv_freq.dims.size() != 1U ||
+        !supported_float(cosine.dtype) || cosine.dtype != sine.dtype ||
+        cosine.dims != sine.dims || cosine.dims.size() != 2U ||
+        cosine.dims[0] != positions.dims[0] ||
+        positions.dims[1] >
+            std::numeric_limits<std::uint64_t>::max() / inv_freq.dims[0] / 2U ||
+        cosine.dims[1] != 2U * positions.dims[1] * inv_freq.dims[0])
+      fail("rotary_position requires f32 positions [S,A], f32 inv_freq [F], "
+           "and matching float cos/sin [S,2*A*F]");
+    return;
+  }
+
+  if (op.opcode == Opcode::LinearBlend) {
+    expect_counts(op, 3, 1);
+    const auto &left = tensor_or_fail(program, op.inputs[0], op);
+    const auto &right = tensor_or_fail(program, op.inputs[1], op);
+    const auto &factor = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(left, right, op);
+    same_shape_dtype(left, out, op);
+    if (!supported_float(left.dtype) || factor.dtype != DType::F32 ||
+        factor.dims != std::vector<std::uint64_t>{1U})
+      fail("linear_blend requires equal float values/output and f32 [1] factor");
+    return;
+  }
+
+  if (op.opcode == Opcode::FlowEulerStep) {
+    expect_counts(op, 4, 1);
+    const auto &sample = tensor_or_fail(program, op.inputs[0], op);
+    const auto &velocity = tensor_or_fail(program, op.inputs[1], op);
+    const auto &timesteps = tensor_or_fail(program, op.inputs[2], op);
+    const auto &sigmas = tensor_or_fail(program, op.inputs[3], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(sample, velocity, op);
+    same_shape_dtype(sample, out, op);
+    const auto *step_attribute = op.find(AttrKey::StepIndex);
+    if (!supported_float(sample.dtype) || timesteps.dtype != DType::F32 ||
+        timesteps.dims.size() != 1U || sigmas.dtype != DType::F32 ||
+        sigmas.dims.size() != 1U ||
+        timesteps.dims[0] == std::numeric_limits<std::uint64_t>::max() ||
+        sigmas.dims[0] != timesteps.dims[0] + 1U || !step_attribute ||
+        step_attribute->as_u64() >= timesteps.dims[0])
+      fail("flow_euler_step requires equal float sample/velocity/output, "
+           "f32 timesteps [K], f32 sigmas [K+1], and StepIndex<K");
+    return;
+  }
+
+  if (op.opcode == Opcode::Patchify3D ||
+      op.opcode == Opcode::Unpatchify3D) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &output = tensor_or_fail(program, op.outputs[0], op);
+    const auto *patch_t_attr = op.find(AttrKey::PatchT);
+    const auto *patch_h_attr = op.find(AttrKey::PatchH);
+    const auto *patch_w_attr = op.find(AttrKey::PatchW);
+    if (!patch_t_attr || !patch_h_attr || !patch_w_attr)
+      fail("patchify_3d/unpatchify_3d requires PatchT, PatchH, and PatchW");
+    const auto patch_t = patch_t_attr->as_u64();
+    const auto patch_h = patch_h_attr->as_u64();
+    const auto patch_w = patch_w_attr->as_u64();
+    const auto &volume = op.opcode == Opcode::Patchify3D ? input : output;
+    const auto &rows = op.opcode == Opcode::Patchify3D ? output : input;
+    if (!supported_float(input.dtype) || input.dtype != output.dtype ||
+        volume.dims.size() != 5U || rows.dims.size() != 2U ||
+        patch_t == 0U || patch_h == 0U || patch_w == 0U ||
+        volume.dims[2] % patch_t != 0U ||
+        volume.dims[3] % patch_h != 0U ||
+        volume.dims[4] % patch_w != 0U)
+      fail("patchify_3d/unpatchify_3d requires equal float dtype, rank-5 "
+           "[B,C,T,H,W], rank-2 rows, and divisible nonzero patches");
+    if (patch_t > std::numeric_limits<std::uint64_t>::max() / patch_h ||
+        patch_t * patch_h >
+            std::numeric_limits<std::uint64_t>::max() / patch_w ||
+        patch_t * patch_h * patch_w >
+            std::numeric_limits<std::uint64_t>::max() / volume.dims[1])
+      fail("patchify_3d/unpatchify_3d patch geometry overflows");
+    const auto expected_columns =
+        volume.dims[1] * patch_t * patch_h * patch_w;
+    const auto expected_rows = volume.element_count() / expected_columns;
+    if (rows.dims[0] != expected_rows || rows.dims[1] != expected_columns ||
+        rows.element_count() != volume.element_count())
+      fail("patchify_3d/unpatchify_3d row geometry does not match volume");
+    return;
+  }
+
+  if (op.opcode == Opcode::RmsNormModulate) {
+    if ((op.inputs.size() != 3 && op.inputs.size() != 4) || op.outputs.size() != 1)
+      fail("rms_norm_modulate expects x,[weight],scale,shift and one output");
+    const auto &x = tensor_or_fail(program, op.inputs[0], op);
+    const auto scale_index = op.inputs.size() == 4 ? 2U : 1U;
+    const auto shift_index = op.inputs.size() == 4 ? 3U : 2U;
+    const auto &scale = tensor_or_fail(program, op.inputs[scale_index], op);
+    const auto &shift = tensor_or_fail(program, op.inputs[shift_index], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(x, scale, op);
+    same_shape_dtype(x, shift, op);
+    same_shape_dtype(x, out, op);
+    if (!supported_float(x.dtype) || x.dims.size() != 2)
+      fail("rms_norm_modulate semantics require rank-2 f32, bf16, or f16 tensors");
+    if (op.inputs.size() == 4) {
+      const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+      if (weight.dtype != x.dtype || weight.dims.size() != 1 ||
+          weight.dims[0] != x.dims[1])
+        fail("rms_norm_modulate weight must match x dtype and [hidden]");
+    }
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("rms_norm_modulate epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256);
+    if (block < 32 || block > 1024 || (block & (block - 1U)) != 0U)
+      fail("rms_norm_modulate block size must be a power of two in [32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::SwiGlu) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || out.dtype != input.dtype ||
+        input.dims.size() != out.dims.size() || input.dims.empty())
+      fail("swiglu semantics require compatible f32, bf16, or f16 tensors");
+    auto expected = out.dims;
+    expected.back() *= 2U;
+    if (input.dims != expected)
+      fail("swiglu input final dimension must be twice output final dimension");
+    return;
+  }
+
+  if (op.opcode == Opcode::ResidualGate) {
+    expect_counts(op, 3, 1);
+    const auto &residual = tensor_or_fail(program, op.inputs[0], op);
+    const auto &branch = tensor_or_fail(program, op.inputs[1], op);
+    const auto &gate = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(residual, branch, op);
+    same_shape_dtype(residual, gate, op);
+    same_shape_dtype(residual, out, op);
+    if (!supported_float(residual.dtype))
+      fail("residual_gate semantics admit f32, bf16, or f16");
+    return;
+  }
+
+  if (op.opcode == Opcode::Linear) {
+    if ((op.inputs.size() != 2U && op.inputs.size() != 3U) ||
+        op.outputs.size() != 1U)
+      fail("linear expects input, weight, optional bias, and one output");
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || weight.dtype != input.dtype ||
+        out.dtype != input.dtype || input.dims.empty() ||
+        weight.dims.size() != 2 || out.dims.empty())
+      fail("linear semantics require uniform f32/bf16/f16 and rank-2 weights");
+    const auto rows = input.dims[0];
+    const auto inner = input.element_count() / rows;
+    const auto out_width = out.element_count() / out.dims[0];
+    if (inner != weight.dims[1] || out.dims[0] != rows ||
+        out_width != weight.dims[0])
+      fail("linear shapes must flatten as [M,K] x [N,K] -> [M,N]");
+    if (op.inputs.size() == 3U) {
+      const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+      if (bias.dtype != input.dtype || bias.dims.size() != 1U ||
+          bias.dims[0] != weight.dims[0])
+        fail("linear bias must have the graph dtype and shape [N]");
+    }
+    const auto implementation = op.u64(AttrKey::Implementation, 1U);
+    if (implementation != 1U && implementation != 2U && implementation != 3U)
+      fail("linear implementation must be 1 (native), 2 (tf32), or 3 "
+           "(direct packed INT5)");
+    if (input.dtype != DType::F32 && implementation == 2U)
+      fail("tf32 Linear implementation requires f32 storage");
+    return;
+  }
+
+  if (op.opcode == Opcode::QkNormPartialRope) {
+    expect_counts(op, 4, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &cos = tensor_or_fail(program, op.inputs[2], op);
+    const auto &sin = tensor_or_fail(program, op.inputs[3], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.size() != 3 ||
+        weight.dtype != input.dtype || weight.dims.size() != 1 ||
+        cos.dtype != input.dtype || sin.dtype != input.dtype || cos.dims != sin.dims ||
+        cos.dims.size() != 2)
+      fail("qk_norm_partial_rope requires input [S,H,D], weight [D], cos/sin [S,R]");
+    const auto heads = op.u64(AttrKey::Heads, input.dims[1]);
+    const auto head_dim = op.u64(AttrKey::HeadDim, input.dims[2]);
+    const auto rotary = op.u64(AttrKey::RotaryDim, cos.dims[1] * 2U);
+    if (heads != input.dims[1] || head_dim != input.dims[2] ||
+        weight.dims[0] != head_dim || cos.dims[0] != input.dims[0] ||
+        rotary == 0 || rotary > head_dim || (rotary % 2U) != 0U ||
+        (cos.dims[1] != rotary && cos.dims[1] * 2U != rotary))
+      fail("qk_norm_partial_rope shape attributes are inconsistent");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("qk_norm_partial_rope block size must be a power of two in [32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::Attention) {
+    expect_counts(op, 3, 1);
+    const auto &q = tensor_or_fail(program, op.inputs[0], op);
+    const auto &k = tensor_or_fail(program, op.inputs[1], op);
+    const auto &v = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(q, k, op);
+    same_shape_dtype(q, v, op);
+    same_shape_dtype(q, out, op);
+    if (!supported_float(q.dtype) || q.dims.size() != 3)
+      fail("attention semantics require f32, bf16, or f16 [S,H,D]");
+    const auto implementation = op.u64(AttrKey::Implementation, 1U);
+    if (implementation != 1U && implementation != 2U)
+      fail("attention implementation must be 1 (generated) or 2 (cuDNN)");
+    if (implementation == 2U && q.dtype != DType::BF16 &&
+        q.dtype != DType::F16)
+      fail("cuDNN attention implementation requires bf16 or f16");
+    if (implementation == 1U && q.dims[0] > 4096U)
+      fail("naive exact attention is admitted only for S<=4096; use a backend implementation");
+    const auto block = op.u64(AttrKey::BlockSize, 64U);
+    if (block < 32U || block > 256U || (block & (block - 1U)) != 0U)
+      fail("initial fused attention requires a power-of-two block in [32,256]");
+    return;
+  }
+
+  if (op.opcode == Opcode::BiasAdd) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &bias = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        bias.dtype != input.dtype || bias.dims.size() != 1U ||
+        bias.dims[0] != input.dims.back())
+      fail("bias_add requires float input/output and matching final-width bias");
+    return;
+  }
+
+  if (op.opcode == Opcode::H3AdaLNSelect) {
+    expect_counts(op, 2, 6);
+    const auto &projected = tensor_or_fail(program, op.inputs[0], op);
+    const auto &indices = tensor_or_fail(program, op.inputs[1], op);
+    if (!supported_float(projected.dtype) || projected.dims.size() != 2U ||
+        indices.dtype != DType::I32 || indices.dims.size() != 1U)
+      fail("h3_adaln_select requires projected [T,18H] and i32 indices [S]");
+    const auto &first = tensor_or_fail(program, op.outputs[0], op);
+    if (first.dtype != projected.dtype || first.dims.size() != 2U ||
+        first.dims[0] != indices.dims[0] ||
+        projected.dims[1] != 18U * first.dims[1])
+      fail("h3_adaln_select output shape is inconsistent");
+    for (const auto output : op.outputs)
+      same_shape_dtype(first, tensor_or_fail(program, output, op), op);
+    return;
+  }
+
+  if (op.opcode == Opcode::H3DeinterleaveQkv) {
+    expect_counts(op, 1, 3);
+    const auto &packed = tensor_or_fail(program, op.inputs[0], op);
+    const auto &q = tensor_or_fail(program, op.outputs[0], op);
+    const auto &k = tensor_or_fail(program, op.outputs[1], op);
+    const auto &v = tensor_or_fail(program, op.outputs[2], op);
+    same_shape_dtype(q, k, op);
+    same_shape_dtype(q, v, op);
+    if (!supported_float(packed.dtype) || q.dtype != packed.dtype ||
+        packed.dims.size() != 2U || q.dims.size() != 3U ||
+        packed.dims[0] != q.dims[0] ||
+        packed.dims[1] != 3U * q.dims[1] * q.dims[2] ||
+        op.u64(AttrKey::Heads, q.dims[1]) != q.dims[1] ||
+        op.u64(AttrKey::HeadDim, q.dims[2]) != q.dims[2])
+      fail("h3_deinterleave_qkv shape/attributes are inconsistent");
+    return;
+  }
+
+  if (op.opcode == Opcode::H3DeinterleaveQkvWeight) {
+    expect_counts(op, 1, 3);
+    const auto &packed = tensor_or_fail(program, op.inputs[0], op);
+    const auto &q = tensor_or_fail(program, op.outputs[0], op);
+    const auto &k = tensor_or_fail(program, op.outputs[1], op);
+    const auto &v = tensor_or_fail(program, op.outputs[2], op);
+    same_shape_dtype(q, k, op);
+    same_shape_dtype(q, v, op);
+    if (!supported_float(packed.dtype) || q.dtype != packed.dtype ||
+        packed.dims.size() != 2U || q.dims.size() != 2U ||
+        packed.dims[0] != 3U * q.dims[0] || packed.dims[1] != q.dims[1])
+      fail("h3_deinterleave_qkv_weight requires [3N,K] -> three [N,K] tensors");
+    const auto heads = op.u64(AttrKey::Heads, 0U);
+    const auto head_dim = op.u64(AttrKey::HeadDim, 0U);
+    if (heads == 0U || head_dim == 0U || q.dims[0] != heads * head_dim)
+      fail("h3_deinterleave_qkv_weight head geometry disagrees with N");
+    return;
+  }
+
+  if (op.opcode == Opcode::DequantizeInt4) {
+    if ((op.inputs.size() != 2U && op.inputs.size() != 4U) ||
+        op.outputs.size() != 1U)
+      fail("dequantize_int4 expects packed, scales, optional outlier index "
+           "and residual, and one output");
+    const auto &packed = tensor_or_fail(program, op.inputs[0], op);
+    const auto &scales = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const auto group = op.u64(AttrKey::GroupSize, 64U);
+    if (packed.dtype != DType::I8 || packed.dims.size() != 2U ||
+        !supported_float(scales.dtype) || scales.dtype != out.dtype ||
+        scales.dims.size() != 2U || out.dims.size() != 2U ||
+        out.dims[1] % 2U != 0U || packed.dims[0] != out.dims[0] ||
+        packed.dims[1] != out.dims[1] / 2U || group < 16U || group > 256U ||
+        (group & (group - 1U)) != 0U || out.dims[1] % group != 0U ||
+        scales.dims[0] != out.dims[0] ||
+        scales.dims[1] != out.dims[1] / group)
+      fail("dequantize_int4 requires i8-packed [N,K/2], float scales "
+           "[N,K/group], and float output [N,K]");
+    if (op.inputs.size() == 4U) {
+      const auto &indices = tensor_or_fail(program, op.inputs[2], op);
+      const auto &residuals = tensor_or_fail(program, op.inputs[3], op);
+      if (indices.dtype != DType::I8 || indices.dims != scales.dims ||
+          residuals.dtype != out.dtype || residuals.dims != scales.dims)
+        fail("dequantize_int4 outlier correction requires i8 indices and "
+             "float residuals shaped like the scales");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::DequantizeInt5) {
+    if ((op.inputs.size() != 2U && op.inputs.size() != 3U) ||
+        op.outputs.size() != 1U)
+      fail("dequantize_int5 expects packed, group scales, optional column "
+           "scales, and one output");
+    const auto &packed = tensor_or_fail(program, op.inputs[0], op);
+    const auto &scales = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const auto group = op.u64(AttrKey::GroupSize, 64U);
+    if (packed.dtype != DType::I8 || packed.dims.size() != 2U ||
+        !supported_float(scales.dtype) || scales.dtype != out.dtype ||
+        scales.dims.size() != 2U || out.dims.size() != 2U ||
+        out.dims[1] % 8U != 0U || packed.dims[0] != out.dims[0] ||
+        packed.dims[1] != out.dims[1] * 5U / 8U || group < 16U ||
+        group > 256U || (group & (group - 1U)) != 0U ||
+        out.dims[1] % group != 0U || scales.dims[0] != out.dims[0] ||
+        scales.dims[1] != out.dims[1] / group)
+      fail("dequantize_int5 requires bit-packed [N,5K/8], float scales "
+           "[N,K/group], and float output [N,K]");
+    if (op.inputs.size() == 3U) {
+      const auto &columns = tensor_or_fail(program, op.inputs[2], op);
+      if (columns.dtype != out.dtype || columns.dims.size() != 1U ||
+          columns.dims[0] != out.dims[1])
+        fail("dequantize_int5 column scales must match output dtype and [K]");
+    }
+    return;
+  }
+
+  fail("unsupported DiffIR operation");
+}
+
+} // namespace
+
+void verify(const Program &program) {
+  if (program.version != kVersion)
+    fail("unsupported DiffIR program version");
+  if (program.tensors.empty())
+    fail("DiffIR program has no tensors");
+
+  std::unordered_set<std::uint32_t> tensor_ids;
+  for (const auto &tensor : program.tensors) {
+    if (tensor.id == 0 || !tensor_ids.insert(tensor.id).second)
+      fail("DiffIR tensor ids must be unique and nonzero");
+    if (!valid_dtype(tensor.dtype) || tensor.dims.empty() || tensor.dims.size() > kMaxRank)
+      fail("DiffIR tensor has invalid dtype or rank");
+    constexpr std::uint32_t valid_roles =
+        TensorRole::Input | TensorRole::Output | TensorRole::Constant |
+        TensorRole::Streamed | TensorRole::Parameter |
+        TensorRole::OptimizerState;
+    if ((tensor.roles & ~valid_roles) != 0U)
+      fail("DiffIR tensor has unknown role flags");
+    if (tensor.has_role(TensorRole::Streamed) &&
+        !tensor.has_role(TensorRole::Constant))
+      fail("DiffIR streamed tensor must also be constant");
+    if (tensor.has_role(TensorRole::Parameter) &&
+        (!tensor.has_role(TensorRole::Input) &&
+         !tensor.has_role(TensorRole::Output)))
+      fail("DiffIR parameter must be an input or output");
+    if (tensor.has_role(TensorRole::OptimizerState) &&
+        (!tensor.has_role(TensorRole::Input) &&
+         !tensor.has_role(TensorRole::Output)))
+      fail("DiffIR optimizer state must be an input or output");
+    if ((tensor.has_role(TensorRole::Parameter) ||
+         tensor.has_role(TensorRole::OptimizerState)) &&
+        tensor.has_role(TensorRole::Constant))
+      fail("DiffIR mutable training state cannot be constant");
+    (void)tensor.byte_count();
+  }
+
+  std::unordered_set<std::uint32_t> operation_ids;
+  std::unordered_map<std::uint32_t, std::uint32_t> writers;
+  std::unordered_set<std::uint32_t> available;
+  for (const auto &tensor : program.tensors) {
+    if (tensor.has_role(TensorRole::Input) || tensor.has_role(TensorRole::Constant))
+      available.insert(tensor.id);
+  }
+
+  for (const auto &op : program.operations) {
+    if (op.id == 0 || !operation_ids.insert(op.id).second)
+      fail("DiffIR operation ids must be unique and nonzero");
+    if (!valid_opcode(op.opcode))
+      fail("DiffIR operation has unknown opcode");
+    for (const auto input : op.inputs) {
+      if (!available.contains(input))
+        fail("DiffIR operation consumes an unavailable tensor");
+    }
+    for (const auto output : op.outputs) {
+      if (!program.tensor(output))
+        fail("DiffIR operation produces an undeclared tensor");
+      if (!writers.emplace(output, op.id).second)
+        fail("DiffIR tensor has multiple writers");
+      if (program.tensor(output)->has_role(TensorRole::Input) ||
+          program.tensor(output)->has_role(TensorRole::Constant))
+        fail("DiffIR operation cannot overwrite input or constant tensor");
+      available.insert(output);
+    }
+    verify_operation(program, op);
+  }
+
+  for (const auto &tensor : program.tensors) {
+    if (tensor.has_role(TensorRole::Output) && !available.contains(tensor.id))
+      fail("DiffIR output tensor is unavailable");
+  }
+}
+
+} // namespace dif::ir

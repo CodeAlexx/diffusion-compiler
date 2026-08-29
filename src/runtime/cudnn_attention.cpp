@@ -1,0 +1,159 @@
+#include "dif/runtime/cudnn_attention.hpp"
+
+#include "dif/support/error.hpp"
+
+#include <cudnn_frontend.h>
+#include <cuda_runtime_api.h>
+
+#include <array>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace dif::runtime {
+namespace {
+
+namespace fe = cudnn_frontend;
+
+constexpr std::int64_t kQueryUid = 1;
+constexpr std::int64_t kKeyUid = 2;
+constexpr std::int64_t kValueUid = 3;
+constexpr std::int64_t kOutputUid = 4;
+constexpr std::int64_t kScaleUid = 5;
+
+void check(cudnnStatus_t status, const char *action) {
+  if (status == CUDNN_STATUS_SUCCESS)
+    return;
+  fail(std::string(action) + ": " + cudnnGetErrorString(status));
+}
+
+std::int64_t dimension(std::uint64_t value, const char *label) {
+  if (value == 0U ||
+      value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+    fail(std::string("cuDNN attention ") + label + " is outside int64 range");
+  return static_cast<std::int64_t>(value);
+}
+
+} // namespace
+
+struct CudnnAttentionPlan::Impl {
+  cudnnHandle_t handle{};
+  std::shared_ptr<fe::graph::Graph> graph;
+  std::size_t workspace{};
+  float scale{};
+
+  ~Impl() {
+    graph.reset();
+    if (handle)
+      (void)cudnnDestroy(handle);
+  }
+};
+
+CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
+                                       double scale, bool causal)
+    : impl_(std::make_unique<Impl>()) {
+  if ((query.dtype != ir::DType::BF16 && query.dtype != ir::DType::F16) ||
+      query.dims.size() != 3U)
+    fail("cuDNN attention requires BF16 or F16 [S,H,D]");
+  const auto sequence = dimension(query.dims[0], "sequence");
+  const auto heads = dimension(query.dims[1], "heads");
+  const auto head_dim = dimension(query.dims[2], "head dimension");
+  if (!(scale > 0.0))
+    fail("cuDNN attention scale must be positive");
+
+  check(cudnnCreate(&impl_->handle), "cudnnCreate");
+  impl_->graph = std::make_shared<fe::graph::Graph>();
+  impl_->graph
+      ->set_io_data_type(query.dtype == ir::DType::BF16
+                             ? fe::DataType_t::BFLOAT16
+                             : fe::DataType_t::HALF)
+      .set_intermediate_data_type(fe::DataType_t::FLOAT)
+      .set_compute_data_type(fe::DataType_t::FLOAT);
+
+  impl_->scale = static_cast<float>(scale);
+  const std::vector<std::int64_t> dims{1, heads, sequence, head_dim};
+  // DiffIR stores [S,H,D].  Expose those bytes as the same non-contiguous
+  // [B,H,S,D] view that PyTorch creates by permuting a contiguous [B,S,H,D]
+  // tensor before SDPA.
+  const std::vector<std::int64_t> strides{
+      heads * sequence * head_dim, head_dim, heads * head_dim, 1};
+  auto tensor = [&](const char *name, std::int64_t uid) {
+    return impl_->graph->tensor(fe::graph::Tensor_attributes()
+                                    .set_name(name)
+                                    .set_uid(uid)
+                                    .set_dim(dims)
+                                    .set_stride(strides));
+  };
+  auto q = tensor("Q", kQueryUid);
+  auto k = tensor("K", kKeyUid);
+  auto v = tensor("V", kValueUid);
+  auto attention_scale =
+      impl_->graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Attn_scale")
+                               .set_uid(kScaleUid)
+                               .set_dim({1, 1, 1, 1})
+                               .set_stride({1, 1, 1, 1})
+                               .set_is_pass_by_value(true)
+                               .set_data_type(fe::DataType_t::FLOAT));
+  auto attributes = fe::graph::SDPA_attributes()
+                        .set_name("dif_cudnn_sdpa")
+                        .set_generate_stats(false)
+                        .set_attn_scale(attention_scale);
+  if (causal)
+    attributes.set_causal_mask(true);
+  auto [output, stats] = impl_->graph->sdpa(q, k, v, attributes);
+  (void)stats;
+  output->set_output(true)
+      .set_uid(kOutputUid)
+      .set_dim(dims)
+      .set_stride(strides);
+
+  auto status = impl_->graph->build(impl_->handle, {fe::HeurMode_t::A});
+  if (!status.is_good())
+    fail("cuDNN attention graph build: " + status.get_message());
+  std::int64_t workspace = 0;
+  status = impl_->graph->get_workspace_size(workspace);
+  if (!status.is_good())
+    fail("cuDNN attention workspace query: " + status.get_message());
+  if (workspace < 0 ||
+      static_cast<std::uint64_t>(workspace) >
+          static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+    fail("cuDNN attention workspace is outside size_t range");
+  impl_->workspace = static_cast<std::size_t>(workspace);
+}
+
+CudnnAttentionPlan::~CudnnAttentionPlan() = default;
+CudnnAttentionPlan::CudnnAttentionPlan(CudnnAttentionPlan &&) noexcept = default;
+CudnnAttentionPlan &
+CudnnAttentionPlan::operator=(CudnnAttentionPlan &&) noexcept = default;
+
+std::size_t CudnnAttentionPlan::workspace_bytes() const {
+  return impl_->workspace;
+}
+
+void CudnnAttentionPlan::execute(std::uintptr_t query, std::uintptr_t key,
+                                 std::uintptr_t value, std::uintptr_t output,
+                                 std::uintptr_t workspace,
+                                 std::uintptr_t stream) {
+  if (!query || !key || !value || !output)
+    fail("cuDNN attention received a null tensor pointer");
+  if (impl_->workspace != 0U && !workspace)
+    fail("cuDNN attention received a null workspace");
+  check(cudnnSetStream(impl_->handle, reinterpret_cast<cudaStream_t>(stream)),
+        "cudnnSetStream");
+  std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> bindings{
+      {kQueryUid, reinterpret_cast<void *>(query)},
+      {kKeyUid, reinterpret_cast<void *>(key)},
+      {kValueUid, reinterpret_cast<void *>(value)},
+      {kOutputUid, reinterpret_cast<void *>(output)},
+      {kScaleUid, &impl_->scale},
+  };
+  auto status = impl_->graph->execute(
+      impl_->handle, bindings, reinterpret_cast<void *>(workspace));
+  if (!status.is_good())
+    fail("cuDNN attention execute: " + status.get_message());
+}
+
+} // namespace dif::runtime

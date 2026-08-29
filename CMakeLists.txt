@@ -1,0 +1,184 @@
+cmake_minimum_required(VERSION 3.24)
+
+project(diffusion_compiler VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(DIF_ENABLE_CUDA "Build the CUDA Driver/NVRTC backend" ON)
+option(DIF_ENABLE_CUDNN "Build optional cuDNN SDPA lowering" ON)
+option(DIF_BUILD_TESTS "Build unit tests" ON)
+option(DIF_ENABLE_OPENCL "Build the vendor-neutral OpenCL reference backend" ON)
+set(DIF_CUDNN_ROOT "" CACHE PATH "cuDNN installation root (include/ and lib/)")
+
+add_library(difcore
+    src/backend/plugin.cpp
+    src/compiler/compiler.cpp
+    src/compiler/int4.cpp
+    src/compiler/memory_plan.cpp
+  src/frontend/h3.cpp
+  src/frontend/h3_conditioning.cpp
+  src/frontend/h3_vae.cpp
+  src/frontend/training.cpp
+    src/ir/codec.cpp
+    src/ir/verify.cpp
+    src/runtime/cpu_executor.cpp
+    src/runtime/executor.cpp
+    src/runtime/scalar.cpp
+    src/runtime/tensor_io.cpp
+    src/sampling/rectified_flow.cpp
+    src/support/sha256.cpp
+    src/support/json.cpp
+    src/tune/database.cpp
+    src/training/autodiff.cpp
+    src/training/checkpoint.cpp
+    src/weights/safetensors.cpp
+    src/weights/bundle.cpp
+)
+target_include_directories(difcore PUBLIC include)
+target_compile_options(difcore PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_link_libraries(difcore PRIVATE ${CMAKE_DL_LIBS})
+
+if(DIF_ENABLE_CUDA)
+  find_package(CUDAToolkit QUIET)
+endif()
+
+if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
+  target_sources(difcore PRIVATE src/runtime/cuda_executor.cpp)
+  target_link_libraries(difcore PRIVATE CUDA::cuda_driver CUDA::nvrtc
+                                        CUDA::cublas CUDA::cublasLt)
+  target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=1)
+  if(DIF_ENABLE_CUDNN)
+    find_path(DIF_CUDNN_INCLUDE_DIR cudnn.h
+              HINTS "${DIF_CUDNN_ROOT}" ENV CUDNN_ROOT
+              PATH_SUFFIXES include)
+    find_library(DIF_CUDNN_LIBRARY
+                 NAMES cudnn libcudnn.so.9
+                 HINTS "${DIF_CUDNN_ROOT}" ENV CUDNN_ROOT
+                 PATH_SUFFIXES lib lib64)
+  endif()
+  if(DIF_ENABLE_CUDNN AND DIF_CUDNN_INCLUDE_DIR AND DIF_CUDNN_LIBRARY)
+    target_sources(difcore PRIVATE src/runtime/cudnn_attention.cpp)
+    target_include_directories(
+        difcore SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cudnn_frontend/include"
+        "${DIF_CUDNN_INCLUDE_DIR}")
+    target_link_libraries(difcore PRIVATE CUDA::cudart "${DIF_CUDNN_LIBRARY}")
+    target_compile_definitions(difcore PUBLIC DIF_HAS_CUDNN=1)
+    message(STATUS "Diffusion compiler cuDNN SDPA: ${DIF_CUDNN_LIBRARY}")
+  else()
+    target_compile_definitions(difcore PUBLIC DIF_HAS_CUDNN=0)
+    message(STATUS "Diffusion compiler cuDNN SDPA: disabled")
+  endif()
+else()
+  target_sources(difcore PRIVATE src/runtime/cuda_executor_stub.cpp)
+  target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=0 DIF_HAS_CUDNN=0)
+endif()
+
+add_executable(difc tools/difc.cpp)
+target_link_libraries(difc PRIVATE difcore)
+
+add_executable(difrun tools/difrun.cpp)
+target_link_libraries(difrun PRIVATE difcore)
+
+add_executable(difinspect tools/difinspect.cpp)
+target_link_libraries(difinspect PRIVATE difcore)
+
+add_executable(diftune tools/diftune.cpp)
+target_link_libraries(diftune PRIVATE difcore)
+
+add_executable(difcast tools/difcast.cpp)
+target_link_libraries(difcast PRIVATE difcore)
+
+add_executable(difcompare tools/difcompare.cpp)
+target_link_libraries(difcompare PRIVATE difcore)
+
+add_executable(difschedule tools/difschedule.cpp)
+target_link_libraries(difschedule PRIVATE difcore)
+
+add_executable(difh3layout tools/difh3layout.cpp)
+target_link_libraries(difh3layout PRIVATE difcore)
+
+add_executable(difweights tools/difweights.cpp)
+target_link_libraries(difweights PRIVATE difcore)
+
+add_executable(difquant tools/difquant.cpp)
+target_link_libraries(difquant PRIVATE difcore)
+
+add_executable(difimage tools/difimage.cpp)
+target_link_libraries(difimage PRIVATE difcore)
+
+add_executable(difvaedecode tools/difvaedecode.cpp)
+target_link_libraries(difvaedecode PRIVATE difcore)
+
+add_executable(diftrain tools/diftrain.cpp)
+target_link_libraries(diftrain PRIVATE difcore)
+
+add_executable(difh3infer tools/difh3infer.cpp)
+target_link_libraries(difh3infer PRIVATE difcore)
+
+if(DIF_ENABLE_OPENCL)
+  find_path(DIF_OPENCL_INCLUDE_DIR CL/cl.h
+            HINTS ${CUDAToolkit_INCLUDE_DIRS}
+                  /usr/local/cuda/targets/x86_64-linux/include)
+  find_library(DIF_OPENCL_LIBRARY OpenCL
+               HINTS /usr/local/cuda/targets/x86_64-linux/lib)
+endif()
+if(DIF_ENABLE_OPENCL AND DIF_OPENCL_INCLUDE_DIR AND DIF_OPENCL_LIBRARY)
+  add_library(dif_backend_opencl SHARED
+      backends/opencl/opencl_backend.cpp
+      src/compiler/memory_plan.cpp
+      src/ir/codec.cpp
+      src/ir/verify.cpp
+      src/support/sha256.cpp)
+  target_include_directories(dif_backend_opencl PRIVATE include
+                                                     "${DIF_OPENCL_INCLUDE_DIR}")
+  target_compile_options(dif_backend_opencl PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_link_libraries(dif_backend_opencl PRIVATE "${DIF_OPENCL_LIBRARY}")
+  set_target_properties(dif_backend_opencl PROPERTIES CXX_VISIBILITY_PRESET hidden)
+  install(TARGETS dif_backend_opencl LIBRARY DESTINATION lib)
+  message(STATUS "Diffusion compiler OpenCL backend: ${DIF_OPENCL_LIBRARY}")
+else()
+  message(STATUS "Diffusion compiler OpenCL backend: disabled")
+endif()
+
+install(TARGETS difc difrun difinspect diftune difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer
+        RUNTIME DESTINATION bin)
+
+if(DIF_BUILD_TESTS)
+  enable_testing()
+  add_executable(dif_tests tests/dif_tests.cpp)
+  target_link_libraries(dif_tests PRIVATE difcore)
+  add_test(NAME dif_tests COMMAND dif_tests)
+
+  add_library(dif_mock_backend SHARED tests/mock_backend.cpp)
+  target_include_directories(dif_mock_backend PRIVATE include)
+  target_compile_options(dif_mock_backend PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  set_target_properties(dif_mock_backend PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
+  add_library(dif_mock_backend_v2 SHARED tests/mock_backend_v2.cpp)
+  target_include_directories(dif_mock_backend_v2 PRIVATE include)
+  target_compile_options(dif_mock_backend_v2 PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  set_target_properties(dif_mock_backend_v2 PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
+  add_executable(dif_plugin_tests tests/plugin_tests.cpp)
+  target_link_libraries(dif_plugin_tests PRIVATE difcore)
+  target_compile_definitions(
+      dif_plugin_tests PRIVATE
+      DIF_MOCK_BACKEND_V1_PATH="$<TARGET_FILE:dif_mock_backend>"
+      DIF_MOCK_BACKEND_V2_PATH="$<TARGET_FILE:dif_mock_backend_v2>")
+  add_dependencies(dif_plugin_tests dif_mock_backend dif_mock_backend_v2)
+  add_test(NAME dif_plugin_tests COMMAND dif_plugin_tests)
+
+  if(TARGET dif_backend_opencl)
+    add_executable(dif_opencl_plugin_tests tests/opencl_plugin_tests.cpp)
+    target_link_libraries(dif_opencl_plugin_tests PRIVATE difcore)
+    target_compile_definitions(
+        dif_opencl_plugin_tests PRIVATE
+        DIF_OPENCL_BACKEND_PATH="$<TARGET_FILE:dif_backend_opencl>")
+    add_dependencies(dif_opencl_plugin_tests dif_backend_opencl)
+    add_test(NAME dif_opencl_plugin_tests COMMAND dif_opencl_plugin_tests)
+    set_tests_properties(dif_opencl_plugin_tests PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+endif()

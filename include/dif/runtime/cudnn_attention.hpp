@@ -1,0 +1,31 @@
+#pragma once
+
+#include "dif/ir/ir.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+namespace dif::runtime {
+
+class CudnnAttentionPlan {
+public:
+  CudnnAttentionPlan(const ir::TensorDesc &query, double scale, bool causal);
+  ~CudnnAttentionPlan();
+
+  CudnnAttentionPlan(const CudnnAttentionPlan &) = delete;
+  CudnnAttentionPlan &operator=(const CudnnAttentionPlan &) = delete;
+  CudnnAttentionPlan(CudnnAttentionPlan &&) noexcept;
+  CudnnAttentionPlan &operator=(CudnnAttentionPlan &&) noexcept;
+
+  std::size_t workspace_bytes() const;
+  void execute(std::uintptr_t query, std::uintptr_t key, std::uintptr_t value,
+               std::uintptr_t output, std::uintptr_t workspace,
+               std::uintptr_t stream);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace dif::runtime
