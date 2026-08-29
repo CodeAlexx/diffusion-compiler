@@ -318,9 +318,11 @@ int main(int argc, char **argv) {
     } else {
       if (!weight_bundle.empty()) {
         const auto bundle = dif::weights::read_weight_bundle(weight_bundle);
-        // Fails when the bundle was sealed against a different program, so a
-        // checkpoint can never be bound to a graph it does not describe.
-        dif::weights::verify_weight_bundle(bundle, base.program, verify_shards);
+        // load_weight_bundle verifies before it maps anything: the program
+        // fingerprint, every binding against its descriptor, and each shard's
+        // size, plus the shard digests when asked and the SafeTensors metadata
+        // as it maps. Verifying separately here would hash every shard a second
+        // time, so the load is the single verification point.
         base.bindings =
             dif::weights::load_weight_bundle(bundle, base.program, verify_shards);
         std::cout << "BUNDLE path=" << weight_bundle.string()

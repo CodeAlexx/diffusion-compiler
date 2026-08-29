@@ -129,10 +129,38 @@ one:
 - A constant that no source covers is a hard failure
   (`difopt: missing constant tensor N`), not a zero-fill.
 
-This was verified end to end on a small transformer program with a synthetic
-SafeTensors shard carrying the real checkpoint tensor names. The fixture weights
-are meaningless — the point is only that the plumbing carries a sealed bundle
-into the search:
+Shard digests are hashed **once per invocation**. `load_weight_bundle` already
+verifies before it maps anything, so `difopt` does not call
+`verify_weight_bundle` separately; doing both would hash every shard twice.
+Measured with `strace -e trace=openat` on a `--verify-shards` run: the shard is
+opened 4 times before the fix and 3 after (digest, SafeTensors metadata, mmap).
+No check was dropped — the program fingerprint, per-binding descriptor, shard
+file size, and SafeTensors metadata comparisons all still run.
+
+`--verify-shards` is deliberately **advisory**, not mandatory. A search may seal
+and fully verify once, then skip re-hashing every shard for every candidate; a
+run that omits it warns on stderr and still enforces every non-digest check.
+
+`tests/difopt_cli_tests.cpp` (CTest target `dif_difopt_cli_tests`, CPU-only,
+~0.2 s) is the gate on all of this. It builds a SafeTensors shard through the
+public `SafeTensorWriter`, seals a `WeightBundle` against it, and drives the real
+`difopt` binary through: bundle binding succeeds; bundle plus explicit `--bind`
+succeeds; an explicit tensor overrides the same tensor from the bundle (checked
+by the base candidate fingerprint moving, since it covers bound constant values);
+real bindings plus `--synthetic-bindings` is a usage error, as is no binding
+source at all; a bundle sealed against a different program is refused by
+fingerprint; an unbound constant is refused; and `--verify-shards` refuses a
+shard whose payload changed after sealing while its size did not, which the
+size check alone cannot catch.
+
+The gate was mutation-checked rather than assumed: reverting `insert_or_assign`
+to `emplace`, ignoring `--verify-shards`, and loosening the exclusivity rule each
+make it fail.
+
+The composition rules were also verified end to end by hand on a small
+transformer program with a synthetic SafeTensors shard carrying the real
+checkpoint tensor names. The fixture weights are meaningless — the point is only
+that the plumbing carries a sealed bundle into the search:
 
 ```sh
 difc make-h3-transformer-bf16 xf.difir 8 32 2 16 64 8 1 2 16 64 resident packed

@@ -176,6 +176,14 @@ if(DIF_BUILD_TESTS)
   target_link_libraries(dif_opt_tests PRIVATE difcore)
   add_test(NAME dif_opt_tests COMMAND dif_opt_tests)
 
+  add_executable(dif_difopt_cli_tests tests/difopt_cli_tests.cpp)
+  target_link_libraries(dif_difopt_cli_tests PRIVATE difcore)
+  target_compile_definitions(
+      dif_difopt_cli_tests PRIVATE
+      DIF_DIFOPT_PATH="$<TARGET_FILE:difopt>")
+  add_dependencies(dif_difopt_cli_tests difopt)
+  add_test(NAME dif_difopt_cli_tests COMMAND dif_difopt_cli_tests)
+
   add_executable(dif_plugin_tests tests/plugin_tests.cpp)
   target_link_libraries(dif_plugin_tests PRIVATE difcore)
   target_compile_definitions(
