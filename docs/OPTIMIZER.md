@@ -182,12 +182,29 @@ reproduce the recorded candidate fingerprint. `optimize` returns its optimized
 context by replaying its own plan, so the program it hands back is exactly what a
 clean rebuild produces.
 
-Every candidate is recorded twice: as a `tune::Measurement` in the existing
-tuning database (candidate hash, base program hash, backend, device, timings,
-numerics, status) and as a full entry in a JSON journal that additionally carries
-the transform sequence, the depth and parent, the planned/naive/resident/streamed
-byte counts, the relative L2, the acceptance bars, the noise bound, and the
-effective decision rules.
+Every candidate is recorded twice.
+
+As a `tune::Measurement` in the existing tuning database: base program
+fingerprint (`program_hash`), candidate fingerprint (`candidate_hash`), backend,
+device, timings, planned memory, the numerical metrics, the verdict including
+its rejection reason (`status`), and the canonical transform sequence (`plan`).
+The record format grew two fields for this — `planned_memory_bytes` and `plan` —
+so the database went to version 3. Version 1 and 2 files still load, exactly as
+version 1 already did when version 2 added the norm ratio, and are rewritten at
+version 3 on the next record. `diftune` writes the same table and simply leaves
+the two new fields empty.
+
+The `plan` field is the candidate's reproducible identity, not a label:
+`decode_transform_sequence` inverts the canonical text form, so a persisted row
+can be decoded and replayed against the base program, and must rebuild the
+`candidate_hash` recorded beside it. `test_measurements_persist_reproducible_provenance`
+holds every row of a search to exactly that, rejected rows included — a refused
+candidate keeps full provenance so a later run can see what was already tried
+and why it was refused.
+
+And as a full entry in a JSON journal, which additionally carries the depth and
+parent, the naive/resident/streamed byte counts, the relative L2, the acceptance
+bars, the noise bound, and the effective decision rules.
 
 ## Measured results
 
@@ -201,6 +218,24 @@ measured noise bound.
 Constants and inputs are the deterministic fixture from
 `dif::opt::synthesize_bindings`. **They are an experiment fixture, not a model.
 Nothing here is a statement about output quality.**
+
+### Phase-1 proving gate
+
+Each required piece of evidence, and the check that produces it. Every row is
+executed by `ctest`; the searches are also reproducible from the command line.
+
+| Required evidence | Where it is demonstrated | Result |
+|---|---|---|
+| A candidate fails a hard gate | `test_phase_one_h3_optimization_search` | 11 `rejected_numerical`, 11 `rejected_memory` of 48 measured |
+| Multiple valid candidates are timed | same | 26 accepted, each timed |
+| The fastest accepted candidate is selected automatically | `test_latency_objective_selects_the_fastest_accepted_candidate` | winner is the fastest of every accepted candidate; a candidate 21.8x faster was refused |
+| Transformation provenance is persisted | `test_measurements_persist_reproducible_provenance` | 12/12 rows carry a plan that rebuilds their own candidate hash |
+| The winning plan serializes | `test_plan_serialization_round_trip` | JSON round-trips |
+| Clean-process replay gives the same candidate fingerprint | `difopt --replay` in a fresh build tree | byte-identical `.difir` |
+| Replay produces the same accepted numerical result | `test_phase_one_h3_optimization_search`, latency test | outputs bit-identical |
+| A memory limit independently rejects a valid candidate | `test_search_enforces_the_memory_constraint` | numerically exact candidates refused for footprint alone |
+| Thresholds are unreachable from the transformation APIs | structural | `transform.hpp`, `plan.hpp` and `rewrite.hpp` do not include `gate.hpp` or name `AcceptanceBars`; no non-const `AcceptanceGate&` exists in the tree |
+| No manually selected winner | all searches | the winner is chosen by `objective_value` alone; no test names an expected winning transform |
 
 ### Phase 1: one real H3 denoiser block
 
@@ -269,6 +304,47 @@ tolerance widened from 1.05 to 1.19, which is what allowed the genuinely
 smallest-memory candidate to win instead of a same-memory candidate that happened
 to time faster.
 
+### The latency objective, on a deterministic clock
+
+The Phase-1 search above minimizes planned memory, because wall-clock latency on
+this container is not resolvable at the magnitudes the search compares between
+candidates. That is a property of the machine, not of the rule, and it would be
+dishonest to leave the latency rule itself unproven — "fastest accepted candidate
+wins" is the claim the whole acceptance order exists to constrain.
+
+`test_latency_objective_selects_the_fastest_accepted_candidate` proves it against
+a deterministic clock instead of a noisy one. A `ScriptedLatencyExecutor`
+delegates every *value* to the portable CPU reference — verification, execution,
+numerics and planned memory are measured exactly as they are everywhere else —
+and replaces only the timer with a pure function of the candidate program. That
+function is deliberately adversarial: it rewards precisely what the numerical
+gate exists to catch, scoring `f16` and INT4/INT5 candidates fastest. The fastest
+program the search can measure is therefore always one that must be rejected.
+
+Measured, on the same one-block H3 fixture (48 candidates, 50 transforms
+discovered):
+
+| | latency | verdict |
+|---|---|---|
+| Baseline | 100.000 ms | — |
+| Fastest candidate measured | **0.654 ms** | **`rejected_numerical`** |
+| Winner | 14.286 ms | accepted |
+
+The winner is `set_linear_implementation ops=1,3,27,29,54,56 params=2`, and it is
+the fastest of every accepted candidate. A candidate **21.8x faster than the
+winner** was measured, ranked, and refused. The test asserts each link
+separately: the fastest candidate overall is not accepted, its verdict is
+specifically the numerical gate rather than memory or an execution failure, it is
+strictly faster than the winner, the winner is accepted and cleared the
+improvement margin, and no accepted candidate is faster than the winner. The
+winning plan then replays to its recorded fingerprint and to identical outputs,
+like any other plan.
+
+The deterministic clock has no spread and no drift, so the search reports a noise
+bound of exactly `1.0` and leaves the improvement margin at its requested `0.02`.
+That is checked too: the noise machinery must not inflate the margin on a quiet
+machine any more than it may be bypassed on a noisy one.
+
 ### Expansion to the full fifty-block denoiser
 
 `make_h3_denoiser` with `layers = 50`: 890 operations, 1 783 tensors, baseline
@@ -301,6 +377,12 @@ planned working set by 42x with bit-exact results.
 - **Latency on this machine is not resolvable at these magnitudes.** Every
   latency figure here is quoted with the search's measured noise bound. Where the
   bound exceeds the difference, no claim is made.
+- **The scripted clock proves the selection rule, not hardware performance.** The
+  latency numbers in *The latency objective* are generated by a deterministic
+  function, so they establish that the search ranks, gates and selects correctly.
+  They are not a measurement of any device and imply nothing about how fast any
+  of those candidates would actually run. A real latency result needs a real
+  backend, which is what `difopt --backend cuda` is for.
 - **Planned memory is the planner's model**, not an allocator measurement.
 - **`TileM`/`TileN`/`TileK` are not consumed by any current backend**, so
   `set_tile_shape` is implemented but left out of default discovery; enabling it

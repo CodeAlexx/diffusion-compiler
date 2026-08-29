@@ -70,6 +70,11 @@ void record_measurement(tune::Database &database, const SearchResult &result,
   measurement.cosine_similarity = record.numerics.cosine_similarity;
   measurement.norm_ratio = record.numerics.norm_ratio;
   measurement.nonfinite_count = record.numerics.nonfinite_count;
+  measurement.planned_memory_bytes = record.memory.planned_bytes;
+  // The reproducible identity of this candidate: replaying this sequence
+  // against program_hash must rebuild candidate_hash. Rejected candidates keep
+  // theirs too, so a later run can see what was already tried and refused.
+  measurement.plan = encode_transform_sequence(record.transforms);
   measurement.status = std::string(verdict_name(record.verdict));
   measurement.created_unix = now_unix();
   database.record(measurement);

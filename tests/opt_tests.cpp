@@ -11,12 +11,16 @@
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
 #include "dif/support/error.hpp"
+#include "dif/tune/database.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -648,6 +652,237 @@ void test_search_enforces_the_memory_constraint() {
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// The Latency objective.
+//
+// Wall-clock latency on a shared container is not resolvable at the magnitudes
+// this search compares between candidates, so the latency winner rule cannot be
+// proven against a real clock here. This executor delegates every *value* to the
+// portable CPU reference -- verification, execution, numerics and memory are
+// measured exactly as they are everywhere else -- and replaces only the clock
+// with a deterministic function of the candidate program.
+//
+// That function is deliberately adversarial: it rewards precisely the programs
+// the numerical gate exists to catch. Reduced-precision and quantized
+// candidates are scored fastest, so the fastest candidate the search measures
+// is always one that must be rejected. "Fastest accepted candidate wins" and
+// "a candidate is never accepted merely because it is faster" are therefore
+// separable, and both are checked below.
+// ---------------------------------------------------------------------------
+double scripted_latency(const ir::Program &program) {
+  double aggression = 0.0;
+  for (const auto &tensor : program.tensors) {
+    if (tensor.dtype == ir::DType::F16)
+      aggression += 4.0;
+    else if (tensor.dtype == ir::DType::I8)
+      aggression += 8.0;
+  }
+  for (const auto &operation : program.operations) {
+    if (operation.opcode == ir::Opcode::Linear &&
+        operation.u64(ir::AttrKey::Implementation, 1U) == 2U)
+      aggression += 1.0;
+  }
+  return 100.0 / (1.0 + aggression);
+}
+
+class ScriptedPrepared final : public runtime::PreparedExecution {
+public:
+  ScriptedPrepared(std::unique_ptr<runtime::PreparedExecution> inner,
+                   double milliseconds)
+      : inner_(std::move(inner)), milliseconds_(milliseconds) {}
+
+  runtime::RunResult run(const runtime::TensorMap &inputs,
+                         const runtime::RunOptions &options) override {
+    auto result = inner_->run(inputs, options);
+    result.mean_milliseconds = milliseconds_;
+    result.minimum_milliseconds = milliseconds_;
+    result.maximum_milliseconds = milliseconds_;
+    result.backend_name = "scripted";
+    result.device_name = "scripted";
+    return result;
+  }
+  std::string name() const override { return "scripted"; }
+  std::uint64_t resident_bytes() const override {
+    return inner_->resident_bytes();
+  }
+
+private:
+  std::unique_ptr<runtime::PreparedExecution> inner_;
+  double milliseconds_{};
+};
+
+class ScriptedLatencyExecutor final : public runtime::Executor {
+public:
+  ScriptedLatencyExecutor() : inner_(runtime::make_cpu_executor()) {}
+
+  std::unique_ptr<runtime::PreparedExecution>
+  prepare(const ir::Program &program, const runtime::TensorMap &bindings,
+          const runtime::RunOptions &options) override {
+    return std::make_unique<ScriptedPrepared>(
+        inner_->prepare(program, bindings, options), scripted_latency(program));
+  }
+  std::string name() const override { return "scripted"; }
+
+private:
+  std::unique_ptr<runtime::Executor> inner_;
+};
+
+void test_latency_objective_selects_the_fastest_accepted_candidate() {
+  const auto base = h3_denoiser_fixture(1U, 256U);
+  const auto baseline_memory = opt::measure_memory(base);
+
+  opt::AcceptanceBars bars;
+  bars.max_absolute_error = 1.0e-4;
+  bars.min_cosine_similarity = 0.999999;
+  bars.min_norm_ratio = 0.9999;
+  bars.max_norm_ratio = 1.0001;
+  bars.max_relative_l2 = 1.0e-3;
+  // Deliberately generous, so that the memory constraint is not what stops the
+  // fast candidates and the numerical gate is doing the rejecting on its own.
+  bars.memory_budget_bytes = baseline_memory.planned_bytes * 2U;
+  const opt::AcceptanceGate gate(bars);
+
+  auto options = proving_options(1U);
+  options.objective = opt::Objective::Latency;
+
+  ScriptedLatencyExecutor executor;
+  const auto result = opt::optimize(base, executor, gate, options, nullptr);
+  report(result, "h3_denoiser_1_layer_latency");
+
+  const auto &baseline = result.candidates.front();
+  const auto &winner = result.candidates[result.winner];
+
+  // The deterministic clock has no spread and no drift, so the search should
+  // report a noise bound of exactly one and fall back on the requested margin.
+  expect(result.latency_noise_bound == 1.0 &&
+             result.effective_improvement_margin == options.improvement_margin,
+         "a noiseless clock leaves the improvement margin at its requested "
+         "value");
+
+  const auto fastest = std::min_element(
+      result.candidates.begin(), result.candidates.end(),
+      [](const opt::CandidateRecord &a, const opt::CandidateRecord &b) {
+        return a.minimum_milliseconds < b.minimum_milliseconds;
+      });
+  expect(fastest != result.candidates.end() && !fastest->accepted,
+         "the fastest candidate measured is not accepted");
+  expect(fastest->verdict == opt::Verdict::RejectedNumerical,
+         "the fastest candidate is refused by the numerical gate, not by "
+         "memory or by execution");
+  expect(fastest->minimum_milliseconds < winner.minimum_milliseconds,
+         "a strictly faster candidate than the winner was measured and "
+         "refused: speed alone never wins");
+
+  expect(winner.accepted && result.improved,
+         "the winner is an accepted candidate that beat the baseline");
+  expect(winner.minimum_milliseconds <
+             baseline.minimum_milliseconds *
+                 (1.0 - result.effective_improvement_margin),
+         "the winner cleared the improvement margin against the baseline");
+
+  double best_accepted = std::numeric_limits<double>::infinity();
+  for (const auto &record : result.candidates) {
+    if (record.accepted)
+      best_accepted = std::min(best_accepted, record.minimum_milliseconds);
+  }
+  expect(winner.minimum_milliseconds == best_accepted,
+         "the winner is the fastest of every accepted candidate");
+
+  // The winning plan still has to rebuild, exactly, like any other plan.
+  const auto rebuilt = opt::replay(result.plan, base);
+  expect(opt::candidate_fingerprint(rebuilt) ==
+             result.plan.candidate_fingerprint,
+         "the latency winner's plan replays to its recorded fingerprint");
+  expect(identical_outputs(run_once(rebuilt), run_once(result.optimized)),
+         "the replayed latency winner produces identical outputs");
+  std::cout << "LATENCY winner_plan=["
+            << opt::encode_transform_sequence(result.plan.transforms)
+            << "] baseline_ms=" << baseline.minimum_milliseconds
+            << " winner_ms=" << winner.minimum_milliseconds
+            << " fastest_rejected_ms=" << fastest->minimum_milliseconds << "\n";
+}
+
+
+// ---------------------------------------------------------------------------
+// Persistence.
+//
+// A measurement is only useful later if it carries enough to identify what was
+// measured and why it was refused. This checks that every candidate -- accepted
+// and rejected alike -- reaches the tuning database with its base fingerprint,
+// its candidate fingerprint, backend, device, timings, planned memory,
+// numerical metrics, verdict, and a plan string that actually rebuilds it.
+// ---------------------------------------------------------------------------
+void test_measurements_persist_reproducible_provenance() {
+  const auto base = raw_h3_block_fixture();
+  const auto baseline_memory = opt::measure_memory(base);
+  opt::AcceptanceBars bars;
+  bars.max_absolute_error = 1.0e-4;
+  bars.min_cosine_similarity = 0.999999;
+  bars.max_relative_l2 = 1.0e-3;
+  bars.memory_budget_bytes = baseline_memory.planned_bytes;
+  const opt::AcceptanceGate gate(bars);
+
+  auto options = proving_options(1U);
+  options.objective = opt::Objective::PlannedMemory;
+  options.max_candidates = 12U;
+  options.max_depth = 2U;
+
+  const auto path = std::filesystem::temp_directory_path() /
+                    "dif_opt_provenance_test.db";
+  std::filesystem::remove(path);
+
+  std::string base_program_fingerprint;
+  std::size_t recorded = 0U;
+  {
+    tune::Database database(path);
+    auto executor = runtime::make_cpu_executor();
+    const auto result = opt::optimize(base, *executor, gate, options, &database);
+    base_program_fingerprint = result.base_program_fingerprint;
+    recorded = result.candidates.size();
+  }
+  expect(recorded > 1U, "the provenance search measured several candidates");
+
+  // Reopen from disk: this is what a later run or another tool would see.
+  const tune::Database reopened(path);
+  const auto rows = reopened.results(base_program_fingerprint);
+  expect(rows.size() == recorded,
+         "every measured candidate survives a database round trip");
+
+  std::size_t rebuilt_rows = 0U;
+  std::size_t rejected_rows = 0U;
+  for (const auto &row : rows) {
+    expect(!row.candidate_hash.empty() && !row.backend.empty() &&
+               !row.device.empty() && row.planned_memory_bytes > 0U &&
+               !row.status.empty() && row.created_unix > 0,
+           "measurement " + row.candidate_hash +
+               " carries candidate, backend, device, memory and status");
+    if (row.status != "accepted") {
+      ++rejected_rows;
+      // The rejection reason is the status itself, not a generic failure.
+      expect(row.status.rfind("rejected_", 0U) == 0U,
+             "a refused measurement names why it was refused: " + row.status);
+    }
+    // The persisted plan is the reproducible identity of the row: decoding and
+    // replaying it against the base must rebuild exactly this candidate.
+    auto rebuilt = base;
+    for (const auto &transform : opt::decode_transform_sequence(row.plan))
+      opt::apply(transform, rebuilt);
+    if (opt::candidate_fingerprint(rebuilt) == row.candidate_hash)
+      ++rebuilt_rows;
+  }
+  expect(rebuilt_rows == rows.size(),
+         "every persisted plan rebuilds its own recorded candidate hash (" +
+             std::to_string(rebuilt_rows) + "/" + std::to_string(rows.size()) +
+             ")");
+  expect(rejected_rows > 0U,
+         "rejected measurements are preserved rather than discarded");
+  std::cout << "PROVENANCE rows=" << rows.size()
+            << " rebuilt=" << rebuilt_rows << " rejected=" << rejected_rows
+            << "\n";
+  std::filesystem::remove(path);
+}
+
 void test_search_scales_to_a_full_h3_denoiser() {
   const auto base = h3_denoiser_fixture(50U, 64U);
   expect(base.program.operations.size() > 800U,
@@ -727,6 +962,8 @@ int main() {
     test_plan_replay_rejects_a_different_base();
     test_search_enforces_the_memory_constraint();
     test_phase_one_h3_optimization_search();
+    test_latency_objective_selects_the_fastest_accepted_candidate();
+    test_measurements_persist_reproducible_provenance();
     test_search_scales_to_a_full_h3_denoiser();
   } catch (const std::exception &error) {
     std::cerr << "FAIL: unexpected exception: " << error.what() << "\n";

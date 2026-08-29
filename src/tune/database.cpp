@@ -17,7 +17,7 @@ namespace dif::tune {
 namespace {
 
 constexpr std::array<std::uint8_t, 8> kMagic = {'D', 'I', 'F', 'T', 'U', 'N', 'E', '1'};
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 3;
 constexpr std::size_t kDigestBytes = 32;
 constexpr std::uint32_t kMaxRecords = 1U << 20U;
 constexpr std::uint32_t kMaxString = 1U << 20U;
@@ -126,6 +126,8 @@ void save(const Store &store) {
     writer.f64(value.cosine_similarity);
     writer.f64(value.norm_ratio);
     writer.u64(value.nonfinite_count);
+    writer.u64(value.planned_memory_bytes);
+    writer.string(value.plan);
     writer.string(value.status);
     writer.u64(std::bit_cast<std::uint64_t>(value.created_unix));
   }
@@ -162,7 +164,8 @@ void load(Store &store) {
   if (!std::equal(kMagic.begin(), kMagic.end(), magic.begin()))
     fail("invalid tuning database magic");
   const auto version = reader.u32();
-  if (version != 1U && version != kVersion)
+  // Records grew fields in versions 2 and 3; every earlier layout still reads.
+  if (version == 0U || version > kVersion)
     fail("unsupported tuning database version");
   const auto count = reader.u32();
   if (count > kMaxRecords)
@@ -185,6 +188,10 @@ void load(Store &store) {
     } else {
       value.norm_ratio = 1.0;
       value.nonfinite_count = 0U;
+    }
+    if (version >= 3U) {
+      value.planned_memory_bytes = reader.u64();
+      value.plan = reader.string();
     }
     value.status = reader.string();
     value.created_unix = std::bit_cast<std::int64_t>(reader.u64());

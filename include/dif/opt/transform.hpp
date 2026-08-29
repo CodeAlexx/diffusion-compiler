@@ -78,6 +78,11 @@ std::string encode_transform(const Transform &transform);
 Transform decode_transform(std::string_view text);
 
 std::string encode_transform_sequence(const std::vector<Transform> &transforms);
+// Inverse of encode_transform_sequence. An empty string decodes to an empty
+// sequence, which is the baseline. This is what makes the canonical one-line
+// form a reproducible plan identity rather than only a label: a sequence
+// recorded in the tuning database can be decoded and replayed.
+std::vector<Transform> decode_transform_sequence(std::string_view text);
 
 bool operator==(const Transform &left, const Transform &right);
 inline bool operator!=(const Transform &left, const Transform &right) {

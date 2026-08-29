@@ -203,6 +203,20 @@ std::string encode_transform_sequence(const std::vector<Transform> &transforms) 
   return out;
 }
 
+std::vector<Transform> decode_transform_sequence(std::string_view text) {
+  std::vector<Transform> transforms;
+  constexpr std::string_view separator = " ; ";
+  while (!text.empty()) {
+    const auto split = text.find(separator);
+    const auto item = text.substr(0U, split);
+    transforms.push_back(decode_transform(item));
+    if (split == std::string_view::npos)
+      break;
+    text.remove_prefix(split + separator.size());
+  }
+  return transforms;
+}
+
 bool operator==(const Transform &left, const Transform &right) {
   return left.kind == right.kind && left.operations == right.operations &&
          left.tensors == right.tensors && left.parameters == right.parameters;
