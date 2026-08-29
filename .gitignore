@@ -4,6 +4,7 @@
 /.cache/
 *.md
 !/README.md
+!/docs/OPTIMIZER.md
 *.log
 *.safetensors
 *.ckpt

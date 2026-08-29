@@ -22,6 +22,9 @@ ComfyUI, or another diffusion framework.
   operations, and optional explicit cuDNN attention candidates.
 - A pure-C backend plugin ABI with reusable resident constants.
 - An OpenCL 1.2 reference plugin for the current semantic operation set.
+- A backend-neutral optimization and search layer between verified DiffIR and
+  backend lowering: explicit transforms, legality discovery, candidate
+  generation, a trusted acceptance oracle, and replayable optimization plans.
 - Lifetime-aware device memory planning and dual-stream CUDA weight prefetch.
 - Actual-pass CUDA profiling for mapped checkpoint staging, H2D copies,
   per-operation GPU work, attention, and resident-weight upload.
@@ -95,6 +98,7 @@ the runtime does not silently substitute a different attention algorithm.
 | `difinspect` | Inspect tensors, operations, and the memory plan |
 | `difrun` | Execute a program on CPU, CUDA, or a plugin backend |
 | `diftune` | Evaluate CUDA candidates under numerical acceptance bars |
+| `difopt` | Search DiffIR transformations under numerical and memory gates |
 | `difweights` | Inspect and bind SafeTensors-backed weight bundles |
 | `difquant` | Create backend-neutral INT4/INT5 candidates |
 | `difcast` | Convert checked tensors between supported floating-point formats |
@@ -109,6 +113,33 @@ the runtime does not silently substitute a different attention algorithm.
 Run a tool without arguments to print its complete usage. Binary `.difir`,
 `.diftensor`, `.difbind`, and `.diftrain` files are canonical; CLI text is an
 inspection and operations surface, not a second IR format.
+
+## Optimization search
+
+`difopt` searches over explicit DiffIR transformations rather than over emitter
+flags. It discovers which rewrites are legal on a verified program, generates
+candidate programs, verifies and executes each one, admits a candidate only after
+it clears the numerical gate and the memory constraint, and only then compares
+performance. The winning transformation sequence is written as a plan that
+rebuilds the optimized program byte-for-byte from the base program.
+
+```sh
+build/difopt --h3-denoiser --layers 1 --hidden 256 --heads 8 --head-dim 32 \
+    --ffn 512 --rotary 24 --audio-input-dim 16 --synthetic-bindings 13 \
+    --objective memory --warmups 1 --iterations 2 --depth 3 --beam 2 \
+    --max-candidates 48 --no-memory --blocks 64,512 --quant-groups 16 \
+    --memory-budget-mib 4 --plan plan.json --journal journal.json
+```
+
+A candidate is never accepted for being faster. The acceptance order is: the
+candidate DiffIR verifies, it executes without non-finite values or runtime
+failure, it clears the numerical bars, it fits the memory budget, and only then
+is it timed. The acceptance oracle is fixed at construction and the search
+cannot relax it.
+
+The design, the transformation vocabulary, and every measured result are in
+[`docs/OPTIMIZER.md`](docs/OPTIMIZER.md), including the controls used and the
+cases where no improvement is claimed.
 
 ### Pipeline profiling
 
@@ -129,7 +160,7 @@ universally additive.
 
 ```text
 include/dif/       Public C++ and backend ABI headers
-src/               IR, compiler, runtime, frontend, training, and weight code
+src/               IR, optimizer, compiler, runtime, frontend, training, and weight code
 backends/opencl/   OpenCL reference plugin
 tools/             Command-line programs
 tests/             CPU, CUDA, plugin ABI, and OpenCL tests
@@ -150,6 +181,10 @@ repository.
 - Training coverage is a bounded F32 diffusion objective, not production-scale
   H3 mixed-precision or LoRA training.
 - OpenCL has not yet been validated on non-NVIDIA hardware.
+- The optimization results recorded in `docs/OPTIMIZER.md` were measured on the
+  portable CPU reference backend with no CUDA device present. Planned-memory
+  results are deterministic; the latency measurements there are noise-dominated
+  and no speedup is claimed from them.
 
 The test suite separates build success, backend execution, numerical parity,
 and decoded-output validation. A successful compile alone is not a model

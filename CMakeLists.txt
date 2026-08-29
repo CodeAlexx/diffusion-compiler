@@ -23,6 +23,13 @@ add_library(difcore
   src/frontend/training.cpp
     src/ir/codec.cpp
     src/ir/verify.cpp
+    src/opt/bindings.cpp
+    src/opt/gate.cpp
+    src/opt/plan.cpp
+    src/opt/rewrite.cpp
+    src/opt/search.cpp
+    src/opt/semantics.cpp
+    src/opt/transform.cpp
     src/runtime/cpu_executor.cpp
     src/runtime/executor.cpp
     src/runtime/scalar.cpp
@@ -88,6 +95,9 @@ target_link_libraries(difinspect PRIVATE difcore)
 add_executable(diftune tools/diftune.cpp)
 target_link_libraries(diftune PRIVATE difcore)
 
+add_executable(difopt tools/difopt.cpp)
+target_link_libraries(difopt PRIVATE difcore)
+
 add_executable(difcast tools/difcast.cpp)
 target_link_libraries(difcast PRIVATE difcore)
 
@@ -143,7 +153,7 @@ else()
   message(STATUS "Diffusion compiler OpenCL backend: disabled")
 endif()
 
-install(TARGETS difc difrun difinspect diftune difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer
+install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer
         RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)
@@ -161,6 +171,10 @@ if(DIF_BUILD_TESTS)
   target_include_directories(dif_mock_backend_v2 PRIVATE include)
   target_compile_options(dif_mock_backend_v2 PRIVATE -Wall -Wextra -Wpedantic -Werror)
   set_target_properties(dif_mock_backend_v2 PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
+  add_executable(dif_opt_tests tests/opt_tests.cpp)
+  target_link_libraries(dif_opt_tests PRIVATE difcore)
+  add_test(NAME dif_opt_tests COMMAND dif_opt_tests)
 
   add_executable(dif_plugin_tests tests/plugin_tests.cpp)
   target_link_libraries(dif_plugin_tests PRIVATE difcore)
