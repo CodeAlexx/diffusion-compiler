@@ -30,6 +30,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <sys/resource.h>
+#include <unistd.h>
 
 namespace dif::runtime {
 namespace {
@@ -1006,14 +1008,55 @@ public:
         resident_weight_bytes_ += description.byte_count();
     }
     const auto resident_upload_start = std::chrono::steady_clock::now();
+    if (options.profile_pipeline && resident_weight_bytes_ != 0U) {
+      struct rusage before {};
+      struct rusage after {};
+      if (getrusage(RUSAGE_SELF, &before) != 0)
+        fail("getrusage before resident prefault failed");
+      const auto page_size = ::sysconf(_SC_PAGESIZE);
+      if (page_size <= 0)
+        fail("cannot determine host page size for resident profile");
+      const auto prefault_start = std::chrono::steady_clock::now();
+      std::uint64_t checksum = 0U;
+      for (const auto &description : program_.tensors) {
+        if (!description.has_role(ir::TensorRole::Constant) ||
+            description.has_role(ir::TensorRole::Streamed))
+          continue;
+        const auto &constant = constants_.at(description.id);
+        const auto bytes = constant.byte_size();
+        const auto *data = constant.data();
+        const auto stride = static_cast<std::size_t>(page_size);
+        for (std::size_t offset = 0U; offset < bytes; offset += stride)
+          checksum += data[offset];
+        if (bytes != 0U)
+          checksum += data[bytes - 1U];
+      }
+      resident_prefault_checksum_ = checksum;
+      resident_host_prefault_milliseconds_ =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - prefault_start)
+              .count();
+      if (getrusage(RUSAGE_SELF, &after) != 0)
+        fail("getrusage after resident prefault failed");
+      resident_minor_page_faults_ = static_cast<std::uint64_t>(
+          std::max<long>(0L, after.ru_minflt - before.ru_minflt));
+      resident_major_page_faults_ = static_cast<std::uint64_t>(
+          std::max<long>(0L, after.ru_majflt - before.ru_majflt));
+    }
+    const auto resident_h2d_start = std::chrono::steady_clock::now();
     upload_resident_constants(program_, constants_, buffers_, context_.stream());
     check(cuStreamSynchronize(context_.stream()),
           "resident constant upload synchronization");
-    if (resident_weight_bytes_ != 0U)
+    if (resident_weight_bytes_ != 0U) {
+      resident_h2d_milliseconds_ =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - resident_h2d_start)
+              .count();
       resident_upload_milliseconds_ =
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - resident_upload_start)
               .count();
+    }
     for (const auto &description : program_.tensors) {
       if (description.has_role(ir::TensorRole::Constant) &&
           !description.has_role(ir::TensorRole::Streamed))
@@ -1169,6 +1212,14 @@ public:
       result.pipeline_profile.enabled = true;
       result.pipeline_profile.measured_iterations = options.iterations;
       result.pipeline_profile.resident_weight_bytes = resident_weight_bytes_;
+      result.pipeline_profile.resident_host_prefault_milliseconds =
+          resident_host_prefault_milliseconds_;
+      result.pipeline_profile.resident_minor_page_faults =
+          resident_minor_page_faults_;
+      result.pipeline_profile.resident_major_page_faults =
+          resident_major_page_faults_;
+      result.pipeline_profile.resident_h2d_milliseconds =
+          resident_h2d_milliseconds_;
       result.pipeline_profile.resident_upload_milliseconds =
           resident_upload_milliseconds_;
       double kernel_total = 0.0;
@@ -1320,6 +1371,11 @@ private:
   std::uint64_t free_bytes_before_{};
   double preparation_milliseconds_{};
   double resident_upload_milliseconds_{};
+  double resident_host_prefault_milliseconds_{};
+  double resident_h2d_milliseconds_{};
+  std::uint64_t resident_minor_page_faults_{};
+  std::uint64_t resident_major_page_faults_{};
+  std::uint64_t resident_prefault_checksum_{};
   bool uses_cudnn_attention_{};
 };
 

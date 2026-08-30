@@ -133,11 +133,14 @@ Acceptance order, applied per candidate in exactly this sequence:
    `rejected_memory`.
 6. Only then is performance compared, and only among accepted candidates.
 
-Reference outputs come from the portable typed CPU executor running the **base**
-program, so candidates are judged against DiffIR semantics rather than against
-whatever the measurement backend happened to produce. Outputs are read through
-the typed scalar accessors, so a `bf16` or `f16` result is measured at its
-declared precision.
+Reference outputs default to the portable typed CPU executor running the
+**base** program. For real model admission the caller may instead bind every
+declared output to an independently captured source tensor with `--reference`;
+the optimizer refuses incomplete references and refuses references to
+non-output tensors. Outputs are read through the typed scalar accessors, so a
+`bf16` or `f16` result is measured at its declared precision. In either mode,
+the measurement backend must first prove that the unoptimized base clears the
+fixed bars.
 
 ## Search
 
@@ -148,6 +151,9 @@ declared precision.
   candidate after it.
 - At each depth, `discover` enumerates legal transforms for each beam member,
   each is applied to a copy, and the result is measured.
+- `--min-free-mib` carries the CUDA pressure guard into every candidate's
+  preparation and execution; actual free-before/free-after and resident bytes
+  are retained in the journal alongside the planned footprint.
 - Candidates are deduplicated by **candidate fingerprint**: SHA-256 over the
   encoded program, the prefetch distance, and the SHA-256 of every bound
   constant. Two transform sequences that reach the same executable program are
@@ -181,6 +187,14 @@ refuses a transform that is no longer legal, and refuses a rebuild that does not
 reproduce the recorded candidate fingerprint. `optimize` returns its optimized
 context by replaying its own plan, so the program it hands back is exactly what a
 clean rebuild produces.
+
+Short-chain promotion is a different operation from exact replay.
+`--replay-global-strategy` clears the measured plan's operation/tensor scopes
+and reapplies each transform to every legal site in the target program. It
+rechecks target-side legality and reports a new fingerprint; it never claims
+that the target is the candidate recorded by the one-block plan. This is meant
+for an explicitly all-site strategy such as promoting a one-block QKV fusion
+and schedule choice to a 3- or 5-block recurrence gate.
 
 Every candidate is recorded twice.
 

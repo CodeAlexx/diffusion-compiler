@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <string>
 
@@ -70,6 +71,11 @@ AcceptanceGate::measure(const runtime::TensorMap &reference,
     // Outputs are read through the typed scalar accessors so a bf16 or f16
     // result is measured at its declared precision rather than refused.
     for (std::uint64_t index = 0; index < elements; ++index) {
+      const auto element_bytes = expected_tensor.byte_size() / elements;
+      if (std::memcmp(expected_tensor.data() + index * element_bytes,
+                      actual_tensor.data() + index * element_bytes,
+                      static_cast<std::size_t>(element_bytes)) != 0)
+        ++result.exact_mismatch_count;
       const auto expected_value = runtime::load_float(expected_tensor, index);
       const auto actual_value = runtime::load_float(actual_tensor, index);
       const auto want = static_cast<long double>(expected_value);

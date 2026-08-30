@@ -260,8 +260,14 @@ void test_acceptance_gate_is_a_fixed_oracle() {
   expect(refused, "the gate refuses a candidate that omits a reference output");
   const auto measured = gate.measure(reference, reference);
   expect(measured.max_absolute_error == 0.0 && measured.relative_l2 == 0.0 &&
-             measured.compared_elements == 2U,
+             measured.compared_elements == 2U &&
+             measured.exact_mismatch_count == 0U,
          "identical outputs measure as exactly identical");
+  auto one_bit_different = reference;
+  one_bit_different.at(1U).bytes[0] ^= 1U;
+  const auto bit_measured = gate.measure(reference, one_bit_different);
+  expect(bit_measured.exact_mismatch_count == 1U,
+         "the gate reports declared-dtype bit mismatches separately");
 }
 
 void test_structural_rewrites_preserve_semantics() {
@@ -459,6 +465,65 @@ void test_plan_replay_rejects_a_different_base() {
     refused = true;
   }
   expect(refused, "replay refuses a plan that does not reproduce its candidate");
+}
+
+void test_global_strategy_rechecks_and_expands_scopes() {
+  const auto one_program = frontend::make_h3_transformer_bf16(
+      8U, 32U, 2U, 16U, 64U, 8U, 1U, 2U, 16U, 64U, false, true);
+  opt::RewriteContext one{one_program,
+                          opt::synthesize_bindings(one_program, 7U)};
+  const auto available = opt::discover(one, {});
+  const auto fusion = std::find_if(
+      available.begin(), available.end(), [](const opt::Transform &transform) {
+        return transform.kind == opt::TransformKind::FuseQkvProjection;
+      });
+  expect(fusion != available.end(), "the source-shaped block exposes QKV fusion");
+  if (fusion == available.end())
+    return;
+  auto scheduled = *fusion;
+  opt::OptimizationPlan plan;
+  plan.transforms.push_back(scheduled);
+
+  opt::Transform block_size;
+  block_size.kind = opt::TransformKind::SetBlockSize;
+  block_size.operations = {1U}; // A measured one-block scope, intentionally.
+  block_size.parameters = {256U};
+  plan.transforms.push_back(block_size);
+
+  const auto packed = frontend::make_h3_transformer_bf16(
+      8U, 32U, 2U, 16U, 64U, 8U, 1U, 2U, 16U, 64U, false, false);
+  opt::RewriteContext target{packed, opt::synthesize_bindings(packed, 8U)};
+  // A target that already uses packed QKV has no weight-side fusion site, so
+  // target-side legality must refuse this strategy.
+  bool refused = false;
+  try {
+    (void)opt::apply_global_strategy(plan, target);
+  } catch (const Error &) {
+    refused = true;
+  }
+  expect(refused, "global strategy rechecks legality on the target program");
+
+  const auto source = frontend::make_h3_transformer_bf16(
+      8U, 32U, 2U, 16U, 64U, 8U, 3U, 2U, 16U, 64U, false, true);
+  opt::RewriteContext recurrence{source, opt::synthesize_bindings(source, 9U)};
+  const auto promoted = opt::apply_global_strategy(plan, recurrence);
+  const auto packed_splits = std::count_if(
+      promoted.program.operations.begin(), promoted.program.operations.end(),
+      [](const ir::Operation &operation) {
+        return operation.opcode == ir::Opcode::H3DeinterleaveQkv;
+      });
+  const auto weight_splits = std::count_if(
+      promoted.program.operations.begin(), promoted.program.operations.end(),
+      [](const ir::Operation &operation) {
+        return operation.opcode == ir::Opcode::H3DeinterleaveQkvWeight;
+      });
+  expect(packed_splits == 3 && weight_splits == 0,
+         "global QKV strategy expands from one block to every target block");
+  for (const auto &operation : promoted.program.operations) {
+    if (operation.find(ir::AttrKey::BlockSize))
+      expect(operation.u64(ir::AttrKey::BlockSize, 0U) == 256U,
+             "global schedule strategy expands beyond its recorded scope");
+  }
 }
 
 } // namespace
@@ -960,6 +1025,7 @@ int main() {
     test_numeric_transforms_respect_pinned_semantics();
     test_plan_serialization_round_trip();
     test_plan_replay_rejects_a_different_base();
+    test_global_strategy_rechecks_and_expands_scopes();
     test_search_enforces_the_memory_constraint();
     test_phase_one_h3_optimization_search();
     test_latency_objective_selects_the_fastest_accepted_candidate();

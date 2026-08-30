@@ -6,9 +6,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <string>
 
 namespace {
@@ -82,6 +85,8 @@ int main(int argc, char **argv) {
       dif::fail("reference and actual tensor shapes differ");
     if (reference.element_count() != actual.element_count())
       dif::fail("reference and actual tensor element counts differ");
+    if (reference.element_count() == 0U)
+      dif::fail("difcompare requires at least one tensor element");
 
     long double dot = 0.0L;
     long double reference_squared = 0.0L;
@@ -90,6 +95,18 @@ int main(int argc, char **argv) {
     long double absolute_sum = 0.0L;
     double maximum_absolute = 0.0;
     std::uint64_t nonfinite = 0U;
+    std::optional<std::uint64_t> exact_mismatches;
+    if (reference.dtype == actual.dtype) {
+      exact_mismatches = 0U;
+      const auto element_bytes =
+          reference.byte_size() / reference.element_count();
+      for (std::uint64_t index = 0; index < reference.element_count(); ++index) {
+        if (std::memcmp(reference.data() + index * element_bytes,
+                        actual.data() + index * element_bytes,
+                        static_cast<std::size_t>(element_bytes)) != 0)
+          ++*exact_mismatches;
+      }
+    }
     for (std::uint64_t index = 0; index < reference.element_count(); ++index) {
       const auto expected =
           static_cast<double>(dif::runtime::load_float(reference, index));
@@ -133,14 +150,20 @@ int main(int argc, char **argv) {
         norm_ratio >= minimum_norm_ratio &&
         norm_ratio <= maximum_norm_ratio &&
         maximum_absolute <= maximum_absolute_bar;
-    std::cout << "GATE " << (accepted ? "PASS" : "FAIL")
+    std::cout << std::setprecision(17)
+              << "GATE " << (accepted ? "PASS" : "FAIL")
               << " reference=" << argv[1] << " actual=" << argv[2]
               << " elements=" << reference.element_count()
               << " max_abs=" << maximum_absolute
               << " mean_abs=" << mean_absolute
               << " rel_l2=" << relative_l2 << " cosine=" << cosine
               << " norm_ratio=" << norm_ratio
-              << " nonfinite=" << nonfinite << " bars={min_cos:"
+              << " nonfinite=" << nonfinite << " exact_mismatches=";
+    if (exact_mismatches)
+      std::cout << *exact_mismatches;
+    else
+      std::cout << "n/a";
+    std::cout << " bars={min_cos:"
               << minimum_cosine << ",max_rel_l2:" << maximum_relative_l2
               << ",min_norm_ratio:" << minimum_norm_ratio
               << ",max_norm_ratio:" << maximum_norm_ratio

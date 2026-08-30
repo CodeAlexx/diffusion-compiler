@@ -6,6 +6,7 @@
 !/README.md
 !/docs/OPTIMIZER.md
 !/docs/PHASE2_READINESS.md
+!/docs/PHASE2_H3_BLOCK_RESULT_2026-08-29.md
 *.log
 *.safetensors
 *.ckpt

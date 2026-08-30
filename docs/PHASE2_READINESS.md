@@ -1,9 +1,13 @@
 # Phase 2 readiness: one real MiniMax-H3 block
 
-**Status: blocked on environment, not on code.** Nothing in this document is a
-parity result or a performance result. It records what a real-block proving run
-needs, what is already in place, what is measured, and what is missing, so that
-the run can start immediately once a device and a checkpoint are available.
+**Historical readiness snapshot.** The environment blockers recorded below
+were resolved on the local GPU machine on 2026-08-29. Phase 2A/2B and the
+requested 1/3/5 recurrence gate have now run; see
+[`PHASE2_H3_BLOCK_RESULT_2026-08-29.md`](PHASE2_H3_BLOCK_RESULT_2026-08-29.md)
+for the sealed checkpoint identity, source parity, real-CUDA search, controlled
+timing, profile attribution, clean replay, and promotion boundary. This file is
+retained to preserve the pre-run requirements and should not be read as current
+machine status.
 
 Phase 2 is defined as proving the optimizer on **one real H3 transformer block**:
 real released checkpoint tensors, real checkpoint layouts, real model

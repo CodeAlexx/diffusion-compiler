@@ -145,8 +145,10 @@ cases where no improvement is claimed.
 (`--verify-shards` re-digests every shard). A bundle and explicit `--bind`
 tensors compose; `--synthetic-bindings` is the alternative to both and never a
 supplement, so a real run cannot silently fall back to invented values.
-[`docs/PHASE2_READINESS.md`](docs/PHASE2_READINESS.md) records the state of the
-real-checkpoint proving run.
+[`docs/PHASE2_READINESS.md`](docs/PHASE2_READINESS.md) records the pre-run
+requirements. The completed real-checkpoint block result, CUDA search, profile,
+and 1/3/5 recurrence gate are in
+[`docs/PHASE2_H3_BLOCK_RESULT_2026-08-29.md`](docs/PHASE2_H3_BLOCK_RESULT_2026-08-29.md).
 
 ### Pipeline profiling
 
@@ -159,9 +161,11 @@ the non-operation part of the top-level device timeline.
 scheduler, unpatchify, denoiser, and VAE stage measurements.
 
 Host staging includes page faults encountered while copying mapped checkpoint
-data into pinned memory. Resident upload combines page-in and device upload.
-Copy and host-work sums can overlap GPU work and must not be treated as
-universally additive.
+data into pinned memory. With resident weights, profile mode explicitly reports
+mapped-page prefault time and fault counts before the post-prefault resident
+staging/H2D wall boundary; total resident upload remains available too. Copy and
+host-work sums can overlap GPU work and must not be treated as universally
+additive.
 
 ## Source layout
 
@@ -188,10 +192,10 @@ repository.
 - Training coverage is a bounded F32 diffusion objective, not production-scale
   H3 mixed-precision or LoRA training.
 - OpenCL has not yet been validated on non-NVIDIA hardware.
-- The optimization results recorded in `docs/OPTIMIZER.md` were measured on the
-  portable CPU reference backend with no CUDA device present. Planned-memory
-  results are deterministic; the latency measurements there are noise-dominated
-  and no speedup is claimed from them.
+- The Phase-1 optimization results in `docs/OPTIMIZER.md` were measured on the
+  portable CPU reference backend. The distinct Phase-2 real-CUDA result is
+  hardware- and sequence-specific and is recorded with its noise bound in
+  `docs/PHASE2_H3_BLOCK_RESULT_2026-08-29.md`; it is not a whole-model claim.
 
 The test suite separates build success, backend execution, numerical parity,
 and decoded-output validation. A successful compile alone is not a model

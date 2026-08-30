@@ -43,6 +43,14 @@ struct PipelineProfile {
   bool enabled{};
   std::uint32_t measured_iterations{};
   std::uint64_t resident_weight_bytes{};
+  // Profile-only resident preparation is split into an explicit mapped-page
+  // prefault followed by the upload. The latter is wall time after prefaulting
+  // and therefore includes driver pageable-memory staging plus H2D, but not
+  // checkpoint page faults.
+  double resident_host_prefault_milliseconds{};
+  std::uint64_t resident_minor_page_faults{};
+  std::uint64_t resident_major_page_faults{};
+  double resident_h2d_milliseconds{};
   double resident_upload_milliseconds{};
   std::uint64_t streamed_weight_bytes{};
   double streamed_host_stage_milliseconds{};

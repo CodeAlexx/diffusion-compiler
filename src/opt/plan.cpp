@@ -220,4 +220,16 @@ RewriteContext replay(const OptimizationPlan &plan,
   return context;
 }
 
+RewriteContext apply_global_strategy(const OptimizationPlan &plan,
+                                     const RewriteContext &target) {
+  RewriteContext context = target;
+  for (auto transform : plan.transforms) {
+    transform.operations.clear();
+    transform.tensors.clear();
+    apply(transform, context);
+  }
+  ir::verify(context.program);
+  return context;
+}
+
 } // namespace dif::opt

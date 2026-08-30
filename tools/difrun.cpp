@@ -188,6 +188,14 @@ int main(int argc, char **argv) {
       std::cout << "PIPELINE_PROFILE iterations="
                 << profile.measured_iterations
                 << " resident_weight_bytes=" << profile.resident_weight_bytes
+                << " resident_host_prefault_ms="
+                << profile.resident_host_prefault_milliseconds
+                << " resident_minor_faults="
+                << profile.resident_minor_page_faults
+                << " resident_major_faults="
+                << profile.resident_major_page_faults
+                << " resident_h2d_ms="
+                << profile.resident_h2d_milliseconds
                 << " resident_upload_ms="
                 << profile.resident_upload_milliseconds
                 << " streamed_weight_bytes=" << profile.streamed_weight_bytes

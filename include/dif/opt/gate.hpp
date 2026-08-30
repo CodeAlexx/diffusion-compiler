@@ -18,6 +18,10 @@ namespace dif::opt {
 struct NumericalMeasurement {
   // Elements actually compared across all reference outputs.
   std::uint64_t compared_elements{};
+  // Elements whose declared-dtype payload differs bit for bit. This is
+  // reported even when the numerical contract is tolerance-based, so a BF16
+  // gate never silently turns "close" into "exact".
+  std::uint64_t exact_mismatch_count{};
   // Non-finite values observed in the candidate outputs.
   std::uint64_t nonfinite_count{};
   double max_absolute_error{};

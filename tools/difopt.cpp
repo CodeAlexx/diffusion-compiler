@@ -92,12 +92,14 @@ void usage() {
       "  --weight-bundle FILE.difbind sealed checkpoint bindings\n"
       "  --verify-shards              re-digest every bundle shard on load\n"
       "  --bind ID=FILE [--bind ...]  bind inputs and constants from tensors\n"
+      "  --reference ID=FILE           trusted source output for the gate\n"
       "  --synthetic-bindings SEED    deterministic experiment fixture\n"
       "\n"
       "search:\n"
       "  --objective latency|memory   default latency\n"
       "  --backend cpu|cuda           default cpu\n"
       "  --warmups N --iterations N   measurement shape\n"
+      "  --min-free-mib N              CUDA pressure guard\n"
       "  --beam N --depth N --max-candidates N --margin F\n"
       "  --latency-tolerance F        memory objective latency ceiling\n"
       "  --no-structural --no-schedule --no-numeric --no-memory\n"
@@ -112,7 +114,8 @@ void usage() {
       "  --plan FILE --journal FILE --out FILE --db FILE\n"
       "\n"
       "replay:\n"
-      "  --replay FILE                rebuild a recorded plan and verify it\n";
+      "  --replay FILE                rebuild a recorded plan and verify it\n"
+      "  --replay-global-strategy FILE apply each transform to all legal sites\n";
 }
 
 } // namespace
@@ -121,6 +124,7 @@ int main(int argc, char **argv) {
   try {
     std::filesystem::path program_path;
     std::filesystem::path replay_path;
+    std::filesystem::path global_strategy_path;
     std::filesystem::path plan_path;
     std::filesystem::path journal_path;
     std::filesystem::path output_path;
@@ -128,6 +132,7 @@ int main(int argc, char **argv) {
     bool build_h3 = false;
     std::optional<std::uint64_t> synthetic_seed;
     std::vector<std::pair<std::uint32_t, std::filesystem::path>> bindings;
+    std::vector<std::pair<std::uint32_t, std::filesystem::path>> references;
     std::filesystem::path weight_bundle;
     bool verify_shards = false;
     std::string backend = "cpu";
@@ -208,6 +213,8 @@ int main(int argc, char **argv) {
         h3.streamed_constants = true;
       else if (option == "--bind")
         bindings.push_back(binding(value()));
+      else if (option == "--reference")
+        references.push_back(binding(value()));
       else if (option == "--weight-bundle")
         weight_bundle = value();
       else if (option == "--verify-shards")
@@ -229,6 +236,9 @@ int main(int argc, char **argv) {
       else if (option == "--iterations")
         options.iterations =
             static_cast<std::uint32_t>(number(value(), "iterations"));
+      else if (option == "--min-free-mib")
+        options.minimum_free_bytes =
+            number(value(), "minimum free memory") * 1024ULL * 1024ULL;
       else if (option == "--beam")
         options.beam_width =
             static_cast<std::uint32_t>(number(value(), "beam width"));
@@ -285,6 +295,8 @@ int main(int argc, char **argv) {
         database_path = value();
       else if (option == "--replay")
         replay_path = value();
+      else if (option == "--replay-global-strategy")
+        global_strategy_path = value();
       else {
         usage();
         return 2;
@@ -295,6 +307,8 @@ int main(int argc, char **argv) {
       usage();
       return 2;
     }
+    if (!replay_path.empty() && !global_strategy_path.empty())
+      dif::fail("exact replay and global-strategy replay are mutually exclusive");
     // A sealed bundle and explicit tensors compose: the bundle carries the
     // checkpoint constants and --bind supplies captured inputs on top. The
     // synthetic fixture is the alternative to both, never a supplement to
@@ -356,29 +370,59 @@ int main(int argc, char **argv) {
       std::cout << "REPLAY reproduced the recorded candidate\n";
       return 0;
     }
+    if (!global_strategy_path.empty()) {
+      const auto plan = dif::opt::read_plan(global_strategy_path);
+      const auto rebuilt = dif::opt::apply_global_strategy(plan, base);
+      std::cout << "GLOBAL_STRATEGY transforms=" << plan.transforms.size()
+                << " program="
+                << dif::opt::program_fingerprint(rebuilt.program)
+                << " candidate=" << dif::opt::candidate_fingerprint(rebuilt)
+                << " planned_bytes="
+                << dif::opt::measure_memory(rebuilt).planned_bytes << "\n";
+      for (const auto &transform : plan.transforms)
+        std::cout << "  global "
+                  << dif::opt::transform_kind_name(transform.kind) << "\n";
+      if (!output_path.empty())
+        dif::ir::write_file(rebuilt.program, output_path);
+      std::cout << "GLOBAL_STRATEGY applied with target-side legality checks\n";
+      return 0;
+    }
 
     auto executor = backend == "cuda" ? dif::runtime::make_cuda_executor()
                                       : dif::runtime::make_cpu_executor();
     if (backend != "cpu" && backend != "cuda")
       dif::fail("backend must be cpu or cuda");
     const dif::opt::AcceptanceGate gate(bars);
+    dif::runtime::TensorMap reference_outputs;
+    for (const auto &[id, path] : references)
+      reference_outputs.insert_or_assign(id, dif::runtime::read_tensor(path));
     std::optional<dif::tune::Database> database;
     if (!database_path.empty())
       database.emplace(database_path);
 
     const auto result = dif::opt::optimize(
-        base, *executor, gate, options, database ? &*database : nullptr);
+        base, *executor, gate, options, database ? &*database : nullptr,
+        reference_outputs.empty() ? nullptr : &reference_outputs,
+        "source-capture");
 
     std::cout << std::fixed << std::setprecision(4);
     for (const auto &record : result.candidates) {
       std::cout << "CANDIDATE " << record.index << " depth=" << record.depth
                 << " status=" << dif::opt::verdict_name(record.verdict)
+                << " prepare_ms=" << record.preparation_milliseconds
                 << " min_ms=" << record.minimum_milliseconds
                 << " mean_ms=" << record.mean_milliseconds
                 << " planned_bytes=" << record.memory.planned_bytes
                 << " max_abs=" << record.numerics.max_absolute_error
                 << " cos=" << record.numerics.cosine_similarity
+                << " norm_ratio=" << record.numerics.norm_ratio
                 << " rel_l2=" << record.numerics.relative_l2
+                << " nonfinite=" << record.numerics.nonfinite_count
+                << " exact_mismatches="
+                << record.numerics.exact_mismatch_count
+                << " resident_bytes=" << record.resident_bytes
+                << " free_before=" << record.free_bytes_before
+                << " free_after=" << record.free_bytes_after
                 << " hash=" << record.candidate_fingerprint.substr(
                                    0, std::min<std::size_t>(
                                           16U,
@@ -416,6 +460,11 @@ int main(int argc, char **argv) {
                             static_cast<double>(baseline.memory.planned_bytes)
                       : 0.0)
               << "\n";
+    std::cout << "NOISE bound=" << result.latency_noise_bound
+              << " effective_margin=" << result.effective_improvement_margin
+              << " effective_latency_tolerance="
+              << result.effective_latency_tolerance
+              << " reference_backend=" << result.reference_backend << "\n";
 
     if (!plan_path.empty())
       dif::opt::write_plan(result.plan, plan_path);

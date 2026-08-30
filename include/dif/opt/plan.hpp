@@ -38,6 +38,15 @@ OptimizationPlan read_plan(const std::filesystem::path &path);
 RewriteContext replay(const OptimizationPlan &plan,
                       const RewriteContext &base);
 
+// Applies the transformation *strategy* from a measured plan to another
+// program by clearing every recorded operation/tensor scope before each apply.
+// This is deliberately distinct from replay: it does not claim fingerprint
+// identity and is only appropriate when the recorded scopes represented all
+// legal sites (for example, promoting a one-block all-site strategy to a short
+// recurrence chain). Legality is rechecked on the target program.
+RewriteContext apply_global_strategy(const OptimizationPlan &plan,
+                                     const RewriteContext &target);
+
 // JSON string literal including surrounding quotes, with control characters
 // escaped. Shared by the plan writer and the search journal writer.
 std::string json_quote(std::string_view text);

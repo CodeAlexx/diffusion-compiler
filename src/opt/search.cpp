@@ -25,7 +25,7 @@ runtime::RunOptions run_options(const SearchOptions &options) {
   runtime::RunOptions run;
   run.warmups = options.warmups;
   run.iterations = options.iterations;
-  run.minimum_free_bytes = 0U;
+  run.minimum_free_bytes = options.minimum_free_bytes;
   return run;
 }
 
@@ -103,9 +103,12 @@ std::string_view objective_name(Objective objective) {
   fail("unknown optimization objective");
 }
 
-SearchResult optimize(const RewriteContext &base, runtime::Executor &executor,
-                      const AcceptanceGate &gate, const SearchOptions &options,
-                      tune::Database *database) {
+SearchResult optimize(
+    const RewriteContext &base, runtime::Executor &executor,
+    const AcceptanceGate &gate, const SearchOptions &options,
+    tune::Database *database,
+    const runtime::TensorMap *trusted_reference_outputs,
+    std::string_view trusted_reference_backend) {
   if (options.iterations == 0U)
     fail("optimization search requires a nonzero iteration count");
   if (options.beam_width == 0U)
@@ -122,9 +125,28 @@ SearchResult optimize(const RewriteContext &base, runtime::Executor &executor,
   result.bars = gate.bars();
   result.base_program_fingerprint = program_fingerprint(base.program);
   result.base_fingerprint = candidate_fingerprint(base);
-  result.reference_backend = "cpu";
+  result.reference_backend =
+      trusted_reference_outputs ? std::string(trusted_reference_backend)
+                                : "cpu";
+  if (trusted_reference_outputs) {
+    for (const auto &description : base.program.tensors) {
+      if (description.has_role(ir::TensorRole::Output) &&
+          !trusted_reference_outputs->contains(description.id))
+        fail("trusted reference omitted program output tensor " +
+             std::to_string(description.id));
+    }
+    for (const auto &[id, tensor] : *trusted_reference_outputs) {
+      (void)tensor;
+      const auto *description = base.program.tensor(id);
+      if (!description || !description->has_role(ir::TensorRole::Output))
+        fail("trusted reference names non-output tensor " +
+             std::to_string(id));
+    }
+  }
 
-  const auto reference = reference_outputs(base);
+  const auto reference = trusted_reference_outputs
+                             ? *trusted_reference_outputs
+                             : reference_outputs(base);
   const auto run = run_options(options);
   if (options.warm_process_before_baseline) {
     runtime::RunOptions warm = run;
@@ -170,9 +192,13 @@ SearchResult optimize(const RewriteContext &base, runtime::Executor &executor,
       record.backend = measured.backend_name.empty() ? executor.name()
                                                      : measured.backend_name;
       record.device = measured.device_name;
+      record.preparation_milliseconds = measured.preparation_milliseconds;
       record.mean_milliseconds = measured.mean_milliseconds;
       record.minimum_milliseconds = measured.minimum_milliseconds;
       record.maximum_milliseconds = measured.maximum_milliseconds;
+      record.free_bytes_before = measured.free_bytes_before;
+      record.free_bytes_after = measured.free_bytes_after;
+      record.resident_bytes = measured.resident_bytes;
       record.numerics = gate.measure(reference, measured.outputs);
     } catch (const std::exception &error) {
       record.verdict = Verdict::RejectedExecution;
@@ -424,12 +450,20 @@ std::string serialize_journal(const SearchResult &result) {
     out += ", \"device\": " + json_quote(record.device);
     out += ", \"warmups\": " + std::to_string(record.warmups);
     out += ", \"iterations\": " + std::to_string(record.iterations);
+    out += ", \"preparation_milliseconds\": " +
+           json_number(record.preparation_milliseconds);
     out += ", \"mean_milliseconds\": " +
            json_number(record.mean_milliseconds);
     out += ", \"minimum_milliseconds\": " +
            json_number(record.minimum_milliseconds);
     out += ", \"maximum_milliseconds\": " +
            json_number(record.maximum_milliseconds);
+    out += ", \"free_bytes_before\": " +
+           std::to_string(record.free_bytes_before);
+    out += ", \"free_bytes_after\": " +
+           std::to_string(record.free_bytes_after);
+    out += ", \"resident_bytes\": " +
+           std::to_string(record.resident_bytes);
     out += ", \"planned_bytes\": " +
            std::to_string(record.memory.planned_bytes);
     out += ", \"naive_bytes\": " + std::to_string(record.memory.naive_bytes);
@@ -439,6 +473,8 @@ std::string serialize_journal(const SearchResult &result) {
            std::to_string(record.memory.streamed_constant_bytes);
     out += ", \"compared_elements\": " +
            std::to_string(record.numerics.compared_elements);
+    out += ", \"exact_mismatch_count\": " +
+           std::to_string(record.numerics.exact_mismatch_count);
     out += ", \"nonfinite_count\": " +
            std::to_string(record.numerics.nonfinite_count);
     out += ", \"max_absolute_error\": " +

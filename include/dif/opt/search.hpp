@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dif::opt {
@@ -30,6 +31,10 @@ struct SearchOptions {
   Objective objective{Objective::Latency};
   std::uint32_t warmups{1};
   std::uint32_t iterations{5};
+  // CUDA pressure guard applied before preparation and execution. Zero disables
+  // an additional reserve; real-device searches should keep enough free memory
+  // for the rest of the process and display stack.
+  std::uint64_t minimum_free_bytes{};
   // How many accepted candidates survive as parents for the next depth.
   std::uint32_t beam_width{3};
   std::uint32_t max_depth{3};
@@ -66,9 +71,16 @@ struct CandidateRecord {
   std::string device;
   std::uint32_t warmups{};
   std::uint32_t iterations{};
+  // Preparation is outside the hot latency objective. The actual allocation
+  // and free-memory readings are retained beside the planner's estimate so a
+  // candidate cannot be promoted on planned memory alone.
+  double preparation_milliseconds{};
   double mean_milliseconds{};
   double minimum_milliseconds{};
   double maximum_milliseconds{};
+  std::uint64_t free_bytes_before{};
+  std::uint64_t free_bytes_after{};
+  std::uint64_t resident_bytes{};
   MemoryFootprint memory;
   NumericalMeasurement numerics;
   Verdict verdict{Verdict::RejectedExecution};
@@ -115,16 +127,20 @@ struct SearchResult {
 
 // Runs the optimization search.
 //
-// Reference outputs come from the portable typed CPU executor running the base
-// program, so a candidate is judged against DiffIR semantics rather than
-// against whatever the measurement backend happened to produce. The search
-// fails when the base program cannot clear its own numerical bars on the
-// measurement backend, because no comparison after that would mean anything.
+// Reference outputs default to the portable typed CPU executor running the base
+// program. A caller may instead supply independently captured source outputs;
+// every declared program output must then be present and no non-output tensor
+// may be named. The search fails when the base program cannot clear the fixed
+// numerical bars on the measurement backend, because no comparison after that
+// would mean anything.
 //
 // `database`, when non-null, receives one measurement per candidate.
-SearchResult optimize(const RewriteContext &base,
-                      runtime::Executor &executor, const AcceptanceGate &gate,
-                      const SearchOptions &options, tune::Database *database);
+SearchResult optimize(
+    const RewriteContext &base, runtime::Executor &executor,
+    const AcceptanceGate &gate, const SearchOptions &options,
+    tune::Database *database,
+    const runtime::TensorMap *trusted_reference_outputs = nullptr,
+    std::string_view trusted_reference_backend = "external");
 
 // Full JSON record of a search: every candidate's transform sequence,
 // fingerprints, timings, memory, numerics, and verdict.
