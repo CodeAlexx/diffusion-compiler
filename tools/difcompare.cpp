@@ -1,6 +1,7 @@
 #include "dif/runtime/scalar.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
+#include "dif/weights/safetensors.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,10 +26,24 @@ double number(const char *text, const char *label) {
 }
 
 void usage() {
-  std::cerr << "usage: difcompare REFERENCE.diftensor ACTUAL.diftensor"
+  std::cerr << "usage: difcompare REFERENCE ACTUAL"
                " [--min-cos N] [--max-rel-l2 N]"
                " [--min-norm-ratio N] [--max-norm-ratio N]"
-               " [--max-abs N] [--flatten]\n";
+               " [--max-abs N] [--flatten]\n"
+               "REFERENCE/ACTUAL may be FILE.diftensor or "
+               "FILE.safetensors::TENSOR_NAME\n";
+}
+
+dif::runtime::Tensor load_tensor_spec(std::string_view spec) {
+  const auto separator = spec.find("::");
+  if (separator == std::string_view::npos)
+    return dif::runtime::read_tensor(std::filesystem::path(spec));
+  if (separator == 0U || separator + 2U == spec.size())
+    dif::fail("invalid SafeTensors tensor specification");
+  const auto path = std::filesystem::path(spec.substr(0U, separator));
+  const auto name = spec.substr(separator + 2U);
+  return dif::weights::map_safetensor(dif::weights::read_safetensors(path),
+                                      name);
 }
 
 } // namespace
@@ -74,10 +89,8 @@ int main(int argc, char **argv) {
         maximum_absolute_bar < 0.0)
       dif::fail("invalid comparison admission bars");
 
-    const auto reference =
-        dif::runtime::read_tensor(std::filesystem::path(argv[1]));
-    const auto actual =
-        dif::runtime::read_tensor(std::filesystem::path(argv[2]));
+    const auto reference = load_tensor_spec(argv[1]);
+    const auto actual = load_tensor_spec(argv[2]);
     if (!dif::runtime::is_float_dtype(reference.dtype) ||
         !dif::runtime::is_float_dtype(actual.dtype))
       dif::fail("difcompare requires floating-point tensors");

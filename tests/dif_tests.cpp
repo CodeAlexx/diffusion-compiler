@@ -1,5 +1,6 @@
 #include "dif/compiler/compiler.hpp"
 #include "dif/compiler/int4.hpp"
+#include "dif/compiler/slice.hpp"
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/compiler/memory_plan.hpp"
@@ -1244,14 +1245,47 @@ void test_h3_bf16_lowering_preserves_source_reduction_identity() {
       18, 5376, 56, 128, 14336, 96, 1, 2, 2688, 256, false,
       false);
   const auto generated = dif::compiler::emit_cuda(program);
-  expect(generated.source.find("pack+=128ULL") != std::string::npos,
-         "H3 hidden RMSNorm uses the 128-thread vector reduction");
-  expect(generated.source.find("reduction[0]+=reduction[64]") !=
+  expect(generated.source.find("col+=256ULL") != std::string::npos &&
+             generated.source.find("active=128U;active>0U;active>>=1U") !=
+                 std::string::npos,
+         "H3 hidden RMSNorm uses Serenity's accepted 256-thread reduction");
+  expect(generated.source.find(
+             "float result=(1.0f+dif_load(scale,vector+col))*normed+") !=
              std::string::npos,
-         "H3 hidden RMSNorm preserves PyTorch warp-total grouping");
-  expect(generated.source.find("for(unsigned stride=16U;stride>0U;") !=
-             std::string::npos,
-         "H3 QK RMSNorm uses the source-compatible one-warp reduction");
+         "H3 hidden RMSNorm preserves the BF16 norm boundary and F32 AdaLN");
+  expect(generated.source.find("active=64U;active>0U;active>>=1U") !=
+                 std::string::npos &&
+             generated.source.find("float norm0=dif_round(") !=
+                 std::string::npos,
+         "H3 QK RMSNorm preserves Serenity's 128-lane reduction and BF16 "
+         "normalization boundary");
+}
+
+void test_h3_long_sequence_transformer_declares_backend_attention() {
+  const auto cudnn = dif::frontend::make_h3_transformer_bf16(
+      9065, 5376, 56, 128, 14336, 96, 1, 2, 2688, 256, false,
+      true, 2U);
+  dif::ir::verify(cudnn);
+  const auto attention = std::find_if(
+      cudnn.operations.begin(), cudnn.operations.end(),
+      [](const dif::ir::Operation &operation) {
+        return operation.opcode == dif::ir::Opcode::Attention;
+      });
+  expect(attention != cudnn.operations.end() &&
+             attention->u64(dif::ir::AttrKey::Implementation, 0U) == 2U,
+         "long-sequence H3 block carries the requested cuDNN identity");
+
+  bool rejected = false;
+  try {
+    const auto generated = dif::frontend::make_h3_transformer_bf16(
+        9065, 5376, 56, 128, 14336, 96, 1, 2, 2688, 256, false,
+        true, 1U);
+    dif::ir::verify(generated);
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected,
+         "long-sequence H3 block refuses the naive generated attention path");
 }
 
 void test_h3_mixed_denoiser_frontend_and_cuda_parity() {
@@ -1583,6 +1617,37 @@ void test_memory_plan_reserves_prefetch_storage() {
          "prefetch storage is explicit in the memory budget");
 }
 
+void test_memory_plan_omits_backend_replaced_constants() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 4}},
+      {2, DType::F32, TensorRole::Constant, {1, 4}},
+      {3, DType::F32, TensorRole::Output, {1, 4}},
+  };
+  program.operations = {{1, Opcode::Add, {1, 2}, {3}, {}}};
+  const std::unordered_set<std::uint32_t> replaced_constants = {2U};
+  const auto ordinary = dif::compiler::plan_memory(program);
+  const auto replaced = dif::compiler::plan_memory(
+      program, 256U, 0U, {}, replaced_constants);
+  expect(ordinary.assignment(2U) != nullptr &&
+             replaced.assignment(2U) == nullptr &&
+             replaced.total_bytes < ordinary.total_bytes,
+         "memory plan omits a semantic constant replaced by a prepared "
+         "backend primitive");
+
+  bool rejected_nonconstant = false;
+  try {
+    (void)dif::compiler::plan_memory(
+        program, 256U, 0U, {},
+        std::unordered_set<std::uint32_t>{1U});
+  } catch (const dif::Error &) {
+    rejected_nonconstant = true;
+  }
+  expect(rejected_nonconstant,
+         "memory plan rejects replacement of a dynamic semantic input");
+}
+
 void test_weight_bundle_roundtrip() {
   using namespace dif::ir;
   const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1663,6 +1728,37 @@ void test_safetensors_streaming_writer() {
   const auto values = float_values(mapped_scales);
   expect(values == std::vector<float>({0.25F, 0.5F, 1.0F, 2.0F}),
          "streaming SafeTensors writer preserves BF16 values");
+  std::filesystem::remove_all(directory);
+}
+
+void test_safetensors_tensor_metadata_is_skipped() {
+  const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("dif-safetensors-metadata-test-" +
+                          std::to_string(nonce));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "metadata.safetensors";
+  const std::string header =
+      R"({"__meta__.version":{"dtype":"I64","shape":[1],"data_offsets":[0,8]},"weight":{"dtype":"F32","shape":[1,4],"data_offsets":[8,24]}})";
+  {
+    std::ofstream shard(path, std::ios::binary);
+    const auto header_size = static_cast<std::uint64_t>(header.size());
+    for (unsigned shift = 0; shift < 64U; shift += 8U)
+      shard.put(static_cast<char>(header_size >> shift));
+    shard.write(header.data(), static_cast<std::streamsize>(header.size()));
+    const std::int64_t metadata = 1;
+    const std::array<float, 4> values = {1, 2, 3, 4};
+    shard.write(reinterpret_cast<const char *>(&metadata), sizeof(metadata));
+    shard.write(reinterpret_cast<const char *>(values.data()), sizeof(values));
+  }
+  const auto file = dif::weights::read_safetensors(path);
+  expect(file.tensors.size() == 1U && file.find("weight") != nullptr &&
+             file.find("__meta__.version") == nullptr,
+         "SafeTensors tensor-form metadata is validated but not exposed");
+  const auto weight = dif::weights::map_safetensor(file, "weight");
+  const auto values = weight.f32();
+  expect(values.size() == 4U && values[0] == 1.0F && values[3] == 4.0F,
+         "SafeTensors metadata skipping preserves following tensor offsets");
   std::filesystem::remove_all(directory);
 }
 
@@ -1869,6 +1965,184 @@ void test_int5_weight_rewrite_and_cpu_execution() {
          "buffer from the CUDA memory plan");
 }
 
+void test_operation_slice_preserves_stable_ids_and_boundary_roles() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::BF16, TensorRole::Input, {2, 4}},
+      {2, DType::BF16,
+       static_cast<std::uint32_t>(TensorRole::Constant) |
+           static_cast<std::uint32_t>(TensorRole::Streamed),
+       {2, 4}},
+      {3, DType::BF16, TensorRole::Internal, {2, 4}},
+      {4, DType::BF16, TensorRole::Internal, {2, 4}},
+      {5, DType::BF16, TensorRole::Output, {2, 4}},
+  };
+  program.operations = {
+      {7, Opcode::Add, {1, 2}, {3}, {}},
+      {8, Opcode::SiLU, {3}, {4}, {}},
+      {9, Opcode::Add, {4, 1}, {5}, {}},
+  };
+  dif::ir::verify(program);
+
+  const auto prefix = dif::compiler::slice_operations(program, 7U, 8U);
+  expect(prefix.operations.size() == 2U &&
+             prefix.operations.front().id == 7U &&
+             prefix.operations.back().id == 8U,
+         "operation slicing preserves source operation ids");
+  const auto *input = prefix.tensor(1U);
+  const auto *constant = prefix.tensor(2U);
+  const auto *internal = prefix.tensor(3U);
+  const auto *output = prefix.tensor(4U);
+  expect(input && input->has_role(TensorRole::Input) && constant &&
+             constant->has_role(TensorRole::Constant) &&
+             constant->has_role(TensorRole::Streamed) && internal &&
+             internal->roles ==
+                 static_cast<std::uint32_t>(TensorRole::Internal) &&
+             output &&
+             output->has_role(TensorRole::Output),
+         "operation slicing assigns standalone boundary roles");
+
+  const auto suffix = dif::compiler::slice_operations(program, 8U, 9U);
+  expect(suffix.tensor(3U) && suffix.tensor(3U)->has_role(TensorRole::Input) &&
+             suffix.tensor(4U) &&
+             suffix.tensor(4U)->roles ==
+                 static_cast<std::uint32_t>(TensorRole::Internal) &&
+             suffix.tensor(5U) &&
+             suffix.tensor(5U)->has_role(TensorRole::Output),
+         "operation slicing promotes incoming and outgoing values");
+
+  auto branched = program;
+  branched.tensors.push_back(
+      {6, DType::BF16, TensorRole::Output, {2, 4}});
+  branched.operations.push_back({10, Opcode::Add, {3, 1}, {6}, {}});
+  dif::ir::verify(branched);
+  const auto branch_prefix =
+      dif::compiler::slice_operations(branched, 7U, 8U);
+  expect(branch_prefix.tensor(3U) &&
+             branch_prefix.tensor(3U)->has_role(TensorRole::Output),
+         "operation slicing exports values consumed by a later branch");
+}
+
+void test_cuda_linear_tuning_and_exact_swiglu_fusion() {
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  constexpr std::uint64_t rows = 65U;
+  constexpr std::uint64_t inner = 32U;
+  constexpr std::uint64_t width = 65U;
+  Program program;
+  program.tensors = {
+      {1, DType::BF16, TensorRole::Input, {rows, inner}},
+      {2, DType::BF16, TensorRole::Constant, {2U * width, inner}},
+      {3, DType::BF16, TensorRole::Internal, {rows, 2U * width}},
+      {4, DType::BF16, TensorRole::Output, {rows, width}},
+  };
+  program.operations = {
+      {11, Opcode::Linear, {1, 2}, {3},
+       {Attribute::u64(AttrKey::Implementation, 1U)}},
+      {12, Opcode::SwiGlu, {3}, {4},
+       {Attribute::boolean(AttrKey::GateFirst, true)}},
+  };
+  dif::ir::verify(program);
+
+  std::vector<float> input_values(rows * inner);
+  for (std::size_t index = 0; index < input_values.size(); ++index)
+    input_values[index] =
+        static_cast<float>(static_cast<int>(index % 17U) - 8) * 0.125F;
+  std::vector<float> weight_values(2U * width * inner, 0.0F);
+  for (std::uint64_t row = 0U; row < 2U * width; ++row)
+    weight_values[row * inner + row % inner] =
+        row < width ? 0.5F : 0.25F;
+  const dif::runtime::TensorMap bindings = {
+      {1, float_tensor(DType::BF16, {rows, inner}, input_values)},
+      {2, float_tensor(DType::BF16, {2U * width, inner}, weight_values)},
+  };
+
+  dif::runtime::RunOptions baseline_options;
+  baseline_options.warmups = 0U;
+  baseline_options.iterations = 1U;
+  baseline_options.tune_linear_operations = {11U};
+  baseline_options.linear_tuning_warmups = 0U;
+  baseline_options.linear_tuning_iterations = 1U;
+  baseline_options.linear_tuning_sessions = 2U;
+  const auto baseline = dif::runtime::make_cuda_executor()->run(
+      program, bindings, baseline_options);
+  expect(baseline.linear_tuning_results.size() == 1U &&
+             !baseline.linear_tuning_results.front().candidates.empty(),
+         "explicit cuBLASLt tuning records admitted algorithms");
+
+  dif::runtime::RunOptions fused_options;
+  fused_options.warmups = 0U;
+  fused_options.iterations = 1U;
+  fused_options.fuse_linear_swiglu_operations = {11U};
+  const auto fused = dif::runtime::make_cuda_executor()->run(
+      program, bindings, fused_options);
+  const auto expected_eliminated = rows * 2U * width * sizeof(std::uint16_t);
+  expect(fused.primitive_fusions.size() == 1U &&
+             fused.primitive_fusions.front().linear_operation_id == 11U &&
+             fused.primitive_fusions.front().swiglu_operation_id == 12U &&
+             fused.primitive_fusions.front().eliminated_intermediate_bytes ==
+                 expected_eliminated,
+         "explicit Linear-to-SwiGLU fusion reports its exact memory saving");
+  expect(fused.resident_bytes < baseline.resident_bytes,
+         "fused Linear-to-SwiGLU excludes the FC1 intermediate allocation");
+  expect(fused.outputs.at(4U).bytes == baseline.outputs.at(4U).bytes,
+         "fused Linear-to-SwiGLU preserves BF16 output bits");
+}
+
+void test_cuda_cutlass_linear_primitive() {
+#if DIF_HAS_CUTLASS
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  constexpr std::uint64_t rows = 64U;
+  constexpr std::uint64_t inner = 32U;
+  constexpr std::uint64_t width = 64U;
+  Program program;
+  program.tensors = {
+      {1, DType::BF16, TensorRole::Input, {rows, inner}},
+      {2, DType::BF16, TensorRole::Constant, {width, inner}},
+      {3, DType::BF16, TensorRole::Output, {rows, width}},
+  };
+  program.operations = {
+      {11, Opcode::Linear, {1, 2}, {3},
+       {Attribute::u64(AttrKey::Implementation, 1U)}},
+  };
+  dif::ir::verify(program);
+
+  std::vector<float> input_values(rows * inner);
+  std::vector<float> weight_values(width * inner);
+  for (std::size_t index = 0; index < input_values.size(); ++index)
+    input_values[index] =
+        static_cast<float>(static_cast<int>(index % 23U) - 11) * 0.0625F;
+  for (std::size_t index = 0; index < weight_values.size(); ++index)
+    weight_values[index] =
+        static_cast<float>(static_cast<int>(index % 19U) - 9) * 0.03125F;
+  const dif::runtime::TensorMap bindings = {
+      {1, float_tensor(DType::BF16, {rows, inner}, input_values)},
+      {2, float_tensor(DType::BF16, {width, inner}, weight_values)},
+  };
+
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  const auto cublas =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  options.cutlass_linear_operations = {{11U, 1U}};
+  const auto cutlass =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cutlass.outputs.at(3U).bytes == cublas.outputs.at(3U).bytes,
+         "CUTLASS BF16 GEMM primitive preserves cuBLASLt output bits");
+  expect(cutlass.gemm_primitives.size() == 1U &&
+             cutlass.gemm_primitives.front().operation_id == 11U &&
+             cutlass.gemm_primitives.front().schedule == 1U &&
+             cutlass.gemm_primitives.front().threads_per_block == 128U &&
+             cutlass.gemm_primitives.front().dynamic_shared_bytes != 0U,
+         "CUTLASS BF16 GEMM primitive reports its schedule resources");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -1891,15 +2165,21 @@ int main() {
   test_verifier_rejects_multiple_writers();
   test_attention_implementation_identity();
   test_h3_bf16_lowering_preserves_source_reduction_identity();
+  test_h3_long_sequence_transformer_declares_backend_attention();
   test_h3_mixed_denoiser_frontend_and_cuda_parity();
   test_h3_token_refiner_frontend_and_cuda_parity();
   test_memory_plan_reuses_dead_internal_storage();
   test_memory_plan_pages_streamed_constants();
   test_memory_plan_reserves_prefetch_storage();
+  test_memory_plan_omits_backend_replaced_constants();
   test_weight_bundle_roundtrip();
   test_safetensors_streaming_writer();
+  test_safetensors_tensor_metadata_is_skipped();
   test_int4_weight_rewrite_and_cpu_execution();
   test_int5_weight_rewrite_and_cpu_execution();
+  test_operation_slice_preserves_stable_ids_and_boundary_roles();
+  test_cuda_linear_tuning_and_exact_swiglu_fusion();
+  test_cuda_cutlass_linear_primitive();
   if (failures) {
     std::cerr << failures << " test assertion(s) failed\n";
     return 1;

@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -46,7 +47,7 @@ std::uint64_t unsigned_number(const json::Value &value, const char *label) {
   return static_cast<std::uint64_t>(number);
 }
 
-ir::DType dtype(std::string_view name) {
+std::optional<ir::DType> dtype(std::string_view name) {
   if (name == "F32")
     return ir::DType::F32;
   if (name == "BF16")
@@ -57,6 +58,16 @@ ir::DType dtype(std::string_view name) {
     return ir::DType::I8;
   if (name == "I32")
     return ir::DType::I32;
+  return std::nullopt;
+}
+
+std::size_t safetensors_dtype_size(std::string_view name) {
+  if (const auto parsed = dtype(name))
+    return ir::dtype_size(*parsed);
+  if (name == "U8")
+    return 1U;
+  if (name == "I64")
+    return 8U;
   fail("unsupported SafeTensors dtype: " + std::string(name));
 }
 
@@ -233,6 +244,7 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
   if (!root.is_object())
     fail("SafeTensors header root must be an object");
 
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> all_ranges;
   for (const auto &[name, value] : root.object()) {
     if (name == "__metadata__")
       continue;
@@ -245,7 +257,8 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
       fail("invalid SafeTensors tensor record: " + name);
     SafeTensorEntry entry;
     entry.name = name;
-    entry.dtype = dtype(dtype_value->string());
+    const auto dtype_name = dtype_value->string();
+    const auto parsed_dtype = dtype(dtype_name);
     for (const auto &dimension : shape_value->array())
       entry.dims.push_back(unsigned_number(dimension, "shape"));
     if (entry.dims.empty() || entry.dims.size() > ir::kMaxRank)
@@ -259,6 +272,7 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
       fail("SafeTensors tensor offset is out of bounds: " + name);
     entry.file_offset = output.data_offset + relative_begin;
     entry.byte_count = relative_end - relative_begin;
+    all_ranges.emplace_back(entry.file_offset, entry.byte_count);
     std::uint64_t elements = 1U;
     for (const auto dimension : entry.dims) {
       if (dimension == 0U ||
@@ -266,29 +280,30 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
         fail("SafeTensors tensor shape overflow: " + name);
       elements *= dimension;
     }
-    const auto width = ir::dtype_size(entry.dtype);
+    const auto width = safetensors_dtype_size(dtype_name);
     if (elements > std::numeric_limits<std::uint64_t>::max() / width ||
         elements * width != entry.byte_count)
       fail("SafeTensors tensor byte count mismatch: " + name);
-    output.tensors.emplace(name, std::move(entry));
+    if (parsed_dtype) {
+      entry.dtype = *parsed_dtype;
+      output.tensors.emplace(name, std::move(entry));
+    } else if (!name.starts_with("__meta__.")) {
+      fail("unsupported non-metadata SafeTensors dtype " + dtype_name +
+           " for tensor " + name);
+    }
   }
   if (output.tensors.empty())
     fail("SafeTensors file has no tensors");
 
-  std::vector<const SafeTensorEntry *> ordered;
-  ordered.reserve(output.tensors.size());
-  for (const auto &[name, entry] : output.tensors) {
-    (void)name;
-    ordered.push_back(&entry);
-  }
-  std::sort(ordered.begin(), ordered.end(), [](const auto *a, const auto *b) {
-    return a->file_offset < b->file_offset;
+  std::sort(all_ranges.begin(), all_ranges.end(), [](const auto &a,
+                                                     const auto &b) {
+    return a.first < b.first;
   });
   std::uint64_t expected = output.data_offset;
-  for (const auto *entry : ordered) {
-    if (entry->file_offset != expected)
+  for (const auto &[offset, bytes] : all_ranges) {
+    if (offset != expected)
       fail("SafeTensors data contains a hole or overlap");
-    expected += entry->byte_count;
+    expected += bytes;
   }
   if (expected != output.file_size)
     fail("SafeTensors tensor data does not cover the file");

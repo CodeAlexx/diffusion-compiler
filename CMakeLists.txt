@@ -11,12 +11,14 @@ option(DIF_ENABLE_CUDNN "Build optional cuDNN SDPA lowering" ON)
 option(DIF_BUILD_TESTS "Build unit tests" ON)
 option(DIF_ENABLE_OPENCL "Build the vendor-neutral OpenCL reference backend" ON)
 set(DIF_CUDNN_ROOT "" CACHE PATH "cuDNN installation root (include/ and lib/)")
+set(DIF_CUTLASS_ROOT "" CACHE PATH "CUTLASS source root (contains include/cutlass)")
 
 add_library(difcore
     src/backend/plugin.cpp
     src/compiler/compiler.cpp
     src/compiler/int4.cpp
     src/compiler/memory_plan.cpp
+    src/compiler/slice.cpp
   src/frontend/h3.cpp
   src/frontend/h3_conditioning.cpp
   src/frontend/h3_vae.cpp
@@ -44,7 +46,12 @@ add_library(difcore
     src/weights/bundle.cpp
 )
 target_include_directories(difcore PUBLIC include)
-target_compile_options(difcore PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_compile_options(
+    difcore PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>
+    # NVCC's generated host stubs use GCC-style line directives that trip
+    # host -Wpedantic. Keep all actionable CUDA/host warnings fatal.
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>)
 target_link_libraries(difcore PRIVATE ${CMAKE_DL_LIBS})
 
 if(DIF_ENABLE_CUDA)
@@ -55,7 +62,26 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_sources(difcore PRIVATE src/runtime/cuda_executor.cpp)
   target_link_libraries(difcore PRIVATE CUDA::cuda_driver CUDA::nvrtc
                                         CUDA::cublas CUDA::cublasLt)
-  target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=1)
+  target_compile_definitions(
+      difcore PUBLIC DIF_HAS_CUDA=1
+      PRIVATE DIF_CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}")
+  find_path(DIF_CUTLASS_INCLUDE_DIR cutlass/cutlass.h
+            HINTS "${DIF_CUTLASS_ROOT}" ENV CUTLASS_ROOT
+            PATH_SUFFIXES include)
+  if(DIF_CUTLASS_INCLUDE_DIR)
+    enable_language(CUDA)
+    target_sources(difcore PRIVATE src/runtime/cutlass_gemm.cu)
+    target_include_directories(difcore SYSTEM PRIVATE "${DIF_CUTLASS_INCLUDE_DIR}")
+    target_link_libraries(difcore PRIVATE CUDA::cudart)
+    target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=1)
+    set_property(TARGET difcore PROPERTY CUDA_ARCHITECTURES 86)
+    set_property(TARGET difcore PROPERTY CUDA_STANDARD 17)
+    set_property(TARGET difcore PROPERTY CUDA_STANDARD_REQUIRED ON)
+    message(STATUS "Diffusion compiler CUTLASS GEMM: ${DIF_CUTLASS_INCLUDE_DIR}")
+  else()
+    target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=0)
+    message(STATUS "Diffusion compiler CUTLASS GEMM: disabled")
+  endif()
   if(DIF_ENABLE_CUDNN)
     find_path(DIF_CUDNN_INCLUDE_DIR cudnn.h
               HINTS "${DIF_CUDNN_ROOT}" ENV CUDNN_ROOT
@@ -80,7 +106,8 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   endif()
 else()
   target_sources(difcore PRIVATE src/runtime/cuda_executor_stub.cpp)
-  target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=0 DIF_HAS_CUDNN=0)
+  target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=0 DIF_HAS_CUDNN=0
+                                            DIF_HAS_CUTLASS=0)
 endif()
 
 add_executable(difc tools/difc.cpp)
@@ -128,6 +155,9 @@ target_link_libraries(diftrain PRIVATE difcore)
 add_executable(difh3infer tools/difh3infer.cpp)
 target_link_libraries(difh3infer PRIVATE difcore)
 
+add_executable(difslice tools/difslice.cpp)
+target_link_libraries(difslice PRIVATE difcore)
+
 if(DIF_ENABLE_OPENCL)
   find_path(DIF_OPENCL_INCLUDE_DIR CL/cl.h
             HINTS ${CUDAToolkit_INCLUDE_DIRS}
@@ -153,7 +183,7 @@ else()
   message(STATUS "Diffusion compiler OpenCL backend: disabled")
 endif()
 
-install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer
+install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer difslice
         RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)

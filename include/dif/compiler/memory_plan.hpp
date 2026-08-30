@@ -35,6 +35,8 @@ MemoryPlan plan_memory(const ir::Program &program,
                        std::uint64_t alignment = 256U,
                        std::uint64_t stream_prefetch_distance = 0U,
                        const std::unordered_set<std::uint32_t>
-                           &excluded_internal_tensors = {});
+                           &excluded_internal_tensors = {},
+                       const std::unordered_set<std::uint32_t>
+                           &replaced_constant_tensors = {});
 
 } // namespace dif::compiler

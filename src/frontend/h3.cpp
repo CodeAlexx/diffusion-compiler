@@ -622,12 +622,14 @@ ir::Program make_h3_transformer_bf16(
     std::uint64_t head_dim, std::uint64_t ffn, std::uint64_t rotary,
     std::uint64_t layers, std::uint64_t timestep_tables,
     std::uint64_t time_embed_dim, std::uint64_t block_size,
-    bool streamed_constants, bool source_shaped_qkv) {
+    bool streamed_constants, bool source_shaped_qkv,
+    std::uint64_t attention_implementation) {
   using namespace ir;
   if (sequence == 0U || hidden == 0U || heads == 0U || head_dim == 0U ||
       ffn == 0U || layers == 0U || timestep_tables == 0U ||
       time_embed_dim == 0U || rotary == 0U || rotary > head_dim ||
       (rotary % 2U) != 0U ||
+      (attention_implementation != 1U && attention_implementation != 2U) ||
       heads > std::numeric_limits<std::uint64_t>::max() / head_dim ||
       hidden > std::numeric_limits<std::uint64_t>::max() / 18U ||
       ffn > std::numeric_limits<std::uint64_t>::max() / 2U)
@@ -676,6 +678,7 @@ ir::Program make_h3_transformer_bf16(
                      1.0 / std::sqrt(static_cast<double>(head_dim))),
       Attribute::boolean(AttrKey::Causal, false),
       Attribute::u64(AttrKey::BlockSize, 64U),
+      Attribute::u64(AttrKey::Implementation, attention_implementation),
   };
   const auto qkv_attrs = std::vector<Attribute>{
       Attribute::u64(AttrKey::Heads, heads),

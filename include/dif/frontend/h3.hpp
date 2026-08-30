@@ -55,7 +55,8 @@ ir::Program make_h3_transformer_bf16(std::uint64_t sequence,
                                      std::uint64_t time_embed_dim,
                                      std::uint64_t block_size,
                                      bool streamed_constants,
-                                     bool source_shaped_qkv = true);
+                                     bool source_shaped_qkv = true,
+                                     std::uint64_t attention_implementation = 1);
 
 ir::Program make_h3_token_refiner_bf16(std::uint64_t sequence,
                                        std::uint64_t hidden,

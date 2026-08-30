@@ -565,6 +565,7 @@ void usage() {
                "       difweights make-h3-video-vae-bundle SOURCE.safetensors PROGRAM.difir OUT.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights reuse-h3-video-vae-bundle SEALED.difbind PROGRAM.difir GEOMETRY.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights rebind-program SEALED.difbind PROGRAM.difir OUT.difbind\n"
+               "       difweights subset-bundle SOURCE.difbind PROGRAM.difir OUT.difbind\n"
                "       difweights verify-bundle FILE.difbind PROGRAM.difir\n";
 }
 
@@ -783,6 +784,21 @@ int main(int argc, char **argv) {
         std::cout << "binding tensor=" << binding.tensor_id
                   << " shard=" << binding.shard_index
                   << " name=" << binding.tensor_name << "\n";
+      return 0;
+    }
+    if (command == "subset-bundle" && argc == 5) {
+      if (std::filesystem::exists(argv[4]))
+        dif::fail("refusing to overwrite subset weight bundle");
+      const auto source = dif::weights::read_weight_bundle(argv[2]);
+      const auto program = dif::ir::read_file(argv[3]);
+      const auto subset = dif::weights::subset_weight_bundle(source, program);
+      dif::weights::write_weight_bundle(subset, argv[4]);
+      std::cout << "SUBSET_BUNDLE path=" << argv[4]
+                << " program="
+                << dif::hex_digest(subset.program_fingerprint)
+                << " index=" << dif::hex_digest(subset.index_fingerprint)
+                << " shards=" << subset.shards.size()
+                << " bindings=" << subset.bindings.size() << "\n";
       return 0;
     }
     if (command == "verify-bundle" && argc == 4) {

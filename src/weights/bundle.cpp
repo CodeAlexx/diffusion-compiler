@@ -201,6 +201,45 @@ WeightBundle read_weight_bundle(const std::filesystem::path &path) {
   return bundle;
 }
 
+WeightBundle subset_weight_bundle(const WeightBundle &bundle,
+                                  const ir::Program &program) {
+  WeightBundle result;
+  result.program_fingerprint = ir::fingerprint(program);
+  result.index_fingerprint = bundle.index_fingerprint;
+  std::vector<std::uint32_t> shard_map(
+      bundle.shards.size(), std::numeric_limits<std::uint32_t>::max());
+  std::set<std::uint32_t> selected_tensors;
+  for (const auto &binding : bundle.bindings) {
+    const auto *description = program.tensor(binding.tensor_id);
+    if (!description ||
+        !description->has_role(ir::TensorRole::Constant))
+      continue;
+    if (description->dtype != binding.dtype ||
+        description->dims != binding.dims ||
+        description->byte_count() != binding.byte_count)
+      fail("subset bundle constant disagrees with source binding");
+    auto &mapped = shard_map.at(binding.shard_index);
+    if (mapped == std::numeric_limits<std::uint32_t>::max()) {
+      mapped = static_cast<std::uint32_t>(result.shards.size());
+      result.shards.push_back(bundle.shards.at(binding.shard_index));
+    }
+    auto selected = binding;
+    selected.shard_index = mapped;
+    result.bindings.push_back(std::move(selected));
+    selected_tensors.insert(binding.tensor_id);
+  }
+  for (const auto &description : program.tensors) {
+    if (description.has_role(ir::TensorRole::Constant) &&
+        !selected_tensors.contains(description.id))
+      fail("subset bundle source lacks program constant " +
+           std::to_string(description.id));
+  }
+  if (result.bindings.empty())
+    fail("cannot create a weight-bundle subset without constants");
+  verify_weight_bundle(result, program, false);
+  return result;
+}
+
 void verify_weight_bundle(const WeightBundle &bundle, const ir::Program &program,
                           bool verify_shard_digests) {
   if (bundle.program_fingerprint != ir::fingerprint(program))

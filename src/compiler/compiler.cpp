@@ -758,6 +758,36 @@ void emit_rms_norm_modulate(std::ostringstream &out, const ir::Program &program,
   const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
   const bool weighted = op.inputs.size() == 4;
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  const auto *scale = program.tensor(op.inputs[weighted ? 2U : 1U]);
+  if (weighted && program.tensor(op.inputs[0])->dtype == ir::DType::BF16 &&
+      block == 256U && scale->element_count() % cols == 0U &&
+      rows % (scale->element_count() / cols) == 0U) {
+    const auto rows_per_vector = rows / (scale->element_count() / cols);
+    // Port of Serenity's accepted fused BF16 RMSNorm + AdaLN modulation.
+    // Preserve the BF16 norm output boundary, then perform modulation in F32
+    // with only the final BF16 store.
+    out << std::setprecision(17)
+        << "extern \"C\" __global__ void " << function_name(op)
+        << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* scale,const dif_scalar* shift,dif_scalar* y){"
+           "extern __shared__ float reduction[];unsigned long long row=blockIdx.x;"
+           "unsigned tid=threadIdx.x;if(row>="
+        << rows
+        << "ULL)return;float local=0.0f;for(unsigned long long col=tid;col<"
+        << cols
+        << "ULL;col+=256ULL){float value=dif_load(x,row*" << cols
+        << "ULL+col);local=__fadd_rn(local,__fmul_rn(value,value));}"
+           "reduction[tid]=local;__syncthreads();for(unsigned active=128U;active>0U;active>>=1U){"
+           "if(tid<active)reduction[tid]=__fadd_rn(reduction[tid],reduction[tid+active]);"
+           "__syncthreads();}float inv=rsqrtf(__fadd_rn(__fdiv_rn(reduction[0],"
+        << cols << ".0f)," << static_cast<float>(epsilon)
+        << "f));unsigned long long vector=(row/" << rows_per_vector << "ULL)*"
+        << cols << "ULL;for(unsigned long long col=tid;col<" << cols
+        << "ULL;col+=256ULL){unsigned long long i=row*" << cols
+        << "ULL+col;float normed=dif_round(dif_load(x,i)*inv*dif_load(weight,col));"
+           "float result=(1.0f+dif_load(scale,vector+col))*normed+dif_load(shift,vector+col);"
+           "dif_store(y,i,result);}}\n";
+    return;
+  }
   out << std::setprecision(17)
       << "extern \"C\" __global__ void " << function_name(op)
       << (weighted
@@ -992,6 +1022,43 @@ void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
   const auto half = rotary / 2U;
   const auto table_width = program.tensor(op.inputs[2])->dims[1];
   const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
+  if (program.tensor(op.inputs[0])->dtype == ir::DType::BF16 && dim == 128U &&
+      table_width == rotary) {
+    // Port of Serenity's accepted MiniMax-H3 fused Q/K RMSNorm + partial-RoPE
+    // primitive. One lane owns one head value, preserving the 128-lane F32
+    // reduction and the required BF16 normalization boundary before RoPE.
+    out << std::setprecision(17)
+        << "extern \"C\" __global__ void " << function_name(op)
+        << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* cosv,const dif_scalar* sinv,dif_scalar* y){\n"
+           " extern __shared__ float reduction[];unsigned long long row=blockIdx.x;"
+           "unsigned tid=threadIdx.x;if(row>="
+        << sequence * heads
+        << "ULL)return;unsigned long long base=row*128ULL;float local=0.0f;"
+           "for(unsigned col=tid;col<128U;col+=128U){float value=dif_load(x,base+col);"
+           "local=__fadd_rn(local,__fmul_rn(value,value));}"
+           "reduction[tid]=local;__syncthreads();for(unsigned active=64U;active>0U;active>>=1U){"
+           "if(tid<active)reduction[tid]=__fadd_rn(reduction[tid],reduction[tid+active]);__syncthreads();}"
+           "float inv=rsqrtf(__fadd_rn(__fdiv_rn(reduction[0],128.0f),"
+        << static_cast<float>(epsilon)
+        << "f));unsigned long long token=row/" << heads << "ULL;if(tid<"
+        << half
+        << "U){unsigned lane=tid;float value0=dif_load(x,base+lane);"
+           "float value1=dif_load(x,base+lane+"
+        << half
+        << "ULL);float norm0=dif_round(value0*inv*dif_load(weight,lane));"
+           "float norm1=dif_round(value1*inv*dif_load(weight,lane+"
+        << half
+        << "ULL));unsigned long long table=token*" << table_width
+        << "ULL;float result0=norm0*dif_load(cosv,table+lane)-norm1*dif_load(sinv,table+lane);"
+           "float result1=norm1*dif_load(cosv,table+lane+"
+        << half
+        << "ULL)+norm0*dif_load(sinv,table+lane+" << half
+        << "ULL);dif_store(y,base+lane,result0);dif_store(y,base+lane+"
+        << half << "ULL,result1);}else if(tid>=" << rotary
+        << "U&&tid<128U){float value=dif_load(x,base+tid);"
+           "dif_store(y,base+tid,value*inv*dif_load(weight,tid));}}\n";
+    return;
+  }
   out << std::setprecision(17)
       << "extern \"C\" __global__ void " << function_name(op)
       << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* cosv,const dif_scalar* sinv,dif_scalar* y){\n"

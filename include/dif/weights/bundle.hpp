@@ -37,6 +37,8 @@ struct WeightBundle {
 void write_weight_bundle(const WeightBundle &bundle,
                          const std::filesystem::path &path);
 WeightBundle read_weight_bundle(const std::filesystem::path &path);
+WeightBundle subset_weight_bundle(const WeightBundle &bundle,
+                                  const ir::Program &program);
 runtime::TensorMap load_weight_bundle(const WeightBundle &bundle,
                                       const ir::Program &program,
                                       bool verify_shard_digests);

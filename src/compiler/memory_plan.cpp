@@ -38,7 +38,9 @@ const BufferAssignment *MemoryPlan::assignment(std::uint32_t tensor_id) const {
 MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
                        std::uint64_t stream_prefetch_distance,
                        const std::unordered_set<std::uint32_t>
-                           &excluded_internal_tensors) {
+                           &excluded_internal_tensors,
+                       const std::unordered_set<std::uint32_t>
+                           &replaced_constant_tensors) {
   ir::verify(program);
   (void)align_up(0U, alignment);
   const auto end = static_cast<std::uint64_t>(program.operations.size());
@@ -64,6 +66,13 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
           tensor.has_role(ir::TensorRole::Constant) ||
           tensor.has_role(ir::TensorRole::Output))
         fail("memory plan may exclude only internal lowering intermediates");
+      continue;
+    }
+    if (replaced_constant_tensors.contains(tensor.id)) {
+      if (!tensor.has_role(ir::TensorRole::Constant) ||
+          tensor.has_role(ir::TensorRole::Input) ||
+          tensor.has_role(ir::TensorRole::Output))
+        fail("memory plan may replace only semantic constant tensors");
       continue;
     }
     const auto streamed = tensor.has_role(ir::TensorRole::Streamed);

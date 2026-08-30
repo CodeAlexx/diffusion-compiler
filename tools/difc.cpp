@@ -347,7 +347,7 @@ void usage() {
             << "  difc make-h3-block OUT.difir S HIDDEN HEADS DIM FFN ROTARY BLOCK\n"
             << "  difc make-h3-block-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY BLOCK\n"
             << "  difc make-h3-stack-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY LAYERS BLOCK resident|streamed\n"
-            << "  difc make-h3-transformer-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY LAYERS TABLES TIME_EMBED BLOCK resident|streamed [split|packed]\n"
+            << "  difc make-h3-transformer-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY LAYERS TABLES TIME_EMBED BLOCK resident|streamed [split|packed] [generated|cudnn]\n"
             << "  difc make-h3-token-refiner-bf16 OUT.difir S HIDDEN HEADS DIM FFN LAYERS BLOCK resident|streamed\n"
             << "  difc make-h3-denoiser OUT.difir VIDEO_TOKENS AUDIO_TOKENS TEXT_TOKENS TIMESTEP_TABLES resident|streamed generated|cudnn [LAYERS REFINER_LAYERS]\n"
             << "  difc make-h3-video-vae OUT.difir LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
@@ -474,13 +474,16 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (command == "make-h3-transformer-bf16" &&
-        (argc == 14 || argc == 15)) {
+        (argc == 14 || argc == 15 || argc == 16)) {
       const std::string residency = argv[13];
       if (residency != "resident" && residency != "streamed")
         dif::fail("H3 transformer residency must be resident or streamed");
-      const std::string qkv = argc == 15 ? argv[14] : "split";
+      const std::string qkv = argc >= 15 ? argv[14] : "split";
       if (qkv != "split" && qkv != "packed")
         dif::fail("H3 transformer QKV mode must be split or packed");
+      const std::string attention = argc == 16 ? argv[15] : "generated";
+      if (attention != "generated" && attention != "cudnn")
+        dif::fail("H3 transformer attention must be generated or cudnn");
       const auto program = dif::frontend::make_h3_transformer_bf16(
           number(argv[3], "sequence"), number(argv[4], "hidden"),
           number(argv[5], "heads"), number(argv[6], "head dimension"),
@@ -488,10 +491,11 @@ int main(int argc, char **argv) {
           number(argv[9], "layers"), number(argv[10], "timestep tables"),
           number(argv[11], "time embedding dimension"),
           number(argv[12], "block size"), residency == "streamed",
-          qkv == "split");
+          qkv == "split", attention == "cudnn" ? 2U : 1U);
       dif::ir::write_file(program, argv[2]);
       std::cout << "PROGRAM path=" << argv[2] << " layers=" << argv[9]
                 << " constant_residency=" << residency << " qkv=" << qkv
+                << " attention=" << attention
                 << " fingerprint="
                 << dif::hex_digest(dif::ir::fingerprint(program)) << "\n";
       return 0;

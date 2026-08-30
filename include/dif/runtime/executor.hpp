@@ -3,6 +3,7 @@
 #include "dif/ir/ir.hpp"
 #include "dif/runtime/tensor.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -14,11 +15,54 @@ namespace dif::runtime {
 
 using TensorMap = std::unordered_map<std::uint32_t, Tensor>;
 
+struct CutlassLinearChoice {
+  std::uint32_t operation_id{};
+  std::uint32_t schedule{};
+};
+
+struct LinearAlgorithmChoice {
+  std::uint32_t operation_id{};
+  std::uint32_t heuristic_rank{};
+};
+
 struct RunOptions {
   std::uint32_t warmups{2};
   std::uint32_t iterations{5};
   std::uint64_t minimum_free_bytes{256ULL * 1024ULL * 1024ULL};
   std::filesystem::path cache_directory;
+  // Backend-only prepared execution choices. DiffIR semantics remain
+  // unchanged; these ids identify exact Linear operations to benchmark or
+  // exact Linear->SwiGlu chains to lower as a fused CUDA primitive.
+  std::vector<std::uint32_t> tune_linear_operations;
+  std::vector<std::uint32_t> fuse_linear_swiglu_operations;
+  std::vector<CutlassLinearChoice> cutlass_linear_operations;
+  std::vector<LinearAlgorithmChoice> linear_algorithm_choices;
+  // Accepted MiniMax-H3 W8A8 precision route. The cache is the Serenity
+  // resident row-scale SafeTensors store; the backend recognizes and replaces
+  // only an exclusive Linear->SwiGlu->Linear->ResidualGate MLP chain.
+  std::filesystem::path h3_w8a8_cache;
+  std::uint32_t h3_w8a8_layer{};
+  // Accepted MiniMax-H3 groupwise INT8 weight-only route. The Serenity cache
+  // stores transformed I8 projection weights with compact F16 group scales;
+  // the backend dequantizes each projection into shared BF16 scratch below
+  // the unchanged DiffIR semantic boundary.
+  std::filesystem::path h3_groupwise_cache;
+  std::uint32_t h3_groupwise_layer{};
+  // Serenity's accepted prepared AdaLN path. The cache contains the BF16
+  // modulation result for each block; the companion DiffTensor is the exact
+  // activated BF16 timestep input used to build it and is checked byte-for-
+  // byte on every prepared run.
+  std::filesystem::path h3_modulation_cache;
+  std::filesystem::path h3_modulation_input;
+  std::uint32_t h3_modulation_layer{};
+  // Accepted architecture-tagged Comfy Kitchen H3 attention route. This is an
+  // explicit approximate backend under the semantic Attention operation; an
+  // empty path retains the exact DiffIR-selected implementation.
+  std::filesystem::path h3_ck_attention_dso;
+  std::uint32_t linear_tuning_warmups{3};
+  std::uint32_t linear_tuning_iterations{10};
+  std::uint32_t linear_tuning_sessions{3};
+  bool expand_linear_algorithms{false};
   bool trace_operations{false};
   bool overlap_streaming{true};
   bool profile_pipeline{false};
@@ -30,6 +74,125 @@ struct OperationTiming {
   double mean_milliseconds{};
   double minimum_milliseconds{};
   double maximum_milliseconds{};
+};
+
+struct LinearAlgorithmTiming {
+  std::uint32_t heuristic_index{};
+  std::int32_t algorithm_id{-1};
+  std::uint32_t tile_id{};
+  std::uint32_t stages_id{};
+  std::int32_t split_k{};
+  std::uint32_t reduction_scheme{};
+  std::uint32_t cta_swizzle{};
+  std::uint32_t custom_option{};
+  double waves_count{};
+  std::uint64_t workspace_bytes{};
+  double mean_milliseconds{};
+  double minimum_session_milliseconds{};
+  double maximum_session_milliseconds{};
+};
+
+struct LinearTuningResult {
+  std::uint32_t operation_id{};
+  std::uint32_t selected_heuristic_index{};
+  std::int32_t selected_algorithm_id{-1};
+  double default_mean_milliseconds{};
+  double selected_mean_milliseconds{};
+  double observed_noise_milliseconds{};
+  double tuning_milliseconds{};
+  bool changed_from_default{};
+  std::string decision;
+  std::vector<LinearAlgorithmTiming> candidates;
+};
+
+struct PrimitiveFusionResult {
+  std::uint32_t linear_operation_id{};
+  std::uint32_t swiglu_operation_id{};
+  std::uint64_t eliminated_intermediate_bytes{};
+  std::string implementation;
+};
+
+struct GemmPrimitiveResult {
+  std::uint32_t operation_id{};
+  std::uint32_t schedule{};
+  std::string implementation;
+  std::uint32_t threadblock_m{};
+  std::uint32_t threadblock_n{};
+  std::uint32_t threadblock_k{};
+  std::uint32_t warp_m{};
+  std::uint32_t warp_n{};
+  std::uint32_t warp_k{};
+  std::uint32_t stages{};
+  std::uint32_t threads_per_block{};
+  std::uint32_t registers_per_thread{};
+  std::uint64_t static_shared_bytes{};
+  std::uint64_t dynamic_shared_bytes{};
+  std::uint64_t maximum_dynamic_shared_bytes{};
+};
+
+struct H3W8A8MlpResult {
+  std::uint32_t fc1_operation_id{};
+  std::uint32_t swiglu_operation_id{};
+  std::uint32_t fc2_operation_id{};
+  std::uint32_t residual_operation_id{};
+  std::uint32_t layer{};
+  std::uint32_t chunk_rows{};
+  std::uint64_t quantized_weight_bytes{};
+  std::uint64_t scratch_bytes{};
+  std::uint64_t eliminated_intermediate_bytes{};
+  std::string classification;
+  std::string implementation;
+  std::string cache_path;
+};
+
+struct H3W8A8AttentionResult {
+  std::uint32_t qkv_layout_operation_id{};
+  std::array<std::uint32_t, 3> qkv_linear_operation_ids{};
+  std::uint32_t output_linear_operation_id{};
+  std::uint32_t residual_operation_id{};
+  std::uint32_t layer{};
+  std::uint32_t chunk_rows{};
+  std::uint64_t quantized_weight_bytes{};
+  std::uint64_t scratch_bytes{};
+  std::uint64_t eliminated_intermediate_bytes{};
+  std::string classification;
+  std::string implementation;
+  std::string cache_path;
+};
+
+struct H3CKAttentionResult {
+  std::uint32_t operation_id{};
+  std::uint32_t target_sm{};
+  std::uint64_t scratch_bytes{};
+  std::string classification;
+  std::string implementation;
+  std::string dso_path;
+};
+
+struct H3GroupwiseInt8Result {
+  std::uint32_t qkv_layout_operation_id{};
+  std::uint32_t output_linear_operation_id{};
+  std::uint32_t fc1_operation_id{};
+  std::uint32_t fc2_operation_id{};
+  std::uint32_t layer{};
+  std::array<std::uint32_t, 4> group_sizes{};
+  std::uint64_t quantized_weight_bytes{};
+  std::uint64_t scratch_bytes{};
+  std::string classification;
+  std::string implementation;
+  std::string cache_path;
+};
+
+struct H3ModulationCacheResult {
+  std::uint32_t linear_operation_id{};
+  std::uint32_t select_operation_id{};
+  std::uint32_t layer{};
+  std::uint64_t cache_bytes{};
+  std::uint64_t replaced_weight_bytes{};
+  std::string classification;
+  std::string implementation;
+  std::string cache_path;
+  std::string input_path;
 };
 
 // Profiling values describe the timed iterations of one prepared CUDA run.
@@ -74,6 +237,15 @@ struct RunResult {
   std::string generated_source_hash;
   std::uint64_t resident_bytes{};
   std::vector<OperationTiming> operation_timings;
+  std::vector<LinearTuningResult> linear_tuning_results;
+  std::vector<LinearAlgorithmChoice> selected_linear_algorithms;
+  std::vector<PrimitiveFusionResult> primitive_fusions;
+  std::vector<GemmPrimitiveResult> gemm_primitives;
+  std::vector<H3W8A8MlpResult> h3_w8a8_mlps;
+  std::vector<H3W8A8AttentionResult> h3_w8a8_attentions;
+  std::vector<H3CKAttentionResult> h3_ck_attentions;
+  std::vector<H3GroupwiseInt8Result> h3_groupwise_int8;
+  std::vector<H3ModulationCacheResult> h3_modulation_caches;
   PipelineProfile pipeline_profile;
 };
 
