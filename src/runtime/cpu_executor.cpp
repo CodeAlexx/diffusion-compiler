@@ -134,9 +134,11 @@ void linear_backward_weight(const ir::Operation &op, TensorMap &tensors) {
   const auto &grad_output = tensors.at(op.inputs[0]);
   const auto &input = tensors.at(op.inputs[1]);
   auto &grad_weight = tensors.at(op.outputs[0]);
-  const auto inner = input.dims.back();
+  // Geometry from the [N,K] weight gradient itself: rank-agnostic over both
+  // admitted operand forms (same-rank broadcast and flatten).
+  const auto outputs = grad_weight.dims[0];
+  const auto inner = grad_weight.dims[1];
   const auto rows = input.element_count() / inner;
-  const auto outputs = grad_output.dims.back();
   for (std::uint64_t output = 0U; output < outputs; ++output) {
     for (std::uint64_t column = 0U; column < inner; ++column) {
       float value = 0.0F;

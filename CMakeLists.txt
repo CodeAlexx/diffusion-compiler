@@ -24,6 +24,7 @@ add_library(difcore
   src/frontend/h3_latents.cpp
   src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
+  src/frontend/dit_block.cpp
   src/frontend/lora.cpp
   src/frontend/training.cpp
     src/ir/codec.cpp
@@ -154,6 +155,9 @@ target_link_libraries(difvaedecode PRIVATE difcore)
 
 add_executable(difditops tools/difditops.cpp)
 target_link_libraries(difditops PRIVATE difcore)
+
+add_executable(difdittrain tools/difdittrain.cpp)
+target_link_libraries(difdittrain PRIVATE difcore)
 
 add_executable(diftrain tools/diftrain.cpp)
 target_link_libraries(diftrain PRIVATE difcore)

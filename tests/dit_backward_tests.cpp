@@ -7,6 +7,8 @@
 // reference authority, these are the always-on structural gates).
 
 #include "dif/compiler/compiler.hpp"
+#include "dif/frontend/dit_block.hpp"
+#include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -338,6 +340,37 @@ GradientCase swiglu_case(dif::ir::DType dtype, bool gate_first) {
   return grad_case;
 }
 
+// Linear declared with a split trailing shape ([S,Hd] x [Hd,Hd] -> [S,H,D],
+// the q/k/v projection pattern): exercises the flatten-form admission of
+// LinearBackwardInput/Weight and the flattened-row-width BiasBackward.
+GradientCase linear_rank3_case(dif::ir::DType dtype) {
+  using namespace dif::ir;
+  GradientCase grad_case;
+  grad_case.name =
+      std::string("linear_rank3_") + std::string(dtype_name(dtype));
+  const std::uint64_t sequence = 5U;
+  const std::uint64_t heads = 2U;
+  const std::uint64_t dim = 3U;
+  const std::uint64_t hidden = heads * dim;
+  grad_case.forward.tensors = {
+      {1U, dtype, TensorRole::Input, {sequence, hidden}},
+      {2U, dtype, TensorRole::Input, {hidden, hidden}},
+      {3U, dtype, TensorRole::Input, {hidden}},
+      {4U, dtype, TensorRole::Internal, {sequence, heads, dim}},
+  };
+  grad_case.forward.operations = {
+      {1U, Opcode::Linear, {1U, 2U, 3U}, {4U}, {}},
+  };
+  grad_case.targets = {1U, 2U, 3U};
+  grad_case.bindings.emplace(
+      1U, random_tensor(dtype, {sequence, hidden}, 101U));
+  grad_case.bindings.emplace(
+      2U, random_tensor(dtype, {hidden, hidden}, 102U, 0.4F));
+  grad_case.bindings.emplace(3U, random_tensor(dtype, {hidden}, 103U, 0.2F));
+  append_loss(grad_case, 4U, 104U);
+  return grad_case;
+}
+
 GradientCase attention_case(dif::ir::DType dtype, bool causal) {
   using namespace dif::ir;
   GradientCase grad_case;
@@ -515,6 +548,7 @@ void test_group1_finite_differences() {
   finite_difference_check(qk_norm_rope_case(dif::ir::DType::F32, false));
   finite_difference_check(attention_case(dif::ir::DType::F32, false));
   finite_difference_check(attention_case(dif::ir::DType::F32, true));
+  finite_difference_check(linear_rank3_case(dif::ir::DType::F32));
   finite_difference_check(composed_group1_case());
 }
 
@@ -535,6 +569,7 @@ void test_group1_backend_parity() {
                       f32_bar);
   backend_cross_check(attention_case(dif::ir::DType::F32, false), f32_bar);
   backend_cross_check(attention_case(dif::ir::DType::F32, true), f32_bar);
+  backend_cross_check(linear_rank3_case(dif::ir::DType::F32), f32_bar);
   backend_cross_check(composed_group1_case(), f32_bar);
   backend_cross_check(rms_norm_case(dif::ir::DType::BF16), bf16_bar);
   backend_cross_check(rms_norm_modulate_case(dif::ir::DType::BF16, true),
@@ -572,6 +607,123 @@ void test_group1_frozen_weight_economy() {
       expect(operation.outputs.size() == 2U,
              "weight-target RmsNorm differentiation emits the weight "
              "gradient");
+}
+
+void test_dit_block_builder() {
+  dif::frontend::DitBlockTrainingConfig config;
+  config.sequence = 6U;
+  config.heads = 2U;
+  config.head_dim = 4U;
+  config.mlp_width = 8U;
+  config.blocks = 2U;
+  config.rotary_dim = 4U;
+  const auto build = dif::frontend::make_dit_block_training(config);
+  const auto rebuilt = dif::frontend::make_dit_block_training(config);
+  expect(dif::ir::fingerprint(build.program) ==
+             dif::ir::fingerprint(rebuilt.program),
+         "DiT block training builder is deterministic");
+  expect(build.parameters.size() ==
+                 dif::frontend::kDitBlockParameterCount * config.blocks &&
+             build.optimizer_bindings.size() == build.parameters.size() &&
+             build.parameter_names.front() == "block0.norm1_w" &&
+             build.parameter_names.back() == "block1.fc2_b",
+         "DiT block training exposes the canonical parameter set");
+
+  const auto hidden = config.heads * config.head_dim;
+  dif::runtime::TensorMap inputs;
+  inputs.emplace(build.x_input,
+                 random_tensor(dif::ir::DType::F32,
+                               {config.sequence, hidden}, 91U));
+  inputs.emplace(build.cos_input,
+                 random_tensor(dif::ir::DType::F32,
+                               {config.sequence, config.rotary_dim}, 92U));
+  inputs.emplace(build.sin_input,
+                 random_tensor(dif::ir::DType::F32,
+                               {config.sequence, config.rotary_dim}, 93U));
+  inputs.emplace(build.target_input,
+                 random_tensor(dif::ir::DType::F32,
+                               {config.sequence, hidden}, 94U));
+  std::uint64_t seed = 95U;
+  for (const auto &modulation : build.modulation_inputs)
+    for (const auto id :
+         {modulation.scale1, modulation.shift1, modulation.gate1,
+          modulation.scale2, modulation.shift2, modulation.gate2})
+      inputs.emplace(id,
+                     random_tensor(dif::ir::DType::F32,
+                                   {config.sequence, hidden}, seed++, 0.2F));
+  for (const auto parameter : build.parameters) {
+    const auto &description = *build.program.tensor(parameter);
+    const bool is_norm_weight = description.dims.size() == 1U &&
+                                (description.dims[0] == hidden ||
+                                 description.dims[0] == config.head_dim);
+    inputs.emplace(parameter,
+                   random_tensor(dif::ir::DType::F32, description.dims,
+                                 seed++, is_norm_weight ? 0.2F : 0.15F,
+                                 is_norm_weight ? 1.0F : 0.0F));
+  }
+  for (const auto &binding : build.optimizer_bindings) {
+    inputs.emplace(binding.first_moment_input,
+                   dif::runtime::zeros(
+                       *build.program.tensor(binding.first_moment_input)));
+    inputs.emplace(binding.second_moment_input,
+                   dif::runtime::zeros(
+                       *build.program.tensor(binding.second_moment_input)));
+  }
+  dif::runtime::Tensor step{dif::ir::DType::I32, {1U}, {0U, 0U, 0U, 0U}};
+  inputs.emplace(build.step_input, step);
+
+  auto executor = dif::runtime::make_cpu_executor();
+  auto state = inputs;
+  std::vector<float> losses;
+  for (std::int32_t iteration = 0; iteration < 3; ++iteration) {
+    dif::runtime::Tensor step_tensor{dif::ir::DType::I32, {1U}, {}};
+    step_tensor.bytes.resize(sizeof(std::int32_t));
+    std::memcpy(step_tensor.bytes.data(), &iteration, sizeof(iteration));
+    state.insert_or_assign(build.step_input, std::move(step_tensor));
+    auto result =
+        executor->run(build.program, state, single_run_options());
+    losses.push_back(result.outputs.at(build.loss_output).f32()[0]);
+    for (const auto &binding : build.optimizer_bindings) {
+      state.insert_or_assign(
+          binding.parameter_input,
+          std::move(result.outputs.at(binding.parameter_output)));
+      state.insert_or_assign(
+          binding.first_moment_input,
+          std::move(result.outputs.at(binding.first_moment_output)));
+      state.insert_or_assign(
+          binding.second_moment_input,
+          std::move(result.outputs.at(binding.second_moment_output)));
+    }
+  }
+  expect(std::isfinite(losses.front()) && std::isfinite(losses.back()) &&
+             losses.back() < losses.front(),
+         "2-block DiT training decreases the loss over three CPU steps");
+  std::cout << "DIT_BLOCK smoke losses " << losses[0] << " " << losses[1]
+            << " " << losses[2] << "\n";
+
+  if (dif::runtime::cuda_available()) {
+    const auto reference =
+        executor->run(build.program, inputs, single_run_options());
+    const auto candidate = dif::runtime::make_cuda_executor()->run(
+        build.program, inputs, single_run_options());
+    float maximum_absolute_error = 0.0F;
+    for (const auto &[id, expected_tensor] : reference.outputs) {
+      const auto expected = float_values(expected_tensor);
+      const auto actual = float_values(candidate.outputs.at(id));
+      for (std::size_t index = 0U; index < expected.size(); ++index)
+        maximum_absolute_error =
+            std::max(maximum_absolute_error,
+                     std::abs(expected[index] - actual[index]));
+    }
+    // Bar set AFTER measurement: full 2-block forward+backward+AdamW step,
+    // every output tensor compared; measured worst max_abs 1.21e-7
+    // (2026-08-31, cuda-nvrtc-cublaslt), admitted 1e-4.
+    expect(maximum_absolute_error <= 1.0e-4F,
+           "2-block DiT one-step CUDA parity (max_abs=" +
+               std::to_string(maximum_absolute_error) + ")");
+    std::cout << "GATE dit_block_one_step backend=" << candidate.backend_name
+              << " max_abs=" << maximum_absolute_error << "\n";
+  }
 }
 
 void expect_rejected(dif::ir::Program program, const char *message) {
@@ -740,6 +892,7 @@ int main() {
     test_group1_finite_differences();
     test_group1_backend_parity();
     test_group1_frozen_weight_economy();
+    test_dit_block_builder();
     test_group1_verifier_negatives();
   } catch (const std::exception &error) {
     std::cerr << "UNCAUGHT: " << error.what() << "\n";

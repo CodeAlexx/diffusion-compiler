@@ -430,11 +430,13 @@ void emit_linear_backward_weight(std::ostringstream &out,
                                  const ir::Program &program,
                                  const ir::Operation &op) {
   const auto *input = program.tensor(op.inputs[1]);
-  const auto *grad_output = program.tensor(op.inputs[0]);
-  const auto count = program.tensor(op.outputs[0])->element_count();
-  const auto inner = input->dims.back();
+  const auto *grad_weight = program.tensor(op.outputs[0]);
+  const auto count = grad_weight->element_count();
+  // Geometry from the [N,K] weight gradient itself: rank-agnostic over both
+  // admitted operand forms (same-rank broadcast and flatten).
+  const auto outputs = grad_weight->dims[0];
+  const auto inner = grad_weight->dims[1];
   const auto rows = input->element_count() / inner;
-  const auto outputs = grad_output->dims.back();
   out << "extern \"C\" __global__ void " << function_name(op)
       << "(const dif_scalar* grad_output,const dif_scalar* input,dif_scalar* grad_weight){"
          "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"

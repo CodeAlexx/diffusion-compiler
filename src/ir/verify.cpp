@@ -198,12 +198,25 @@ void verify_operation(const Program &program, const Operation &op) {
     if (!supported_float(grad_output.dtype) ||
         weight.dtype != grad_output.dtype ||
         grad_input.dtype != grad_output.dtype || grad_output.dims.empty() ||
-        grad_input.dims.empty() || weight.dims.size() != 2U ||
-        grad_output.dims.size() != grad_input.dims.size() ||
-        !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
-                    grad_input.dims.begin()) ||
-        grad_output.dims.back() != weight.dims[0] ||
-        grad_input.dims.back() != weight.dims[1])
+        grad_input.dims.empty() || weight.dims.size() != 2U)
+      fail("linear_backward_input has incompatible float dtypes or ranks");
+    // Two admitted geometries, mirroring the forward Linear contract:
+    // (a) same-rank leading-broadcast: [...,N] x [N,K] -> [...,K];
+    // (b) flatten form: rows = dims[0] and trailing dims flatten, exactly
+    //     the shapes forward Linear admits (e.g. grad of a [S,H,D]-declared
+    //     projection back to [S,H*D]).  The kernels index the flat
+    //     row-major view and are correct for both.
+    const bool same_rank_form =
+        grad_output.dims.size() == grad_input.dims.size() &&
+        std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
+                   grad_input.dims.begin()) &&
+        grad_output.dims.back() == weight.dims[0] &&
+        grad_input.dims.back() == weight.dims[1];
+    const bool flatten_form =
+        grad_output.dims[0] == grad_input.dims[0] &&
+        grad_output.element_count() / grad_output.dims[0] == weight.dims[0] &&
+        grad_input.element_count() / grad_input.dims[0] == weight.dims[1];
+    if (!same_rank_form && !flatten_form)
       fail("linear_backward_input has incompatible float shapes");
     return;
   }
@@ -217,12 +230,21 @@ void verify_operation(const Program &program, const Operation &op) {
     if (!supported_float(grad_output.dtype) ||
         input.dtype != grad_output.dtype ||
         grad_weight.dtype != grad_output.dtype || grad_output.dims.empty() ||
-        input.dims.empty() || grad_weight.dims.size() != 2U ||
-        grad_output.dims.size() != input.dims.size() ||
-        !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
-                    input.dims.begin()) ||
-        grad_weight.dims[0] != grad_output.dims.back() ||
-        grad_weight.dims[1] != input.dims.back())
+        input.dims.empty() || grad_weight.dims.size() != 2U)
+      fail("linear_backward_weight has incompatible float dtypes or ranks");
+    // Same two geometries as linear_backward_input (see the comment there).
+    const bool same_rank_form =
+        grad_output.dims.size() == input.dims.size() &&
+        std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
+                   input.dims.begin()) &&
+        grad_weight.dims[0] == grad_output.dims.back() &&
+        grad_weight.dims[1] == input.dims.back();
+    const bool flatten_form =
+        grad_output.dims[0] == input.dims[0] &&
+        grad_weight.dims[0] ==
+            grad_output.element_count() / grad_output.dims[0] &&
+        grad_weight.dims[1] == input.element_count() / input.dims[0];
+    if (!same_rank_form && !flatten_form)
       fail("linear_backward_weight has incompatible float shapes");
     return;
   }
@@ -233,10 +255,19 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_bias = tensor_or_fail(program, op.outputs[0], op);
     check_accumulator_f32(op);
     if (!supported_float(grad_output.dtype) || grad_output.dims.empty() ||
-        grad_bias.dtype != grad_output.dtype || grad_bias.dims.size() != 1U ||
-        grad_bias.dims[0] != grad_output.dims.back())
-      fail("bias_backward requires a float output gradient and matching "
-           "vector");
+        grad_bias.dtype != grad_output.dtype || grad_bias.dims.size() != 1U)
+      fail("bias_backward requires a float output gradient and a vector "
+           "gradient");
+    // The kernel sums the flat row-major view in rows of grad_bias's width.
+    // Two named widths are admitted: the final dimension (BiasAdd's
+    // broadcast-over-leading-dims contract) and the flattened row width
+    // (a Linear bias whose output was declared with split trailing dims,
+    // e.g. [S,H,D] with bias [H*D]).
+    if (grad_bias.dims[0] != grad_output.dims.back() &&
+        grad_bias.dims[0] !=
+            grad_output.element_count() / grad_output.dims[0])
+      fail("bias_backward gradient width must be the final dimension or "
+           "the flattened row width");
     return;
   }
 
