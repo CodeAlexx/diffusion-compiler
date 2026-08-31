@@ -152,6 +152,9 @@ target_link_libraries(difimage PRIVATE difcore)
 add_executable(difvaedecode tools/difvaedecode.cpp)
 target_link_libraries(difvaedecode PRIVATE difcore)
 
+add_executable(difditops tools/difditops.cpp)
+target_link_libraries(difditops PRIVATE difcore)
+
 add_executable(diftrain tools/diftrain.cpp)
 target_link_libraries(diftrain PRIVATE difcore)
 
