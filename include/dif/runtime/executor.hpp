@@ -209,6 +209,30 @@ struct H3ModulationCacheResult {
   std::string input_path;
 };
 
+// Dispatch and transfer counters for one execution phase of the CUDA
+// backend. Counters are incremented at the centralized submission sites
+// (kernel launches, library GEMM/attention dispatches, every cuMemcpy*, and
+// the host-blocking synchronization calls), so they census exactly what the
+// runtime submitted -- including profiling-only event records when
+// profile_pipeline is enabled. They are always collected; the cost is a
+// host-side increment per call.
+struct LaunchTelemetry {
+  std::uint64_t kernel_launches{};
+  std::uint64_t cublaslt_matmuls{};
+  std::uint64_t cublas_gemms{};
+  std::uint64_t cudnn_attention_dispatches{};
+  std::uint64_t cutlass_launches{};
+  std::uint64_t ck_attention_dispatches{};
+  std::uint64_t h2d_copies{};
+  std::uint64_t h2d_bytes{};
+  std::uint64_t d2h_copies{};
+  std::uint64_t d2h_bytes{};
+  std::uint64_t event_records{};
+  std::uint64_t stream_wait_events{};
+  std::uint64_t host_event_synchronizes{};
+  std::uint64_t host_stream_synchronizes{};
+};
+
 // Profiling values describe the timed iterations of one prepared CUDA run.
 // Host staging is the memcpy from mapped/owned constants into pinned memory;
 // for mapped checkpoints it includes any page-fault and storage wait incurred
@@ -261,6 +285,12 @@ struct RunResult {
   std::vector<H3GroupwiseInt8Result> h3_groupwise_int8;
   std::vector<H3ModulationCacheResult> h3_modulation_caches;
   PipelineProfile pipeline_profile;
+  // CUDA backend only; other executors leave these zeroed. The preparation
+  // phase counters describe the one-time prepare() of the executing plan;
+  // the run counters describe exactly this run() call (warmups, timed
+  // iterations, input upload, and output readback included).
+  LaunchTelemetry preparation_telemetry;
+  LaunchTelemetry run_telemetry;
 };
 
 class PreparedExecution {
