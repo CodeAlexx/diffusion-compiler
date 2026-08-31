@@ -90,5 +90,22 @@ NVIDIA cuDNN 9 distribution.
    the rebuilt binary (see port doc §M1).
 2. Public-remote hygiene — checked: the branch adds no artifacts, logs, or
    weight files, and a secrets/PII scan of the full diff is clean.
-3. Final full ctest (11 suites) and the final SHA are recorded in the port
-   doc and below.
+3. Final full ctest (11 suites) green on BOTH the default and the
+   vendored-cuDNN build; branch pushed.
+
+## Final state
+
+- Branch `flame-runtime-integration` pushed to
+  `origin` (github.com/CodeAlexx/diffusion-compiler).
+- Final SHA at handoff: `994df681b6683e2f8fc31a1000556e072b5f3734`
+  (the doc-only commit after it records this line).
+- 92+ files, ~23k insertions over `main@305a321`; no artifacts, logs, or
+  weight files are tracked by the branch.
+- Suites: 11/11 green (dif_tests, lora, dit_backward, dit_lora, fusion,
+  epilogue, opt, difopt_cli, plugin, opencl_plugin, tokenizer).
+- Milestones: M1 (golden H3 byte-identical through the consolidated
+  runtime, re-proved on the vendored-cuDNN binary) and M2 (BF16 LoRA
+  training on composed DiT blocks with byte-identical resume, no torch at
+  runtime) both achieved. M3 partial: removal-order steps 1-4 done plus the
+  tokenizer half of step 5; the Qwen3-VL conditioner is the sole remaining
+  Mojo dependency in the generation path.
