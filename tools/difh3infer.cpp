@@ -9,6 +9,7 @@
 #include "dif/weights/bundle.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -44,6 +45,7 @@ struct Options {
   std::filesystem::path output_handoff;
   std::filesystem::path output_raw;
   std::filesystem::path output_decoded;
+  std::filesystem::path first_evaluation_input_directory;
   std::filesystem::path cache_directory;
   std::filesystem::path h3_w8a8_cache;
   std::filesystem::path h3_ck_attention_dso;
@@ -60,6 +62,7 @@ struct Options {
   std::uint64_t patch_height{2U};
   std::uint64_t patch_width{2U};
   std::uint32_t schedule_points{};
+  std::uint32_t maximum_evaluations{};
   std::vector<dif::frontend::H3KeyframeAnchor> keyframes;
   std::uint64_t minimum_free_bytes{4096ULL * 1024ULL * 1024ULL};
   bool verify_shards{false};
@@ -77,7 +80,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N --keyframes none|first|last|first-last --output-latent FILE.diftensor --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-resident-layers N] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--cache-dir DIR] [--min-free-mib N]\n";
+      << "usage: difh3infer --backend cpu|cuda --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N --keyframes none|first|last|first-last --output-latent FILE.diftensor --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-resident-layers N] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--cache-dir DIR] [--min-free-mib N]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -185,6 +188,18 @@ Options parse(int argc, char **argv) {
       options.output_raw = value("--output-raw");
     else if (option == "--output-decoded")
       options.output_decoded = value("--output-decoded");
+    else if (option == "--first-eval-input-dir")
+      options.first_evaluation_input_directory =
+          value("--first-eval-input-dir");
+    else if (option == "--max-evaluations") {
+      const auto evaluations =
+          number(value("--max-evaluations"), "maximum evaluations");
+      if (evaluations == 0U ||
+          evaluations > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("maximum evaluations must be in the U32 positive range");
+      options.maximum_evaluations =
+          static_cast<std::uint32_t>(evaluations);
+    }
     else if (option == "--cache-dir")
       options.cache_directory = value("--cache-dir");
     else if (option == "--min-free-mib")
@@ -429,6 +444,27 @@ int main(int argc, char **argv) {
     if (video_sigmas.size() != audio_sigmas.size())
       dif::fail("video/audio schedules diverged after float32 deduplication");
     const auto steps = video_sigmas.size() - 1U;
+    const auto evaluations =
+        options.maximum_evaluations == 0U
+            ? steps
+            : std::min<std::size_t>(steps, options.maximum_evaluations);
+    if (options.maximum_evaluations > steps)
+      dif::fail("maximum evaluations exceed the released schedule");
+    if (!options.first_evaluation_input_directory.empty()) {
+      if (std::filesystem::exists(options.first_evaluation_input_directory) &&
+          !std::filesystem::is_empty(
+              options.first_evaluation_input_directory))
+        dif::fail("first-evaluation input directory is not empty: " +
+                  options.first_evaluation_input_directory.string());
+      std::filesystem::create_directories(
+          options.first_evaluation_input_directory);
+      dif::runtime::write_tensor(
+          f32_tensor({video_sigmas.size()}, video_sigmas),
+          options.first_evaluation_input_directory / "video_sigmas.diftensor");
+      dif::runtime::write_tensor(
+          f32_tensor({audio_sigmas.size()}, audio_sigmas),
+          options.first_evaluation_input_directory / "audio_sigmas.diftensor");
+    }
 
     dif::runtime::RunOptions run_options;
     run_options.warmups = 0U;
@@ -502,7 +538,7 @@ int main(int argc, char **argv) {
       auto prepared = backend->prepare(program, inputs, denoiser_run_options);
       denoiser_prepare_ms = prepared->preparation_milliseconds();
       denoiser_resident = prepared->resident_bytes();
-      for (std::size_t step = 0U; step < steps; ++step) {
+      for (std::size_t step = 0U; step < evaluations; ++step) {
         const auto video_timestep = 1.0F - video_sigmas[step];
         const auto audio_timestep = 1.0F - audio_sigmas[step];
         const auto step_layout_start = std::chrono::steady_clock::now();
@@ -532,6 +568,32 @@ int main(int argc, char **argv) {
             8U, i32_tensor({layout.sequence_length}, plan.adaln_indices));
         inputs.insert_or_assign(
             9U, i32_tensor({layout.sequence_length}, plan.timestep_indices));
+        if (step == 0U &&
+            !options.first_evaluation_input_directory.empty()) {
+          constexpr std::array<const char *, 12> names = {
+              "input_01_video_state_rows.diftensor",
+              "input_02_audio_state_rows.diftensor",
+              "input_03_text_conditioning.diftensor",
+              "input_04_timesteps.diftensor",
+              "input_05_text_map.diftensor",
+              "input_06_video_map.diftensor",
+              "input_07_audio_map.diftensor",
+              "input_08_adaln_indices.diftensor",
+              "input_09_timestep_indices.diftensor",
+              "input_10_video_indices.diftensor",
+              "input_11_audio_indices.diftensor",
+              "input_12_position_ids.diftensor",
+          };
+          for (std::size_t input_index = 0U; input_index < names.size();
+               ++input_index) {
+            const auto tensor_id =
+                static_cast<std::uint32_t>(input_index + 1U);
+            dif::runtime::write_tensor(
+                inputs.at(tensor_id),
+                options.first_evaluation_input_directory /
+                    names[input_index]);
+          }
+        }
         denoiser_step_layout_ms += elapsed_milliseconds(step_layout_start);
         denoiser_run_options.h3_modulation_slice =
             static_cast<std::uint32_t>(step);
@@ -701,6 +763,7 @@ int main(int argc, char **argv) {
       std::cout << "H3_DENOISE PASS backend=" << backend_name << " device=\""
                 << device_name << "\" schedule_points="
                 << video_sigmas.size() << " model_evaluations=" << steps
+                << " executed_evaluations=" << evaluations
                 << " sequence=" << layout.sequence_length
                 << " attention_class="
                 << (h3_ck_attention_count == 0U

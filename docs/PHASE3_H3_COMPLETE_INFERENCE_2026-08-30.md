@@ -2,6 +2,13 @@
 
 Date: 2026-08-30
 
+Follow-on result: the real Qwen3-VL conditioned, matched-start exact-BF16
+natural-language quality gate is documented in
+`docs/H3_NATURAL_LANGUAGE_QUALITY_GATE_2026-08-30.md`. That gate produces a
+visibly good 175-frame Compiler video while also recording a material final
+latent divergence from Serenity; it supersedes the analytic fixture for visual
+quality claims, but not for numerical-parity claims.
+
 Phase 3 is complete for the compiler's precomputed-conditioning H3 product
 boundary. The retained path runs the released 50-block transformer at production
 geometry, advances the video and audio states through the released schedule,

@@ -1350,7 +1350,8 @@ std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
     if (!options.h3_modulation_input.empty() ||
         !options.h3_modulation_source_index.empty() ||
         options.h3_modulation_steps != 0U ||
-        options.h3_modulation_layer != 0U)
+        options.h3_modulation_layer != 0U ||
+        options.h3_modulation_total_layers != 0U)
       fail("H3 modulation input/layer requires an H3 modulation cache");
     return {};
   }
@@ -1519,9 +1520,18 @@ std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
     if (options.h3_modulation_input.empty())
       fail("single-slice modulation cache requires its exact source input");
   } else {
-    if (result.size() != static_cast<std::size_t>(block_count) + 1U)
-      fail("schedule modulation cache requires the final output-head tensor");
-    validate_h3_modulation_cache_metadata(cache, options, slices, block_count);
+    if (options.h3_modulation_total_layers == 0U) {
+      if (result.size() != static_cast<std::size_t>(block_count) + 1U)
+        fail("schedule modulation cache requires the final output-head tensor");
+      validate_h3_modulation_cache_metadata(cache, options, slices,
+                                            block_count);
+    } else {
+      if (options.h3_modulation_layer + block_count >
+          options.h3_modulation_total_layers)
+        fail("H3 diagnostic modulation slice exceeds total layer count");
+      validate_h3_modulation_cache_metadata(
+          cache, options, slices, options.h3_modulation_total_layers);
+    }
   }
   return result;
 }

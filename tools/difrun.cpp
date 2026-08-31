@@ -72,6 +72,9 @@ void usage() {
                " [--h3-modulation-cache FILE.safetensors]"
                " [--h3-modulation-input FILE.diftensor]"
                " [--h3-modulation-layer N]"
+               " [--h3-modulation-source-index FILE.index.json]"
+               " [--h3-modulation-steps N]"
+               " [--h3-modulation-total-layers N]"
                " [--h3-ck-attention-dso FILE.so]"
                " [--profile-pipeline] [--serial-streaming] [--map-inputs]\n";
   std::cerr << "input PATH may be FILE.diftensor or SHARD.safetensors::TENSOR_NAME\n";
@@ -160,6 +163,14 @@ int main(int argc, char **argv) {
       else if (option == "--h3-modulation-layer" && i + 1 < argc)
         options.h3_modulation_layer = static_cast<std::uint32_t>(
             number(argv[++i], "H3 modulation layer"));
+      else if (option == "--h3-modulation-source-index" && i + 1 < argc)
+        options.h3_modulation_source_index = argv[++i];
+      else if (option == "--h3-modulation-steps" && i + 1 < argc)
+        options.h3_modulation_steps = static_cast<std::uint32_t>(
+            number(argv[++i], "H3 modulation steps"));
+      else if (option == "--h3-modulation-total-layers" && i + 1 < argc)
+        options.h3_modulation_total_layers = static_cast<std::uint32_t>(
+            number(argv[++i], "H3 modulation total layers"));
       else if (option == "--h3-ck-attention-dso" && i + 1 < argc)
         options.h3_ck_attention_dso = argv[++i];
       else if (option == "--trace-ops")

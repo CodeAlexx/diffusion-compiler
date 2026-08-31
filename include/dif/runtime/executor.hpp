@@ -63,6 +63,10 @@ struct RunOptions {
   std::uint32_t h3_modulation_layer{};
   std::uint32_t h3_modulation_steps{};
   std::uint32_t h3_modulation_slice{};
+  // Diagnostic subgraphs can contain only a prefix of H3 blocks while using
+  // the source schedule cache. A nonzero value validates cache provenance
+  // against the complete checkpoint block count, not the sliced graph count.
+  std::uint32_t h3_modulation_total_layers{};
   // Accepted architecture-tagged Comfy Kitchen H3 attention route. This is an
   // explicit approximate backend under the semantic Attention operation; an
   // empty path retains the exact DiffIR-selected implementation.
