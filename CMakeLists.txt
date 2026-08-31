@@ -166,6 +166,13 @@ target_link_libraries(difslice PRIVATE difcore)
 add_executable(difimport tools/difimport.cpp)
 target_link_libraries(difimport PRIVATE difcore)
 
+add_executable(difmodcache tools/difmodcache.cpp)
+target_link_libraries(difmodcache PRIVATE difcore)
+if(TARGET CUDA::cuda_driver)
+  target_link_libraries(difmodcache PRIVATE CUDA::cuda_driver CUDA::nvrtc
+                                            ${CMAKE_DL_LIBS})
+endif()
+
 if(DIF_ENABLE_OPENCL)
   find_path(DIF_OPENCL_INCLUDE_DIR CL/cl.h
             HINTS ${CUDAToolkit_INCLUDE_DIRS}
