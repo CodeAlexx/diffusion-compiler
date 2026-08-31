@@ -441,6 +441,18 @@ void emit_silu(std::ostringstream &out, const ir::Program &program,
       << count << "ULL)dif_store(y,i,dif_silu(dif_load(x,i)));}\n";
 }
 
+void emit_gelu(std::ostringstream &out, const ir::Program &program,
+               const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count
+      << "ULL){float v=dif_load(x,i);float c=v*v*v;float z="
+         "7.978845608e-1f*(v+4.471500218e-2f*c);"
+         "dif_store(y,i,5.0e-1f*v*(1.0f+tanhf(z)));}}\n";
+}
+
 // The training ops below may legally mix storage dtypes across their
 // arguments (e.g. BF16 prediction into an F32 loss, BF16 parameters with F32
 // moments), so they bypass the per-operation dif_load/dif_store macro system
@@ -2235,6 +2247,9 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::SiLU:
       emit_silu(source, program, op);
+      break;
+    case ir::Opcode::Gelu:
+      emit_gelu(source, program, op);
       break;
     case ir::Opcode::RmsNorm:
       emit_rms_norm(source, program, op);

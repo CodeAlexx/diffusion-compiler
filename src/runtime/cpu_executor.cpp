@@ -85,6 +85,20 @@ void silu(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void gelu(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  constexpr float kSqrtTwoOverPi = 0.7978845608028654F;
+  constexpr float kCubicCoefficient = 0.044715F;
+  for (std::uint64_t i = 0; i < out.element_count(); ++i) {
+    const auto value = load_float(input, i);
+    const auto cubic = value * value * value;
+    const auto inner = kSqrtTwoOverPi *
+                       (value + kCubicCoefficient * cubic);
+    store_float(out, i, 0.5F * value * (1.0F + std::tanh(inner)));
+  }
+}
+
 void mse_loss(const ir::Operation &op, TensorMap &tensors) {
   const auto &prediction = tensors.at(op.inputs[0]);
   const auto &target = tensors.at(op.inputs[1]);
@@ -1491,6 +1505,9 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::SiLU:
       silu(op, tensors);
+      break;
+    case ir::Opcode::Gelu:
+      gelu(op, tensors);
       break;
     case ir::Opcode::RmsNorm:
       rms_norm(op, tensors);

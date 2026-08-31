@@ -26,6 +26,7 @@ add_library(difcore
   src/frontend/h3_vae.cpp
   src/frontend/h3_audio_vae.cpp
   src/frontend/qwen3vl_conditioner.cpp
+  src/frontend/krea2.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
   src/frontend/lora.cpp

@@ -4,12 +4,14 @@
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/compiler/memory_plan.hpp"
+#include "dif/opt/gate.hpp"
 #include "dif/frontend/h3.hpp"
 #include "dif/frontend/h3_conditioning.hpp"
 #include "dif/frontend/h3_latents.hpp"
 #include "dif/frontend/h3_media.hpp"
 #include "dif/frontend/h3_vae.hpp"
 #include "dif/frontend/h3_audio_vae.hpp"
+#include "dif/frontend/krea2.hpp"
 #include "dif/frontend/training.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -296,6 +298,8 @@ dif::ir::Program all_opcodes_program(dif::ir::DType dtype) {
   program.tensors.push_back({76, dtype, input, {1, 2, 2, 2, 2}});
   program.tensors.push_back({77, dtype, output, {2, 8}});
   program.tensors.push_back({78, dtype, output, {1, 2, 2, 2, 2}});
+  program.tensors.push_back({79, dtype, input, {1, 2}});
+  program.tensors.push_back({80, dtype, output, {1, 2}});
   program.operations = {
       {1, Opcode::Add, {1, 2}, {3}, {}},
       {2, Opcode::Multiply, {1, 2}, {4}, {}},
@@ -345,6 +349,10 @@ dif::ir::Program all_opcodes_program(dif::ir::DType dtype) {
        {Attribute::u64(AttrKey::PatchT, 1U),
         Attribute::u64(AttrKey::PatchH, 2U),
         Attribute::u64(AttrKey::PatchW, 2U)}},
+      {26, Opcode::Gelu, {79}, {80},
+       {Attribute::u64(
+           AttrKey::Approximation,
+           static_cast<std::uint64_t>(GeluApproximation::Tanh))}},
   };
   return program;
 }
@@ -422,6 +430,7 @@ void test_cpu_all_opcodes_and_float_dtypes() {
     inputs.emplace(74, f32_tensor({2}, {0.75F, 0.5F}));
     bind(76, {1, 2, 2, 2, 2},
          {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    bind(79, {1, 2}, {-1.0F, 1.0F});
 
     auto executor = dif::runtime::make_cpu_executor();
     dif::runtime::RunOptions options;
@@ -477,7 +486,180 @@ void test_cpu_all_opcodes_and_float_dtypes() {
     check(78, {0, 1, 2, 3, 4, 5, 6, 7,
                8, 9, 10, 11, 12, 13, 14, 15},
           "CPU typed Unpatchify3D");
+    check(80, {-0.1588079929F, 0.8411920071F}, "CPU typed tanh Gelu");
   }
+}
+
+void test_krea2_gelu_creator_parity() {
+  using namespace dif::ir;
+  const std::vector<float> inputs{-8.0F, -5.0F, -3.0F, -1.0F, -0.5F,
+                                  -0.1F, 0.0F,  0.1F,  0.5F,  1.0F,
+                                  3.0F,  5.0F,  8.0F};
+  const std::vector<float> f32_expected = floats_from_bits(
+      {0x80000000U, 0xb4a00000U, 0xbb6e6200U, 0xbe229e90U, 0xbe1dfd26U,
+       0xbd3c7c95U, 0x00000000U, 0x3d5d1d05U, 0x3eb1016dU, 0x3f57585cU,
+       0x403fc468U, 0x409fffffU, 0x41000000U});
+  const std::vector<float> bf16_expected{
+      -0.0F,          -2.980232238769531e-7F, -0.003631591796875F,
+      -0.1591796875F, -0.154296875F,           -0.046142578125F,
+      0.0F,           0.053955078125F,          0.345703125F,
+      0.83984375F,    3.0F,                     5.0F,
+      8.0F};
+  const std::vector<float> f16_expected{
+      -0.0F,             -2.980232238769531e-7F,
+      -0.0036373138427734375F, -0.1588134765625F,
+      -0.154296875F,     -0.0460205078125F,
+      0.0F,              0.053955078125F,
+      0.345703125F,      0.84130859375F,
+      2.99609375F,       5.0F,
+      8.0F};
+
+  const auto run_gate = [&](DType dtype, const std::vector<float> &expected,
+                            const char *dtype_label) {
+    Program program;
+    program.tensors = {{1, dtype, TensorRole::Input, {inputs.size()}},
+                       {2, dtype, TensorRole::Output, {inputs.size()}}};
+    program.operations = {
+        {1, Opcode::Gelu, {1}, {2},
+         {Attribute::u64(
+             AttrKey::Approximation,
+             static_cast<std::uint64_t>(GeluApproximation::Tanh))}}};
+    verify(program);
+    dif::runtime::TensorMap bindings;
+    bindings.emplace(1, float_tensor(dtype, {inputs.size()}, inputs));
+    dif::runtime::TensorMap creator;
+    creator.emplace(2, float_tensor(dtype, {expected.size()}, expected));
+    dif::runtime::RunOptions options;
+    options.warmups = 0;
+    options.iterations = 1;
+    options.minimum_free_bytes = 0;
+    const auto cpu =
+        dif::runtime::make_cpu_executor()->run(program, bindings, options);
+    const dif::opt::AcceptanceBars bars{
+        dtype == DType::F32
+            ? 1.0e-6
+            : (dtype == DType::BF16 ? 7.8125e-3 : 9.765625e-4),
+        0.999999, 0.999, 1.001, 1.0e-3, ~std::uint64_t{0}};
+    const dif::opt::AcceptanceGate gate(bars);
+    const auto cpu_metrics = gate.measure(creator, cpu.outputs);
+    expect(gate.judge(cpu_metrics, 0U) == dif::opt::Verdict::Accepted,
+           "CPU tanh GELU matches the official Krea 2 creator fixture");
+    std::cout << "GATE krea2_gelu creator=krea-2@db3984f dtype="
+              << dtype_label << " backend=cpu"
+              << " cosine=" << cpu_metrics.cosine_similarity
+              << " rel_l2=" << cpu_metrics.relative_l2
+              << " max_abs=" << cpu_metrics.max_absolute_error
+              << " norm_ratio=" << cpu_metrics.norm_ratio
+              << " nonfinite=" << cpu_metrics.nonfinite_count
+              << " bit_mismatch=" << cpu_metrics.exact_mismatch_count
+              << "\n";
+    if (!dif::runtime::cuda_available())
+      return;
+    const auto cuda =
+        dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    const auto cuda_metrics = gate.measure(creator, cuda.outputs);
+    expect(gate.judge(cuda_metrics, 0U) == dif::opt::Verdict::Accepted,
+           "CUDA tanh GELU matches the official Krea 2 creator fixture");
+    std::cout << "GATE krea2_gelu creator=krea-2@db3984f dtype="
+              << dtype_label << " backend=" << cuda.backend_name
+              << " device=" << cuda.device_name
+              << " cosine=" << cuda_metrics.cosine_similarity
+              << " rel_l2=" << cuda_metrics.relative_l2
+              << " max_abs=" << cuda_metrics.max_absolute_error
+              << " norm_ratio=" << cuda_metrics.norm_ratio
+              << " nonfinite=" << cuda_metrics.nonfinite_count
+              << " bit_mismatch=" << cuda_metrics.exact_mismatch_count
+              << "\n";
+  };
+
+  run_gate(DType::F32, f32_expected, "f32");
+  run_gate(DType::BF16, bf16_expected, "bf16");
+  run_gate(DType::F16, f16_expected, "f16");
+
+  Program rejected;
+  rejected.tensors = {{1, DType::F32, TensorRole::Input, {1}},
+                      {2, DType::F32, TensorRole::Output, {1}}};
+  rejected.operations = {{1, Opcode::Gelu, {1}, {2}, {}}};
+  bool failed_closed = false;
+  try {
+    verify(rejected);
+  } catch (const dif::Error &) {
+    failed_closed = true;
+  }
+  expect(failed_closed,
+         "Gelu without an explicit source approximation fails closed");
+}
+
+void test_krea2_real_dimension_frontend_scaffold() {
+  using namespace dif::frontend;
+  using namespace dif::ir;
+  const Krea2Config config;
+  const auto architecture = inspect_krea2_architecture(config);
+  expect(architecture.latent_height == 128U &&
+             architecture.latent_width == 128U &&
+             architecture.image_grid_height == 64U &&
+             architecture.image_grid_width == 64U &&
+             architecture.image_tokens == 4096U &&
+             architecture.combined_tokens == 4608U &&
+             architecture.padded_tokens == 4608U &&
+             architecture.patch_input_dim == 64U &&
+             architecture.patch_output_dim == 64U,
+         "Krea 2 default geometry matches the official 1024px architecture");
+  expect(Krea2Config::kFeatures == 6144U && Krea2Config::kHeads == 48U &&
+             Krea2Config::kKvHeads == 12U &&
+             Krea2Config::kHeadDim == 128U &&
+             Krea2Config::kMlpDim == 16384U &&
+             Krea2Config::kLayers == 28U &&
+             Krea2Config::kTextDim == 2560U &&
+             Krea2Config::kTextLayers == 12U,
+         "Krea 2 frontend pins released checkpoint dimensions");
+
+  const auto build = make_krea2_time_conditioning(config);
+  verify(build.program);
+  expect(build.program.tensors.size() == 15U &&
+             build.program.operations.size() == 8U &&
+             build.checkpoint_tensors.size() == 6U &&
+             build.checkpoint_names ==
+                 std::vector<std::string>{"tmlp.0.weight", "tmlp.0.bias",
+                                          "tmlp.2.weight", "tmlp.2.bias",
+                                          "tproj.1.weight", "tproj.1.bias"},
+         "Krea 2 time scaffold has the exact creator tensor inventory");
+  expect(build.program.tensor(build.timestep_input)->dtype == DType::BF16 &&
+             build.program.tensor(build.timestep_input)->dims ==
+                 std::vector<std::uint64_t>{1U} &&
+             build.program.tensor(build.timestep_embedding)->dtype ==
+                 DType::F32 &&
+             build.program.tensor(build.timestep_embedding)->dims ==
+                 std::vector<std::uint64_t>({1U, 256U}) &&
+             build.program.tensor(build.timestep_output)->dims ==
+                 std::vector<std::uint64_t>({1U, 6144U}) &&
+             build.program.tensor(build.modulation_output)->dims ==
+                 std::vector<std::uint64_t>({1U, 36864U}),
+         "Krea 2 time scaffold preserves source BF16/F32 boundaries and real dims");
+  std::uint64_t gelu_count = 0U;
+  std::uint64_t linear_count = 0U;
+  for (const auto &operation : build.program.operations) {
+    gelu_count += operation.opcode == Opcode::Gelu ? 1U : 0U;
+    linear_count += operation.opcode == Opcode::Linear ? 1U : 0U;
+    expect(operation.opcode != Opcode::H3AdaLNSelect &&
+               operation.opcode != Opcode::H3DeinterleaveQkv &&
+               operation.opcode != Opcode::H3DeinterleaveQkvWeight,
+           "Krea 2 scaffold does not reuse H3-only frontend semantics");
+  }
+  expect(gelu_count == 2U && linear_count == 3U,
+         "Krea 2 time scaffold matches creator operation ordering");
+  const auto fingerprint = dif::hex_digest(dif::ir::fingerprint(build.program));
+  const auto memory = dif::compiler::plan_memory(build.program, 256U);
+  expect(fingerprint ==
+             "d8e0997e9fa8f75b648fccd2eb7c556a31373a8bbdceab46fc22414bed1817af",
+         "Krea 2 real-dimension scaffold has a stable DiffIR fingerprint");
+  expect(memory.total_bytes == 531740672U,
+         "Krea 2 streamed time scaffold memory plan is stable");
+  std::cout << "GATE krea2_frontend source=krea-2@db3984f"
+            << " fingerprint=" << fingerprint
+            << " tensors=" << build.program.tensors.size()
+            << " operations=" << build.program.operations.size()
+            << " planned_bytes=" << memory.total_bytes << "\n";
 }
 
 void test_backend_neutral_flow_scheduler() {
@@ -2669,6 +2851,8 @@ int main() {
   test_cpu_linear_bias();
   test_float_storage_conversions();
   test_cpu_all_opcodes_and_float_dtypes();
+  test_krea2_gelu_creator_parity();
+  test_krea2_real_dimension_frontend_scaffold();
   test_new_primitives_cuda_parity();
   test_vae_normalization_primitives();
   test_h3_video_vae_frontend_contract();

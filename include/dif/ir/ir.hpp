@@ -80,6 +80,7 @@ enum class Opcode : std::uint32_t {
   AttentionBackward = 46,
   Conv1d = 47,
   SnakeBeta = 48,
+  Gelu = 49,
 };
 
 enum class AttrKey : std::uint32_t {
@@ -122,7 +123,12 @@ enum class AttrKey : std::uint32_t {
   TrimLeft = 37,
   TrimRight = 38,
   KvHeads = 39,
+  Approximation = 40,
 };
+
+// Gelu carries an explicit approximation because exact-erf and tanh GELU are
+// observably different source semantics.  Krea 2 uses the tanh form.
+enum class GeluApproximation : std::uint64_t { Tanh = 1 };
 
 enum class AttrKind : std::uint32_t { U64 = 1, I64 = 2, F64 = 3, Bool = 4 };
 

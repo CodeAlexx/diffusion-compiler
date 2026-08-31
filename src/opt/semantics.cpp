@@ -13,6 +13,7 @@ bool pinned_numeric_semantics(const ir::Operation &op) {
   case ir::Opcode::DequantizeInt4:
   case ir::Opcode::DequantizeInt5:
   case ir::Opcode::RotaryPosition:
+  case ir::Opcode::Gelu:
     return true;
   default:
     break;
@@ -61,6 +62,7 @@ bool dtype_uniform(ir::Opcode opcode) {
   case ir::Opcode::Add:
   case ir::Opcode::Multiply:
   case ir::Opcode::SiLU:
+  case ir::Opcode::Gelu:
   case ir::Opcode::RmsNorm:
   case ir::Opcode::RmsNormModulate:
   case ir::Opcode::SwiGlu:

@@ -22,11 +22,11 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::SnakeBeta;
+  return opcode >= Opcode::Add && opcode <= Opcode::Gelu;
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::KvHeads;
+  return key >= AttrKey::Epsilon && key <= AttrKey::Approximation;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -99,6 +99,21 @@ void verify_operation(const Program &program, const Operation &op) {
     same_shape_dtype(a, out, op);
     if (!supported_float(a.dtype))
       fail("elementwise semantics admit f32, bf16, or f16");
+    return;
+  }
+
+  if (op.opcode == Opcode::Gelu) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype))
+      fail("gelu semantics admit f32, bf16, or f16");
+    const auto *approximation = op.find(AttrKey::Approximation);
+    if (approximation == nullptr || approximation->kind != AttrKind::U64 ||
+        approximation->bits !=
+            static_cast<std::uint64_t>(GeluApproximation::Tanh))
+      fail("gelu currently requires Approximation=1 (tanh)");
     return;
   }
 

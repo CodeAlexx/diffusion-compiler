@@ -254,6 +254,8 @@ std::string_view opcode_name(Opcode opcode) {
     return "conv1d";
   case Opcode::SnakeBeta:
     return "snake_beta";
+  case Opcode::Gelu:
+    return "gelu";
   }
   return "invalid";
 }
