@@ -179,6 +179,7 @@ must subsequently pass runtime and NVIDIA-lowering gates before it can move to
 | 6144-wide / 16384-wide cuBLASLt Linear | **SUPPORTED BUT NEEDS REAL-DIM GATE** | Generic Linear exists; exact Raw shapes have not run. |
 | Add, Multiply, SiLU, Cast, Bias Linear | **ALREADY_SUPPORTED** | Generic DiffIR + CPU + NVIDIA paths exist. |
 | tanh GELU | **ALREADY_SUPPORTED** | Added generically as `Gelu` + explicit `Approximation=Tanh`; creator parity below. |
+| tanh GELU on OpenCL reference backend | **BLOCKED / UNKNOWN** | Explicitly fails closed; OpenCL is outside the NVIDIA-first K2-A admission and needs a separate future parity gate. |
 | GELU backward | **TRAINING-BACKWARD MISSING** | Autodiff fails closed until the generic derivative is added and gated. |
 | RMSNorm | **SUPPORTED BUT NEEDS REAL-DIM GATE** | Kernel exists; Krea scale-delta (`1+scale`) loading and 6144/128 widths need fixtures. |
 | Qwen3-VL transformer primitives | **SUPPORTED BUT NEEDS REAL-DIM GATE** | H3's generic Qwen frontend is reusable after configuration/tap/mask generalization. |
@@ -273,9 +274,15 @@ float printouts.
 | F32 | native CPU | 1 | 0 | 0 | 1 | 0 | 0/13 |
 | BF16 | native CPU | 1 | 0 | 0 | 1 | 0 | 0/13 |
 | F16 | native CPU | 1 | 0 | 0 | 1 | 0 | 0/13 |
+| F32 | NVIDIA NVRTC, RTX 3090 Ti | 1 | 0 | 0 | 1 | 0 | 0/13 |
+| BF16 | NVIDIA NVRTC, RTX 3090 Ti | 1 | 0 | 0 | 1 | 0 | 0/13 |
+| F16 | NVIDIA NVRTC, RTX 3090 Ti | 1 | 0 | 0 | 1 | 0 | 0/13 |
 
-CUDA rows are added only after the shared GPU lock is free; Claude's full H3
-run owned it during the intake. No competing GPU job was submitted.
+The CUDA gate ran only after Claude's full H3 run released
+`/tmp/dc-gpu.lock`; no competing GPU job was submitted. This local CMake
+configuration did not discover cuDNN, which is immaterial to the elementwise
+GELU gate but remains mandatory for the later real-dimension masked-attention
+gate.
 
 ## Exact reproduction
 
@@ -288,6 +295,23 @@ cmake -S . -B build-krea2-cpu \
 cmake --build build-krea2-cpu -j2
 ./build-krea2-cpu/dif_tests | tee /tmp/dc-krea2-dif-tests-cpu.log
 ```
+
+NVIDIA build and non-optimizer gates:
+
+```bash
+cmake -S . -B build-krea2-cuda \
+  -DDIF_ENABLE_CUDA=ON -DDIF_ENABLE_CUDNN=ON \
+  -DDIF_ENABLE_OPENCL=OFF -DDIF_BUILD_TESTS=ON
+cmake --build build-krea2-cuda -j2
+flock /tmp/dc-gpu.lock -c './build-krea2-cuda/dif_tests'
+flock /tmp/dc-gpu.lock -c \
+  "ctest --test-dir build-krea2-cuda --output-on-failure \
+   -E 'dif_opt_tests|dif_difopt_cli_tests' -j1"
+```
+
+Both CPU and CUDA configurations passed all eight non-optimizer CTest targets.
+The two optimizer/search targets were excluded deliberately because this phase
+explicitly forbids optimizer-search work; no search result is part of K2-A.
 
 Header-only checkpoint inspection (development oracle; no tensor payload is
 loaded and this is not a production dependency):
@@ -307,9 +331,9 @@ PY
 
 ## Ordered next gates
 
-1. Rebase the Krea branch over the landed native Qwen frontend without
-   changing Claude-owned H3/Qwen behavior. Generalize that frontend through
-   configuration and selected-output taps instead of copying it.
+1. Generalize the now-landed native Qwen frontend through configuration and
+   selected-output taps without changing its accepted H3 behavior or copying
+   its executor.
 2. Add generic layout primitives (reshape/view, permute, concat, pad, slice)
    with codec/verifier/CPU/NVIDIA tests.
 3. Extend generic Attention with explicit boolean mask and batch semantics;

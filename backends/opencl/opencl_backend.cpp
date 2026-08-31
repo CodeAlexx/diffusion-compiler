@@ -996,6 +996,12 @@ std::string generate_source(const dif::ir::Program &program) {
       dif::fail("OpenCL reference backend does not implement the audio "
                 "decode opcodes");
       break;
+    case Opcode::Gelu:
+      // NVIDIA is the admitted production backend for K2-A. Keep the OpenCL
+      // reference boundary explicit until its tanh transcendental parity is
+      // measured instead of silently emitting a missing kernel.
+      dif::fail("OpenCL reference backend does not implement tanh GELU");
+      break;
     }
     end_float_operation(source);
   }

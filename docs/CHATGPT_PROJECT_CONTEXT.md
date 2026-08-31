@@ -44,18 +44,19 @@ Conv1d and 127 SnakeBeta operations) executed by the same DiffIR and CUDA
 runtime. That proves the runtime can execute a substantially different graph;
 it does not prove broad diffusion-model coverage.
 
-The final native H3 gap is the Qwen3-VL-32B text conditioner. The tokenizer,
-initial noise, modulation-cache creation, checkpoint importer, denoiser,
-scheduler, video decode, audio decode, and media output are native and gated.
-Prompt text to `[439,5120]` BF16 conditioning still depends on the accepted
-Serenity/Mojo path. GQA support has landed, so the conditioner can now be built
-from existing generic DiffIR operations. Until that is finished and visually
-re-gated, do not call H3 fully native from prompt to MP4.
+The final native H3 gap is closed. Literal prompt text now runs through the
+native tokenizer and a generic-op Qwen3-VL-32B DiffIR conditioner, then the
+native denoiser, video/audio decode, and mux path. The complete chain was
+process-inspected in an environment where importing torch fails and its output
+was visually re-gated. PyTorch is now an H3 development oracle, not a runtime
+dependency. See `H3_NATIVE_PROMPT_TO_MP4_GATE_2026-08-31.md` for metrics,
+resources, and exact evidence.
 
 See:
 
 - `FLAME_CPP_RUNTIME_PORT.md` for the current port matrix and measured gates.
-- `QWEN3VL_CONDITIONER_PLAN.md` for the remaining conditioner implementation.
+- `H3_NATIVE_PROMPT_TO_MP4_GATE_2026-08-31.md` for the completed conditioner
+  and literal-prompt quality gate.
 - `FLAME_PORT_HANDOFF_2026-08-31.md` for exact reproduction commands and open work.
 - `RUNTIME_MODULES.md` for ownership and module boundaries.
 
@@ -132,6 +133,13 @@ latent geometry, decoders, and supported tasks. A frontend lowers that model
 description into verified DiffIR; the same execution planner and runtime then
 run it.
 
+Krea 2 is now model family #2. Its official checkpoint/config intake and full
+gap map are in `KREA2_COMPILER_INTAKE.md`. The first admitted frontend slice
+uses real 6144/36864 projection dimensions and the shared runtime; it is not a
+claim of full Krea inference. Generic tanh GELU has landed and is creator-exact
+on CPU/CUDA. Full Krea blocks still require layout/broadcast, masked batched
+attention, and interleaved three-axis RoPE; Qwen-Image VAE decode remains open.
+
 ## Remaining capabilities for broad inference
 
 The next model families will require generic functionality that H3 did not:
@@ -142,7 +150,7 @@ The next model families will require generic functionality that H3 did not:
    - broadcast semantics and dynamic-but-bounded image/video shapes
 
 2. **Transformer variants**
-   - GELU, GEGLU, and additional modulation/gating forms
+   - GEGLU and additional modulation/gating forms (tanh GELU is now present)
    - batched, masked, cross-, joint-, and windowed-attention contracts
    - model-specific RoPE policies expressed through general attributes or ops
 
@@ -153,7 +161,7 @@ The next model families will require generic functionality that H3 did not:
    - tiled/spatial/temporal VAE encode as well as decode
 
 4. **Conditioners**
-   - native Qwen3-VL conditioner first
+   - generalize the native Qwen3-VL conditioner for Krea's 4B/twelve-tap mask
    - reusable BPE and SentencePiece-class tokenizer support
    - CLIP, T5/UMT5, Gemma/Llama-family, and vision/reference encoders as needed
    - prompt weighting, negative conditioning, pooled outputs, masks, and
@@ -198,17 +206,20 @@ model family.
 
 ## Recommended proof sequence
 
-1. Finish the native Qwen3-VL conditioner and repeat the accepted H3 visual and
-   audio gate from literal prompt text.
+1. Preserve the completed native H3 literal-prompt visual/audio gate while
+   generalizing shared primitives; do not regress its accepted artifact.
 2. Provide one unified `diffusion` CLI/model-package path instead of requiring
    operators to compose many development executables manually.
-3. Add FLUX through the same runtime. This exercises a second DiT family,
-   different text conditioning, generic image VAE operations, and image output.
-4. Add a convolution-heavy family such as SDXL to prove the runtime is not only
+3. Finish Krea 2 through the same runtime. This is the active second DiT-family
+   proof and exercises selected-layer text fusion, masked GQA, generic layout,
+   image VAE operations, and native image output.
+4. Add FLUX as the next family to prove those shared additions generalize
+   beyond H3/Krea rather than becoming Krea-shaped runtime behavior.
+5. Add a convolution-heavy family such as SDXL to prove the runtime is not only
    transformer-shaped.
-5. Add WAN or LTX to prove general temporal/video attention, video VAE, and
+6. Add WAN or LTX to prove general temporal/video attention, video VAE, and
    conditioning behavior.
-6. Repeat the same sequence for training: small deterministic gate, real
+7. Repeat the same sequence for training: small deterministic gate, real
    dimensions, checkpoint/resume, and then a visually evaluated LoRA artifact.
 
 For each supported model, admission means: checkpoint fingerprint, exact prompt
@@ -232,8 +243,9 @@ libraries; it is not a model-runtime dependency.
 ## Rules for future ChatGPT answers
 
 - Do not say the compiler supports all models today.
-- Do not say H3 is fully native prompt-to-MP4 until the Qwen3-VL conditioner and
-  end-to-end visual re-gate land.
+- H3 is admitted as fully native prompt-to-MP4 only in the precise sense and
+  measured scope documented by `H3_NATIVE_PROMPT_TO_MP4_GATE_2026-08-31.md`;
+  do not broaden that evidence to untested tasks or geometries.
 - Do not describe Diffusion Compiler as an H3 runtime; H3 is its first proving
   frontend and currently its only production-scale diffusion consumer.
 - Distinguish generic runtime capability from admitted model support.
