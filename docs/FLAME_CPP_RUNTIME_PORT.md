@@ -167,16 +167,18 @@ Torch remains only in oracles (/home/alex/diffusion-fixtures) and
 evaluation tooling (whisper, media metrics) — allowed as development
 oracles by policy.
 
-**Link-level proof (ldd sweep, 2026-08-31, integration build):** every
+**Link-level proof (ldd sweep, 2026-08-31, integration build; re-verified
+on the vendored-cuDNN build whose only non-system dependency path is
+/home/alex/dif-vendor/cudnn):** every
 generation/training-path binary (difh3infer, difvaedecode, difh3media,
 difrun, diftrain, difdittrain, diftokenize, difmodcache, difh3noise,
 difimport) links only CUDA (cuda/cudart/cublas/cublasLt/nvrtc), cuDNN 9,
 and glibc/libstdc++ — zero libtorch, zero libpython. The single subprocess
-in the tree is difh3media's declared ffmpeg exec. Remaining hygiene item:
-cuDNN currently RESOLVES FROM a pip site-packages path
-(~/.local/.../nvidia/cudnn/lib) — same library, wrong provenance for the
-final claim; pin to a system/vendored path and revalidate byte-identity
-before the final handoff.
+in the tree is difh3media's declared ffmpeg exec. RESOLVED: cuDNN was vendored to /home/alex/dif-vendor/cudnn (NVIDIA's own
+redistributable; the library itself links nothing from torch or Python) and
+the tree rebuilt against it, so no runtime library resolves from a Python
+site-packages path. M1 byte-identity was re-proved on that binary and the
+full 11-suite ctest re-run against it.
 
 ## 6. Open threads that must not be lost (from the open-threads audit)
 
@@ -331,9 +333,13 @@ W8A8 fix + fusion + backward opcodes + tokenizer + audio opcodes all merged)
 produced BYTE-IDENTICAL video-latent (5a6b8e15...), audio-rows (47495ca9...)
 and audio-latent (e1b87749...) vs the accepted artifact; H3_DENOISE PASS,
 0 OOM events, prepare device_mem_allocs=1 (arena live on the production
-graph). Perf note: this rerun ran cold-cache/default-policy (132 s/eval vs
-the accepted 22.4 s/eval warm run) — NOT a comparable measurement; the
-matched-conditions H3-scale staging measurement remains an open item; (M2) BF16 LoRA
+graph). RE-PROVED 2026-08-31 on the vendored-cuDNN binary (no runtime library
+resolved from any Python tree): the same 19-evaluation run again produced
+all three latents byte-identical. Perf note: the first rerun ran cold-cache
+at 132 s/eval and the vendored rerun warm at 26.2 s/eval, against the
+accepted run's 22.4 s/eval — neither is a controlled comparison (differing
+page-cache state and staging policy), so no speed claim is made from them;
+the matched-conditions H3-scale staging measurement remains an open item; (M2) BF16 LoRA
 training proof with no torch at runtime — ACHIEVED 2026-08-31 at composed
 DiT-block scope (2+4 blocks, 100 steps, CPU+CUDA, byte-identical resume;
 docs/M2_DIT_LORA_TRAINING_GATE_2026-08-31.md; real-H3-geometry LoRA remains
