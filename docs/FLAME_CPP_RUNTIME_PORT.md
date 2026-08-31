@@ -225,10 +225,20 @@ branches w1-* cut from 5eb5f13; GPU tests serialized on /tmp/dc-gpu.lock):**
   mismatches); difh3noise reproduces seeds 4242/4243 initial states
   byte-exactly. Remaining Mojo deps: tokenizer+Qwen3-VL conditioner (XL),
   BigVGAN audio decode (L).
-- w1-runtime IN FLIGHT — telemetry + staging policies (2a-2c committed on its
-  branch; 2d/2e pending).
+- w1-runtime MERGED — telemetry (launch/memcpy/host-stall counters) PROVEN;
+  streamed-staging policy knobs PROVEN with byte-identical defaults:
+  keep-mapped-pages opt-in -34%/iter, ring+depth+threaded-staging combo
+  -43%/iter on the 2.7 GiB streamed gate; pinned-io identity-proven (perf
+  hypothesis at gate scale); W8A8 tail-on-copy-stream implemented default-off.
+  DISCOVERED PRE-EXISTING DEFECT: the W8A8+streamed route is nondeterministic
+  on the unmodified baseline binary (3 pristine runs, 3 output SHAs; cos 0.57
+  run-to-run; resident-only also nondeterministic => tail staging exonerated).
+  Reproducer committed under gate-w1r/. Root-cause = top Wave-2 runtime item;
+  W8A8 byte-replay claims suspect until resolved. Arena consolidation NOT DONE
+  (deferred). Warm-cache boundary: measured wins should grow on the >RAM H3
+  checkpoint case — unmeasured, needs an H3-scale rerun decision.
 
-**Wave 2:** backward opcodes for the DiT set (flame equations + torch
+**Wave 2 (in flight):** w2-backward (DiT backward-opcode set + composed-block gate) and w3-conditioner (native tokenizer + Qwen3-VL conditioner plan) are running. Queued: W8A8-nondeterminism root-cause (reproducer in gate-w1r/), arena consolidation, backward opcodes for the DiT set (flame equations + torch
 fixtures); fused elementwise region emission via skipped_operations;
 cuBLASLt epilogue extension + heuristic persistence; grad clipping; EMA
 wiring; IR generality ops (DeinterleaveGroups, ReshapeView, Transpose,
