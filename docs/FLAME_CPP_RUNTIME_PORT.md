@@ -255,9 +255,23 @@ branches w1-* cut from 5eb5f13; GPU tests serialized on /tmp/dc-gpu.lock):**
 - w3-conditioner MERGED — native tokenizer PROVEN (439-token golden gate,
   0/3564 oracle mismatches); conditioner plan committed, single gap = GQA
   (decision: KvHeads attr on Attention).
-- In flight: W8A8-nondeterminism root-cause + arena (w2-runtime branch).
-  Remaining Wave-2 queue: fused elementwise regions, cuBLASLt epilogues +
-  heuristic persistence, grad clipping, EMA wiring, IR generality ops for the DiT set (flame equations + torch
+- w2-fusion MERGED — elementwise fused-region emission as a fingerprinted
+  candidate property (difc set-elementwise-fusion; default-off proven inert;
+  byte-identical via per-stage in-register rounding + __fmul_rn, with the two
+  cheaper barriers measured to failure and recorded). Launch deltas: chains
+  6->1, rf 60->56, lora 56->52; honest zero-census on GEMM-separated DiT and
+  gate programs. 4.9x on a real 6-op BF16 chain. Next-tier queue recorded in
+  docs/ELEMENTWISE_FUSION_2026-08-31.md: planner-aware lifetime extension,
+  cuBLASLt epilogue absorption (the real DiT win), norm-headed regions,
+  backward regions.
+- M2 MILESTONE (see §7 milestones): BF16 LoRA on composed DiT blocks landed
+  (m2-dit-lora merge).
+- In flight: W8A8 fix (root-caused: fused plans read streamed constants of
+  skipped ops ahead of the prefetch fence; fix = promote to fenced resident
+  storage; cross-mode convergence proven) + arena (w2-runtime branch);
+  BigVGAN chunks 1-5 (w3-audio branch, opcodes 47/48).
+  Remaining Wave-2/3 queue: cuBLASLt epilogues + heuristic persistence, grad
+  clipping, EMA wiring, IR generality ops, GQA KvHeads -> conditioner build for the DiT set (flame equations + torch
 fixtures); fused elementwise region emission via skipped_operations;
 cuBLASLt epilogue extension + heuristic persistence; grad clipping; EMA
 wiring; IR generality ops (DeinterleaveGroups, ReshapeView, Transpose,
