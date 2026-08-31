@@ -206,6 +206,28 @@ branches w1-* cut from 5eb5f13; GPU tests serialized on /tmp/dc-gpu.lock):**
   native modulation-cache builder (difweights or new mode), native seeded
   noise. Owner files: scripts/, tools/ (new files).
 
+**Wave 1 landed results (2026-08-31):**
+- w1-lora MERGED — F32 LoRA vertical PROVEN: builder (activation-path, alpha/rank
+  as fingerprinted Fill), frozen-dW autodiff economy, diftrain
+  make/run/export-lora, .alpha-guarded export, byte-identical 40+60 resume,
+  100-step torch gate 70/70 green CPU+CUDA (docs/LORA_TRAINING_GATE_2026-08-31.md).
+- w1-training MERGED — BF16/F32-accumulate training PROVEN: 7 training ops
+  dtype-relaxed, AdamW param/grad {F32,BF16} with F32-always moments, Cast
+  backward, gradient dtype = forward dtype (flame Option A); recorded F32 gates
+  reproduce bit-for-bit; 100-step BF16 gate: all BF16-stored tensors
+  BIT-IDENTICAL to the torch reference on CPU+CUDA
+  (docs/MIXED_PRECISION_TRAINING_GATE_2026-08-31.md). Not done: loss scaling,
+  F16 path, DiT backward ops, OpenCL BF16 training.
+- w1-deps MERGED — removal-order steps 1-4 PROVEN (integrator-reproduced):
+  mem_safe_runtime.sh vendored; difimport (C++ importer, byte-identical to the
+  Python tool); difmodcache regenerates the schedule modulation cache
+  BYTE-IDENTICAL to the recorded Serenity file (sha 2f47ac3a..., 0/184,267,776
+  mismatches); difh3noise reproduces seeds 4242/4243 initial states
+  byte-exactly. Remaining Mojo deps: tokenizer+Qwen3-VL conditioner (XL),
+  BigVGAN audio decode (L).
+- w1-runtime IN FLIGHT — telemetry + staging policies (2a-2c committed on its
+  branch; 2d/2e pending).
+
 **Wave 2:** backward opcodes for the DiT set (flame equations + torch
 fixtures); fused elementwise region emission via skipped_operations;
 cuBLASLt epilogue extension + heuristic persistence; grad clipping; EMA
