@@ -283,7 +283,15 @@ capture for resident programs; device-resident optimizer loop; gradient
 checkpointing; native tokenizer + Qwen3-VL conditioner (long pole).
 
 **Milestone gates:** (M1) golden-artifact-matched H3 run through the
-consolidated runtime, byte-identical latents — PENDING; (M2) BF16 LoRA
+consolidated runtime — ACHIEVED 2026-08-31: the full 19-evaluation golden
+denoise rerun on the integration build (telemetry + staging knobs + arena +
+W8A8 fix + fusion + backward opcodes + tokenizer + audio opcodes all merged)
+produced BYTE-IDENTICAL video-latent (5a6b8e15...), audio-rows (47495ca9...)
+and audio-latent (e1b87749...) vs the accepted artifact; H3_DENOISE PASS,
+0 OOM events, prepare device_mem_allocs=1 (arena live on the production
+graph). Perf note: this rerun ran cold-cache/default-policy (132 s/eval vs
+the accepted 22.4 s/eval warm run) — NOT a comparable measurement; the
+matched-conditions H3-scale staging measurement remains an open item; (M2) BF16 LoRA
 training proof with no torch at runtime — ACHIEVED 2026-08-31 at composed
 DiT-block scope (2+4 blocks, 100 steps, CPU+CUDA, byte-identical resume;
 docs/M2_DIT_LORA_TRAINING_GATE_2026-08-31.md; real-H3-geometry LoRA remains
