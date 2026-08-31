@@ -10,7 +10,10 @@ namespace dif::runtime {
 
 class CudnnAttentionPlan {
 public:
-  CudnnAttentionPlan(const ir::TensorDesc &query, double scale, bool causal);
+  // kv_heads: number of K/V heads (GQA); must divide the query head count.
+  // Pass query.dims[1] for dense attention.
+  CudnnAttentionPlan(const ir::TensorDesc &query, std::uint64_t kv_heads,
+                     double scale, bool causal);
   ~CudnnAttentionPlan();
 
   CudnnAttentionPlan(const CudnnAttentionPlan &) = delete;

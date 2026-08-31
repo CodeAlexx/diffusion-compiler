@@ -434,6 +434,7 @@ struct CudnnAttentionKey {
   ir::DType dtype{};
   std::uint64_t sequence{};
   std::uint64_t heads{};
+  std::uint64_t kv_heads{};
   std::uint64_t head_dim{};
   std::uint64_t scale_bits{};
   bool causal{};
@@ -451,6 +452,7 @@ struct CudnnAttentionKeyHash {
     mix(static_cast<std::uint64_t>(key.dtype));
     mix(key.sequence);
     mix(key.heads);
+    mix(key.kv_heads);
     mix(key.head_dim);
     mix(key.scale_bits);
     mix(key.causal ? 1U : 0U);
@@ -3785,6 +3787,7 @@ public:
           query->dtype,
           query->dims.at(0),
           query->dims.at(1),
+          op.u64(ir::AttrKey::KvHeads, query->dims.at(1)),
           query->dims.at(2),
           std::bit_cast<std::uint64_t>(op.f64(
               ir::AttrKey::AttentionScale,
@@ -3794,7 +3797,8 @@ public:
       auto found = cudnn_plan_cache.find(key);
       if (found == cudnn_plan_cache.end()) {
         auto plan = std::make_shared<CudnnAttentionPlan>(
-            *query, std::bit_cast<double>(key.scale_bits), key.causal);
+            *query, key.kv_heads, std::bit_cast<double>(key.scale_bits),
+            key.causal);
         found = cudnn_plan_cache.emplace(key, std::move(plan)).first;
       }
       cudnn_attention_plans_.emplace(op.id, found->second);

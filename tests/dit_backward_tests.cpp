@@ -660,6 +660,77 @@ void test_group1_frozen_weight_economy() {
              "gradient");
 }
 
+// cuDNN GQA forward (implementation 2): grouped K/V descriptors on the
+// native cudnn_frontend SDPA, checked against the CPU reference math.  The
+// program carries BOTH a dense and a grouped attention op over the same
+// query geometry, so a plan cache that ignored KvHeads would reuse the
+// dense plan for the grouped op and fail the comparison (behavioral
+// plan-key-separation proof).
+void test_cudnn_gqa_attention() {
+#if DIF_HAS_CUDNN
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  const std::uint64_t sequence = 32U;
+  const std::uint64_t heads = 8U;
+  const std::uint64_t kv_heads = 2U;
+  const std::uint64_t dim = 128U;
+  Program program;
+  program.tensors = {
+      {1U, DType::BF16, TensorRole::Input, {sequence, heads, dim}},
+      {2U, DType::BF16, TensorRole::Input, {sequence, kv_heads, dim}},
+      {3U, DType::BF16, TensorRole::Input, {sequence, kv_heads, dim}},
+      {4U, DType::BF16, TensorRole::Input, {sequence, heads, dim}},
+      {5U, DType::BF16, TensorRole::Input, {sequence, heads, dim}},
+      {6U, DType::BF16, TensorRole::Output, {sequence, heads, dim}},
+      {7U, DType::BF16, TensorRole::Output, {sequence, heads, dim}},
+  };
+  program.operations = {
+      {1U, Opcode::Attention, {1U, 2U, 3U}, {6U},
+       {Attribute::u64(AttrKey::Implementation, 2U),
+        Attribute::u64(AttrKey::KvHeads, kv_heads),
+        Attribute::boolean(AttrKey::Causal, true)}},
+      {2U, Opcode::Attention, {1U, 4U, 5U}, {7U},
+       {Attribute::u64(AttrKey::Implementation, 2U),
+        Attribute::boolean(AttrKey::Causal, true)}},
+  };
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1U, random_tensor(DType::BF16,
+                                     {sequence, heads, dim}, 121U));
+  bindings.emplace(2U, random_tensor(DType::BF16,
+                                     {sequence, kv_heads, dim}, 122U));
+  bindings.emplace(3U, random_tensor(DType::BF16,
+                                     {sequence, kv_heads, dim}, 123U));
+  bindings.emplace(4U, random_tensor(DType::BF16,
+                                     {sequence, heads, dim}, 124U));
+  bindings.emplace(5U, random_tensor(DType::BF16,
+                                     {sequence, heads, dim}, 125U));
+  const auto reference = dif::runtime::make_cpu_executor()->run(
+      program, bindings, single_run_options());
+  const auto candidate = dif::runtime::make_cuda_executor()->run(
+      program, bindings, single_run_options());
+  float maximum_absolute_error = 0.0F;
+  for (const auto tensor_id : {6U, 7U}) {
+    const auto expected = float_values(reference.outputs.at(tensor_id));
+    const auto actual = float_values(candidate.outputs.at(tensor_id));
+    expect(expected.size() == actual.size(),
+           "cuDNN GQA output size parity");
+    for (std::size_t index = 0U; index < expected.size(); ++index)
+      maximum_absolute_error =
+          std::max(maximum_absolute_error,
+                   std::abs(expected[index] - actual[index]));
+  }
+  // Bar set AFTER measurement: BF16 cuDNN SDPA vs the CPU F32-math
+  // reference; measured worst max_abs 3.91e-3 (one BF16 ulp at unit
+  // magnitude, 2026-08-31, cuda-nvrtc-cudnn), admitted 3.2e-2.
+  expect(maximum_absolute_error <= 3.2e-2F,
+         "cuDNN GQA attention matches the CPU reference (max_abs=" +
+             std::to_string(maximum_absolute_error) + ")");
+  std::cout << "GATE cudnn_gqa_attention backend=" << candidate.backend_name
+            << " max_abs=" << maximum_absolute_error << "\n";
+#endif
+}
+
 void test_kv_heads_fingerprint_stability() {
   dif::frontend::DitBlockTrainingConfig config;
   config.blocks = 2U;
@@ -996,6 +1067,7 @@ int main() {
     test_group1_frozen_weight_economy();
     test_dit_block_builder();
     test_kv_heads_fingerprint_stability();
+    test_cudnn_gqa_attention();
     test_group1_verifier_negatives();
   } catch (const std::exception &error) {
     std::cerr << "UNCAUGHT: " << error.what() << "\n";

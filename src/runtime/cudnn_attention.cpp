@@ -52,7 +52,8 @@ struct CudnnAttentionPlan::Impl {
 };
 
 CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
-                                       double scale, bool causal)
+                                       std::uint64_t kv_heads, double scale,
+                                       bool causal)
     : impl_(std::make_unique<Impl>()) {
   if ((query.dtype != ir::DType::BF16 && query.dtype != ir::DType::F16) ||
       query.dims.size() != 3U)
@@ -60,6 +61,11 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
   const auto sequence = dimension(query.dims[0], "sequence");
   const auto heads = dimension(query.dims[1], "heads");
   const auto head_dim = dimension(query.dims[2], "head dimension");
+  // GQA: cudnn_frontend SDPA supports grouped K/V natively via differing
+  // head counts on the K/V tensor descriptors (H % KvH == 0).
+  const auto key_value_heads = dimension(kv_heads, "kv heads");
+  if (key_value_heads > heads || heads % key_value_heads != 0)
+    fail("cuDNN attention kv heads must divide the query head count");
   if (!(scale > 0.0))
     fail("cuDNN attention scale must be positive");
 
@@ -76,19 +82,26 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
   const std::vector<std::int64_t> dims{1, heads, sequence, head_dim};
   // DiffIR stores [S,H,D].  Expose those bytes as the same non-contiguous
   // [B,H,S,D] view that PyTorch creates by permuting a contiguous [B,S,H,D]
-  // tensor before SDPA.
+  // tensor before SDPA.  K/V use their own (possibly smaller) head count.
   const std::vector<std::int64_t> strides{
       heads * sequence * head_dim, head_dim, heads * head_dim, 1};
-  auto tensor = [&](const char *name, std::int64_t uid) {
+  const std::vector<std::int64_t> key_value_dims{1, key_value_heads,
+                                                 sequence, head_dim};
+  const std::vector<std::int64_t> key_value_strides{
+      key_value_heads * sequence * head_dim, head_dim,
+      key_value_heads * head_dim, 1};
+  auto tensor = [&](const char *name, std::int64_t uid,
+                    const std::vector<std::int64_t> &tensor_dims,
+                    const std::vector<std::int64_t> &tensor_strides) {
     return impl_->graph->tensor(fe::graph::Tensor_attributes()
                                     .set_name(name)
                                     .set_uid(uid)
-                                    .set_dim(dims)
-                                    .set_stride(strides));
+                                    .set_dim(tensor_dims)
+                                    .set_stride(tensor_strides));
   };
-  auto q = tensor("Q", kQueryUid);
-  auto k = tensor("K", kKeyUid);
-  auto v = tensor("V", kValueUid);
+  auto q = tensor("Q", kQueryUid, dims, strides);
+  auto k = tensor("K", kKeyUid, key_value_dims, key_value_strides);
+  auto v = tensor("V", kValueUid, key_value_dims, key_value_strides);
   auto attention_scale =
       impl_->graph->tensor(fe::graph::Tensor_attributes()
                                .set_name("Attn_scale")
