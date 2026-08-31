@@ -53,7 +53,7 @@ for index in "${!BOUNDARIES[@]}"; do
   "$BUILD/difimport" make-audio-bundle "$WORKDIR/folded.safetensors" \
     "$dir/program.difir" "$dir/derived.safetensors" "$dir/bundle.difbind" \
     2 292 "$stages" > "$dir/bundle.log"
-  "$BUILD/difrun" --backend cpu --program "$dir/program.difir" \
+  "$BUILD/difrun" --backend "${DIF_AUDIO_BACKEND:-cpu}" --program "$dir/program.difir" \
     --weight-bundle "$dir/bundle.difbind" \
     --input "$input_id=$WORKDIR/latent.diftensor" \
     --output "$output_id=$dir/actual.diftensor" \

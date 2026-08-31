@@ -14,6 +14,7 @@
 !/docs/FLAME_PORT_SOURCE_NOTES.md
 !/docs/RUNTIME_MODULES.md
 !/docs/BIGVGAN_DECODE_PLAN.md
+!/docs/H3_AUDIO_DECODE_GATE_2026-08-31.md
 *.log
 *.safetensors
 *.ckpt
