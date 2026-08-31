@@ -24,6 +24,11 @@ names its evidence. Rejected experiments are preserved evidence — never clean.
 | Native importer (difimport) | byte-identical to Python tool on recorded evidence | difimport commit body |
 | BigVGAN opcodes 47/48 + CPU reference + fold importer + builder | fold BIT-EXACT vs f64 torch ref 779/779; stage parity on real rows >2.5x margin | w3-audio merge f4f3971 |
 | M1: golden H3 rerun on consolidated runtime | ALL THREE latents byte-identical to accepted artifact | scratch m1_rerun/run.log + port doc |
+| GQA (KvHeads) on the Attention family | 184/184 torch comparisons incl. conditioner 64/8; cuDNN grouped descriptors; fingerprint-stable when absent | GQA_ATTENTION_GATE_2026-08-31.md |
+| cuBLASLt bias-epilogue absorption (default-off knob) | F32 byte-identical; launches drop by site count; BF16 0.125 under frozen 0.25 bar | EPILOGUE_PERSISTENCE_2026-08-31.md |
+| cuBLASLt heuristic persistence (default-off knob) | inert when off; 2nd prepare restores all plans, rejected=0; byte-identical outputs | EPILOGUE_PERSISTENCE_2026-08-31.md |
+| Native BigVGAN audio decode | header byte-identical, max int16 delta 1, 0.079% differing, SNR 86.87 dB, 0.63 s vs 3.27 s bar | H3_AUDIO_DECODE_GATE_2026-08-31.md |
+| cuDNN vendored out of the Python tree | binary link set contains no site-packages path; M1 re-proved on it | port doc §5 |
 
 ## Rejected / declined (with cause; keep the evidence)
 
@@ -39,6 +44,9 @@ names its evidence. Rejected experiments are preserved evidence — never clean.
 | bare tokenizer.json as the H3 tokenizer | misses 7 config-only special tokens -> 440 not 439 tokens | w3-conditioner report |
 | Device-side zero-insert+unflipped-conv transposed-conv shortcut (BigVGAN) | only valid for symmetric filters; real transposed conv implemented | BIGVGAN_DECODE_PLAN.md |
 | Cold-vs-warm H3 perf comparison for M1 | unmatched conditions (132 vs 22.4 s/eval) — recorded as NOT comparable | port doc M1 note |
+| cuBLASLt activation (RELU/GELU) epilogues | cuBLASLt offers no SiLU/SwiGLU; DiffIR has no GELU opcode; no matchable pattern exists — would be dead code | EPILOGUE_PERSISTENCE_2026-08-31.md |
+| Widening the F32 absolute bar globally for GQA | rejected in favour of a shape-scoped bar with measured provenance (CUDA arm of the same case straddles the small-shape bar) | GQA_ATTENTION_GATE_2026-08-31.md |
+| Whole-file byte identity as the audio bar | different executor/reduction order cannot reproduce another implementation's F32 summation order; int16-level + staged torch parity used instead | H3_AUDIO_DECODE_GATE_2026-08-31.md |
 
 ## Pre-existing recorded rejections (inherited, preserved)
 
