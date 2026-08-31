@@ -465,7 +465,10 @@ class LinearPlan {
 public:
   LinearPlan(const ir::Program &program, const ir::Operation &op,
              const DeviceBuffers &buffers, cublasLtHandle_t handle,
-             std::size_t workspace_bytes, bool expand_algorithms) {
+             std::size_t workspace_bytes, bool expand_algorithms, int major,
+             int minor, const std::filesystem::path &cache_directory,
+             bool persist, bool allow_restore,
+             LinearHeuristicCacheStats *cache_stats) {
     const auto *input = program.tensor(op.inputs.at(0));
     const auto *weight = program.tensor(op.inputs.at(1));
     const auto *output = program.tensor(op.outputs.at(0));
@@ -579,12 +582,78 @@ public:
                     preference, attribute, &alignment, sizeof(alignment)),
                 "cublasLtMatmulPreferenceSetAttribute alignment");
       }
+      const auto matrix_a = has_bias_ ? weight_ : input_;
+      const auto matrix_b = has_bias_ ? input_ : weight_;
+      persist_ = persist;
+      cache_stats_ = cache_stats;
+      if (persist) {
+        // PTX-cache-style keyed store: the key is the full problem identity,
+        // so any environment change (library, arch, workspace policy) misses
+        // and falls open to fresh heuristics.
+        const std::string key_material =
+            "linear-algo-v1\nm=" + std::to_string(m) +
+            " n=" + std::to_string(n) + " k=" + std::to_string(k) +
+            " storage=" + std::to_string(static_cast<int>(storage)) +
+            " compute=" + std::to_string(static_cast<int>(compute)) +
+            " bias=" + std::to_string(has_bias_ ? 1 : 0) +
+            " workspace=" + std::to_string(preference_workspace) +
+            " ltver=" + std::to_string(cublasLtGetVersion()) +
+            " arch=sm_" + std::to_string(major) + std::to_string(minor);
+        const auto key_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t *>(key_material.data()),
+            key_material.size());
+        const auto digest = hex_digest(sha256(key_bytes));
+        const auto directory =
+            cache_directory.empty()
+                ? std::filesystem::temp_directory_path() / "dif-ptx-cache"
+                : cache_directory;
+        std::filesystem::create_directories(directory);
+        tuned_cache_file_ =
+            directory / ("linear-algo-tuned-" + digest + ".txt");
+        passive_cache_file_ =
+            directory / ("linear-algo-passive-" + digest + ".txt");
+      }
+      bool restored = false;
+      if (persist && allow_restore) {
+        for (const auto *path : {&tuned_cache_file_, &passive_cache_file_}) {
+          PersistedAlgorithm stored;
+          if (!read_persisted_algorithm(*path, stored))
+            continue;
+          cublasLtMatmulHeuristicResult_t candidate{};
+          if (cublasLtMatmulAlgoInit(handle, compute, CUDA_R_32F, storage,
+                                     storage, storage, storage,
+                                     stored.algorithm_id, &candidate.algo) !=
+                  CUBLAS_STATUS_SUCCESS ||
+              !apply_persisted_configuration(candidate.algo, stored)) {
+            if (cache_stats_)
+              ++cache_stats_->rejected;
+            continue;
+          }
+          cublasLtMatmulHeuristicResult_t checked{};
+          if (cublasLtMatmulAlgoCheck(handle, operation_, matrix_a, matrix_b,
+                                      output_, output_, &candidate.algo,
+                                      &checked) != CUBLAS_STATUS_SUCCESS ||
+              checked.workspaceSize > preference_workspace) {
+            if (cache_stats_)
+              ++cache_stats_->rejected;
+            continue;
+          }
+          candidate.workspaceSize = checked.workspaceSize;
+          candidate.wavesCount = checked.wavesCount;
+          candidate.state = CUBLAS_STATUS_SUCCESS;
+          heuristics_.assign(1U, candidate);
+          heuristic_ = candidate;
+          restored = true;
+          if (cache_stats_)
+            ++cache_stats_->restored;
+          break;
+        }
+      }
+      if (!restored) {
       constexpr int requested_algorithms = 32;
       std::array<cublasLtMatmulHeuristicResult_t, requested_algorithms>
           heuristics{};
       int returned = 0;
-      const auto matrix_a = has_bias_ ? weight_ : input_;
-      const auto matrix_b = has_bias_ ? input_ : weight_;
       check(cublasLtMatmulAlgoGetHeuristic(handle, operation_, matrix_a,
                                             matrix_b, output_, output_,
                                             preference, requested_algorithms,
@@ -632,6 +701,11 @@ public:
         }
       }
       heuristic_ = heuristics_.front();
+      if (persist)
+        save_persisted_algorithm(passive_cache_file_, heuristic_,
+                                 cache_stats_ ? &cache_stats_->saved_passive
+                                              : nullptr);
+      }
     } catch (...) {
       (void)cublasLtMatmulPreferenceDestroy(preference);
       throw;
@@ -772,6 +846,10 @@ public:
     result.selected_heuristic_index = static_cast<std::uint32_t>(selected);
     result.selected_algorithm_id = algorithm_id(heuristic_);
     result.selected_mean_milliseconds = means[selected];
+    if (persist_)
+      save_persisted_algorithm(tuned_cache_file_, heuristic_,
+                               cache_stats_ ? &cache_stats_->saved_tuned
+                                            : nullptr);
     result.tuning_milliseconds =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tuning_start)
@@ -874,6 +952,82 @@ private:
                    right, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION);
   }
 
+  struct PersistedAlgorithm {
+    std::int32_t algorithm_id{};
+    std::uint32_t tile_id{};
+    std::uint32_t stages_id{};
+    std::int32_t split_k{};
+    std::uint32_t reduction_scheme{};
+    std::uint32_t cta_swizzle{};
+    std::uint32_t custom_option{};
+  };
+
+  static bool read_persisted_algorithm(const std::filesystem::path &path,
+                                       PersistedAlgorithm &value) {
+    std::ifstream input(path);
+    if (!input)
+      return false;
+    input >> value.algorithm_id >> value.tile_id >> value.stages_id >>
+        value.split_k >> value.reduction_scheme >> value.cta_swizzle >>
+        value.custom_option;
+    return static_cast<bool>(input);
+  }
+
+  static bool apply_persisted_configuration(cublasLtMatmulAlgo_t &algo,
+                                            const PersistedAlgorithm &value) {
+    const auto set = [&](cublasLtMatmulAlgoConfigAttributes_t attribute,
+                         const void *data, std::size_t bytes) {
+      return cublasLtMatmulAlgoConfigSetAttribute(&algo, attribute, data,
+                                                  bytes) ==
+             CUBLAS_STATUS_SUCCESS;
+    };
+    return set(CUBLASLT_ALGO_CONFIG_TILE_ID, &value.tile_id,
+               sizeof(value.tile_id)) &&
+           set(CUBLASLT_ALGO_CONFIG_STAGES_ID, &value.stages_id,
+               sizeof(value.stages_id)) &&
+           set(CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &value.split_k,
+               sizeof(value.split_k)) &&
+           set(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+               &value.reduction_scheme, sizeof(value.reduction_scheme)) &&
+           set(CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &value.cta_swizzle,
+               sizeof(value.cta_swizzle)) &&
+           set(CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &value.custom_option,
+               sizeof(value.custom_option));
+  }
+
+  // Cache writes fail open: a filesystem problem must never fail a prepare.
+  static void save_persisted_algorithm(
+      const std::filesystem::path &path,
+      const cublasLtMatmulHeuristicResult_t &heuristic,
+      std::uint64_t *counter) {
+    std::ofstream output(path, std::ios::trunc);
+    if (!output)
+      return;
+    output << algorithm_id(heuristic) << ' '
+           << algorithm_config<std::uint32_t>(heuristic,
+                                              CUBLASLT_ALGO_CONFIG_TILE_ID)
+           << ' '
+           << algorithm_config<std::uint32_t>(heuristic,
+                                              CUBLASLT_ALGO_CONFIG_STAGES_ID)
+           << ' '
+           << algorithm_config<std::int32_t>(heuristic,
+                                             CUBLASLT_ALGO_CONFIG_SPLITK_NUM)
+           << ' '
+           << algorithm_config<std::uint32_t>(
+                  heuristic, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)
+           << ' '
+           << algorithm_config<std::uint32_t>(
+                  heuristic, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING)
+           << ' '
+           << algorithm_config<std::uint32_t>(
+                  heuristic, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION)
+           << '\n';
+    if (!output)
+      return;
+    if (counter)
+      ++*counter;
+  }
+
   cublasLtMatmulDesc_t operation_{};
   cublasLtMatrixLayout_t input_{};
   cublasLtMatrixLayout_t weight_{};
@@ -881,6 +1035,10 @@ private:
   std::vector<cublasLtMatmulHeuristicResult_t> heuristics_;
   cublasLtMatmulHeuristicResult_t heuristic_{};
   bool has_bias_{};
+  bool persist_{};
+  LinearHeuristicCacheStats *cache_stats_{};
+  std::filesystem::path tuned_cache_file_;
+  std::filesystem::path passive_cache_file_;
 };
 
 #if DIF_HAS_CUTLASS
@@ -1125,6 +1283,126 @@ void launch_fused_linear_swiglu(const FusedLinearSwiGluPlan &plan,
   check(counted_launch_kernel(plan.function, grid_x, grid_y, 1U, 256U, 1U, 1U, 0U,
                        stream, arguments.data(), nullptr),
         "cuLaunchKernel fused Linear->SwiGlu");
+}
+
+struct AbsorbedLinearBiasPlan {
+  std::uint32_t linear_operation{};
+  std::uint32_t bias_operation{};
+  std::uint32_t intermediate_tensor{};
+  std::uint32_t output_tensor{};
+  std::uint64_t eliminated_intermediate_bytes{};
+  // The Linear operation re-expressed in the biased form the LinearPlan
+  // builds and launches: the Linear's input and weight plus the BiasAdd's
+  // bias, writing the BiasAdd's output.
+  ir::Operation launch_operation;
+};
+
+// Absorb an unbiased Linear's exclusive, immediately-following BiasAdd into
+// the cuBLASLt bias epilogue: one library launch, no materialized
+// intermediate.  Explicit ids fail closed on any malformed pattern.  The
+// absorbed launch runs at the Linear's position but writes the BiasAdd's
+// output one position early, so every tensor it reads must be provably safe
+// against memory-plan slot reuse (the write-early hazard recorded by the
+// arena audit): each of input/weight/bias must hold a dedicated slot, stay
+// semantically live through the BiasAdd's position, or be impossible for
+// the planner to hand to the early-written output (no streamed constants in
+// the program AND either the output is dedicated or the read tensor's
+// aligned slot is smaller than the output needs).
+std::vector<AbsorbedLinearBiasPlan> find_absorbed_linear_bias_plans(
+    const ir::Program &program, const RunOptions &options) {
+  std::vector<AbsorbedLinearBiasPlan> result;
+  if (options.absorb_linear_bias_operations.empty())
+    return result;
+  bool streamed_program = false;
+  for (const auto &tensor : program.tensors)
+    if (tensor.has_role(ir::TensorRole::Streamed))
+      streamed_program = true;
+  const auto dedicated = [](const ir::TensorDesc &tensor) {
+    return tensor.has_role(ir::TensorRole::Input) ||
+           tensor.has_role(ir::TensorRole::Output) ||
+           (tensor.has_role(ir::TensorRole::Constant) &&
+            !tensor.has_role(ir::TensorRole::Streamed));
+  };
+  const auto align256 = [](std::uint64_t bytes) {
+    return (bytes + 255U) & ~static_cast<std::uint64_t>(255U);
+  };
+  std::unordered_set<std::uint32_t> requested;
+  for (const auto operation_id : options.absorb_linear_bias_operations) {
+    if (!requested.insert(operation_id).second)
+      continue;
+    auto position = program.operations.size();
+    for (std::size_t index = 0; index < program.operations.size(); ++index)
+      if (program.operations[index].id == operation_id)
+        position = index;
+    if (position >= program.operations.size())
+      fail("absorbed Linear id does not exist: " +
+           std::to_string(operation_id));
+    const auto &linear = program.operations[position];
+    if (linear.opcode != ir::Opcode::Linear || linear.inputs.size() != 2U ||
+        linear.u64(ir::AttrKey::Implementation, 1U) == 3U)
+      fail("bias absorption requires an unbiased cuBLASLt Linear id: " +
+           std::to_string(operation_id));
+    const auto intermediate = linear.outputs.at(0);
+    if (position + 1U >= program.operations.size())
+      fail("absorbed Linear has no following BiasAdd: " +
+           std::to_string(operation_id));
+    const auto &bias_add = program.operations[position + 1U];
+    if (bias_add.opcode != ir::Opcode::BiasAdd ||
+        bias_add.inputs.size() != 2U || bias_add.inputs[0] != intermediate)
+      fail("bias absorption requires the BiasAdd to immediately follow its "
+           "Linear: " +
+           std::to_string(operation_id));
+    std::size_t uses = 0U;
+    for (const auto &operation : program.operations)
+      for (const auto input : operation.inputs)
+        if (input == intermediate)
+          ++uses;
+    if (uses != 1U || program.tensor(intermediate)->roles != 0U)
+      fail("bias absorption requires an exclusive internal Linear "
+           "intermediate: " +
+           std::to_string(operation_id));
+    const auto *weight = program.tensor(linear.inputs[1]);
+    const auto *bias = program.tensor(bias_add.inputs[1]);
+    const auto *output = program.tensor(bias_add.outputs.at(0));
+    if (!weight || !bias || !output || weight->dims.size() != 2U ||
+        bias->dims.size() != 1U || bias->dims[0] != weight->dims[0])
+      fail("bias absorption bias width must match the Linear output "
+           "width: " +
+           std::to_string(operation_id));
+    for (const auto tensor_id :
+         {linear.inputs[0], linear.inputs[1], bias_add.inputs[1]}) {
+      const auto *description = program.tensor(tensor_id);
+      if (dedicated(*description))
+        continue;
+      std::size_t last_use = 0U;
+      for (std::size_t index = 0; index < program.operations.size(); ++index)
+        for (const auto input : program.operations[index].inputs)
+          if (input == tensor_id)
+            last_use = index;
+      if (last_use >= position + 1U)
+        continue;
+      if (!streamed_program &&
+          (dedicated(*output) || align256(description->byte_count()) <
+                                     align256(output->byte_count())))
+        continue;
+      fail("bias absorption would read tensor " + std::to_string(tensor_id) +
+           " past its planned lifetime (write-early hazard); refusing "
+           "Linear id " +
+           std::to_string(operation_id));
+    }
+    AbsorbedLinearBiasPlan plan;
+    plan.linear_operation = linear.id;
+    plan.bias_operation = bias_add.id;
+    plan.intermediate_tensor = intermediate;
+    plan.output_tensor = bias_add.outputs.at(0);
+    plan.eliminated_intermediate_bytes =
+        program.tensor(intermediate)->byte_count();
+    plan.launch_operation = linear;
+    plan.launch_operation.inputs.push_back(bias_add.inputs[1]);
+    plan.launch_operation.outputs = bias_add.outputs;
+    result.push_back(std::move(plan));
+  }
+  return result;
 }
 
 constexpr std::uint32_t kH3W8A8MlpChunkRows = 1024U;
@@ -3605,6 +3883,8 @@ public:
     free_bytes_before_ = free_before;
     fused_linear_swiglu_plans_ =
         find_fused_linear_swiglu_plans(program_, options, major);
+    absorbed_linear_bias_plans_ =
+        find_absorbed_linear_bias_plans(program_, options);
     h3_modulation_cache_plans_ =
         find_h3_modulation_cache_plans(program_, options);
     if (!h3_modulation_cache_plans_.empty()) {
@@ -3687,6 +3967,8 @@ public:
       fused_linear_operations.insert(fusion.linear_operation);
       excluded_tensors.insert(fusion.intermediate_tensor);
     }
+    for (const auto &plan : absorbed_linear_bias_plans_)
+      excluded_tensors.insert(plan.intermediate_tensor);
     for (const auto &plan : h3_modulation_cache_plans_) {
       fused_linear_operations.insert(plan.linear_operation);
       excluded_tensors.insert(plan.projected_tensor);
@@ -3961,6 +4243,8 @@ public:
     skipped_operations_ = generated.skipped_operations;
     for (const auto &fusion : fused_linear_swiglu_plans_)
       skipped_operations_.insert(fusion.swiglu_operation);
+    for (const auto &plan : absorbed_linear_bias_plans_)
+      skipped_operations_.insert(plan.bias_operation);
     for (const auto &plan : h3_w8a8_mlp_plans_) {
       skipped_operations_.insert(plan.swiglu_operation);
       skipped_operations_.insert(plan.fc2_operation);
@@ -4107,15 +4391,45 @@ public:
       pinned_io_ = std::make_unique<PinnedHostWorkspace>(
           static_cast<std::size_t>(io_bytes));
     }
-    for (const auto &op : program_.operations) {
-      if (op.opcode == ir::Opcode::Linear &&
-          !fused_launch_inputs_.contains(op.id) &&
-          !fused_linear_operations.contains(op.id))
+    {
+      std::unordered_set<std::uint32_t> tuned_ids(
+          options.tune_linear_operations.begin(),
+          options.tune_linear_operations.end());
+      std::unordered_set<std::uint32_t> ranked_ids;
+      for (const auto &choice : options.linear_algorithm_choices)
+        ranked_ids.insert(choice.operation_id);
+      for (const auto &op : program_.operations) {
+        if (op.opcode != ir::Opcode::Linear ||
+            fused_launch_inputs_.contains(op.id) ||
+            fused_linear_operations.contains(op.id))
+          continue;
+        const auto absorbed = std::find_if(
+            absorbed_linear_bias_plans_.begin(),
+            absorbed_linear_bias_plans_.end(),
+            [&](const AbsorbedLinearBiasPlan &plan) {
+              return plan.linear_operation == op.id;
+            });
+        // An absorbed Linear builds and launches the biased plan form:
+        // input and weight plus the BiasAdd's bias, writing its output.
+        const auto &plan_operation =
+            absorbed != absorbed_linear_bias_plans_.end()
+                ? absorbed->launch_operation
+                : op;
+        // A restored single-candidate plan cannot serve tuning, rank
+        // selection, or an expanded search; those always take fresh
+        // heuristics.
+        const auto allow_restore = !options.expand_linear_algorithms &&
+                                   !tuned_ids.contains(op.id) &&
+                                   !ranked_ids.contains(op.id);
         linear_plans_.emplace(
             op.id,
-            std::make_unique<LinearPlan>(program_, op, buffers_,
-                                         context_.cublas_lt(), workspace_bytes_,
-                                         options.expand_linear_algorithms));
+            std::make_unique<LinearPlan>(
+                program_, plan_operation, buffers_, context_.cublas_lt(),
+                workspace_bytes_, options.expand_linear_algorithms, major,
+                minor, options.cache_directory,
+                options.persist_linear_heuristics, allow_restore,
+                &linear_heuristic_cache_stats_));
+      }
     }
 #if DIF_HAS_CUTLASS
     std::unordered_set<std::uint32_t> cutlass_operations;
@@ -4265,8 +4579,18 @@ public:
             !linear_plans_.contains(operation_id) || cutlass_override)
           fail("requested cuBLASLt tuning id is not an unfused Linear: " +
                std::to_string(operation_id));
+        const auto absorbed_tuned = std::find_if(
+            absorbed_linear_bias_plans_.begin(),
+            absorbed_linear_bias_plans_.end(),
+            [&](const AbsorbedLinearBiasPlan &plan) {
+              return plan.linear_operation == operation_id;
+            });
         linear_tuning_results_.push_back(linear_plans_.at(operation_id)->tune(
-            operation_id, *operation, buffers_, context_.cublas_lt(),
+            operation_id,
+            absorbed_tuned != absorbed_linear_bias_plans_.end()
+                ? absorbed_tuned->launch_operation
+                : *operation,
+            buffers_, context_.cublas_lt(),
             *workspace_, context_.stream(), options.linear_tuning_warmups,
             options.linear_tuning_iterations,
             options.linear_tuning_sessions));
@@ -4509,10 +4833,19 @@ public:
         cutlass->second->launch(context_.stream());
       }
 #endif
-      else if (op.opcode == ir::Opcode::Linear)
-        linear_plans_.at(op.id)->launch(op, buffers_, context_.cublas_lt(),
-                                        *workspace_, context_.stream());
-      else if (op.opcode == ir::Opcode::Attention &&
+      else if (op.opcode == ir::Opcode::Linear) {
+        const auto absorbed = std::find_if(
+            absorbed_linear_bias_plans_.begin(),
+            absorbed_linear_bias_plans_.end(),
+            [&](const AbsorbedLinearBiasPlan &plan) {
+              return plan.linear_operation == op.id;
+            });
+        linear_plans_.at(op.id)->launch(
+            absorbed != absorbed_linear_bias_plans_.end()
+                ? absorbed->launch_operation
+                : op,
+            buffers_, context_.cublas_lt(), *workspace_, context_.stream());
+      } else if (op.opcode == ir::Opcode::Attention &&
                h3_ck_attention_plans_.contains(op.id)) {
         count_ck_attention_dispatch();
         h3_ck_attention_plans_.at(op.id)->execute(op, buffers_,
@@ -4632,6 +4965,12 @@ public:
           {fusion.linear_operation, fusion.swiglu_operation,
            program_.tensor(fusion.intermediate_tensor)->byte_count(),
            "wmma_bf16_fc1_swiglu"});
+    result.linear_bias_fusions.reserve(absorbed_linear_bias_plans_.size());
+    for (const auto &plan : absorbed_linear_bias_plans_)
+      result.linear_bias_fusions.push_back(
+          {plan.linear_operation, plan.bias_operation,
+           plan.eliminated_intermediate_bytes, "cublaslt-bias-epilogue"});
+    result.linear_heuristic_cache = linear_heuristic_cache_stats_;
 #if DIF_HAS_CUTLASS
     result.gemm_primitives.reserve(cutlass_linear_plans_.size());
     for (const auto &[operation_id, plan] : cutlass_linear_plans_) {
@@ -4967,6 +5306,8 @@ private:
   std::vector<LinearTuningResult> linear_tuning_results_;
   std::vector<LinearAlgorithmChoice> selected_linear_algorithms_;
   std::vector<FusedLinearSwiGluPlan> fused_linear_swiglu_plans_;
+  std::vector<AbsorbedLinearBiasPlan> absorbed_linear_bias_plans_;
+  LinearHeuristicCacheStats linear_heuristic_cache_stats_;
   std::vector<H3W8A8MlpPlan> h3_w8a8_mlp_plans_;
   std::vector<H3W8A8AttentionPlan> h3_w8a8_attention_plans_;
   std::vector<H3GroupwiseBlockPlan> h3_groupwise_plans_;
