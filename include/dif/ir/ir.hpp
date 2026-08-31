@@ -75,6 +75,7 @@ enum class Opcode : std::uint32_t {
   SwiGluBackward = 41,
   ResidualGateBackward = 42,
   LayerNormBackward = 43,
+  QkNormPartialRopeBackward = 44,
 };
 
 enum class AttrKey : std::uint32_t {

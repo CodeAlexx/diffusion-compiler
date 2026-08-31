@@ -338,6 +338,43 @@ GradientCase swiglu_case(dif::ir::DType dtype, bool gate_first) {
   return grad_case;
 }
 
+GradientCase qk_norm_rope_case(dif::ir::DType dtype, bool full_table) {
+  using namespace dif::ir;
+  GradientCase grad_case;
+  grad_case.name = std::string("qk_norm_rope_") +
+                   (full_table ? "fulltable_" : "halftable_") +
+                   std::string(dtype_name(dtype));
+  const std::uint64_t sequence = 4U;
+  const std::uint64_t heads = 2U;
+  const std::uint64_t dim = 6U;
+  const std::uint64_t rotary = 4U;  // partial rotation, 2 pass-through dims
+  const std::uint64_t table = full_table ? rotary : rotary / 2U;
+  grad_case.forward.tensors = {
+      {1U, dtype, TensorRole::Input, {sequence, heads, dim}},
+      {2U, dtype, TensorRole::Input, {dim}},
+      {3U, dtype, TensorRole::Input, {sequence, table}},
+      {4U, dtype, TensorRole::Input, {sequence, table}},
+      {5U, dtype, TensorRole::Internal, {sequence, heads, dim}},
+  };
+  grad_case.forward.operations = {
+      {1U, Opcode::QkNormPartialRope, {1U, 2U, 3U, 4U}, {5U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-5),
+        Attribute::u64(AttrKey::RotaryDim, rotary),
+        Attribute::u64(AttrKey::BlockSize, 32U)}},
+  };
+  grad_case.targets = {1U, 2U};
+  grad_case.bindings.emplace(
+      1U, random_tensor(dtype, {sequence, heads, dim}, 71U));
+  grad_case.bindings.emplace(
+      2U, random_tensor(dtype, {dim}, 72U, 0.5F, 1.0F));
+  grad_case.bindings.emplace(
+      3U, random_tensor(dtype, {sequence, table}, 73U));
+  grad_case.bindings.emplace(
+      4U, random_tensor(dtype, {sequence, table}, 74U));
+  append_loss(grad_case, 5U, 75U);
+  return grad_case;
+}
+
 GradientCase layer_norm_case(dif::ir::DType dtype) {
   using namespace dif::ir;
   GradientCase grad_case;
@@ -443,6 +480,8 @@ void test_group1_finite_differences() {
   finite_difference_check(swiglu_case(dif::ir::DType::F32, false));
   finite_difference_check(residual_gate_case(dif::ir::DType::F32));
   finite_difference_check(layer_norm_case(dif::ir::DType::F32));
+  finite_difference_check(qk_norm_rope_case(dif::ir::DType::F32, true));
+  finite_difference_check(qk_norm_rope_case(dif::ir::DType::F32, false));
   finite_difference_check(composed_group1_case());
 }
 
@@ -458,6 +497,9 @@ void test_group1_backend_parity() {
   backend_cross_check(swiglu_case(dif::ir::DType::F32, false), f32_bar);
   backend_cross_check(residual_gate_case(dif::ir::DType::F32), f32_bar);
   backend_cross_check(layer_norm_case(dif::ir::DType::F32), f32_bar);
+  backend_cross_check(qk_norm_rope_case(dif::ir::DType::F32, true), f32_bar);
+  backend_cross_check(qk_norm_rope_case(dif::ir::DType::F32, false),
+                      f32_bar);
   backend_cross_check(composed_group1_case(), f32_bar);
   backend_cross_check(rms_norm_case(dif::ir::DType::BF16), bf16_bar);
   backend_cross_check(rms_norm_modulate_case(dif::ir::DType::BF16, true),
@@ -465,6 +507,8 @@ void test_group1_backend_parity() {
   backend_cross_check(swiglu_case(dif::ir::DType::BF16, true), bf16_bar);
   backend_cross_check(residual_gate_case(dif::ir::DType::BF16), bf16_bar);
   backend_cross_check(layer_norm_case(dif::ir::DType::BF16), bf16_bar);
+  backend_cross_check(qk_norm_rope_case(dif::ir::DType::BF16, true),
+                      bf16_bar);
 }
 
 void test_group1_frozen_weight_economy() {
@@ -593,6 +637,25 @@ void test_group1_verifier_negatives() {
     };
     expect_rejected(mismatch,
                     "layer_norm_backward rejects a mismatched bias gradient");
+  }
+  {
+    // QkNormPartialRopeBackward rejects an inconsistent rotary geometry.
+    Program mismatch;
+    mismatch.tensors = {
+        {1U, DType::F32, TensorRole::Input, {2U, 2U, 6U}},
+        {2U, DType::F32, TensorRole::Input, {2U, 2U, 6U}},
+        {3U, DType::F32, TensorRole::Input, {6U}},
+        {4U, DType::F32, TensorRole::Input, {2U, 3U}},
+        {5U, DType::F32, TensorRole::Input, {2U, 3U}},
+        {6U, DType::F32, TensorRole::Output, {2U, 2U, 6U}},
+    };
+    mismatch.operations = {
+        {1U, Opcode::QkNormPartialRopeBackward, {1U, 2U, 3U, 4U, 5U}, {6U},
+         {Attribute::u64(AttrKey::RotaryDim, 4U)}},
+    };
+    expect_rejected(mismatch,
+                    "qk_norm_partial_rope_backward rejects a table width "
+                    "matching neither R nor R/2");
   }
   {
     // RmsNormBackward weight-gradient shape must match the weight.

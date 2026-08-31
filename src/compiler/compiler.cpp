@@ -1332,6 +1332,80 @@ void emit_swiglu_backward(std::ostringstream &out, const ir::Program &program,
          "dif_store(grad_input,i,gradient);}}\n";
 }
 
+void emit_qk_norm_rope_backward(std::ostringstream &out,
+                                const ir::Program &program,
+                                const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[1]);
+  const auto sequence = input->dims[0];
+  const auto heads = input->dims[1];
+  const auto dim = input->dims[2];
+  const auto count = sequence * heads * dim;
+  const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
+  const auto half = rotary / 2U;
+  const auto table_width = program.tensor(op.inputs[3])->dims[1];
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const bool weight_grad = op.outputs.size() == 2U;
+  // rot(k): the rotation-transpose of the upstream gradient at offset k of
+  // one head row (rb = row base, tb = table base), F32 registers.
+  const auto rotated = [&](const std::string &row_base,
+                           const std::string &table_base,
+                           const std::string &k) {
+    std::ostringstream expression;
+    expression << "(" << k << "<" << half << "ULL?"
+               << "dif_load(grad_output," << row_base << "+" << k
+               << ")*dif_load(cosv," << table_base << "+" << k
+               << ")+dif_load(grad_output," << row_base << "+" << k << "+"
+               << half << "ULL)*dif_load(sinv," << table_base << "+"
+               << (table_width == rotary ? k + "+" + std::to_string(half) +
+                                               "ULL"
+                                         : k)
+               << "):(" << k << "<" << rotary << "ULL?"
+               << "-dif_load(grad_output," << row_base << "+" << k << "-"
+               << half << "ULL)*dif_load(sinv," << table_base << "+" << k
+               << "-" << half << "ULL)+dif_load(grad_output," << row_base
+               << "+" << k << ")*dif_load(cosv," << table_base << "+"
+               << (table_width == rotary ? k
+                                         : k + "-" + std::to_string(half) +
+                                               "ULL")
+               << "):dif_load(grad_output," << row_base << "+" << k << ")))";
+    return expression.str();
+  };
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,const dif_scalar* cosv,const dif_scalar* sinv,dif_scalar* grad_input"
+      << (weight_grad ? ",dif_scalar* grad_weight" : "")
+      << "){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << dim
+      << "ULL,d=i%" << dim << "ULL,rb=row*" << dim
+      << "ULL,tb=(row/" << heads << "ULL)*" << table_width
+      << "ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<" << dim
+      << "ULL;++k){float value=dif_load(x,rb+k);ss=fmaf(value,value,ss);}"
+         "float inv=rsqrtf(ss/"
+      << dim << ".0f+" << epsilon
+      << "f);float dot=0.0f;for(unsigned long long k=0ULL;k<" << dim
+      << "ULL;++k){float rotated_gradient=" << rotated("rb", "tb", "k")
+      << ";dot=fmaf(rotated_gradient*dif_load(weight,k),dif_load(x,rb+k),"
+         "dot);}float own_rotated="
+      << rotated("rb", "tb", "d")
+      << ";float value=dif_load(x,i);"
+         "dif_store(grad_input,i,own_rotated*dif_load(weight,d)*inv-"
+         "value*inv*inv*inv*dot/"
+      << dim << ".0f);";
+  if (weight_grad)
+    out << "if(i<" << dim
+        << "ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<"
+        << sequence * heads << "ULL;++r){unsigned long long rrb=r*" << dim
+        << "ULL,rtb=(r/" << heads << "ULL)*" << table_width
+        << "ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<" << dim
+        << "ULL;++k){float rv=dif_load(x,rrb+k);rss=fmaf(rv,rv,rss);}"
+           "float rinv=rsqrtf(rss/"
+        << dim << ".0f+" << epsilon << "f);float rotated_gradient="
+        << rotated("rrb", "rtb", "i")
+        << ";acc=fmaf(rotated_gradient*dif_load(x,rrb+i),rinv,acc);}"
+           "dif_store(grad_weight,i,acc);}";
+  out << "}}\n" << std::defaultfloat;
+}
+
 void emit_layer_norm_backward(std::ostringstream &out,
                               const ir::Program &program,
                               const ir::Operation &op) {
@@ -1575,6 +1649,9 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::LayerNormBackward:
       emit_layer_norm_backward(source, program, op);
+      break;
+    case ir::Opcode::QkNormPartialRopeBackward:
+      emit_qk_norm_rope_backward(source, program, op);
       break;
     }
     end_float_operation(source);

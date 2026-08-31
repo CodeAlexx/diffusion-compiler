@@ -223,6 +223,37 @@ AutodiffResult differentiate(const ir::Program &forward,
         accumulate(operation.inputs[1], grad_weight);
       break;
     }
+    case ir::Opcode::QkNormPartialRope: {
+      const auto x = operation.inputs[0];
+      const auto weight = operation.inputs[1];
+      // cos/sin are precomputed non-differentiable tables; the rotation
+      // layout travels on the op as an explicit RotaryDim (stamped with the
+      // executor's default so forward and backward can never disagree).
+      const bool needs_weight =
+          requested.contains(weight) || produced.contains(weight);
+      const auto grad_input = add_tensor(*result.program.tensor(x));
+      std::vector<std::uint32_t> outputs{grad_input};
+      std::uint32_t grad_weight = 0U;
+      if (needs_weight) {
+        grad_weight = add_tensor(*result.program.tensor(weight));
+        outputs.push_back(grad_weight);
+      }
+      const auto head_dim = result.program.tensor(x)->dims[2];
+      add_operation(
+          ir::Opcode::QkNormPartialRopeBackward,
+          {grad_output, x, weight, operation.inputs[2],
+           operation.inputs[3]},
+          std::move(outputs),
+          {ir::Attribute::f64(ir::AttrKey::Epsilon,
+                              operation.f64(ir::AttrKey::Epsilon, 1.0e-5)),
+           ir::Attribute::u64(ir::AttrKey::RotaryDim,
+                              operation.u64(ir::AttrKey::RotaryDim,
+                                            head_dim))});
+      accumulate(x, grad_input);
+      if (needs_weight)
+        accumulate(weight, grad_weight);
+      break;
+    }
     case ir::Opcode::LayerNorm: {
       const auto grad_input =
           add_tensor(*result.program.tensor(operation.inputs[0]));

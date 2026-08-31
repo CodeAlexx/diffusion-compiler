@@ -817,6 +817,79 @@ void swiglu_backward(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+// Backward of qk_norm_rope: apply the transpose of the recorded rotation to
+// the upstream gradient (per pair (d, d+half): ga = c1*g0 + s2*g1,
+// gb = -s1*g0 + c2*g1 — the exact adjoint of out0 = c1*a - s1*b,
+// out1 = s2*a + c2*b, honoring the duplicated-table convention), then the
+// per-head RMSNorm backward.  Layout comes from RotaryDim and the table
+// width, never from shape sniffing.
+void qk_norm_rope_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &input = tensors.at(op.inputs[1]);
+  const auto &weight = tensors.at(op.inputs[2]);
+  const auto &cosv = tensors.at(op.inputs[3]);
+  const auto &sinv = tensors.at(op.inputs[4]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  auto *grad_weight =
+      op.outputs.size() == 2U ? &tensors.at(op.outputs[1]) : nullptr;
+  const auto sequence = input.dims[0];
+  const auto heads = input.dims[1];
+  const auto dim = input.dims[2];
+  const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
+  const auto half = rotary / 2U;
+  const auto table_width = cosv.dims[1];
+  const auto epsilon =
+      static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  std::vector<float> rotated_gradient(dim);
+  std::vector<float> weight_accumulator(grad_weight ? dim : 0U, 0.0F);
+  for (std::uint64_t sequence_index = 0U; sequence_index < sequence;
+       ++sequence_index) {
+    const auto table = sequence_index * table_width;
+    for (std::uint64_t head = 0U; head < heads; ++head) {
+      const auto base = (sequence_index * heads + head) * dim;
+      for (std::uint64_t d = 0U; d < half; ++d) {
+        const auto second_index = table_width == rotary ? d + half : d;
+        const auto cos_first = load_float(cosv, table + d);
+        const auto sin_first = load_float(sinv, table + d);
+        const auto cos_second = load_float(cosv, table + second_index);
+        const auto sin_second = load_float(sinv, table + second_index);
+        const auto upstream_first = load_float(grad_output, base + d);
+        const auto upstream_second =
+            load_float(grad_output, base + d + half);
+        rotated_gradient[d] =
+            upstream_first * cos_first + upstream_second * sin_second;
+        rotated_gradient[d + half] =
+            -upstream_first * sin_first + upstream_second * cos_second;
+      }
+      for (std::uint64_t d = rotary; d < dim; ++d)
+        rotated_gradient[d] = load_float(grad_output, base + d);
+      float sum = 0.0F;
+      for (std::uint64_t d = 0U; d < dim; ++d) {
+        const auto value = load_float(input, base + d);
+        sum += value * value;
+      }
+      const auto inverse =
+          1.0F / std::sqrt(sum / static_cast<float>(dim) + epsilon);
+      float dot = 0.0F;
+      for (std::uint64_t d = 0U; d < dim; ++d)
+        dot = std::fma(rotated_gradient[d] * load_float(weight, d),
+                       load_float(input, base + d), dot);
+      for (std::uint64_t d = 0U; d < dim; ++d) {
+        const auto value = load_float(input, base + d);
+        store_float(grad_input, base + d,
+                    rotated_gradient[d] * load_float(weight, d) * inverse -
+                        value * inverse * inverse * inverse * dot /
+                            static_cast<float>(dim));
+        if (grad_weight)
+          weight_accumulator[d] += rotated_gradient[d] * value * inverse;
+      }
+    }
+  }
+  if (grad_weight)
+    for (std::uint64_t d = 0U; d < dim; ++d)
+      store_float(*grad_weight, d, weight_accumulator[d]);
+}
+
 void layer_norm_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto &grad_output = tensors.at(op.inputs[0]);
   const auto &input = tensors.at(op.inputs[1]);
@@ -1142,6 +1215,9 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::LayerNormBackward:
       layer_norm_backward(op, tensors);
+      break;
+    case ir::Opcode::QkNormPartialRopeBackward:
+      qk_norm_rope_backward(op, tensors);
       break;
     }
   }

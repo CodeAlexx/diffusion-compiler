@@ -244,6 +244,8 @@ std::string_view opcode_name(Opcode opcode) {
     return "residual_gate_backward";
   case Opcode::LayerNormBackward:
     return "layer_norm_backward";
+  case Opcode::QkNormPartialRopeBackward:
+    return "qk_norm_partial_rope_backward";
   }
   return "invalid";
 }

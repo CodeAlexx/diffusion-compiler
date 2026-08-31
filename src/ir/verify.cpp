@@ -22,7 +22,7 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::LayerNormBackward;
+  return opcode >= Opcode::Add && opcode <= Opcode::QkNormPartialRopeBackward;
 }
 
 bool valid_attr_key(AttrKey key) {
@@ -911,6 +911,51 @@ void verify_operation(const Program &program, const Operation &op) {
     if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
       fail("layer_norm_backward block size must be a power of two in "
            "[32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::QkNormPartialRopeBackward) {
+    // Backward of the fused per-head RMSNorm + partial halfsplit rotation.
+    // The rotation layout (RotaryDim, table width) is explicit in the op
+    // semantics, never inferred from shapes (flame's shape-sniff trap: the
+    // HiDream-O1 Q/K LoRA-B gradient collapse).
+    if (op.inputs.size() != 5U || op.outputs.empty() || op.outputs.size() > 2U)
+      fail("qk_norm_partial_rope_backward expects grad_output, input, "
+           "weight, cos, sin and one or two outputs");
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[2], op);
+    const auto &cos = tensor_or_fail(program, op.inputs[3], op);
+    const auto &sin = tensor_or_fail(program, op.inputs[4], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype) || input.dims.size() != 3U ||
+        weight.dtype != input.dtype || weight.dims.size() != 1U ||
+        weight.dims[0] != input.dims[2] || cos.dtype != input.dtype ||
+        sin.dtype != input.dtype || cos.dims != sin.dims ||
+        cos.dims.size() != 2U || cos.dims[0] != input.dims[0])
+      fail("qk_norm_partial_rope_backward requires grad/input [S,H,D], "
+           "weight [D], cos/sin [S,T]");
+    const auto head_dim = input.dims[2];
+    const auto rotary = op.u64(AttrKey::RotaryDim, head_dim);
+    if (rotary == 0U || rotary > head_dim || (rotary % 2U) != 0U ||
+        (cos.dims[1] != rotary && cos.dims[1] * 2U != rotary))
+      fail("qk_norm_partial_rope_backward rotary geometry is inconsistent");
+    if (op.outputs.size() == 2U) {
+      const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);
+      if (grad_weight.dtype != weight.dtype || grad_weight.dims != weight.dims)
+        fail("qk_norm_partial_rope_backward weight gradient must match the "
+             "weight");
+    }
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("qk_norm_partial_rope_backward epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("qk_norm_partial_rope_backward block size must be a power of two "
+           "in [32,1024]");
     return;
   }
 
