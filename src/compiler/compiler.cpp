@@ -2219,6 +2219,12 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
     case ir::Opcode::AttentionBackward:
       emit_attention_backward(source, program, op);
       break;
+    case ir::Opcode::Conv1d:
+    case ir::Opcode::SnakeBeta:
+      // Integrator-approved fail-closed stub (chunk 6 of the audio decode
+      // plan lands the real emitters here).
+      fail("audio opcodes have no CUDA emitter yet");
+      break;
     }
     end_float_operation(source);
   }

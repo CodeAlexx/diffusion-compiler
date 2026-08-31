@@ -24,6 +24,7 @@ add_library(difcore
   src/frontend/h3_latents.cpp
   src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
+  src/frontend/h3_audio_vae.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
   src/frontend/lora.cpp
@@ -171,6 +172,9 @@ target_link_libraries(difh3media PRIVATE difcore)
 
 add_executable(difslice tools/difslice.cpp)
 target_link_libraries(difslice PRIVATE difcore)
+
+add_executable(difaudioops tools/difaudioops.cpp)
+target_link_libraries(difaudioops PRIVATE difcore)
 
 add_executable(difimport tools/difimport.cpp)
 target_link_libraries(difimport PRIVATE difcore)

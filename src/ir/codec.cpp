@@ -250,6 +250,10 @@ std::string_view opcode_name(Opcode opcode) {
     return "attention_lse";
   case Opcode::AttentionBackward:
     return "attention_backward";
+  case Opcode::Conv1d:
+    return "conv1d";
+  case Opcode::SnakeBeta:
+    return "snake_beta";
   }
   return "invalid";
 }

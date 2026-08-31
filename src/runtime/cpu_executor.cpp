@@ -1190,6 +1190,279 @@ void attention_backward(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+
+// BigVGAN-class 1-D convolution: plain / dilated / grouped / depthwise /
+// transposed, zero- or replicate-padded, with transposed output trim.
+// Index-mapped padding (no materialized pad), F32 accumulator per output
+// element — the exact loop ordering of the gated Mojo host oracle
+// (serenitymojo models/minimax_h3/audio_decoder.mojo conv1d /
+// conv_transpose1d), generalized to attribute-driven geometry.
+void conv1d_f32(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto *bias =
+      op.inputs.size() == 3U ? &tensors.at(op.inputs[2]) : nullptr;
+  auto &out = tensors.at(op.outputs[0]);
+  const auto stride = op.u64(ir::AttrKey::Stride, 1U);
+  const auto dilation = op.u64(ir::AttrKey::Dilation, 1U);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto pad_left = op.u64(ir::AttrKey::PadLeft, 0U);
+  const auto pad_mode = op.u64(ir::AttrKey::PadMode, 0U);
+  const auto transposed = op.boolean(ir::AttrKey::Transposed, false);
+  const auto trim_left = op.u64(ir::AttrKey::TrimLeft, 0U);
+  const auto batch = input.dims[0];
+  const auto in_channels = input.dims[1];
+  const auto length = input.dims[2];
+  const auto kernel = weight.dims[2];
+  const auto out_channels = out.dims[1];
+  const auto out_length = out.dims[2];
+  const auto in_per_group = in_channels / groups;
+  const auto out_per_group = out_channels / groups;
+  const auto replicate = pad_mode == 1U;
+  const auto *input_values = reinterpret_cast<const float *>(input.data());
+  const auto *weight_values = reinterpret_cast<const float *>(weight.data());
+  const auto *bias_values =
+      bias ? reinterpret_cast<const float *>(bias->data()) : nullptr;
+  auto *out_values = reinterpret_cast<float *>(out.mutable_data());
+
+  const auto sample = [&](const float *base, std::int64_t position) -> float {
+    auto index = position - static_cast<std::int64_t>(pad_left);
+    if (index < 0 || index >= static_cast<std::int64_t>(length)) {
+      if (!replicate)
+        return 0.0F;
+      index = std::clamp<std::int64_t>(index, 0,
+                                       static_cast<std::int64_t>(length) - 1);
+    }
+    return base[index];
+  };
+
+  for (std::uint64_t b = 0; b < batch; ++b) {
+    if (!transposed) {
+      for (std::uint64_t oc = 0; oc < out_channels; ++oc) {
+        const auto group = oc / out_per_group;
+        auto *out_row = out_values + (b * out_channels + oc) * out_length;
+        for (std::uint64_t o = 0; o < out_length; ++o) {
+          float accumulator = 0.0F;
+          for (std::uint64_t ic = 0; ic < in_per_group; ++ic) {
+            const auto in_channel = group * in_per_group + ic;
+            const auto *in_row =
+                input_values + (b * in_channels + in_channel) * length;
+            const auto *w_row =
+                weight_values + (oc * in_per_group + ic) * kernel;
+            const auto start = static_cast<std::int64_t>(o * stride);
+            for (std::uint64_t k = 0; k < kernel; ++k)
+              accumulator +=
+                  sample(in_row,
+                         start + static_cast<std::int64_t>(k * dilation)) *
+                  w_row[k];
+          }
+          if (bias_values)
+            accumulator += bias_values[oc];
+          out_row[o] = accumulator;
+        }
+      }
+    } else {
+      const auto padded =
+          length + pad_left + op.u64(ir::AttrKey::PadRight, 0U);
+      std::vector<float> full_accumulator;
+      for (std::uint64_t oc = 0; oc < out_channels; ++oc) {
+        const auto group = oc / out_per_group;
+        const auto oc_in_group = oc % out_per_group;
+        auto *out_row = out_values + (b * out_channels + oc) * out_length;
+        full_accumulator.assign(static_cast<std::size_t>(out_length), 0.0F);
+        for (std::uint64_t ic = 0; ic < in_per_group; ++ic) {
+          const auto in_channel = group * in_per_group + ic;
+          const auto *in_row =
+              input_values + (b * in_channels + in_channel) * length;
+          const auto *w_row =
+              weight_values +
+              (in_channel * out_per_group + oc_in_group) * kernel;
+          for (std::uint64_t i = 0; i < padded; ++i) {
+            const auto value =
+                sample(in_row, static_cast<std::int64_t>(i));
+            const auto scatter_base =
+                static_cast<std::int64_t>(i * stride) -
+                static_cast<std::int64_t>(trim_left);
+            for (std::uint64_t k = 0; k < kernel; ++k) {
+              const auto position =
+                  scatter_base + static_cast<std::int64_t>(k);
+              if (position < 0 ||
+                  position >= static_cast<std::int64_t>(out_length))
+                continue;
+              full_accumulator[static_cast<std::size_t>(position)] +=
+                  value * w_row[k];
+            }
+          }
+        }
+        const auto bias_value = bias_values ? bias_values[oc] : 0.0F;
+        for (std::uint64_t o = 0; o < out_length; ++o)
+          out_row[o] = full_accumulator[o] + bias_value;
+      }
+    }
+  }
+}
+
+void conv1d(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto *bias = op.inputs.size() == 3U ? &tensors.at(op.inputs[2]) : nullptr;
+  auto &out = tensors.at(op.outputs[0]);
+  if (input.dtype == ir::DType::F32 && weight.dtype == ir::DType::F32 &&
+      out.dtype == ir::DType::F32 &&
+      (!bias || bias->dtype == ir::DType::F32)) {
+    // Bit-identical fast path: same nesting, same accumulation order, raw
+    // pointers instead of per-element load_float dispatch.
+    conv1d_f32(op, tensors);
+    return;
+  }
+  const auto stride = op.u64(ir::AttrKey::Stride, 1U);
+  const auto dilation = op.u64(ir::AttrKey::Dilation, 1U);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto pad_left = op.u64(ir::AttrKey::PadLeft, 0U);
+  const auto pad_mode = op.u64(ir::AttrKey::PadMode, 0U);
+  const auto transposed = op.boolean(ir::AttrKey::Transposed, false);
+  const auto trim_left = op.u64(ir::AttrKey::TrimLeft, 0U);
+  const auto batch = input.dims[0];
+  const auto in_channels = input.dims[1];
+  const auto length = input.dims[2];
+  const auto kernel = weight.dims[2];
+  const auto out_channels = out.dims[1];
+  const auto out_length = out.dims[2];
+  const auto in_per_group = in_channels / groups;
+  const auto out_per_group = out_channels / groups;
+  const auto replicate = pad_mode == 1U;
+
+  // Padded-coordinate sample: position p in [0, L+PadL+PadR) maps to input
+  // index p-PadL, clamped for replicate pad or zero outside for zero pad.
+  const auto sample = [&](std::uint64_t base, std::int64_t position) -> float {
+    auto index = position - static_cast<std::int64_t>(pad_left);
+    if (index < 0 || index >= static_cast<std::int64_t>(length)) {
+      if (!replicate)
+        return 0.0F;
+      index = std::clamp<std::int64_t>(index, 0,
+                                       static_cast<std::int64_t>(length) - 1);
+    }
+    return load_float(input, base + static_cast<std::uint64_t>(index));
+  };
+
+  for (std::uint64_t b = 0; b < batch; ++b) {
+    if (!transposed) {
+      for (std::uint64_t oc = 0; oc < out_channels; ++oc) {
+        const auto group = oc / out_per_group;
+        const auto out_base = (b * out_channels + oc) * out_length;
+        for (std::uint64_t o = 0; o < out_length; ++o) {
+          float accumulator = 0.0F;
+          for (std::uint64_t ic = 0; ic < in_per_group; ++ic) {
+            const auto in_channel = group * in_per_group + ic;
+            const auto in_base = (b * in_channels + in_channel) * length;
+            const auto weight_base = (oc * in_per_group + ic) * kernel;
+            for (std::uint64_t k = 0; k < kernel; ++k) {
+              const auto position = static_cast<std::int64_t>(o * stride) +
+                                    static_cast<std::int64_t>(k * dilation);
+              accumulator += sample(in_base, position) *
+                             load_float(weight, weight_base + k);
+            }
+          }
+          if (bias)
+            accumulator += load_float(*bias, oc);
+          store_float(out, out_base + o, accumulator);
+        }
+      }
+    } else {
+      // Scatter with stride over the padded input, then trim: output
+      // position (in full coordinates) = i*stride + k, minus TrimLeft.
+      const auto padded =
+          length + pad_left + op.u64(ir::AttrKey::PadRight, 0U);
+      std::vector<float> full_accumulator;
+      for (std::uint64_t oc = 0; oc < out_channels; ++oc) {
+        const auto group = oc / out_per_group;
+        const auto oc_in_group = oc % out_per_group;
+        const auto out_base = (b * out_channels + oc) * out_length;
+        full_accumulator.assign(static_cast<std::size_t>(out_length), 0.0F);
+        for (std::uint64_t ic = 0; ic < in_per_group; ++ic) {
+          const auto in_channel = group * in_per_group + ic;
+          const auto in_base = (b * in_channels + in_channel) * length;
+          const auto weight_base =
+              (in_channel * out_per_group + oc_in_group) * kernel;
+          for (std::uint64_t i = 0; i < padded; ++i) {
+            const auto value = sample(in_base, static_cast<std::int64_t>(i));
+            for (std::uint64_t k = 0; k < kernel; ++k) {
+              const auto position = static_cast<std::int64_t>(i * stride + k) -
+                                    static_cast<std::int64_t>(trim_left);
+              if (position < 0 ||
+                  position >= static_cast<std::int64_t>(out_length))
+                continue;
+              full_accumulator[static_cast<std::size_t>(position)] +=
+                  value * load_float(weight, weight_base + k);
+            }
+          }
+        }
+        const auto bias_value = bias ? load_float(*bias, oc) : 0.0F;
+        for (std::uint64_t o = 0; o < out_length; ++o)
+          store_float(out, out_base + o, full_accumulator[o] + bias_value);
+      }
+    }
+  }
+}
+
+// BigVGAN SnakeBeta: y = x + (exp(beta_c) + eps)^-1 * sin(exp(alpha_c) * x)^2,
+// alpha/beta stored in LOG space as [C] vectors (linear treatment is a
+// near-identity trap; see the audio decode plan).
+void snake_beta(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &log_alpha = tensors.at(op.inputs[1]);
+  const auto &log_beta = tensors.at(op.inputs[2]);
+  auto &out = tensors.at(op.outputs[0]);
+  if (input.dtype == ir::DType::F32 &&
+      log_alpha.dtype == ir::DType::F32 &&
+      log_beta.dtype == ir::DType::F32 && out.dtype == ir::DType::F32) {
+    const auto epsilon =
+        static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-9));
+    const auto batch = input.dims[0];
+    const auto channels = input.dims[1];
+    const auto length = input.dims[2];
+    const auto *input_values = reinterpret_cast<const float *>(input.data());
+    const auto *alpha_values =
+        reinterpret_cast<const float *>(log_alpha.data());
+    const auto *beta_values =
+        reinterpret_cast<const float *>(log_beta.data());
+    auto *out_values = reinterpret_cast<float *>(out.mutable_data());
+    for (std::uint64_t b = 0; b < batch; ++b) {
+      for (std::uint64_t c = 0; c < channels; ++c) {
+        const auto alpha = std::exp(alpha_values[c]);
+        const auto inverse_beta =
+            1.0F / (std::exp(beta_values[c]) + epsilon);
+        const auto *in_row = input_values + (b * channels + c) * length;
+        auto *out_row = out_values + (b * channels + c) * length;
+        for (std::uint64_t i = 0; i < length; ++i) {
+          const auto x = in_row[i];
+          const auto s = std::sin(alpha * x);
+          out_row[i] = x + inverse_beta * s * s;
+        }
+      }
+    }
+    return;
+  }
+  const auto epsilon =
+      static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-9));
+  const auto batch = input.dims[0];
+  const auto channels = input.dims[1];
+  const auto length = input.dims[2];
+  for (std::uint64_t b = 0; b < batch; ++b) {
+    for (std::uint64_t c = 0; c < channels; ++c) {
+      const auto alpha = std::exp(load_float(log_alpha, c));
+      const auto inverse_beta =
+          1.0F / (std::exp(load_float(log_beta, c)) + epsilon);
+      const auto base = (b * channels + c) * length;
+      for (std::uint64_t i = 0; i < length; ++i) {
+        const auto x = load_float(input, base + i);
+        const auto s = std::sin(alpha * x);
+        store_float(out, base + i, x + inverse_beta * s * s);
+      }
+    }
+  }
+}
+
 void execute_once(const ir::Program &program, TensorMap &tensors) {
   for (const auto &op : program.operations) {
     switch (op.opcode) {
@@ -1329,6 +1602,12 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::AttentionBackward:
       attention_backward(op, tensors);
+      break;
+    case ir::Opcode::Conv1d:
+      conv1d(op, tensors);
+      break;
+    case ir::Opcode::SnakeBeta:
+      snake_beta(op, tensors);
       break;
     }
   }

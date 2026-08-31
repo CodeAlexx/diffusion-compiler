@@ -989,6 +989,13 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::DequantizeInt5:
       emit_dequantize(source, program, operation, 5U);
       break;
+    case Opcode::Conv1d:
+    case Opcode::SnakeBeta:
+      // Recorded gap (BigVGAN decode plan, integrator decision 3): the audio
+      // opcodes land on CPU+CUDA first; OpenCL conformance is chunk 8.
+      dif::fail("OpenCL reference backend does not implement the audio "
+                "decode opcodes");
+      break;
     }
     end_float_operation(source);
   }

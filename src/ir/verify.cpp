@@ -22,11 +22,11 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::AttentionBackward;
+  return opcode >= Opcode::Add && opcode <= Opcode::SnakeBeta;
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::WeightDecay;
+  return key >= AttrKey::Epsilon && key <= AttrKey::TrimRight;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -1040,6 +1040,105 @@ void verify_operation(const Program &program, const Operation &op) {
       fail("attention_backward saved logsumexp must be F32 [S,H]");
     if (q.dims[0] > 4096U)
       fail("decomposed attention backward is admitted only for S<=4096");
+    return;
+  }
+
+  if (op.opcode == Opcode::Conv1d) {
+    if ((op.inputs.size() != 2U && op.inputs.size() != 3U) ||
+        op.outputs.size() != 1U)
+      fail("conv1d expects input, weight, optional bias, and one output");
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || weight.dtype != input.dtype ||
+        out.dtype != input.dtype || input.dims.size() != 3U ||
+        weight.dims.size() != 3U || out.dims.size() != 3U)
+      fail("conv1d requires rank-3 [B,C,L] float input/weight/output of one "
+           "dtype");
+    const auto stride = op.u64(AttrKey::Stride, 1U);
+    const auto dilation = op.u64(AttrKey::Dilation, 1U);
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    const auto pad_left = op.u64(AttrKey::PadLeft, 0U);
+    const auto pad_right = op.u64(AttrKey::PadRight, 0U);
+    const auto pad_mode = op.u64(AttrKey::PadMode, 0U);
+    const auto transposed = op.boolean(AttrKey::Transposed, false);
+    const auto trim_left = op.u64(AttrKey::TrimLeft, 0U);
+    const auto trim_right = op.u64(AttrKey::TrimRight, 0U);
+    const auto batch = input.dims[0];
+    const auto in_channels = input.dims[1];
+    const auto length = input.dims[2];
+    const auto kernel = weight.dims[2];
+    // Bounds that keep every length expression below inside uint64.
+    constexpr auto kShortLimit = std::uint64_t{1} << 16U;
+    constexpr auto kLongLimit = std::uint64_t{1} << 40U;
+    if (stride == 0U || dilation == 0U || groups == 0U || kernel == 0U ||
+        pad_mode > 1U || stride > kShortLimit || dilation > kShortLimit ||
+        kernel > kShortLimit || pad_left > kLongLimit ||
+        pad_right > kLongLimit || trim_left > kLongLimit ||
+        trim_right > kLongLimit || length > kLongLimit)
+      fail("conv1d attribute geometry is invalid or out of range");
+    if (in_channels % groups != 0U)
+      fail("conv1d groups must divide the input channels");
+    const auto padded = length + pad_left + pad_right;
+    std::uint64_t out_channels = 0U;
+    std::uint64_t expected_length = 0U;
+    if (transposed) {
+      if (dilation != 1U)
+        fail("conv1d transposed mode requires dilation 1");
+      // ConvTranspose1d checkpoint layout: [C_in, C_out/groups, K] — dim 0
+      // is the INPUT channel. The swap against the forward layout is the
+      // classic port bug; both directions are checked fail-closed.
+      if (weight.dims[0] != in_channels || weight.dims[1] == 0U)
+        fail("conv1d transposed weight must be [C_in, C_out/groups, K]");
+      out_channels = weight.dims[1] * groups;
+      if (padded == 0U)
+        fail("conv1d transposed input is empty after padding");
+      const auto full = (padded - 1U) * stride + kernel;
+      if (trim_left + trim_right >= full)
+        fail("conv1d transposed trim removes the whole output");
+      expected_length = full - trim_left - trim_right;
+    } else {
+      if (trim_left != 0U || trim_right != 0U)
+        fail("conv1d trim attributes are transposed-only");
+      // Forward layout: [C_out, C_in/groups, K].
+      if (weight.dims[1] != in_channels / groups || weight.dims[0] == 0U)
+        fail("conv1d weight must be [C_out, C_in/groups, K]");
+      out_channels = weight.dims[0];
+      const auto effective = dilation * (kernel - 1U) + 1U;
+      if (padded < effective)
+        fail("conv1d kernel does not fit the padded input");
+      expected_length = (padded - effective) / stride + 1U;
+    }
+    if (out_channels % groups != 0U)
+      fail("conv1d groups must divide the output channels");
+    if (out.dims[0] != batch || out.dims[1] != out_channels ||
+        out.dims[2] != expected_length)
+      fail("conv1d output geometry does not match its attributes");
+    if (op.inputs.size() == 3U) {
+      const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+      if (bias.dtype != input.dtype || bias.dims.size() != 1U ||
+          bias.dims[0] != out_channels)
+        fail("conv1d bias must be a [C_out] vector of the input dtype");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::SnakeBeta) {
+    expect_counts(op, 3, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &alpha = tensor_or_fail(program, op.inputs[1], op);
+    const auto &beta = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.size() != 3U ||
+        alpha.dtype != input.dtype || alpha.dims.size() != 1U ||
+        alpha.dims[0] != input.dims[1] || beta.dtype != alpha.dtype ||
+        beta.dims != alpha.dims)
+      fail("snake_beta requires rank-3 [B,C,L] input and [C] log-space "
+           "alpha/beta vectors");
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-9);
+    if (!(epsilon > 0.0))
+      fail("snake_beta epsilon must be positive");
     return;
   }
 
