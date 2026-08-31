@@ -1002,6 +1002,22 @@ std::string generate_source(const dif::ir::Program &program) {
       // measured instead of silently emitting a missing kernel.
       dif::fail("OpenCL reference backend does not implement tanh GELU");
       break;
+    case Opcode::Sigmoid:
+    case Opcode::Reshape:
+    case Opcode::BroadcastTo:
+    case Opcode::Slice:
+    case Opcode::RotaryFrequency:
+    case Opcode::RotaryApply:
+    case Opcode::BooleanMaskToBias:
+    case Opcode::EulerVelocityStep:
+    case Opcode::Permute:
+    case Opcode::Concat:
+      // These generic operations currently have CPU and NVIDIA production
+      // implementations. Keep OpenCL fail-closed until each lowering has its
+      // own parity gate.
+      dif::fail("OpenCL reference backend does not implement the Krea-required "
+                "generic opcodes");
+      break;
     }
     end_float_operation(source);
   }
