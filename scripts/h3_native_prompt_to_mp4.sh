@@ -66,11 +66,24 @@ PY
   --clip-length 17 --token-drop 3 --tile-size 256 --tile-overlap 64 \
   --warmups 0 --iterations 1 --min-free-mib 4096 --cache-dir "$OUT/cache"
 
-# 6. audio decode (native BigVGAN) and 7. mux
+# 6. audio decode (native BigVGAN). The folded weights, program and bundle are
+# built once and reused; folding is a float64 weight-norm removal over the
+# checkpoint's audio_vae shard.
+if [ ! -f "$OUT/audio-folded.safetensors" ]; then
+  "$BUILD/difimport" fold-audio-weight-norm "$CKPT/audio_vae/model.safetensors" \
+    "$OUT/audio-folded.safetensors"
+fi
+if [ ! -f "$OUT/audio.difir" ]; then
+  "$BUILD/difimport" make-audio-program "$OUT/audio.difir" 2 292 8
+  "$BUILD/difimport" make-audio-bundle "$OUT/audio-folded.safetensors" \
+    "$OUT/audio.difir" "$OUT/audio-derived.safetensors" "$OUT/audio.difbind" 2 292 8
+fi
 "$BUILD/difaudiodecode" --backend cuda \
   --program "$OUT/audio.difir" --weight-bundle "$OUT/audio.difbind" \
   --input "$OUT/audio-rows.diftensor" --output-wav "$OUT/audio.wav" \
   --cache-dir "$OUT/cache"
+
+# 7. mux (ffmpeg is the declared native boundary)
 "$BUILD/difh3media" --video "$OUT/video-decoded.diftensor" --audio-wav "$OUT/audio.wav" \
   --output-dir "$OUT/media" --input-fps 24 --encoder h264_nvenc
 
