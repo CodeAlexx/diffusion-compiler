@@ -1473,6 +1473,113 @@ void emit_residual_gate_backward(std::ostringstream &out,
          "dif_store(grad_gate,i,upstream*dif_load(branch,i));}}\n";
 }
 
+void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
+                        const ir::Operation &op) {
+  const auto *q = program.tensor(op.inputs[0]);
+  const auto sequence = q->dims[0];
+  const auto heads = q->dims[1];
+  const auto dim = q->dims[2];
+  const auto count = sequence * heads;
+  const auto scale = static_cast<float>(op.f64(
+      ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
+  const bool causal = op.boolean(ir::AttrKey::Causal, false);
+  const auto *scalar = typed_scalar(q->dtype);
+  const auto *load = typed_load(q->dtype);
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op) << "(const "
+      << scalar << "* q,const " << scalar
+      << "* k,dif_f32* lse){unsigned long long i=(unsigned long long)"
+         "blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long qs=i/" << heads << "ULL,h=i%"
+      << heads << "ULL,qb=(qs*" << heads << "ULL+h)*" << dim
+      << "ULL,kend=" << (causal ? "qs+1ULL" : std::to_string(sequence) + "ULL")
+      << ";float maximum=-3.402823466e+38f;"
+         "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
+         "unsigned long long kb=(ks*"
+      << heads << "ULL+h)*" << dim
+      << "ULL;for(unsigned long long d=0ULL;d<" << dim
+      << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
+      << "(k,kb+d),score);score*=" << scale
+      << "f;maximum=fmaxf(maximum,score);}float denominator=0.0f;"
+         "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
+         "unsigned long long kb=(ks*"
+      << heads << "ULL+h)*" << dim
+      << "ULL;for(unsigned long long d=0ULL;d<" << dim
+      << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
+      << "(k,kb+d),score);denominator+=expf(score*" << scale
+      << "f-maximum);}dif_store_f32(lse,i,maximum+logf(denominator));}}\n"
+      << std::defaultfloat;
+}
+
+void emit_attention_backward(std::ostringstream &out,
+                             const ir::Program &program,
+                             const ir::Operation &op) {
+  const auto *q = program.tensor(op.inputs[1]);
+  const auto sequence = q->dims[0];
+  const auto heads = q->dims[1];
+  const auto dim = q->dims[2];
+  const auto count = sequence * heads * dim;
+  const auto scale = static_cast<float>(op.f64(
+      ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
+  const bool causal = op.boolean(ir::AttrKey::Causal, false);
+  const auto *scalar = typed_scalar(q->dtype);
+  const auto *load = typed_load(q->dtype);
+  const auto *store = typed_store(q->dtype);
+  // Thread i owns element (s,h,d) of ALL THREE gradients: dq for row s as a
+  // query, dk/dv for row s as a key.  P is recomputed from Q,K and the saved
+  // F32 logsumexp; delta = rowsum(dO*O) uses the forward output.  O(S) score
+  // recomputations per thread — the O(S^2) recompute path; acceptable at
+  // gate scale, cuDNN SDPA backward is the Wave-3 replacement.
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op) << "(const "
+      << scalar << "* grad_output,const " << scalar << "* q,const " << scalar
+      << "* k,const " << scalar << "* v,const " << scalar
+      << "* forward_output,const dif_f32* lse," << scalar << "* grad_q,"
+      << scalar << "* grad_k," << scalar
+      << "* grad_v){unsigned long long i=(unsigned long long)blockIdx.x*"
+         "blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << dim << "ULL,d=i%"
+      << dim << "ULL,s=row/" << heads << "ULL,h=row%" << heads
+      << "ULL,base=row*" << dim
+      << "ULL;"
+      // dq[s,h,d]: iterate keys ks<kend(s).
+         "float dq=0.0f;{unsigned long long qb=base,kend="
+      << (causal ? "s+1ULL" : std::to_string(sequence) + "ULL")
+      << ";float row_lse=dif_load_f32(lse,row);float delta=0.0f;"
+         "for(unsigned long long e=0ULL;e<"
+      << dim << "ULL;++e)delta=fmaf(" << load << "(grad_output,qb+e)," << load
+      << "(forward_output,qb+e),delta);"
+         "for(unsigned long long ks=0ULL;ks<kend;++ks){unsigned long long kb="
+         "(ks*"
+      << heads << "ULL+h)*" << dim
+      << "ULL;float score=0.0f,projected=0.0f;"
+         "for(unsigned long long e=0ULL;e<"
+      << dim << "ULL;++e){score=fmaf(" << load << "(q,qb+e)," << load
+      << "(k,kb+e),score);projected=fmaf(" << load << "(grad_output,qb+e),"
+      << load << "(v,kb+e),projected);}float probability=expf(score*" << scale
+      << "f-row_lse);dq=fmaf(probability*(projected-delta)*" << scale
+      << "f," << load << "(k,kb+d),dq);}}" << store
+      << "(grad_q,i,dq);"
+      // dk[s,h,d], dv[s,h,d]: iterate queries qs (qs>=s when causal).
+         "float dk=0.0f,dv=0.0f;{unsigned long long kb=base;"
+         "for(unsigned long long qs="
+      << (causal ? "s" : "0ULL") << ";qs<" << sequence
+      << "ULL;++qs){unsigned long long qb=(qs*" << heads << "ULL+h)*" << dim
+      << "ULL;float row_lse=dif_load_f32(lse,qs*" << heads
+      << "ULL+h);float score=0.0f,projected=0.0f,delta=0.0f;"
+         "for(unsigned long long e=0ULL;e<"
+      << dim << "ULL;++e){score=fmaf(" << load << "(q,qb+e)," << load
+      << "(k,kb+e),score);projected=fmaf(" << load << "(grad_output,qb+e),"
+      << load << "(v,kb+e),projected);delta=fmaf(" << load
+      << "(grad_output,qb+e)," << load
+      << "(forward_output,qb+e),delta);}float probability=expf(score*"
+      << scale << "f-row_lse);dk=fmaf(probability*(projected-delta)*" << scale
+      << "f," << load << "(q,qb+d),dk);dv=fmaf(probability," << load
+      << "(grad_output,qb+d),dv);}}" << store << "(grad_k,i,dk);" << store
+      << "(grad_v,i,dv);}}\n"
+      << std::defaultfloat;
+}
+
 } // namespace
 
 GeneratedCuda emit_cuda(const ir::Program &program) {
@@ -1652,6 +1759,12 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::QkNormPartialRopeBackward:
       emit_qk_norm_rope_backward(source, program, op);
+      break;
+    case ir::Opcode::AttentionLse:
+      emit_attention_lse(source, program, op);
+      break;
+    case ir::Opcode::AttentionBackward:
+      emit_attention_backward(source, program, op);
       break;
     }
     end_float_operation(source);

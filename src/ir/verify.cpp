@@ -22,7 +22,7 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::QkNormPartialRopeBackward;
+  return opcode >= Opcode::Add && opcode <= Opcode::AttentionBackward;
 }
 
 bool valid_attr_key(AttrKey key) {
@@ -956,6 +956,59 @@ void verify_operation(const Program &program, const Operation &op) {
     if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
       fail("qk_norm_partial_rope_backward block size must be a power of two "
            "in [32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::AttentionLse) {
+    // Per-(query,head) max-shifted logsumexp of the attention scores.  A
+    // cross-row reduction/accumulator, so the output is pinned F32
+    // regardless of the Q/K storage dtype (flame dtype contract).
+    expect_counts(op, 2, 1);
+    const auto &q = tensor_or_fail(program, op.inputs[0], op);
+    const auto &k = tensor_or_fail(program, op.inputs[1], op);
+    const auto &lse = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(q, k, op);
+    check_accumulator_f32(op);
+    if (!supported_float(q.dtype) || q.dims.size() != 3U)
+      fail("attention_lse requires f32, bf16, or f16 [S,H,D] inputs");
+    if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
+        lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
+      fail("attention_lse output must be F32 [S,H]");
+    if (q.dims[0] > 4096U)
+      fail("decomposed attention backward is admitted only for S<=4096");
+    return;
+  }
+
+  if (op.opcode == Opcode::AttentionBackward) {
+    // Decomposed recompute backward (flame section 2c): P is recomputed in
+    // F32 from Q,K and the saved logsumexp; delta = rowsum(dO*O) uses the
+    // forward output taken by DIRECT tensor id (flame's saved-O identity
+    // trap: a shape-found O destroyed the dO.O^T identity -> grad_norm=inf).
+    expect_counts(op, 6, 3);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &q = tensor_or_fail(program, op.inputs[1], op);
+    const auto &k = tensor_or_fail(program, op.inputs[2], op);
+    const auto &v = tensor_or_fail(program, op.inputs[3], op);
+    const auto &forward_output = tensor_or_fail(program, op.inputs[4], op);
+    const auto &lse = tensor_or_fail(program, op.inputs[5], op);
+    const auto &grad_q = tensor_or_fail(program, op.outputs[0], op);
+    const auto &grad_k = tensor_or_fail(program, op.outputs[1], op);
+    const auto &grad_v = tensor_or_fail(program, op.outputs[2], op);
+    same_shape_dtype(q, k, op);
+    same_shape_dtype(q, v, op);
+    same_shape_dtype(q, grad_output, op);
+    same_shape_dtype(q, forward_output, op);
+    same_shape_dtype(q, grad_q, op);
+    same_shape_dtype(q, grad_k, op);
+    same_shape_dtype(q, grad_v, op);
+    check_accumulator_f32(op);
+    if (!supported_float(q.dtype) || q.dims.size() != 3U)
+      fail("attention_backward requires f32, bf16, or f16 [S,H,D] tensors");
+    if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
+        lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
+      fail("attention_backward saved logsumexp must be F32 [S,H]");
+    if (q.dims[0] > 4096U)
+      fail("decomposed attention backward is admitted only for S<=4096");
     return;
   }
 

@@ -1085,6 +1085,109 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void attention_lse(const ir::Operation &op, TensorMap &tensors) {
+  const auto &q_tensor = tensors.at(op.inputs[0]);
+  const auto &k = tensors.at(op.inputs[1]);
+  auto &lse = tensors.at(op.outputs[0]);
+  const auto sequence = q_tensor.dims[0];
+  const auto heads = q_tensor.dims[1];
+  const auto dim = q_tensor.dims[2];
+  const auto scale = static_cast<float>(op.f64(
+      ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
+  const bool causal = op.boolean(ir::AttrKey::Causal, false);
+  for (std::uint64_t query = 0U; query < sequence; ++query) {
+    const auto key_end = causal ? query + 1U : sequence;
+    for (std::uint64_t head = 0U; head < heads; ++head) {
+      float maximum = -std::numeric_limits<float>::infinity();
+      std::vector<float> scores(key_end);
+      for (std::uint64_t key = 0U; key < key_end; ++key) {
+        float score = 0.0F;
+        for (std::uint64_t d = 0U; d < dim; ++d)
+          score = std::fma(
+              load_float(q_tensor, (query * heads + head) * dim + d),
+              load_float(k, (key * heads + head) * dim + d), score);
+        scores[key] = score * scale;
+        maximum = std::max(maximum, scores[key]);
+      }
+      float denominator = 0.0F;
+      for (std::uint64_t key = 0U; key < key_end; ++key)
+        denominator += std::exp(scores[key] - maximum);
+      store_float(lse, query * heads + head,
+                  maximum + std::log(denominator));
+    }
+  }
+}
+
+void attention_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &q_tensor = tensors.at(op.inputs[1]);
+  const auto &k = tensors.at(op.inputs[2]);
+  const auto &v = tensors.at(op.inputs[3]);
+  const auto &forward_output = tensors.at(op.inputs[4]);
+  const auto &lse = tensors.at(op.inputs[5]);
+  auto &grad_q = tensors.at(op.outputs[0]);
+  auto &grad_k = tensors.at(op.outputs[1]);
+  auto &grad_v = tensors.at(op.outputs[2]);
+  const auto sequence = q_tensor.dims[0];
+  const auto heads = q_tensor.dims[1];
+  const auto dim = q_tensor.dims[2];
+  const auto scale = static_cast<float>(op.f64(
+      ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
+  const bool causal = op.boolean(ir::AttrKey::Causal, false);
+  // Zero-initialize: causal masking leaves untouched grad slots for keys
+  // beyond every query.
+  for (std::uint64_t i = 0U; i < grad_q.element_count(); ++i) {
+    store_float(grad_q, i, 0.0F);
+    store_float(grad_k, i, 0.0F);
+    store_float(grad_v, i, 0.0F);
+  }
+  std::vector<float> row_gradient(sequence);
+  for (std::uint64_t head = 0U; head < heads; ++head) {
+    for (std::uint64_t query = 0U; query < sequence; ++query) {
+      const auto key_end = causal ? query + 1U : sequence;
+      const auto query_base = (query * heads + head) * dim;
+      const auto row_lse = load_float(lse, query * heads + head);
+      float delta = 0.0F;
+      for (std::uint64_t d = 0U; d < dim; ++d)
+        delta = std::fma(load_float(grad_output, query_base + d),
+                         load_float(forward_output, query_base + d), delta);
+      for (std::uint64_t key = 0U; key < key_end; ++key) {
+        const auto key_base = (key * heads + head) * dim;
+        float score = 0.0F;
+        float projected = 0.0F;
+        for (std::uint64_t d = 0U; d < dim; ++d) {
+          score = std::fma(load_float(q_tensor, query_base + d),
+                           load_float(k, key_base + d), score);
+          projected = std::fma(load_float(grad_output, query_base + d),
+                               load_float(v, key_base + d), projected);
+        }
+        const auto probability = std::exp(score * scale - row_lse);
+        const auto score_gradient =
+            probability * (projected - delta) * scale;
+        row_gradient[key] = score_gradient;
+        for (std::uint64_t d = 0U; d < dim; ++d) {
+          store_float(grad_k, key_base + d,
+                      load_float(grad_k, key_base + d) +
+                          score_gradient *
+                              load_float(q_tensor, query_base + d));
+          store_float(grad_v, key_base + d,
+                      load_float(grad_v, key_base + d) +
+                          probability *
+                              load_float(grad_output, query_base + d));
+        }
+      }
+      for (std::uint64_t d = 0U; d < dim; ++d) {
+        float accumulator = 0.0F;
+        for (std::uint64_t key = 0U; key < key_end; ++key)
+          accumulator = std::fma(row_gradient[key],
+                                 load_float(k, (key * heads + head) * dim + d),
+                                 accumulator);
+        store_float(grad_q, query_base + d, accumulator);
+      }
+    }
+  }
+}
+
 void execute_once(const ir::Program &program, TensorMap &tensors) {
   for (const auto &op : program.operations) {
     switch (op.opcode) {
@@ -1218,6 +1321,12 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::QkNormPartialRopeBackward:
       qk_norm_rope_backward(op, tensors);
+      break;
+    case ir::Opcode::AttentionLse:
+      attention_lse(op, tensors);
+      break;
+    case ir::Opcode::AttentionBackward:
+      attention_backward(op, tensors);
       break;
     }
   }

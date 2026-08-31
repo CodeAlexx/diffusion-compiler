@@ -4,6 +4,7 @@
 #include "dif/support/error.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -221,6 +222,42 @@ AutodiffResult differentiate(const ir::Program &forward,
       accumulate(shift, grad_shift);
       if (weighted)
         accumulate(operation.inputs[1], grad_weight);
+      break;
+    }
+    case ir::Opcode::Attention: {
+      const auto q = operation.inputs[0];
+      const auto k = operation.inputs[1];
+      const auto v = operation.inputs[2];
+      const auto *q_description = result.program.tensor(q);
+      const auto head_dim = q_description->dims[2];
+      const auto scale = operation.f64(
+          ir::AttrKey::AttentionScale,
+          1.0 / std::sqrt(static_cast<double>(head_dim)));
+      const auto causal = operation.boolean(ir::AttrKey::Causal, false);
+      // Saved-stats recompute path: one AttentionLse op recomputes the
+      // per-(query,head) F32 logsumexp, then AttentionBackward recomputes P
+      // from Q,K,lse and consumes the forward output BY DIRECT TENSOR ID
+      // (operation.outputs[0]) for delta = rowsum(dO*O) — flame's saved-O
+      // identity lesson.  AttentionScale and Causal are stamped explicitly
+      // so forward and backward can never resolve different defaults.
+      const auto lse = next_tensor++;
+      result.program.tensors.push_back(
+          {lse, ir::DType::F32, ir::TensorRole::Internal,
+           {q_description->dims[0], q_description->dims[1]}});
+      add_operation(ir::Opcode::AttentionLse, {q, k}, {lse},
+                    {ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
+                     ir::Attribute::boolean(ir::AttrKey::Causal, causal)});
+      const auto grad_q = add_tensor(*result.program.tensor(q));
+      const auto grad_k = add_tensor(*result.program.tensor(k));
+      const auto grad_v = add_tensor(*result.program.tensor(v));
+      add_operation(ir::Opcode::AttentionBackward,
+                    {grad_output, q, k, v, operation.outputs[0], lse},
+                    {grad_q, grad_k, grad_v},
+                    {ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
+                     ir::Attribute::boolean(ir::AttrKey::Causal, causal)});
+      accumulate(q, grad_q);
+      accumulate(k, grad_k);
+      accumulate(v, grad_v);
       break;
     }
     case ir::Opcode::QkNormPartialRope: {

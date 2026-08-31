@@ -246,6 +246,10 @@ std::string_view opcode_name(Opcode opcode) {
     return "layer_norm_backward";
   case Opcode::QkNormPartialRopeBackward:
     return "qk_norm_partial_rope_backward";
+  case Opcode::AttentionLse:
+    return "attention_lse";
+  case Opcode::AttentionBackward:
+    return "attention_backward";
   }
   return "invalid";
 }

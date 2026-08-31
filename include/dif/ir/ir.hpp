@@ -76,6 +76,8 @@ enum class Opcode : std::uint32_t {
   ResidualGateBackward = 42,
   LayerNormBackward = 43,
   QkNormPartialRopeBackward = 44,
+  AttentionLse = 45,
+  AttentionBackward = 46,
 };
 
 enum class AttrKey : std::uint32_t {

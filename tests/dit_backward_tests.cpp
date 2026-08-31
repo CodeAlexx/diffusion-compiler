@@ -338,6 +338,37 @@ GradientCase swiglu_case(dif::ir::DType dtype, bool gate_first) {
   return grad_case;
 }
 
+GradientCase attention_case(dif::ir::DType dtype, bool causal) {
+  using namespace dif::ir;
+  GradientCase grad_case;
+  grad_case.name = std::string("attention_") +
+                   (causal ? "causal_" : "full_") +
+                   std::string(dtype_name(dtype));
+  const std::uint64_t sequence = 5U;
+  const std::uint64_t heads = 2U;
+  const std::uint64_t dim = 4U;
+  grad_case.forward.tensors = {
+      {1U, dtype, TensorRole::Input, {sequence, heads, dim}},
+      {2U, dtype, TensorRole::Input, {sequence, heads, dim}},
+      {3U, dtype, TensorRole::Input, {sequence, heads, dim}},
+      {4U, dtype, TensorRole::Internal, {sequence, heads, dim}},
+  };
+  grad_case.forward.operations = {
+      {1U, Opcode::Attention, {1U, 2U, 3U}, {4U},
+       {Attribute::boolean(AttrKey::Causal, causal),
+        Attribute::u64(AttrKey::BlockSize, 32U)}},
+  };
+  grad_case.targets = {1U, 2U, 3U};
+  grad_case.bindings.emplace(
+      1U, random_tensor(dtype, {sequence, heads, dim}, 81U));
+  grad_case.bindings.emplace(
+      2U, random_tensor(dtype, {sequence, heads, dim}, 82U));
+  grad_case.bindings.emplace(
+      3U, random_tensor(dtype, {sequence, heads, dim}, 83U));
+  append_loss(grad_case, 4U, 84U);
+  return grad_case;
+}
+
 GradientCase qk_norm_rope_case(dif::ir::DType dtype, bool full_table) {
   using namespace dif::ir;
   GradientCase grad_case;
@@ -482,6 +513,8 @@ void test_group1_finite_differences() {
   finite_difference_check(layer_norm_case(dif::ir::DType::F32));
   finite_difference_check(qk_norm_rope_case(dif::ir::DType::F32, true));
   finite_difference_check(qk_norm_rope_case(dif::ir::DType::F32, false));
+  finite_difference_check(attention_case(dif::ir::DType::F32, false));
+  finite_difference_check(attention_case(dif::ir::DType::F32, true));
   finite_difference_check(composed_group1_case());
 }
 
@@ -500,6 +533,8 @@ void test_group1_backend_parity() {
   backend_cross_check(qk_norm_rope_case(dif::ir::DType::F32, true), f32_bar);
   backend_cross_check(qk_norm_rope_case(dif::ir::DType::F32, false),
                       f32_bar);
+  backend_cross_check(attention_case(dif::ir::DType::F32, false), f32_bar);
+  backend_cross_check(attention_case(dif::ir::DType::F32, true), f32_bar);
   backend_cross_check(composed_group1_case(), f32_bar);
   backend_cross_check(rms_norm_case(dif::ir::DType::BF16), bf16_bar);
   backend_cross_check(rms_norm_modulate_case(dif::ir::DType::BF16, true),
@@ -509,6 +544,8 @@ void test_group1_backend_parity() {
   backend_cross_check(layer_norm_case(dif::ir::DType::BF16), bf16_bar);
   backend_cross_check(qk_norm_rope_case(dif::ir::DType::BF16, true),
                       bf16_bar);
+  backend_cross_check(attention_case(dif::ir::DType::BF16, false), bf16_bar);
+  backend_cross_check(attention_case(dif::ir::DType::BF16, true), bf16_bar);
 }
 
 void test_group1_frozen_weight_economy() {
@@ -656,6 +693,27 @@ void test_group1_verifier_negatives() {
     expect_rejected(mismatch,
                     "qk_norm_partial_rope_backward rejects a table width "
                     "matching neither R nor R/2");
+  }
+  {
+    // AttentionBackward pins the saved logsumexp to F32 [S,H].
+    Program mismatch;
+    mismatch.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {2U, 2U, 4U}},
+        {2U, DType::BF16, TensorRole::Input, {2U, 2U, 4U}},
+        {3U, DType::BF16, TensorRole::Input, {2U, 2U, 4U}},
+        {4U, DType::BF16, TensorRole::Input, {2U, 2U, 4U}},
+        {5U, DType::BF16, TensorRole::Input, {2U, 2U, 4U}},
+        {6U, DType::BF16, TensorRole::Input, {2U, 2U}},
+        {7U, DType::BF16, TensorRole::Output, {2U, 2U, 4U}},
+        {8U, DType::BF16, TensorRole::Output, {2U, 2U, 4U}},
+        {9U, DType::BF16, TensorRole::Output, {2U, 2U, 4U}},
+    };
+    mismatch.operations = {
+        {1U, Opcode::AttentionBackward, {1U, 2U, 3U, 4U, 5U, 6U},
+         {7U, 8U, 9U}, {}},
+    };
+    expect_rejected(mismatch,
+                    "attention_backward rejects a non-F32 logsumexp");
   }
   {
     // RmsNormBackward weight-gradient shape must match the weight.
