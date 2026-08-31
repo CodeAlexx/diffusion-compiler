@@ -26,7 +26,7 @@ bool valid_opcode(Opcode opcode) {
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::TrimRight;
+  return key >= AttrKey::Epsilon && key <= AttrKey::KvHeads;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -662,11 +662,22 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &k = tensor_or_fail(program, op.inputs[1], op);
     const auto &v = tensor_or_fail(program, op.inputs[2], op);
     const auto &out = tensor_or_fail(program, op.outputs[0], op);
-    same_shape_dtype(q, k, op);
-    same_shape_dtype(q, v, op);
+    same_shape_dtype(k, v, op);
     same_shape_dtype(q, out, op);
     if (!supported_float(q.dtype) || q.dims.size() != 3)
       fail("attention semantics require f32, bf16, or f16 [S,H,D]");
+    // Grouped-query attention: k/v carry KvHeads heads (AttrKey 39); query
+    // head h reads kv head h/(H/KvHeads).  An absent attribute means
+    // KvHeads == H — bit-for-bit the historical contract, so every existing
+    // program verifies and fingerprints unchanged.
+    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[1]);
+    if (kv_heads == 0U || q.dims[1] % kv_heads != 0U)
+      fail("attention KvHeads must be nonzero and divide the query head "
+           "count");
+    if (k.dtype != q.dtype || k.dims.size() != 3U ||
+        k.dims[0] != q.dims[0] || k.dims[1] != kv_heads ||
+        k.dims[2] != q.dims[2])
+      fail("attention k/v must be [S,KvHeads,D] with the query dtype");
     const auto implementation = op.u64(AttrKey::Implementation, 1U);
     if (implementation != 1U && implementation != 2U)
       fail("attention implementation must be 1 (generated) or 2 (cuDNN)");
@@ -998,10 +1009,17 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &q = tensor_or_fail(program, op.inputs[0], op);
     const auto &k = tensor_or_fail(program, op.inputs[1], op);
     const auto &lse = tensor_or_fail(program, op.outputs[0], op);
-    same_shape_dtype(q, k, op);
     check_accumulator_f32(op);
     if (!supported_float(q.dtype) || q.dims.size() != 3U)
       fail("attention_lse requires f32, bf16, or f16 [S,H,D] inputs");
+    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[1]);
+    if (kv_heads == 0U || q.dims[1] % kv_heads != 0U)
+      fail("attention_lse KvHeads must be nonzero and divide the query head "
+           "count");
+    if (k.dtype != q.dtype || k.dims.size() != 3U ||
+        k.dims[0] != q.dims[0] || k.dims[1] != kv_heads ||
+        k.dims[2] != q.dims[2])
+      fail("attention_lse k must be [S,KvHeads,D] with the query dtype");
     if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
         lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
       fail("attention_lse output must be F32 [S,H]");
@@ -1025,16 +1043,24 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_q = tensor_or_fail(program, op.outputs[0], op);
     const auto &grad_k = tensor_or_fail(program, op.outputs[1], op);
     const auto &grad_v = tensor_or_fail(program, op.outputs[2], op);
-    same_shape_dtype(q, k, op);
-    same_shape_dtype(q, v, op);
     same_shape_dtype(q, grad_output, op);
     same_shape_dtype(q, forward_output, op);
     same_shape_dtype(q, grad_q, op);
-    same_shape_dtype(q, grad_k, op);
-    same_shape_dtype(q, grad_v, op);
+    same_shape_dtype(k, v, op);
+    same_shape_dtype(k, grad_k, op);
+    same_shape_dtype(k, grad_v, op);
     check_accumulator_f32(op);
     if (!supported_float(q.dtype) || q.dims.size() != 3U)
       fail("attention_backward requires f32, bf16, or f16 [S,H,D] tensors");
+    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[1]);
+    if (kv_heads == 0U || q.dims[1] % kv_heads != 0U)
+      fail("attention_backward KvHeads must be nonzero and divide the query "
+           "head count");
+    if (k.dtype != q.dtype || k.dims.size() != 3U ||
+        k.dims[0] != q.dims[0] || k.dims[1] != kv_heads ||
+        k.dims[2] != q.dims[2])
+      fail("attention_backward k/v must be [S,KvHeads,D] with the query "
+           "dtype");
     if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
         lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
       fail("attention_backward saved logsumexp must be F32 [S,H]");

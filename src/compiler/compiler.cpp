@@ -1185,6 +1185,15 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
   const auto sequence = shape[0];
   const auto heads = shape[1];
   const auto dim = shape[2];
+  // GQA (KvHeads attr): query head h reads kv head h/(H/KvHeads).  When
+  // KvHeads == H the emitted source is BYTE-IDENTICAL to the pre-GQA kernel
+  // (kv_head_expr collapses to "h"), so recorded programs keep their
+  // generated-source identity.
+  const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
+  const auto group = heads / kv_heads;
+  const std::string kv_head_expr =
+      group == 1U ? std::string("h")
+                  : "h/" + std::to_string(group) + "ULL";
   const auto scale = op.f64(ir::AttrKey::AttentionScale,
                             1.0 / std::sqrt(static_cast<double>(dim)));
   const auto causal = op.boolean(ir::AttrKey::Causal, false);
@@ -1200,7 +1209,8 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
       << " for(unsigned long long ks=0;ks<kend;++ks){float partial=0.0f;"
          "for(unsigned long long d=threadIdx.x;d<"
       << dim << "ULL;d+=blockDim.x)partial=fmaf(dif_load(q,(qs*" << heads << "ULL+h)*"
-      << dim << "ULL+d),dif_load(k,(ks*" << heads << "ULL+h)*" << dim
+      << dim << "ULL+d),dif_load(k,(ks*" << kv_heads << "ULL+"
+      << kv_head_expr << ")*" << dim
       << "ULL+d),partial);reduction[threadIdx.x]=partial;__syncthreads();"
          "for(unsigned int stride=blockDim.x/2;stride>0;stride>>=1){"
          "if(threadIdx.x<stride)reduction[threadIdx.x]+=reduction[threadIdx.x+stride];"
@@ -1215,7 +1225,8 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
       << " for(unsigned long long d=threadIdx.x;d<" << dim
       << "ULL;d+=blockDim.x){float acc=0.0f;for(unsigned long long ks=0;ks<kend;++ks)"
          "acc=fmaf(probabilities[ks],dif_load(v,(ks*"
-      << heads << "ULL+h)*" << dim << "ULL+d),acc);dif_store(y,(qs*" << heads
+      << kv_heads << "ULL+" << kv_head_expr << ")*" << dim
+      << "ULL+d),acc);dif_store(y,(qs*" << heads
       << "ULL+h)*" << dim << "ULL+d,acc);} }\n";
 }
 
@@ -1483,6 +1494,13 @@ void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
   const auto heads = q->dims[1];
   const auto dim = q->dims[2];
   const auto count = sequence * heads;
+  const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
+  const auto group = heads / kv_heads;
+  // Collapses to "h" when KvHeads == H, keeping the emitted source
+  // byte-identical to the pre-GQA kernel for every existing program.
+  const std::string kv_head_expr =
+      group == 1U ? std::string("h")
+                  : "h/" + std::to_string(group) + "ULL";
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
@@ -1499,14 +1517,14 @@ void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
       << ";float maximum=-3.402823466e+38f;"
          "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
          "unsigned long long kb=(ks*"
-      << heads << "ULL+h)*" << dim
+      << kv_heads << "ULL+" << kv_head_expr << ")*" << dim
       << "ULL;for(unsigned long long d=0ULL;d<" << dim
       << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
       << "(k,kb+d),score);score*=" << scale
       << "f;maximum=fmaxf(maximum,score);}float denominator=0.0f;"
          "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
          "unsigned long long kb=(ks*"
-      << heads << "ULL+h)*" << dim
+      << kv_heads << "ULL+" << kv_head_expr << ")*" << dim
       << "ULL;for(unsigned long long d=0ULL;d<" << dim
       << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
       << "(k,kb+d),score);denominator+=expf(score*" << scale
@@ -1518,9 +1536,12 @@ void emit_attention_backward(std::ostringstream &out,
                              const ir::Program &program,
                              const ir::Operation &op) {
   const auto *q = program.tensor(op.inputs[1]);
+  const auto *k_tensor = program.tensor(op.inputs[2]);
   const auto sequence = q->dims[0];
   const auto heads = q->dims[1];
   const auto dim = q->dims[2];
+  const auto kv_heads = k_tensor->dims[1];
+  const auto group = heads / kv_heads;
   const auto count = sequence * heads * dim;
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
@@ -1528,11 +1549,13 @@ void emit_attention_backward(std::ostringstream &out,
   const auto *scalar = typed_scalar(q->dtype);
   const auto *load = typed_load(q->dtype);
   const auto *store = typed_store(q->dtype);
-  // Thread i owns element (s,h,d) of ALL THREE gradients: dq for row s as a
-  // query, dk/dv for row s as a key.  P is recomputed from Q,K and the saved
-  // F32 logsumexp; delta = rowsum(dO*O) uses the forward output.  O(S) score
-  // recomputations per thread — the O(S^2) recompute path; acceptable at
-  // gate scale, cuDNN SDPA backward is the Wave-3 replacement.
+  // Thread i = (s,h,d) over the QUERY geometry computes dq[s,h,d]; the
+  // threads with h < KvHeads additionally own dk/dv[s,h,d], accumulating in
+  // F32 registers across every query AND every query head of their group
+  // (GQA grouped-KV gradient accumulation).  P is recomputed from Q,K and
+  // the saved F32 logsumexp; delta = rowsum(dO*O) uses the forward output.
+  // O(S) score recomputations per thread — the O(S^2) recompute path;
+  // acceptable at gate scale, cuDNN SDPA backward stays future work.
   out << std::scientific << std::setprecision(9)
       << "extern \"C\" __global__ void " << function_name(op) << "(const "
       << scalar << "* grad_output,const " << scalar << "* q,const " << scalar
@@ -1545,8 +1568,9 @@ void emit_attention_backward(std::ostringstream &out,
       << dim << "ULL,s=row/" << heads << "ULL,h=row%" << heads
       << "ULL,base=row*" << dim
       << "ULL;"
-      // dq[s,h,d]: iterate keys ks<kend(s).
-         "float dq=0.0f;{unsigned long long qb=base,kend="
+      // dq[s,h,d]: iterate keys ks<kend(s) against kv head h/group.
+         "float dq=0.0f;{unsigned long long qb=base,kh=h/"
+      << group << "ULL,kend="
       << (causal ? "s+1ULL" : std::to_string(sequence) + "ULL")
       << ";float row_lse=dif_load_f32(lse,row);float delta=0.0f;"
          "for(unsigned long long e=0ULL;e<"
@@ -1554,7 +1578,7 @@ void emit_attention_backward(std::ostringstream &out,
       << "(forward_output,qb+e),delta);"
          "for(unsigned long long ks=0ULL;ks<kend;++ks){unsigned long long kb="
          "(ks*"
-      << heads << "ULL+h)*" << dim
+      << kv_heads << "ULL+kh)*" << dim
       << "ULL;float score=0.0f,projected=0.0f;"
          "for(unsigned long long e=0ULL;e<"
       << dim << "ULL;++e){score=fmaf(" << load << "(q,qb+e)," << load
@@ -1563,23 +1587,30 @@ void emit_attention_backward(std::ostringstream &out,
       << "f-row_lse);dq=fmaf(probability*(projected-delta)*" << scale
       << "f," << load << "(k,kb+d),dq);}}" << store
       << "(grad_q,i,dq);"
-      // dk[s,h,d], dv[s,h,d]: iterate queries qs (qs>=s when causal).
-         "float dk=0.0f,dv=0.0f;{unsigned long long kb=base;"
-         "for(unsigned long long qs="
+      // dk/dv[s,kvh,d] for threads with h < KvHeads: iterate the group's
+      // query heads and every query (qs>=s when causal).
+         "if(h<"
+      << kv_heads << "ULL){unsigned long long kb=(s*" << kv_heads
+      << "ULL+h)*" << dim
+      << "ULL+d;float dk=0.0f,dv=0.0f;unsigned long long kvb=(s*" << kv_heads
+      << "ULL+h)*" << dim
+      << "ULL;for(unsigned long long g=0ULL;g<" << group
+      << "ULL;++g){unsigned long long qh=h*" << group
+      << "ULL+g;for(unsigned long long qs="
       << (causal ? "s" : "0ULL") << ";qs<" << sequence
-      << "ULL;++qs){unsigned long long qb=(qs*" << heads << "ULL+h)*" << dim
+      << "ULL;++qs){unsigned long long qb=(qs*" << heads << "ULL+qh)*" << dim
       << "ULL;float row_lse=dif_load_f32(lse,qs*" << heads
-      << "ULL+h);float score=0.0f,projected=0.0f,delta=0.0f;"
+      << "ULL+qh);float score=0.0f,projected=0.0f,delta=0.0f;"
          "for(unsigned long long e=0ULL;e<"
       << dim << "ULL;++e){score=fmaf(" << load << "(q,qb+e)," << load
-      << "(k,kb+e),score);projected=fmaf(" << load << "(grad_output,qb+e),"
-      << load << "(v,kb+e),projected);delta=fmaf(" << load
+      << "(k,kvb+e),score);projected=fmaf(" << load << "(grad_output,qb+e),"
+      << load << "(v,kvb+e),projected);delta=fmaf(" << load
       << "(grad_output,qb+e)," << load
       << "(forward_output,qb+e),delta);}float probability=expf(score*"
       << scale << "f-row_lse);dk=fmaf(probability*(projected-delta)*" << scale
       << "f," << load << "(q,qb+d),dk);dv=fmaf(probability," << load
-      << "(grad_output,qb+d),dv);}}" << store << "(grad_k,i,dk);" << store
-      << "(grad_v,i,dv);}}\n"
+      << "(grad_output,qb+d),dv);}}" << store << "(grad_k,kb,dk);" << store
+      << "(grad_v,kb,dv);}}}\n"
       << std::defaultfloat;
 }
 

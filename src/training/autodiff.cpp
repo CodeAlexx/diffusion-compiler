@@ -234,6 +234,14 @@ AutodiffResult differentiate(const ir::Program &forward,
           ir::AttrKey::AttentionScale,
           1.0 / std::sqrt(static_cast<double>(head_dim)));
       const auto causal = operation.boolean(ir::AttrKey::Causal, false);
+      // GQA: mirror the forward op's KvHeads onto the backward chain so
+      // forward and backward can never resolve different groupings.  The
+      // attribute is attached ONLY when the forward op carries it: a
+      // KvHeads-absent program must differentiate to byte-identical IR
+      // (fingerprint stability for every pre-GQA program).
+      const bool grouped = operation.find(ir::AttrKey::KvHeads) != nullptr;
+      const auto kv_heads = operation.u64(ir::AttrKey::KvHeads,
+                                          q_description->dims[1]);
       // Saved-stats recompute path: one AttentionLse op recomputes the
       // per-(query,head) F32 logsumexp, then AttentionBackward recomputes P
       // from Q,K,lse and consumes the forward output BY DIRECT TENSOR ID
@@ -244,17 +252,22 @@ AutodiffResult differentiate(const ir::Program &forward,
       result.program.tensors.push_back(
           {lse, ir::DType::F32, ir::TensorRole::Internal,
            {q_description->dims[0], q_description->dims[1]}});
+      std::vector<ir::Attribute> lse_attributes{
+          ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
+          ir::Attribute::boolean(ir::AttrKey::Causal, causal)};
+      if (grouped)
+        lse_attributes.push_back(
+            ir::Attribute::u64(ir::AttrKey::KvHeads, kv_heads));
       add_operation(ir::Opcode::AttentionLse, {q, k}, {lse},
-                    {ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
-                     ir::Attribute::boolean(ir::AttrKey::Causal, causal)});
+                    lse_attributes);
       const auto grad_q = add_tensor(*result.program.tensor(q));
       const auto grad_k = add_tensor(*result.program.tensor(k));
       const auto grad_v = add_tensor(*result.program.tensor(v));
+      auto backward_attributes = lse_attributes;
       add_operation(ir::Opcode::AttentionBackward,
                     {grad_output, q, k, v, operation.outputs[0], lse},
                     {grad_q, grad_k, grad_v},
-                    {ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
-                     ir::Attribute::boolean(ir::AttrKey::Causal, causal)});
+                    std::move(backward_attributes));
       accumulate(q, grad_q);
       accumulate(k, grad_k);
       accumulate(v, grad_v);
