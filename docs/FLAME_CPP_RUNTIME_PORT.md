@@ -165,6 +165,17 @@ Torch remains only in oracles (/home/alex/diffusion-fixtures) and
 evaluation tooling (whisper, media metrics) — allowed as development
 oracles by policy.
 
+**Link-level proof (ldd sweep, 2026-08-31, integration build):** every
+generation/training-path binary (difh3infer, difvaedecode, difh3media,
+difrun, diftrain, difdittrain, diftokenize, difmodcache, difh3noise,
+difimport) links only CUDA (cuda/cudart/cublas/cublasLt/nvrtc), cuDNN 9,
+and glibc/libstdc++ — zero libtorch, zero libpython. The single subprocess
+in the tree is difh3media's declared ffmpeg exec. Remaining hygiene item:
+cuDNN currently RESOLVES FROM a pip site-packages path
+(~/.local/.../nvidia/cudnn/lib) — same library, wrong provenance for the
+final claim; pin to a system/vendored path and revalidate byte-identity
+before the final handoff.
+
 ## 6. Open threads that must not be lost (from the open-threads audit)
 
 - **Block-1 BF16 divergence vs Serenity** (final video-latent cosine
