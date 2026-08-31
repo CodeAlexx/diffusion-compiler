@@ -3132,20 +3132,26 @@ private:
 
 class StreamedPrefetcher {
 public:
+  // resident_overrides: streamed constants the caller promoted to dedicated
+  // resident storage (uploaded and fenced at preparation) because a fused
+  // plan reads them at an earlier operation than their semantic consumer.
+  // The prefetcher must not stage, wait on, or track them.
   StreamedPrefetcher(const ir::Program &program, const TensorMap &constants,
                      const compiler::MemoryPlan &plan, DeviceBuffers &buffers,
                      Context &context, std::uint32_t staging_buffers,
                      std::uint32_t stage_threads,
-                     std::uint64_t pinned_budget_bytes)
+                     std::uint64_t pinned_budget_bytes,
+                     std::unordered_set<std::uint32_t> resident_overrides)
       : program_(program), constants_(constants), plan_(plan), buffers_(buffers),
-        context_(context), staging_pool_(stage_threads) {
+        context_(context), staging_pool_(stage_threads),
+        resident_overrides_(std::move(resident_overrides)) {
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
       for (const auto id : op.inputs) {
         const auto *desc = program_.tensor(id);
         if (!desc || !desc->has_role(ir::TensorRole::Streamed) ||
-            !buffers_.contains(id))
+            !buffers_.contains(id) || resident_overrides_.contains(id))
           continue;
         if (bytes > std::numeric_limits<std::uint64_t>::max() -
                         desc->byte_count())
@@ -3186,7 +3192,7 @@ public:
       for (const auto id : program_.operations[index].inputs) {
         const auto *desc = program_.tensor(id);
         if (desc && desc->has_role(ir::TensorRole::Streamed) &&
-            buffers_.contains(id))
+            buffers_.contains(id) && !resident_overrides_.contains(id))
           first_consumer_.try_emplace(id, index);
       }
     }
@@ -3253,6 +3259,7 @@ public:
       has_streamed = has_streamed ||
                      (desc && desc->has_role(ir::TensorRole::Streamed) &&
                       buffers_.contains(id) &&
+                      !resident_overrides_.contains(id) &&
                       (force || first_consumer_.at(id) == operation_index));
     }
     if (!has_streamed)
@@ -3270,7 +3277,7 @@ public:
     for (const auto id : op.inputs) {
       const auto *desc = program_.tensor(id);
       if (!desc || !desc->has_role(ir::TensorRole::Streamed) ||
-          !buffers_.contains(id))
+          !buffers_.contains(id) || resident_overrides_.contains(id))
         continue;
       if (!force && first_consumer_.at(id) != operation_index)
         continue;
@@ -3286,7 +3293,7 @@ public:
     for (const auto id : op.inputs) {
       const auto *desc = program_.tensor(id);
       if (!desc || !desc->has_role(ir::TensorRole::Streamed) ||
-          !buffers_.contains(id))
+          !buffers_.contains(id) || resident_overrides_.contains(id))
         continue;
       if (!force && first_consumer_.at(id) != operation_index)
         continue;
@@ -3372,6 +3379,7 @@ private:
   DeviceBuffers &buffers_;
   Context &context_;
   StagingPool staging_pool_;
+  std::unordered_set<std::uint32_t> resident_overrides_;
   std::vector<std::unique_ptr<PinnedHostWorkspace>> staging_;
   std::vector<std::unique_ptr<Event>> copy_done_;
   std::vector<bool> copy_recorded_;
@@ -3634,6 +3642,48 @@ public:
       replaced_constant_tensors.insert(plan.replaced_constant_tensors.begin(),
                                        plan.replaced_constant_tensors.end());
     }
+    // Root cause of the W8A8+streamed nondeterminism: a fused W8A8 plan
+    // launches its kernels at an earlier operation than the semantic ops
+    // it skips, but the streamed prefetcher's readiness wait for a
+    // streamed constant is issued at the SKIPPED consumer's index - so a
+    // streamed constant consumed only by a skipped op (the ResidualGate's
+    // gate/residual inputs, or the QKV chain's attention input) is read
+    // by an already-queued kernel with no ordering edge against its
+    // copy-stream upload. Promote every such constant to dedicated
+    // resident storage uploaded (and fenced) at preparation. Programs
+    // without such constants (all production H3 graphs: gates/residuals
+    // are activations) are byte-for-byte unaffected.
+    auto promote_streamed_constant = [&](std::uint32_t id) {
+      const auto *description = program_.tensor(id);
+      if (!description ||
+          !description->has_role(ir::TensorRole::Constant) ||
+          !description->has_role(ir::TensorRole::Streamed))
+        return;
+      if (std::find(promoted_streamed_constants_.begin(),
+                    promoted_streamed_constants_.end(),
+                    id) != promoted_streamed_constants_.end())
+        return;
+      promoted_streamed_constants_.push_back(id);
+      const auto bytes = align_256(description->byte_count());
+      if (promoted_constant_bytes_ >
+          std::numeric_limits<std::uint64_t>::max() - bytes)
+        fail("promoted streamed-constant storage overflow");
+      promoted_constant_bytes_ += bytes;
+    };
+    for (const auto &plan : h3_w8a8_mlp_plans_) {
+      promote_streamed_constant(plan.residual_tensor);
+      promote_streamed_constant(plan.gate_tensor);
+    }
+    for (const auto &plan : h3_w8a8_attention_plans_) {
+      if (plan.has_qkv_projection)
+        promote_streamed_constant(plan.attention_input_tensor);
+      if (plan.has_output_projection) {
+        promote_streamed_constant(plan.residual_tensor);
+        promote_streamed_constant(plan.gate_tensor);
+      }
+    }
+    for (const auto id : promoted_streamed_constants_)
+      replaced_constant_tensors.insert(id);
     constexpr std::size_t linear_workspace_bytes = 64U * 1024U * 1024U;
     const bool contains_linear = std::any_of(
         program_.operations.begin(), program_.operations.end(),
@@ -3790,8 +3840,11 @@ public:
     if (base_with_weights >
         std::numeric_limits<std::uint64_t>::max() - h3_modulation_bytes)
       fail("DiffIR allocation plus H3 modulation storage overflow");
+    if (base_with_weights + h3_modulation_bytes >
+        std::numeric_limits<std::uint64_t>::max() - promoted_constant_bytes_)
+      fail("DiffIR allocation plus promoted constant storage overflow");
     const auto required =
-        base_with_weights + h3_modulation_bytes;
+        base_with_weights + h3_modulation_bytes + promoted_constant_bytes_;
     if (options.profile_pipeline) {
       std::cerr << "CUDA_MEMORY_PLAN tensor_bytes=" << tensor_bytes
                 << " linear_workspace_bytes=" << workspace_bytes_
@@ -3806,6 +3859,8 @@ public:
                 << h3_w8a8_tail_stage_half_bytes_
                 << " h3_groupwise_bytes=" << h3_groupwise_bytes
                 << " h3_modulation_bytes=" << h3_modulation_bytes
+                << " promoted_streamed_constant_bytes="
+                << promoted_constant_bytes_
                 << " required_bytes=" << required
                 << " free_before_bytes=" << free_before
                 << " minimum_free_bytes=" << options.minimum_free_bytes
@@ -3900,6 +3955,18 @@ public:
         static_cast<std::size_t>(h3_modulation_bytes));
     assign_h3_modulation_storage(h3_modulation_cache_plans_,
                                  h3_modulation_storage_->pointer(), buffers_);
+    promoted_constant_storage_ = std::make_unique<Workspace>(
+        static_cast<std::size_t>(promoted_constant_bytes_));
+    {
+      auto promoted_offset = std::uint64_t{0U};
+      for (const auto id : promoted_streamed_constants_) {
+        buffers_.bind_external(
+            id, promoted_constant_storage_->pointer() + promoted_offset);
+        promoted_offset += align_256(constants_.at(id).byte_size());
+      }
+      if (promoted_offset != promoted_constant_bytes_)
+        fail("promoted streamed-constant storage layout mismatch");
+    }
     if (h3_ck_attention_plan_)
       h3_ck_attention_plan_->allocate();
     for (auto &plan : h3_w8a8_mlp_plans_) {
@@ -3927,7 +3994,10 @@ public:
     streamed_prefetcher_ = std::make_unique<StreamedPrefetcher>(
         program_, constants_, memory_plan_, buffers_, context_,
         options.streamed_staging_buffers, options.streamed_stage_threads,
-        options.streamed_pinned_budget_bytes);
+        options.streamed_pinned_budget_bytes,
+        std::unordered_set<std::uint32_t>(
+            promoted_streamed_constants_.begin(),
+            promoted_streamed_constants_.end()));
     if (options.pinned_io_staging) {
       auto input_bytes = std::uint64_t{0U};
       auto output_bytes = std::uint64_t{0U};
@@ -4005,6 +4075,8 @@ public:
     for (const auto &plan : h3_groupwise_plans_)
       resident_weight_bytes_ += plan.weight_storage_bytes;
     resident_weight_bytes_ += h3_modulation_bytes;
+    for (const auto id : promoted_streamed_constants_)
+      resident_weight_bytes_ += program_.tensor(id)->byte_count();
     std::unordered_set<std::uint32_t> selected_linear_operations;
     for (const auto &choice : options.linear_algorithm_choices) {
       if (!selected_linear_operations.insert(choice.operation_id).second)
@@ -4069,6 +4141,12 @@ public:
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
+    for (const auto id : promoted_streamed_constants_) {
+      const auto &tensor = constants_.at(id);
+      check(counted_memcpy_htod(buffers_.at(id), tensor.data(),
+                                tensor.byte_size(), context_.stream()),
+            "cuMemcpyHtoDAsync promoted streamed constant");
+    }
     check(counted_stream_synchronize(context_.stream()),
           "resident constant upload synchronization");
     if (resident_weight_bytes_ != 0U) {
@@ -4115,6 +4193,8 @@ public:
           !description.has_role(ir::TensorRole::Streamed))
         constants_.at(description.id).discard_mapped_pages();
     }
+    for (const auto id : promoted_streamed_constants_)
+      constants_.at(id).discard_mapped_pages();
     for (auto &plan : h3_w8a8_mlp_plans_) {
       plan.fc1_weight.discard_mapped_pages();
       plan.fc1_scale.discard_mapped_pages();
@@ -4830,6 +4910,9 @@ private:
   std::uint64_t resident_weight_bytes_{};
   std::uint64_t free_bytes_before_{};
   std::uint32_t streamed_prefetch_depth_{1};
+  std::vector<std::uint32_t> promoted_streamed_constants_;
+  std::unique_ptr<Workspace> promoted_constant_storage_;
+  std::uint64_t promoted_constant_bytes_{};
   LaunchTelemetry preparation_telemetry_;
   double preparation_milliseconds_{};
   double resident_upload_milliseconds_{};
