@@ -76,7 +76,8 @@ void usage() {
                " [--h3-modulation-steps N]"
                " [--h3-modulation-total-layers N]"
                " [--h3-ck-attention-dso FILE.so]"
-               " [--profile-pipeline] [--serial-streaming] [--map-inputs]\n";
+               " [--profile-pipeline] [--serial-streaming] [--map-inputs]"
+               " [--streamed-keep-pages]\n";
   std::cerr << "input PATH may be FILE.diftensor or SHARD.safetensors::TENSOR_NAME\n";
 }
 
@@ -175,6 +176,8 @@ int main(int argc, char **argv) {
         options.h3_ck_attention_dso = argv[++i];
       else if (option == "--trace-ops")
         options.trace_operations = true;
+      else if (option == "--streamed-keep-pages")
+        options.streamed_release_mapped_pages_per_copy = false;
       else if (option == "--profile-pipeline")
         options.profile_pipeline = true;
       else if (option == "--serial-streaming")

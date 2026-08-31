@@ -3200,7 +3200,8 @@ public:
               "cuMemcpyHtoDAsync prefetched constant");
       }
       offset += tensor.byte_size();
-      tensor.discard_mapped_pages();
+      if (release_mapped_pages_per_copy_)
+        tensor.discard_mapped_pages();
     }
     check(counted_event_record(ready_events_.at(operation_index)->get(),
                         context_.copy_stream()),
@@ -3209,6 +3210,20 @@ public:
           "cuEventRecord streamed staging copy");
     copy_recorded_[parity] = true;
     return true;
+  }
+
+  void set_release_mapped_pages_per_copy(bool release_per_copy) {
+    release_mapped_pages_per_copy_ = release_per_copy;
+  }
+
+  // Run-end page drop for the release-at-end policy: return every mapped
+  // streamed constant's pages to the kernel once, instead of after each
+  // staging copy inside the run.
+  void release_mapped_pages() const {
+    for (const auto &[id, first] : first_consumer_) {
+      (void)first;
+      constants_.at(id).discard_mapped_pages();
+    }
   }
 
   void wait(std::size_t operation_index, bool ready) {
@@ -3245,6 +3260,7 @@ private:
   std::vector<bool> completion_recorded_;
   std::unordered_map<std::uint32_t, std::size_t> first_consumer_;
   std::unordered_map<std::uint32_t, std::size_t> overwrite_wait_operation_;
+  bool release_mapped_pages_per_copy_{true};
   bool profiling_{};
   std::uint64_t streamed_bytes_{};
   double host_stage_milliseconds_{};
@@ -3973,6 +3989,8 @@ public:
       fail("run iterations must be nonzero");
     LaunchTelemetry run_telemetry;
     TelemetryScope telemetry_scope(run_telemetry);
+    streamed_prefetcher_->set_release_mapped_pages_per_copy(
+        options.streamed_release_mapped_pages_per_copy);
     TensorMap bindings = constants_;
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Input))
@@ -4450,6 +4468,8 @@ public:
     std::size_t total = 0;
     check(cuMemGetInfo(&free_after, &total), "cuMemGetInfo after");
     result.free_bytes_after = free_after;
+    if (!options.streamed_release_mapped_pages_per_copy)
+      streamed_prefetcher_->release_mapped_pages();
     result.preparation_telemetry = preparation_telemetry_;
     result.run_telemetry = run_telemetry;
     if (options.profile_pipeline) {

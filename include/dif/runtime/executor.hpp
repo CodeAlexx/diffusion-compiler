@@ -78,6 +78,14 @@ struct RunOptions {
   bool trace_operations{false};
   bool overlap_streaming{true};
   bool profile_pipeline{false};
+  // W1-R streamed-transport policy. Default preserves the historical
+  // behavior exactly: mapped streamed constants madvise(MADV_DONTNEED)
+  // their source pages after every staging copy, which forces a refault
+  // on every warmup and iteration. When false, pages are kept across the
+  // passes of one run and dropped once at run end instead. Outputs are
+  // byte-identical either way; only host paging behavior changes. Any
+  // non-default choice must enter difopt candidate identity.
+  bool streamed_release_mapped_pages_per_copy{true};
 };
 
 struct OperationTiming {
