@@ -51,13 +51,12 @@ work without reverse-engineering the swarm. Date: 2026-08-31.
 
 ## Open work, in priority order (details in port doc §7)
 
-1. Wave-3 lanes in flight at this writing: BigVGAN chunks 6-7 (CUDA
-   emitters + difaudiodecode + artifact gate; branch w3-audio), GQA KvHeads
-   (branch w3-gqa; gates the conditioner), cuBLASLt epilogue absorption +
-   heuristic persistence (branch w3-epilogue).
-2. Qwen3-VL conditioner build — the XL long pole; complete plan with
-   op-by-op mapping + gate design in QWEN3VL_CONDITIONER_PLAN.md; only IR
-   dependency is GQA.
+1. **Qwen3-VL conditioner build — the ONLY remaining Mojo dependency in the
+   generation path, and the last XL item.** Complete plan with op-by-op
+   mapping, streaming strategy and gate design in
+   QWEN3VL_CONDITIONER_PLAN.md. Its one IR dependency (GQA) is DONE and
+   merged, so the build is unblocked: execute that plan's chunks. The
+   native tokenizer already produces its input contract.
 3. Matched-conditions H3-scale measurement of the Wave-1 staging wins
    (keep-pages/threads) — expected to grow on the 61.7 GiB >RAM case.
 4. cuDNN SDPA backward (decomposed AttentionBackward + fixtures are the
@@ -72,11 +71,24 @@ work without reverse-engineering the swarm. Date: 2026-08-31.
    --h3-modulation-total-layers; next experiments recorded in
    H3_NATURAL_LANGUAGE_QUALITY_GATE and the port doc §6).
 
-## Before pushing the branch
+## Build configuration (important)
 
-1. Vendor cuDNN to a non-pip path (currently resolves from
-   ~/.local/.../site-packages/nvidia/cudnn/lib — same lib, wrong provenance)
-   and re-prove M1 byte-identity on the rebuilt binary.
-2. Re-check the repo's public-commit policy for docs/artifacts (the
-   DEV-handoff-era policy predates this branch tracking docs/).
-3. Final full ctest + record the final SHA in this doc and the port doc.
+cuDNN is vendored at `/home/alex/dif-vendor/cudnn` (NVIDIA's own
+redistributable, copied out of the pip wheel tree so that no runtime
+library resolves from a Python site-packages path). Configure with:
+
+    cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release \
+          -DDIF_CUDNN_ROOT=/home/alex/dif-vendor/cudnn
+
+The directory is outside the repo and is not committed (1 GB of vendor
+binaries); re-create it by copying `nvidia/cudnn/{lib,include}` from any
+NVIDIA cuDNN 9 distribution.
+
+## Pre-push checklist (state at handoff)
+
+1. cuDNN vendored off the Python path — DONE; M1 byte-identity re-proved on
+   the rebuilt binary (see port doc §M1).
+2. Public-remote hygiene — checked: the branch adds no artifacts, logs, or
+   weight files, and a secrets/PII scan of the full diff is clean.
+3. Final full ctest (11 suites) and the final SHA are recorded in the port
+   doc and below.
