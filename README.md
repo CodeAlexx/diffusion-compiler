@@ -106,6 +106,7 @@ the runtime does not silently substitute a different attention algorithm.
 | `difschedule` | Construct authenticated rectified-flow sigma schedules |
 | `difh3layout` | Construct H3 conditioning and row-timestep layouts |
 | `difh3infer` | Run joined H3 denoising, scheduling, VAE decode, and validation |
+| `difh3media` | Validate decoded H3 video and produce the RGB24 H.264/AAC handoff |
 | `difvaedecode` | Run tiled and temporally assembled video VAE decoding |
 | `difimage` | Validate decoded video tensors and export viewable frames |
 | `diftrain` | Run or resume compiled training graphs |
@@ -150,6 +151,11 @@ requirements. The completed real-checkpoint block result, CUDA search, profile,
 and 1/3/5 recurrence gate are in
 [`docs/PHASE2_H3_BLOCK_RESULT_2026-08-29.md`](docs/PHASE2_H3_BLOCK_RESULT_2026-08-29.md).
 
+The completed production-geometry H3 inference path, its exact/approximate
+classification, bounded 24 GiB execution policy, full timing breakdown, and
+matched Serenity comparisons are recorded in
+[`docs/PHASE3_H3_COMPLETE_INFERENCE_2026-08-30.md`](docs/PHASE3_H3_COMPLETE_INFERENCE_2026-08-30.md).
+
 ### Pipeline profiling
 
 `difrun --profile-pipeline` instruments the actual timed CUDA execution. It
@@ -184,8 +190,10 @@ repository.
 
 ## Current limitations
 
-- The included H3 integration uses precomputed conditioning embeddings; it is
-  not a native prompt encoder or production-resolution generation product.
+- The included H3 integration uses precomputed conditioning embeddings rather
+  than a native prompt encoder. The transformer, scheduler, latent handoff,
+  production-resolution video decode, audio bridge, and final media handoff are
+  complete at the tensor boundary documented in the Phase 3 report.
 - Full model checkpoints are supplied separately by the operator and are never
   embedded in DiffIR or this repository.
 - Low-bit H3 candidates remain experimental and require output-level admission.

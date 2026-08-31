@@ -218,6 +218,12 @@ const SafeTensorEntry *SafeTensorFile::find(std::string_view name) const {
   return found == tensors.end() ? nullptr : &found->second;
 }
 
+const SafeTensorMetadataEntry *
+SafeTensorFile::find_metadata(std::string_view name) const {
+  const auto found = metadata_tensors.find(name);
+  return found == metadata_tensors.end() ? nullptr : &found->second;
+}
+
 SafeTensorFile read_safetensors(const std::filesystem::path &path) {
   SafeTensorFile output;
   output.path = path;
@@ -287,7 +293,11 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
     if (parsed_dtype) {
       entry.dtype = *parsed_dtype;
       output.tensors.emplace(name, std::move(entry));
-    } else if (!name.starts_with("__meta__.")) {
+    } else if (name.starts_with("__meta__.")) {
+      output.metadata_tensors.emplace(
+          name, SafeTensorMetadataEntry{name, dtype_name, entry.dims,
+                                        entry.file_offset, entry.byte_count});
+    } else {
       fail("unsupported non-metadata SafeTensors dtype " + dtype_name +
            " for tensor " + name);
     }
@@ -331,6 +341,28 @@ runtime::Tensor map_safetensor(const SafeTensorFile &file,
     fail("SafeTensors tensor is missing: " + std::string(name));
   return runtime::map_tensor_slice(file.path, entry->dtype, entry->dims,
                                    entry->file_offset, entry->byte_count);
+}
+
+std::vector<std::uint8_t>
+read_safetensor_metadata(const SafeTensorFile &file, std::string_view name) {
+  const auto *entry = file.find_metadata(name);
+  if (!entry)
+    fail("SafeTensors metadata tensor is missing: " + std::string(name));
+  if (entry->byte_count > std::numeric_limits<std::size_t>::max())
+    fail("SafeTensors metadata tensor exceeds host size range");
+  std::vector<std::uint8_t> bytes(
+      static_cast<std::size_t>(entry->byte_count));
+  std::ifstream input(file.path, std::ios::binary);
+  if (!input)
+    fail("cannot open SafeTensors metadata source: " + file.path.string());
+  input.seekg(static_cast<std::streamoff>(entry->file_offset));
+  if (!input)
+    fail("cannot seek SafeTensors metadata source");
+  input.read(reinterpret_cast<char *>(bytes.data()),
+             static_cast<std::streamsize>(bytes.size()));
+  if (!input)
+    fail("cannot read SafeTensors metadata tensor: " + std::string(name));
+  return bytes;
 }
 
 } // namespace dif::weights

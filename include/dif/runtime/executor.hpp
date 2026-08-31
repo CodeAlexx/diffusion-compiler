@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -42,6 +43,10 @@ struct RunOptions {
   // only an exclusive Linear->SwiGlu->Linear->ResidualGate MLP chain.
   std::filesystem::path h3_w8a8_cache;
   std::uint32_t h3_w8a8_layer{};
+  // Keep a strict W8A8 block prefix resident and refill one reusable block
+  // store for the tail, matching Serenity's production low-memory policy.
+  std::uint32_t h3_w8a8_resident_layers{
+      std::numeric_limits<std::uint32_t>::max()};
   // Accepted MiniMax-H3 groupwise INT8 weight-only route. The Serenity cache
   // stores transformed I8 projection weights with compact F16 group scales;
   // the backend dequantizes each projection into shared BF16 scratch below
@@ -54,7 +59,10 @@ struct RunOptions {
   // byte on every prepared run.
   std::filesystem::path h3_modulation_cache;
   std::filesystem::path h3_modulation_input;
+  std::filesystem::path h3_modulation_source_index;
   std::uint32_t h3_modulation_layer{};
+  std::uint32_t h3_modulation_steps{};
+  std::uint32_t h3_modulation_slice{};
   // Accepted architecture-tagged Comfy Kitchen H3 attention route. This is an
   // explicit approximate backend under the semantic Attention operation; an
   // empty path retains the exact DiffIR-selected implementation.
@@ -143,6 +151,7 @@ struct H3W8A8MlpResult {
   std::string classification;
   std::string implementation;
   std::string cache_path;
+  bool resident{};
 };
 
 struct H3W8A8AttentionResult {
@@ -158,6 +167,7 @@ struct H3W8A8AttentionResult {
   std::string classification;
   std::string implementation;
   std::string cache_path;
+  bool resident{};
 };
 
 struct H3CKAttentionResult {

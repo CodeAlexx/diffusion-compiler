@@ -6,6 +6,8 @@
 #include "dif/compiler/memory_plan.hpp"
 #include "dif/frontend/h3.hpp"
 #include "dif/frontend/h3_conditioning.hpp"
+#include "dif/frontend/h3_latents.hpp"
+#include "dif/frontend/h3_media.hpp"
 #include "dif/frontend/h3_vae.hpp"
 #include "dif/frontend/training.hpp"
 #include "dif/runtime/executor.hpp"
@@ -503,6 +505,44 @@ void test_backend_neutral_flow_scheduler() {
                  {0x00000000U, 0x3dccccd0U, 0x3e800000U, 0x3f000000U}),
          "shifted schedules are byte-exact to the pinned H3 source fixture");
 
+  auto trajectory = floats_from_bits(
+      {0x00000000U, 0x3de3166fU, 0x3e61aff2U, 0x3ea78611U,
+       0x3edc233eU, 0x3f0704b2U, 0x3f1e4d7cU, 0x3f33a279U});
+  const std::array<std::vector<float>, 4> velocities = {
+      floats_from_bits({0x3e000000U, 0x3dfd6467U, 0x3df59f35U,
+                        0x3de8d8f2U, 0x3dd7543eU, 0x3dc16c78U,
+                        0x3da793dfU, 0x3d8a5141U}),
+      floats_from_bits({0x3e780aa5U, 0x3e6c7f68U, 0x3e5c22afU,
+                        0x3e4749d2U, 0x3e2e618dU, 0x3e11ebc6U,
+                        0x3de4f9dcU, 0x3da171efU}),
+      floats_from_bits({0x3ea87ef0U, 0x3e99ac95U, 0x3e87b8baU,
+                        0x3e6601fcU, 0x3e37e2e6U, 0x3e0604b9U,
+                        0x3da2d71eU, 0x3cd94dffU}),
+      floats_from_bits({0x3ebb4ff6U, 0x3ea08f7aU, 0x3e828992U,
+                        0x3e43b5a7U, 0x3dfcb6dfU, 0x3d59b8b4U,
+                        0xbc94d7c8U, 0xbdb68622U})};
+  const std::array<std::vector<float>, 4> expected_steps = {
+      floats_from_bits({0x3b5d67c0U, 0x3de9efa2U, 0x3e6501aaU,
+                        0x3ea918d4U, 0x3edd97b4U, 0x3f07abfbU,
+                        0x3f1ede6bU, 0x3f341a1aU}),
+      floats_from_bits({0x3c7d5f3dU, 0x3e00c4b2U, 0x3e6ffd8aU,
+                        0x3eae119fU, 0x3ee1f16cU, 0x3f097df4U,
+                        0x3f204c04U, 0x3f351be1U}),
+      floats_from_bits({0x3d653f22U, 0x3e269888U, 0x3e88b30bU,
+                        0x3ebc3920U, 0x3eed4257U, 0x3f0d9d9bU,
+                        0x3f22cd5bU, 0x3f35f1d7U}),
+      floats_from_bits({0x3eb28176U, 0x3ed3bf0cU, 0x3ef1211aU,
+                        0x3f0540e5U, 0x3f0fe6a8U, 0x3f188071U,
+                        0x3f1f14c3U, 0x3f23b13aU})};
+  for (std::size_t step = 0U; step < velocities.size(); ++step) {
+    dif::sampling::h3_euler_step_in_place(
+        trajectory, velocities[step], 4U, 0U,
+        video_schedule.timesteps[step], video_schedule.sigmas[step],
+        video_schedule.sigmas[step + 1U]);
+    expect(trajectory == expected_steps[step],
+           "host H3 Euler trajectory is byte-exact to pinned source");
+  }
+
   Program program;
   program.tensors = {
       {1, DType::F32, TensorRole::Input, {2, 4}},
@@ -594,6 +634,74 @@ void test_backend_neutral_flow_scheduler() {
   std::cout << "GATE flow_scheduler backend=" << candidate.backend_name
             << " device=" << candidate.device_name
             << " max_abs=" << maximum_absolute_error << "\n";
+}
+
+void test_h3_latent_handoff() {
+  std::vector<float> video_values(2U * 96U, -1.0F);
+  for (std::size_t index = 0U; index < 96U; ++index)
+    video_values[96U + index] = static_cast<float>(index);
+  const auto video_rows = f32_tensor({2U, 96U}, video_values);
+  const auto video = dif::frontend::unpack_h3_video_rows(
+      video_rows, 1U, 1U, 2U, 2U);
+  expect(video.dims == std::vector<std::uint64_t>({1U, 24U, 1U, 2U, 2U}) &&
+             std::equal(video.f32().begin(), video.f32().end(),
+                        video_values.begin() + 96),
+         "H3 video row handoff preserves channel-slowest source order");
+
+  std::vector<float> audio_values(4U * 32U);
+  for (std::size_t row = 0U; row < 4U; ++row) {
+    for (std::size_t channel = 0U; channel < 32U; ++channel)
+      audio_values[row * 32U + channel] =
+          static_cast<float>(row * 100U + channel);
+  }
+  const auto audio_rows = f32_tensor({4U, 32U}, audio_values);
+  const auto audio =
+      dif::frontend::unpack_h3_audio_rows(audio_rows, 0U, 2U, false);
+  expect(audio.dims == std::vector<std::uint64_t>({2U, 32U, 2U}) &&
+             audio.f32()[0] == 0.0F && audio.f32()[1] == 100.0F &&
+             audio.f32()[2] == 1.0F && audio.f32()[63] == 131.0F &&
+             audio.f32()[64] == 200.0F && audio.f32()[127] == 331.0F,
+         "H3 audio row handoff preserves stereo-major source order");
+  const auto denormalized =
+      dif::frontend::unpack_h3_audio_rows(audio_rows, 0U, 2U, true);
+  expect(denormalized.f32()[0] == -0.020211687488382354F &&
+             denormalized.f32()[1] ==
+                 100.0F * 1.6895524230479284F - 0.020211687488382354F,
+         "H3 audio handoff applies released per-channel latent normalization");
+
+  const auto path = std::filesystem::temp_directory_path() /
+                    "dif-h3-latent-handoff.safetensors";
+  std::filesystem::remove(path);
+  dif::frontend::write_h3_latent_handoff(path, video_rows, audio_rows);
+  const auto file = dif::weights::read_safetensors(path);
+  const auto mapped_video = dif::weights::map_safetensor(file,
+                                                         "video_state_rows");
+  const auto mapped_audio = dif::weights::map_safetensor(file,
+                                                         "audio_state_rows");
+  expect(mapped_video.dims == video_rows.dims &&
+             mapped_video.byte_size() == video_rows.byte_size() &&
+             std::equal(mapped_video.data(),
+                        mapped_video.data() + mapped_video.byte_size(),
+                        video_rows.data()) &&
+             mapped_audio.dims == audio_rows.dims &&
+             mapped_audio.byte_size() == audio_rows.byte_size() &&
+             std::equal(mapped_audio.data(),
+                        mapped_audio.data() + mapped_audio.byte_size(),
+                        audio_rows.data()),
+         "H3 SafeTensors handoff is byte-exact and Serenity-compatible");
+  std::filesystem::remove(path);
+}
+
+void test_h3_media_handoff() {
+  const auto decoded = f32_tensor(
+      {1U, 3U, 1U, 1U, 2U},
+      {0.0F, 1.0F, 0.5F, 0.25F, 1.0F, 0.0F});
+  const auto rgb = dif::frontend::make_h3_rgb24_video(decoded);
+  expect(rgb.frames == 1U && rgb.height == 1U && rgb.width == 2U &&
+             rgb.minimum == 0.0F && rgb.maximum == 1.0F &&
+             rgb.bytes == std::vector<std::uint8_t>(
+                              {0U, 128U, 255U, 255U, 64U, 0U}),
+         "H3 media handoff interleaves and quantizes source unit RGB");
 }
 
 void test_h3_conditioning_layout() {
@@ -2161,6 +2269,8 @@ int main() {
   test_backend_neutral_diffusion_preprocessing();
   test_backend_neutral_flow_scheduler();
   test_h3_conditioning_layout();
+  test_h3_latent_handoff();
+  test_h3_media_handoff();
   test_prepared_execution_reuses_constants();
   test_verifier_rejects_multiple_writers();
   test_attention_implementation_identity();

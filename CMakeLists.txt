@@ -21,6 +21,8 @@ add_library(difcore
     src/compiler/slice.cpp
   src/frontend/h3.cpp
   src/frontend/h3_conditioning.cpp
+  src/frontend/h3_latents.cpp
+  src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
   src/frontend/training.cpp
     src/ir/codec.cpp
@@ -155,6 +157,9 @@ target_link_libraries(diftrain PRIVATE difcore)
 add_executable(difh3infer tools/difh3infer.cpp)
 target_link_libraries(difh3infer PRIVATE difcore)
 
+add_executable(difh3media tools/difh3media.cpp)
+target_link_libraries(difh3media PRIVATE difcore)
+
 add_executable(difslice tools/difslice.cpp)
 target_link_libraries(difslice PRIVATE difcore)
 
@@ -183,7 +188,7 @@ else()
   message(STATUS "Diffusion compiler OpenCL backend: disabled")
 endif()
 
-install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer difslice
+install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer difh3media difslice
         RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)

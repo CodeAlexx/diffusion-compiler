@@ -66,6 +66,7 @@ void usage() {
                " [--fuse-linear-swiglu OP_ID]"
                " [--cutlass-linear OP_ID:SCHEDULE_ID]"
                " [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-layer N]"
+               " [--h3-w8a8-resident-layers N]"
                " [--h3-groupwise-cache FILE.safetensors]"
                " [--h3-groupwise-layer N]"
                " [--h3-modulation-cache FILE.safetensors]"
@@ -144,6 +145,9 @@ int main(int argc, char **argv) {
       else if (option == "--h3-w8a8-layer" && i + 1 < argc)
         options.h3_w8a8_layer = static_cast<std::uint32_t>(
             number(argv[++i], "H3 W8A8 layer"));
+      else if (option == "--h3-w8a8-resident-layers" && i + 1 < argc)
+        options.h3_w8a8_resident_layers = static_cast<std::uint32_t>(
+            number(argv[++i], "H3 W8A8 resident layers"));
       else if (option == "--h3-groupwise-cache" && i + 1 < argc)
         options.h3_groupwise_cache = argv[++i];
       else if (option == "--h3-groupwise-layer" && i + 1 < argc)
@@ -325,6 +329,7 @@ int main(int argc, char **argv) {
                 << primitive.eliminated_intermediate_bytes
                 << " classification=" << primitive.classification
                 << " implementation=" << primitive.implementation
+                << " resident=" << primitive.resident
                 << " cache=\"" << primitive.cache_path << "\"\n";
     for (const auto &primitive : result.h3_w8a8_attentions)
       std::cout << "H3_W8A8_ATTENTION qkv_layout_op="
@@ -345,6 +350,7 @@ int main(int argc, char **argv) {
                 << primitive.eliminated_intermediate_bytes
                 << " classification=" << primitive.classification
                 << " implementation=" << primitive.implementation
+                << " resident=" << primitive.resident
                 << " cache=\"" << primitive.cache_path << "\"\n";
     for (const auto &primitive : result.h3_ck_attentions)
       std::cout << "H3_CK_ATTENTION op=" << primitive.operation_id

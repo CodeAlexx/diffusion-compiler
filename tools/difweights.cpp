@@ -171,6 +171,108 @@ dif::weights::WeightBundle materialize_h3_video_vae_bundle(
   return bundle;
 }
 
+dif::weights::WeightBundle seal_h3_video_vae_derived_bundle(
+    const std::filesystem::path &derived_path,
+    const std::filesystem::path &source_path,
+    const std::filesystem::path &geometry_path,
+    const dif::frontend::H3VideoVaeBuild &build) {
+  if (std::filesystem::exists(geometry_path))
+    dif::fail("refusing to overwrite H3 video VAE geometry shard");
+  const auto derived = dif::weights::read_safetensors(derived_path);
+  const auto source = dif::weights::read_safetensors(source_path);
+  auto derived_matches = [&](const dif::frontend::H3VideoVaeBinding &binding) {
+    const auto *description = build.program.tensor(binding.tensor_id);
+    const auto *entry = derived.find(binding.name);
+    return description && entry && entry->dtype == description->dtype &&
+           entry->dims == description->dims &&
+           entry->byte_count == description->byte_count();
+  };
+  std::vector<dif::weights::SafeTensorWriteSpec> geometry_specs;
+  for (const auto &binding : build.bindings) {
+    const auto *description = build.program.tensor(binding.tensor_id);
+    if (!description)
+      dif::fail("H3 video VAE binding lost its descriptor");
+    if (binding.source_name.empty() || !derived_matches(binding))
+      geometry_specs.push_back(
+          {binding.name, description->dtype, description->dims});
+  }
+  dif::weights::SafeTensorWriter geometry_writer(geometry_path,
+                                                  std::move(geometry_specs));
+  for (const auto &binding : build.bindings) {
+    if (!binding.source_name.empty() && derived_matches(binding))
+      continue;
+    const auto *description = build.program.tensor(binding.tensor_id);
+    if (!description)
+      dif::fail("H3 video VAE binding lost its descriptor");
+    if (binding.source_name.empty()) {
+      const auto found = build.generated_constants.find(binding.tensor_id);
+      if (found == build.generated_constants.end())
+        dif::fail("H3 video VAE generated binding has no payload");
+      geometry_writer.append(
+          binding.name, {found->second.data(), found->second.byte_size()});
+      continue;
+    }
+    const auto *source_entry = source.find(binding.source_name);
+    if (!source_entry || source_entry->dtype != dif::ir::DType::F32)
+      dif::fail("H3 video VAE F32 source is missing " + binding.source_name);
+    auto tensor = dif::weights::map_safetensor(source, binding.source_name);
+    if (tensor.element_count() != description->element_count())
+      dif::fail("H3 video VAE source tensor element count disagrees: " +
+                binding.source_name);
+    if (description->dtype == dif::ir::DType::F32) {
+      geometry_writer.append(binding.name, {tensor.data(), tensor.byte_size()});
+    } else if (description->dtype == dif::ir::DType::F16) {
+      std::vector<std::uint8_t> converted(
+          static_cast<std::size_t>(description->byte_count()));
+      for (std::uint64_t element = 0; element < tensor.element_count();
+           ++element) {
+        float value = 0.0F;
+        std::memcpy(&value, tensor.data() + element * sizeof(value),
+                    sizeof(value));
+        const auto half = dif::runtime::float_to_f16(value);
+        std::memcpy(converted.data() + element * sizeof(half), &half,
+                    sizeof(half));
+      }
+      geometry_writer.append(binding.name, converted);
+    } else {
+      dif::fail("H3 video VAE derived checkpoint target must be F32 or F16");
+    }
+    tensor.discard_mapped_pages();
+  }
+  const auto geometry = geometry_writer.finish();
+
+  dif::weights::WeightBundle bundle;
+  bundle.program_fingerprint = dif::ir::fingerprint(build.program);
+  std::cout << "HASH source=" << source_path << "\n";
+  bundle.index_fingerprint = dif::sha256_file(source_path);
+  const auto absolute =
+      std::filesystem::absolute(derived_path).lexically_normal();
+  std::cout << "HASH derived=" << absolute << "\n";
+  bundle.shards.push_back(
+      {absolute, derived.file_size, dif::sha256_file(absolute)});
+  const auto geometry_absolute =
+      std::filesystem::absolute(geometry_path).lexically_normal();
+  bundle.shards.push_back({geometry_absolute, geometry.file_size,
+                           dif::sha256_file(geometry_absolute)});
+  for (const auto &binding : build.bindings) {
+    const auto *description = build.program.tensor(binding.tensor_id);
+    const auto use_geometry =
+        binding.source_name.empty() || !derived_matches(binding);
+    const auto &shard = use_geometry ? geometry : derived;
+    const auto *entry = shard.find(binding.name);
+    if (!description || !entry || entry->dtype != description->dtype ||
+        entry->dims != description->dims ||
+        entry->byte_count != description->byte_count())
+      dif::fail("H3 video VAE derived tensor disagrees with DiffIR: " +
+                binding.name);
+    bundle.bindings.push_back(
+        {binding.tensor_id, use_geometry ? 1U : 0U, binding.name,
+         entry->dtype, entry->dims, entry->file_offset, entry->byte_count});
+  }
+  dif::weights::verify_weight_bundle(bundle, build.program, false);
+  return bundle;
+}
+
 dif::weights::WeightBundle reuse_h3_video_vae_bundle(
     const dif::weights::WeightBundle &sealed,
     const dif::frontend::H3VideoVaeBuild &build,
@@ -563,6 +665,7 @@ void usage() {
                "       difweights make-h3-denoiser-bundle INDEX PROGRAM.difir OUT.difbind\n"
                "       difweights rebind-h3-denoiser-bundle SEALED.difbind INDEX PROGRAM.difir OUT.difbind\n"
                "       difweights make-h3-video-vae-bundle SOURCE.safetensors PROGRAM.difir OUT.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
+               "       difweights seal-h3-video-vae-bundle DERIVED.safetensors SOURCE.safetensors PROGRAM.difir OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights reuse-h3-video-vae-bundle SEALED.difbind PROGRAM.difir GEOMETRY.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights rebind-program SEALED.difbind PROGRAM.difir OUT.difbind\n"
                "       difweights subset-bundle SOURCE.difbind PROGRAM.difir OUT.difbind\n"
@@ -712,6 +815,41 @@ int main(int argc, char **argv) {
       dif::weights::write_weight_bundle(bundle, argv[5]);
       std::cout << "H3_VIDEO_VAE_BUNDLE path=" << argv[5]
                 << " shard=" << argv[4]
+                << " program="
+                << dif::hex_digest(bundle.program_fingerprint)
+                << " source=" << dif::hex_digest(bundle.index_fingerprint)
+                << " bindings=" << bundle.bindings.size() << "\n";
+      return 0;
+    }
+    if (command == "seal-h3-video-vae-bundle" && argc == 12) {
+      if (std::filesystem::exists(argv[5]))
+        dif::fail("refusing to overwrite H3 video VAE weight bundle");
+      const std::string residency = argv[10];
+      if (residency != "resident" && residency != "streamed")
+        dif::fail("H3 video VAE residency must be resident or streamed");
+      const std::string attention = argv[11];
+      if (attention != "generated" && attention != "cudnn")
+        dif::fail("H3 video VAE attention must be generated or cudnn");
+      dif::frontend::H3VideoVaeConfig config;
+      config.latent_frames = std::stoull(argv[6]);
+      config.latent_height = std::stoull(argv[7]);
+      config.latent_width = std::stoull(argv[8]);
+      config.layers = std::stoull(argv[9]);
+      config.streamed_constants = residency == "streamed";
+      config.attention_implementation = attention == "cudnn" ? 2U : 1U;
+      const auto build = dif::frontend::make_h3_video_vae_decoder(config);
+      const auto program = dif::ir::read_file(argv[4]);
+      if (dif::ir::fingerprint(program) !=
+          dif::ir::fingerprint(build.program))
+        dif::fail("H3 video VAE program does not match the requested geometry");
+      const auto geometry_path =
+          std::filesystem::path(std::string(argv[5]) + ".geometry.safetensors");
+      const auto bundle = seal_h3_video_vae_derived_bundle(
+          argv[2], argv[3], geometry_path, build);
+      dif::weights::write_weight_bundle(bundle, argv[5]);
+      std::cout << "H3_VIDEO_VAE_SEALED_BUNDLE path=" << argv[5]
+                << " shard=" << argv[2]
+                << " geometry_shard=" << geometry_path
                 << " program="
                 << dif::hex_digest(bundle.program_fingerprint)
                 << " source=" << dif::hex_digest(bundle.index_fingerprint)

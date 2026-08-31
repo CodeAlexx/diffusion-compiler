@@ -27,6 +27,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -37,6 +38,7 @@
 #include <utility>
 #include <vector>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace dif::runtime {
@@ -191,11 +193,18 @@ public:
     if (pointer == 0U || pointers_.contains(id))
       fail("invalid external CUDA tensor binding " + std::to_string(id));
     pointers_.emplace(id, pointer);
+    external_.insert(id);
+  }
+  void rebind_external(std::uint32_t id, CUdeviceptr pointer) {
+    if (pointer == 0U || !external_.contains(id))
+      fail("invalid external CUDA tensor rebinding " + std::to_string(id));
+    pointers_.at(id) = pointer;
   }
 
 private:
   std::vector<CUdeviceptr> allocations_;
   std::unordered_map<std::uint32_t, CUdeviceptr> pointers_;
+  std::unordered_set<std::uint32_t> external_;
 };
 
 class Workspace {
@@ -975,6 +984,7 @@ struct H3W8A8MlpPlan {
   std::uint64_t scratch_bytes{};
   std::uint64_t eliminated_intermediate_bytes{};
   std::filesystem::path cache_path;
+  bool resident{};
 };
 
 struct H3W8A8AttentionPlan {
@@ -1014,6 +1024,7 @@ struct H3W8A8AttentionPlan {
   std::uint64_t scratch_bytes{};
   std::uint64_t eliminated_intermediate_bytes{};
   std::filesystem::path cache_path;
+  bool resident{};
 };
 
 struct H3W8A8Functions {
@@ -1272,23 +1283,77 @@ struct H3ModulationCachePlan {
   std::uint32_t projected_tensor{};
   std::uint32_t input_tensor{};
   std::uint32_t layer{};
+  std::uint32_t slices{1U};
   std::vector<std::uint32_t> replaced_constant_tensors;
   Tensor modulation;
   CUdeviceptr modulation_device{};
   std::uint64_t storage_bytes{};
+  std::uint64_t slice_bytes{};
   std::uint64_t replaced_weight_bytes{};
   std::filesystem::path cache_path;
+  bool final{};
 };
+
+std::uint64_t h3_metadata_u64(const weights::SafeTensorFile &file,
+                              std::string_view name) {
+  const auto *entry = file.find_metadata(name);
+  if (!entry || entry->dtype != "I64" || entry->dims !=
+                                              std::vector<std::uint64_t>{1U})
+    fail("H3 runtime cache has invalid metadata: " + std::string(name));
+  const auto bytes = weights::read_safetensor_metadata(file, name);
+  if (bytes.size() != 8U)
+    fail("H3 runtime cache I64 metadata has invalid width");
+  auto value = std::uint64_t{0U};
+  for (unsigned index = 0U; index < 8U; ++index)
+    value |= static_cast<std::uint64_t>(bytes[index]) << (8U * index);
+  return value;
+}
+
+std::string h3_metadata_string(const weights::SafeTensorFile &file,
+                               std::string_view name) {
+  const auto *entry = file.find_metadata(name);
+  if (!entry || entry->dtype != "U8" || entry->dims.size() != 1U)
+    fail("H3 runtime cache has invalid string metadata: " +
+         std::string(name));
+  const auto bytes = weights::read_safetensor_metadata(file, name);
+  return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
+}
+
+void validate_h3_modulation_cache_metadata(
+    const weights::SafeTensorFile &cache, const RunOptions &options,
+    std::uint32_t slices, std::uint32_t blocks) {
+  if (options.h3_modulation_source_index.empty() ||
+      options.h3_modulation_steps == 0U)
+    fail("schedule modulation cache requires its source index and step count");
+  if (h3_metadata_u64(cache, "__meta__.version") != 1U ||
+      h3_metadata_string(cache, "__meta__.kind") != "adaln-modulation" ||
+      h3_metadata_string(cache, "__meta__.src_path") !=
+          options.h3_modulation_source_index.string() ||
+      h3_metadata_u64(cache, "__meta__.steps") !=
+          options.h3_modulation_steps ||
+      h3_metadata_u64(cache, "__meta__.distinct_timesteps") != 2U * slices ||
+      h3_metadata_u64(cache, "__meta__.nblocks") != blocks)
+    fail("H3 schedule modulation cache metadata does not match this run");
+  struct stat source_stat {};
+  if (::stat(options.h3_modulation_source_index.c_str(), &source_stat) != 0)
+    fail("cannot stat H3 modulation source index");
+  if (h3_metadata_u64(cache, "__meta__.src_size") !=
+          static_cast<std::uint64_t>(source_stat.st_size) ||
+      h3_metadata_u64(cache, "__meta__.src_mtime") !=
+          static_cast<std::uint64_t>(source_stat.st_mtime))
+    fail("H3 modulation source index changed after cache creation");
+}
 
 std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
     const ir::Program &program, const RunOptions &options) {
   if (options.h3_modulation_cache.empty()) {
-    if (!options.h3_modulation_input.empty() || options.h3_modulation_layer != 0U)
+    if (!options.h3_modulation_input.empty() ||
+        !options.h3_modulation_source_index.empty() ||
+        options.h3_modulation_steps != 0U ||
+        options.h3_modulation_layer != 0U)
       fail("H3 modulation input/layer requires an H3 modulation cache");
     return {};
   }
-  if (options.h3_modulation_input.empty())
-    fail("H3 modulation cache requires the exact source input DiffTensor");
   const auto cache = weights::read_safetensors(options.h3_modulation_cache);
   std::unordered_map<std::uint32_t, const ir::Operation *> producer;
   for (const auto &operation : program.operations) {
@@ -1323,7 +1388,6 @@ std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
         bias->dtype != ir::DType::BF16 || bias->dims.size() != 1U ||
         projected->dtype != ir::DType::BF16 || projected->dims.size() != 2U ||
         selected->dtype != ir::DType::BF16 || selected->dims.size() != 2U ||
-        !input->has_role(ir::TensorRole::Input) ||
         !weight->has_role(ir::TensorRole::Constant) ||
         !bias->has_role(ir::TensorRole::Constant) ||
         projected->roles != static_cast<std::uint32_t>(ir::TensorRole::Internal))
@@ -1349,29 +1413,116 @@ std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
 
     const auto layer = options.h3_modulation_layer +
                        static_cast<std::uint32_t>(result.size());
-    auto modulation = weights::map_safetensor(
-        cache, "block." + std::to_string(layer));
-    if (modulation.dtype != ir::DType::BF16 ||
-        modulation.element_count() != projected->element_count() ||
-        (modulation.dims != projected->dims &&
-         modulation.dims != std::vector<std::uint64_t>{3U * tables,
-                                                        6U * hidden}))
+    auto modulation =
+        weights::map_safetensor(cache, "block." + std::to_string(layer));
+    const auto cache_rows_per_slice = 3U * tables;
+    const auto cache_columns = 6U * hidden;
+    std::uint32_t slices = 1U;
+    if (modulation.dtype != ir::DType::BF16)
+      fail("H3 modulation cache block must be BF16");
+    if (modulation.dims == projected->dims) {
+      slices = 1U;
+    } else if (modulation.dims.size() == 2U &&
+               modulation.dims.at(1) == cache_columns &&
+               modulation.dims.at(0) % cache_rows_per_slice == 0U &&
+               modulation.dims.at(0) / cache_rows_per_slice <=
+                   std::numeric_limits<std::uint32_t>::max()) {
+      slices = static_cast<std::uint32_t>(modulation.dims.at(0) /
+                                          cache_rows_per_slice);
+    } else {
       fail("H3 modulation cache block does not match semantic AdaLN output");
+    }
+    if (modulation.byte_size() != projected->byte_count() * slices)
+      fail("H3 modulation cache block slice size mismatch");
     H3ModulationCachePlan plan;
     plan.linear_operation = linear.id;
     plan.select_operation = select.id;
     plan.projected_tensor = projected->id;
     plan.input_tensor = input->id;
     plan.layer = layer;
+    plan.slices = slices;
     plan.replaced_constant_tensors = {weight->id, bias->id};
     plan.modulation = std::move(modulation);
     plan.storage_bytes = align_256(plan.modulation.byte_size());
+    plan.slice_bytes = projected->byte_count();
     plan.replaced_weight_bytes = weight->byte_count() + bias->byte_count();
     plan.cache_path = options.h3_modulation_cache;
     result.push_back(std::move(plan));
   }
   if (result.empty())
     fail("H3 modulation cache requested but no AdaLN chain was found");
+
+  const auto block_count = static_cast<std::uint32_t>(result.size());
+  for (const auto &select : program.operations) {
+    if (select.opcode != ir::Opcode::SelectRowChunks ||
+        select.inputs.size() != 2U || select.outputs.size() != 2U)
+      continue;
+    const auto found = producer.find(select.inputs.at(0));
+    if (found == producer.end() || found->second->opcode != ir::Opcode::Linear)
+      continue;
+    const auto &linear = *found->second;
+    if (linear.inputs.size() != 3U || linear.outputs.size() != 1U)
+      continue;
+    const auto *input = program.tensor(linear.inputs.at(0));
+    const auto *weight = program.tensor(linear.inputs.at(1));
+    const auto *bias = program.tensor(linear.inputs.at(2));
+    const auto *projected = program.tensor(linear.outputs.at(0));
+    const auto *selected = program.tensor(select.outputs.at(0));
+    if (!input || !weight || !bias || !projected || !selected ||
+        input->dtype != ir::DType::BF16 || input->dims.size() != 2U ||
+        input->id != common_input || weight->dtype != ir::DType::BF16 ||
+        bias->dtype != ir::DType::BF16 ||
+        projected->dtype != ir::DType::BF16 ||
+        projected->dims.size() != 2U || selected->dtype != ir::DType::BF16 ||
+        selected->dims.size() != 2U)
+      continue;
+    const auto tables = input->dims.at(0);
+    const auto hidden = selected->dims.at(1);
+    if (projected->dims !=
+            std::vector<std::uint64_t>{tables, 2U * hidden} ||
+        weight->dims !=
+            std::vector<std::uint64_t>{2U * hidden, input->dims.at(1)} ||
+        bias->dims != std::vector<std::uint64_t>{2U * hidden})
+      continue;
+    auto modulation = weights::map_safetensor(cache, "final");
+    if (modulation.dtype != ir::DType::BF16 ||
+        modulation.dims.size() != 2U ||
+        modulation.dims.at(1) != 2U * hidden ||
+        modulation.dims.at(0) % tables != 0U ||
+        modulation.dims.at(0) / tables != result.front().slices ||
+        modulation.byte_size() !=
+            projected->byte_count() * result.front().slices)
+      fail("H3 modulation cache final tensor does not match semantic output");
+    H3ModulationCachePlan plan;
+    plan.linear_operation = linear.id;
+    plan.select_operation = select.id;
+    plan.projected_tensor = projected->id;
+    plan.input_tensor = input->id;
+    plan.layer = block_count;
+    plan.slices = result.front().slices;
+    plan.replaced_constant_tensors = {weight->id, bias->id};
+    plan.modulation = std::move(modulation);
+    plan.storage_bytes = align_256(plan.modulation.byte_size());
+    plan.slice_bytes = projected->byte_count();
+    plan.replaced_weight_bytes = weight->byte_count() + bias->byte_count();
+    plan.cache_path = options.h3_modulation_cache;
+    plan.final = true;
+    result.push_back(std::move(plan));
+    break;
+  }
+  const auto slices = result.front().slices;
+  if (std::any_of(result.begin(), result.end(), [&](const auto &plan) {
+        return plan.slices != slices;
+      }))
+    fail("H3 modulation cache tensors disagree on schedule slices");
+  if (slices == 1U) {
+    if (options.h3_modulation_input.empty())
+      fail("single-slice modulation cache requires its exact source input");
+  } else {
+    if (result.size() != static_cast<std::size_t>(block_count) + 1U)
+      fail("schedule modulation cache requires the final output-head tensor");
+    validate_h3_modulation_cache_metadata(cache, options, slices, block_count);
+  }
   return result;
 }
 
@@ -1383,6 +1534,17 @@ void assign_h3_modulation_storage(
     plan.modulation_device = base + offset;
     buffers.bind_external(plan.projected_tensor, plan.modulation_device);
     offset += plan.storage_bytes;
+  }
+}
+
+void select_h3_modulation_slice(
+    const std::vector<H3ModulationCachePlan> &plans, std::uint32_t slice,
+    DeviceBuffers &buffers) {
+  for (const auto &plan : plans) {
+    if (slice >= plan.slices)
+      fail("H3 modulation cache slice is outside the prepared schedule");
+    buffers.rebind_external(plan.projected_tensor,
+                            plan.modulation_device + slice * plan.slice_bytes);
   }
 }
 
@@ -1779,6 +1941,8 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
     plan.gate_tensor = residual.inputs.at(2);
     plan.output_tensor = residual.outputs.at(0);
     plan.layer = layer;
+    plan.resident = layer - options.h3_w8a8_layer <
+                    options.h3_w8a8_resident_layers;
     plan.rows = input->dims.at(0);
     plan.hidden = hidden;
     plan.ffn = ffn;
@@ -1859,6 +2023,28 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
     }
     if (!valid || qkv_linears[0]->inputs.at(0) != qkv_linears[1]->inputs.at(0) ||
         qkv_linears[0]->inputs.at(0) != qkv_linears[2]->inputs.at(0))
+      continue;
+
+    // A full H3 denoiser places context-refiner QKV chains before the creator
+    // transformer blocks. They use plain RMSNorm and Add residuals, so mapping
+    // block.0 W8A8 weights onto them would be a silent semantic corruption.
+    // Projection-only toolbox programs remain admitted when their QKV outputs
+    // are explicitly observable.
+    const auto q_consumers = consumers.find(qkv_linears[0]->outputs.at(0));
+    const auto k_consumers = consumers.find(qkv_linears[1]->outputs.at(0));
+    const auto transformer_qk =
+        q_consumers != consumers.end() && k_consumers != consumers.end() &&
+        q_consumers->second.size() == 1U && k_consumers->second.size() == 1U &&
+        q_consumers->second.front()->opcode ==
+            ir::Opcode::QkNormPartialRope &&
+        k_consumers->second.front()->opcode ==
+            ir::Opcode::QkNormPartialRope;
+    const auto exposed_projection = std::all_of(
+        qkv_linears.begin(), qkv_linears.end(), [&](const auto *linear) {
+          const auto *description = program.tensor(linear->outputs.at(0));
+          return description && description->has_role(ir::TensorRole::Output);
+        });
+    if (!transformer_qk && !exposed_projection)
       continue;
 
     const auto *attention_input = program.tensor(qkv_linears[0]->inputs.at(0));
@@ -2000,6 +2186,8 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
       planned_output_linears.insert(output_linear->id);
     }
     plan.layer = layer;
+    plan.resident = layer - options.h3_w8a8_layer <
+                    options.h3_w8a8_resident_layers;
     plan.rows = rows;
     plan.hidden = hidden;
     plan.inner = inner;
@@ -2093,6 +2281,8 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
     plan.excluded_tensors = {output_linear.outputs.at(0)};
     plan.replaced_constant_tensors = {output_linear.inputs.at(1)};
     plan.layer = layer;
+    plan.resident = layer - options.h3_w8a8_layer <
+                    options.h3_w8a8_resident_layers;
     plan.rows = rows;
     plan.hidden = hidden;
     plan.inner = inner;
@@ -2187,12 +2377,10 @@ extern "C" __global__ void dif_h3_w8a8_residual(
 )CUDA";
 }
 
-void allocate_h3_w8a8_weights(H3W8A8MlpPlan &plan) {
-  plan.weight_storage = std::make_unique<Workspace>(
-      static_cast<std::size_t>(plan.weight_storage_bytes));
+void assign_h3_w8a8_weights(H3W8A8MlpPlan &plan, CUdeviceptr base) {
   auto weight_offset = std::uint64_t{0U};
   auto assign_weight = [&](CUdeviceptr &pointer, const Tensor &tensor) {
-    pointer = plan.weight_storage->pointer() + weight_offset;
+    pointer = base + weight_offset;
     weight_offset += align_256(tensor.byte_size());
   };
   assign_weight(plan.fc1_weight_device, plan.fc1_weight);
@@ -2201,7 +2389,12 @@ void allocate_h3_w8a8_weights(H3W8A8MlpPlan &plan) {
   assign_weight(plan.fc2_scale_device, plan.fc2_scale);
   if (weight_offset != plan.weight_storage_bytes)
     fail("H3 W8A8 weight-storage layout mismatch");
+}
 
+void allocate_h3_w8a8_weights(H3W8A8MlpPlan &plan) {
+  plan.weight_storage = std::make_unique<Workspace>(
+      static_cast<std::size_t>(plan.weight_storage_bytes));
+  assign_h3_w8a8_weights(plan, plan.weight_storage->pointer());
 }
 
 void assign_h3_w8a8_scratch(H3W8A8MlpPlan &plan, CUdeviceptr scratch) {
@@ -2238,12 +2431,32 @@ void upload_h3_w8a8_weights(const H3W8A8MlpPlan &plan, CUstream stream) {
   upload(plan.fc2_scale_device, plan.fc2_scale);
 }
 
-void allocate_h3_w8a8_weights(H3W8A8AttentionPlan &plan) {
-  plan.weight_storage = std::make_unique<Workspace>(
-      static_cast<std::size_t>(plan.weight_storage_bytes));
+std::uint64_t stage_h3_w8a8_weights(const H3W8A8MlpPlan &plan,
+                                    void *staging,
+                                    std::uint64_t staging_bytes,
+                                    CUstream stream) {
+  auto *base = static_cast<std::uint8_t *>(staging);
+  auto cursor = std::uint64_t{0U};
+  const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
+    if (tensor.byte_size() > staging_bytes - cursor)
+      fail("H3 W8A8 MLP tail staging overflow");
+    std::memcpy(base + cursor, tensor.data(), tensor.byte_size());
+    check(cuMemcpyHtoDAsync(destination, base + cursor, tensor.byte_size(),
+                            stream),
+          "cuMemcpyHtoDAsync H3 W8A8 MLP tail weight");
+    cursor += tensor.byte_size();
+  };
+  upload(plan.fc1_weight_device, plan.fc1_weight);
+  upload(plan.fc1_scale_device, plan.fc1_scale);
+  upload(plan.fc2_weight_device, plan.fc2_weight);
+  upload(plan.fc2_scale_device, plan.fc2_scale);
+  return cursor;
+}
+
+void assign_h3_w8a8_weights(H3W8A8AttentionPlan &plan, CUdeviceptr base) {
   auto offset = std::uint64_t{0U};
   auto assign = [&](CUdeviceptr &pointer, const Tensor &tensor) {
-    pointer = plan.weight_storage->pointer() + offset;
+    pointer = base + offset;
     offset += align_256(tensor.byte_size());
   };
   if (plan.has_qkv_projection) {
@@ -2256,6 +2469,12 @@ void allocate_h3_w8a8_weights(H3W8A8AttentionPlan &plan) {
   }
   if (offset != plan.weight_storage_bytes)
     fail("H3 W8A8 attention weight-storage layout mismatch");
+}
+
+void allocate_h3_w8a8_weights(H3W8A8AttentionPlan &plan) {
+  plan.weight_storage = std::make_unique<Workspace>(
+      static_cast<std::size_t>(plan.weight_storage_bytes));
+  assign_h3_w8a8_weights(plan, plan.weight_storage->pointer());
 }
 
 void assign_h3_w8a8_scratch(H3W8A8AttentionPlan &plan,
@@ -2297,6 +2516,32 @@ void upload_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
     upload(plan.output_weight_device, plan.output_weight);
     upload(plan.output_scale_device, plan.output_scale);
   }
+}
+
+std::uint64_t stage_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
+                                    void *staging,
+                                    std::uint64_t staging_bytes,
+                                    CUstream stream) {
+  auto *base = static_cast<std::uint8_t *>(staging);
+  auto cursor = std::uint64_t{0U};
+  const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
+    if (tensor.byte_size() > staging_bytes - cursor)
+      fail("H3 W8A8 attention tail staging overflow");
+    std::memcpy(base + cursor, tensor.data(), tensor.byte_size());
+    check(cuMemcpyHtoDAsync(destination, base + cursor, tensor.byte_size(),
+                            stream),
+          "cuMemcpyHtoDAsync H3 W8A8 attention tail weight");
+    cursor += tensor.byte_size();
+  };
+  if (plan.has_qkv_projection) {
+    upload(plan.qkv_weight_device, plan.qkv_weight);
+    upload(plan.qkv_scale_device, plan.qkv_scale);
+  }
+  if (plan.has_output_projection) {
+    upload(plan.output_weight_device, plan.output_weight);
+    upload(plan.output_scale_device, plan.output_scale);
+  }
+  return cursor;
 }
 
 unsigned h3_w8a8_grid(std::uint64_t elements) {
@@ -3027,19 +3272,24 @@ public:
     h3_modulation_cache_plans_ =
         find_h3_modulation_cache_plans(program_, options);
     if (!h3_modulation_cache_plans_.empty()) {
-      h3_modulation_expected_input_ =
-          read_tensor(options.h3_modulation_input);
-      h3_modulation_input_path_ = options.h3_modulation_input;
-      const auto input_id = h3_modulation_cache_plans_.front().input_tensor;
-      const auto *description = program_.tensor(input_id);
-      const auto found = bindings.find(input_id);
-      if (!description || found == bindings.end() ||
-          h3_modulation_expected_input_.dtype != description->dtype ||
-          h3_modulation_expected_input_.dims != description->dims ||
-          found->second.byte_size() != h3_modulation_expected_input_.byte_size() ||
-          std::memcmp(found->second.data(), h3_modulation_expected_input_.data(),
-                      found->second.byte_size()) != 0)
-        fail("H3 modulation cache input does not match its source capture");
+      h3_modulation_slices_ = h3_modulation_cache_plans_.front().slices;
+      if (!options.h3_modulation_input.empty()) {
+        h3_modulation_expected_input_ =
+            read_tensor(options.h3_modulation_input);
+        h3_modulation_input_path_ = options.h3_modulation_input;
+        const auto input_id = h3_modulation_cache_plans_.front().input_tensor;
+        const auto *description = program_.tensor(input_id);
+        const auto found = bindings.find(input_id);
+        if (!description || found == bindings.end() ||
+            h3_modulation_expected_input_.dtype != description->dtype ||
+            h3_modulation_expected_input_.dims != description->dims ||
+            found->second.byte_size() !=
+                h3_modulation_expected_input_.byte_size() ||
+            std::memcmp(found->second.data(),
+                        h3_modulation_expected_input_.data(),
+                        found->second.byte_size()) != 0)
+          fail("H3 modulation cache input does not match its source capture");
+      }
     }
     h3_groupwise_plans_ = find_h3_groupwise_plans(program_, options);
     h3_w8a8_mlp_plans_ = find_h3_w8a8_mlp_plans(program_, options);
@@ -3051,8 +3301,21 @@ public:
     if (!options.h3_ck_attention_dso.empty()) {
       auto library = std::make_shared<CkAttentionLibrary>(
           options.h3_ck_attention_dso, major * 10 + minor);
+      std::uint64_t maximum_sequence = 0U;
+      for (const auto &operation : program_.operations) {
+        if (operation.opcode != ir::Opcode::Attention ||
+            operation.inputs.empty())
+          continue;
+        const auto *query = program_.tensor(operation.inputs.front());
+        if (!query || query->dims.empty())
+          fail("H3 CK attention found an invalid query tensor");
+        maximum_sequence = std::max(maximum_sequence, query->dims.front());
+      }
       for (const auto &operation : program_.operations) {
         if (operation.opcode != ir::Opcode::Attention)
+          continue;
+        const auto *query = program_.tensor(operation.inputs.front());
+        if (!query || query->dims.front() != maximum_sequence)
           continue;
         if (operation.u64(ir::AttrKey::Implementation, 1U) != 2U)
           fail("H3 CK attention can replace only an exact backend Attention");
@@ -3182,23 +3445,48 @@ public:
     auto h3_w8a8_weight_bytes = std::uint64_t{0U};
     auto h3_w8a8_scratch_bytes = std::uint64_t{0U};
     for (const auto &plan : h3_w8a8_mlp_plans_) {
-      if (h3_w8a8_weight_bytes >
-          std::numeric_limits<std::uint64_t>::max() -
-              plan.weight_storage_bytes)
-        fail("H3 W8A8 prepared storage overflow");
-      h3_w8a8_weight_bytes += plan.weight_storage_bytes;
+      if (plan.resident) {
+        if (h3_w8a8_weight_bytes >
+            std::numeric_limits<std::uint64_t>::max() -
+                plan.weight_storage_bytes)
+          fail("H3 W8A8 prepared storage overflow");
+        h3_w8a8_weight_bytes += plan.weight_storage_bytes;
+      } else {
+        h3_w8a8_tail_mlp_bytes_ =
+            std::max(h3_w8a8_tail_mlp_bytes_, plan.weight_storage_bytes);
+        h3_w8a8_tail_stage_half_bytes_ = std::max(
+            h3_w8a8_tail_stage_half_bytes_, plan.quantized_weight_bytes);
+      }
       h3_w8a8_scratch_bytes =
           std::max(h3_w8a8_scratch_bytes, plan.scratch_bytes);
     }
     for (const auto &plan : h3_w8a8_attention_plans_) {
-      if (h3_w8a8_weight_bytes >
-          std::numeric_limits<std::uint64_t>::max() -
-              plan.weight_storage_bytes)
-        fail("H3 W8A8 prepared storage overflow");
-      h3_w8a8_weight_bytes += plan.weight_storage_bytes;
+      if (plan.resident) {
+        if (h3_w8a8_weight_bytes >
+            std::numeric_limits<std::uint64_t>::max() -
+                plan.weight_storage_bytes)
+          fail("H3 W8A8 prepared storage overflow");
+        h3_w8a8_weight_bytes += plan.weight_storage_bytes;
+      } else {
+        h3_w8a8_tail_attention_bytes_ = std::max(
+            h3_w8a8_tail_attention_bytes_, plan.weight_storage_bytes);
+        h3_w8a8_tail_stage_half_bytes_ = std::max(
+            h3_w8a8_tail_stage_half_bytes_, plan.quantized_weight_bytes);
+      }
       h3_w8a8_scratch_bytes =
           std::max(h3_w8a8_scratch_bytes, plan.scratch_bytes);
     }
+    if (h3_w8a8_tail_attention_bytes_ >
+        std::numeric_limits<std::uint64_t>::max() -
+            h3_w8a8_tail_mlp_bytes_)
+      fail("H3 W8A8 reusable tail storage overflow");
+    h3_w8a8_tail_weight_bytes_ =
+        h3_w8a8_tail_attention_bytes_ + h3_w8a8_tail_mlp_bytes_;
+    if (h3_w8a8_weight_bytes >
+        std::numeric_limits<std::uint64_t>::max() -
+            h3_w8a8_tail_weight_bytes_)
+      fail("H3 W8A8 resident plus tail storage overflow");
+    h3_w8a8_weight_bytes += h3_w8a8_tail_weight_bytes_;
     const auto h3_w8a8_bytes =
         h3_w8a8_weight_bytes + h3_w8a8_scratch_bytes;
     auto h3_groupwise_weight_bytes = std::uint64_t{0U};
@@ -3241,8 +3529,31 @@ public:
       fail("DiffIR allocation plus H3 modulation storage overflow");
     const auto required =
         base_with_weights + h3_modulation_bytes;
-    if (required > free_before || free_before - required < options.minimum_free_bytes)
-      fail("GPU pressure gate refused candidate: insufficient free memory");
+    if (options.profile_pipeline) {
+      std::cerr << "CUDA_MEMORY_PLAN tensor_bytes=" << tensor_bytes
+                << " linear_workspace_bytes=" << workspace_bytes_
+                << " attention_workspace_bytes=" << cudnn_workspace_bytes_
+                << " ck_attention_scratch_bytes="
+                << ck_attention_scratch_bytes_
+                << " h3_w8a8_weight_bytes=" << h3_w8a8_weight_bytes
+                << " h3_w8a8_scratch_bytes=" << h3_w8a8_scratch_bytes
+                << " h3_w8a8_tail_weight_bytes="
+                << h3_w8a8_tail_weight_bytes_
+                << " h3_w8a8_tail_stage_half_bytes="
+                << h3_w8a8_tail_stage_half_bytes_
+                << " h3_groupwise_bytes=" << h3_groupwise_bytes
+                << " h3_modulation_bytes=" << h3_modulation_bytes
+                << " required_bytes=" << required
+                << " free_before_bytes=" << free_before
+                << " minimum_free_bytes=" << options.minimum_free_bytes
+                << '\n';
+    }
+    if (required > free_before ||
+        free_before - required < options.minimum_free_bytes)
+      fail("GPU pressure gate refused candidate: required=" +
+           std::to_string(required) + " free_before=" +
+           std::to_string(free_before) + " minimum_free=" +
+           std::to_string(options.minimum_free_bytes));
     resident_bytes_ = required;
 
     fused_launch_inputs_ = generated.launch_inputs;
@@ -3305,6 +3616,17 @@ public:
     cudnn_workspace_ = std::make_unique<Workspace>(cudnn_workspace_bytes_);
     h3_w8a8_scratch_storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(h3_w8a8_scratch_bytes));
+    h3_w8a8_tail_weight_storage_ = std::make_unique<Workspace>(
+        static_cast<std::size_t>(h3_w8a8_tail_weight_bytes_));
+    if (h3_w8a8_tail_stage_half_bytes_ != 0U) {
+      if (h3_w8a8_tail_stage_half_bytes_ >
+          std::numeric_limits<std::size_t>::max() / 2U)
+        fail("H3 W8A8 reusable tail host staging overflow");
+      h3_w8a8_tail_stage_ = std::make_unique<PinnedHostWorkspace>(
+          static_cast<std::size_t>(2U * h3_w8a8_tail_stage_half_bytes_));
+      for (auto &event : h3_w8a8_tail_stage_events_)
+        event = std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+    }
     h3_groupwise_scratch_storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(h3_groupwise_scratch_bytes));
     h3_modulation_storage_ = std::make_unique<Workspace>(
@@ -3314,11 +3636,20 @@ public:
     if (h3_ck_attention_plan_)
       h3_ck_attention_plan_->allocate();
     for (auto &plan : h3_w8a8_mlp_plans_) {
-      allocate_h3_w8a8_weights(plan);
+      if (plan.resident)
+        allocate_h3_w8a8_weights(plan);
+      else
+        assign_h3_w8a8_weights(
+            plan, h3_w8a8_tail_weight_storage_->pointer() +
+                      h3_w8a8_tail_attention_bytes_);
       assign_h3_w8a8_scratch(plan, h3_w8a8_scratch_storage_->pointer());
     }
     for (auto &plan : h3_w8a8_attention_plans_) {
-      allocate_h3_w8a8_weights(plan);
+      if (plan.resident)
+        allocate_h3_w8a8_weights(plan);
+      else
+        assign_h3_w8a8_weights(
+            plan, h3_w8a8_tail_weight_storage_->pointer());
       assign_h3_w8a8_scratch(plan, h3_w8a8_scratch_storage_->pointer());
     }
     for (auto &plan : h3_groupwise_plans_) {
@@ -3371,9 +3702,12 @@ public:
         resident_weight_bytes_ += description.byte_count();
     }
     for (const auto &plan : h3_w8a8_mlp_plans_)
-      resident_weight_bytes_ += plan.weight_storage_bytes;
+      if (plan.resident)
+        resident_weight_bytes_ += plan.weight_storage_bytes;
     for (const auto &plan : h3_w8a8_attention_plans_)
-      resident_weight_bytes_ += plan.weight_storage_bytes;
+      if (plan.resident)
+        resident_weight_bytes_ += plan.weight_storage_bytes;
+    resident_weight_bytes_ += h3_w8a8_tail_weight_bytes_;
     for (const auto &plan : h3_groupwise_plans_)
       resident_weight_bytes_ += plan.weight_storage_bytes;
     resident_weight_bytes_ += h3_modulation_bytes;
@@ -3433,9 +3767,11 @@ public:
     const auto resident_h2d_start = std::chrono::steady_clock::now();
     upload_resident_constants(program_, constants_, buffers_, context_.stream());
     for (const auto &plan : h3_w8a8_mlp_plans_)
-      upload_h3_w8a8_weights(plan, context_.stream());
+      if (plan.resident)
+        upload_h3_w8a8_weights(plan, context_.stream());
     for (const auto &plan : h3_w8a8_attention_plans_)
-      upload_h3_w8a8_weights(plan, context_.stream());
+      if (plan.resident)
+        upload_h3_w8a8_weights(plan, context_.stream());
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
@@ -3529,7 +3865,8 @@ public:
       bindings.insert_or_assign(desc.id, found->second);
     }
     validate_inputs(program_, bindings);
-    if (!h3_modulation_cache_plans_.empty()) {
+    if (!h3_modulation_cache_plans_.empty() &&
+        !h3_modulation_input_path_.empty()) {
       const auto &actual = bindings.at(
           h3_modulation_cache_plans_.front().input_tensor);
       if (actual.byte_size() != h3_modulation_expected_input_.byte_size() ||
@@ -3537,11 +3874,48 @@ public:
                       actual.byte_size()) != 0)
         fail("H3 modulation cache input changed after preparation");
     }
+    if (!h3_modulation_cache_plans_.empty()) {
+      if (options.h3_modulation_slice >= h3_modulation_slices_)
+        fail("H3 modulation slice is outside the prepared schedule");
+      select_h3_modulation_slice(h3_modulation_cache_plans_,
+                                 options.h3_modulation_slice, buffers_);
+    }
     upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
     check(cuStreamSynchronize(context_.stream()),
           "dynamic input upload synchronization");
 
-    auto execute_operation = [&](const ir::Operation &op) {
+    auto h3_w8a8_tail_streamed_bytes = std::uint64_t{0U};
+    auto h3_w8a8_tail_host_stage_milliseconds = 0.0;
+    auto stage_h3_w8a8_tail = [&](const auto &plan, bool profile) {
+      if (plan.resident)
+        return;
+      if (!h3_w8a8_tail_stage_ || h3_w8a8_tail_stage_half_bytes_ == 0U)
+        fail("H3 W8A8 tail plan lacks reusable host staging");
+      const auto half = h3_w8a8_tail_stage_turn_ % 2U;
+      if (h3_w8a8_tail_stage_armed_.at(half))
+        check(cuEventSynchronize(h3_w8a8_tail_stage_events_.at(half)->get()),
+              "cuEventSynchronize H3 W8A8 tail staging reuse");
+      const auto stage_start = std::chrono::steady_clock::now();
+      auto *staging = static_cast<std::uint8_t *>(
+          h3_w8a8_tail_stage_->data()) +
+          half * h3_w8a8_tail_stage_half_bytes_;
+      const auto bytes = stage_h3_w8a8_weights(
+          plan, staging, h3_w8a8_tail_stage_half_bytes_, context_.stream());
+      if (profile) {
+        h3_w8a8_tail_streamed_bytes += bytes;
+        h3_w8a8_tail_host_stage_milliseconds +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - stage_start)
+                .count();
+      }
+      check(cuEventRecord(h3_w8a8_tail_stage_events_.at(half)->get(),
+                          context_.stream()),
+            "cuEventRecord H3 W8A8 tail staging copy");
+      h3_w8a8_tail_stage_armed_.at(half) = true;
+      ++h3_w8a8_tail_stage_turn_;
+    };
+
+    auto execute_operation = [&](const ir::Operation &op, bool profile) {
       if (skipped_operations_.contains(op.id))
         return;
       const auto h3_groupwise_qkv = std::find_if(
@@ -3583,26 +3957,33 @@ public:
           [&](const H3W8A8AttentionPlan &plan) {
             return plan.qkv_layout_operation == op.id;
           });
-      if (h3_w8a8_qkv != h3_w8a8_attention_plans_.end())
+      if (h3_w8a8_qkv != h3_w8a8_attention_plans_.end()) {
+        stage_h3_w8a8_tail(*h3_w8a8_qkv, profile);
         launch_h3_w8a8_qkv(*h3_w8a8_qkv, h3_w8a8_functions_, buffers_,
                             context_.cublas(), context_.stream());
+      }
       else if (const auto h3_w8a8_output = std::find_if(
                    h3_w8a8_attention_plans_.begin(),
                    h3_w8a8_attention_plans_.end(),
                    [&](const H3W8A8AttentionPlan &plan) {
                      return plan.output_linear_operation == op.id;
                    });
-               h3_w8a8_output != h3_w8a8_attention_plans_.end())
+               h3_w8a8_output != h3_w8a8_attention_plans_.end()) {
+        if (!h3_w8a8_output->has_qkv_projection)
+          stage_h3_w8a8_tail(*h3_w8a8_output, profile);
         launch_h3_w8a8_output(*h3_w8a8_output, h3_w8a8_functions_, buffers_,
                               context_.cublas(), context_.stream());
+      }
       else if (const auto h3_w8a8_mlp = std::find_if(
           h3_w8a8_mlp_plans_.begin(), h3_w8a8_mlp_plans_.end(),
           [&](const H3W8A8MlpPlan &plan) {
             return plan.fc1_operation == op.id;
           });
-               h3_w8a8_mlp != h3_w8a8_mlp_plans_.end())
+               h3_w8a8_mlp != h3_w8a8_mlp_plans_.end()) {
+        stage_h3_w8a8_tail(*h3_w8a8_mlp, profile);
         launch_h3_w8a8_mlp(*h3_w8a8_mlp, h3_w8a8_functions_, buffers_,
                             context_.cublas(), context_.stream());
+      }
       else if (const auto fused_swiglu = std::find_if(
           fused_linear_swiglu_plans_.begin(),
           fused_linear_swiglu_plans_.end(),
@@ -3675,7 +4056,7 @@ public:
             check(cuEventRecord(timing->start->get(), context_.stream()),
                   "cuEventRecord profiled operation start");
           }
-          execute_operation(op);
+          execute_operation(op, profile);
           if (timing)
             check(cuEventRecord(timing->stop->get(), context_.stream()),
                   "cuEventRecord profiled operation stop");
@@ -3696,7 +4077,7 @@ public:
           check(cuEventRecord(timing->start->get(), context_.stream()),
                 "cuEventRecord profiled operation start");
         }
-        execute_operation(op);
+        execute_operation(op, profile);
         if (timing)
           check(cuEventRecord(timing->stop->get(), context_.stream()),
                 "cuEventRecord profiled operation stop");
@@ -3750,7 +4131,8 @@ public:
            plan.eliminated_intermediate_bytes,
            "approximate_w8a8_established_h3_gate",
            "serenity_h3_w8a8_chunked_mlp_residual",
-           plan.cache_path.string()});
+           plan.cache_path.string(),
+           plan.resident});
     result.h3_w8a8_attentions.reserve(h3_w8a8_attention_plans_.size());
     for (const auto &plan : h3_w8a8_attention_plans_)
       result.h3_w8a8_attentions.push_back(
@@ -3765,7 +4147,8 @@ public:
            plan.eliminated_intermediate_bytes,
            "approximate_w8a8_established_h3_gate",
            "serenity_h3_w8a8_direct_qkv_output_residual",
-           plan.cache_path.string()});
+           plan.cache_path.string(),
+           plan.resident});
     result.h3_ck_attentions.reserve(h3_ck_attention_plans_.size());
     for (const auto &[operation_id, plan] : h3_ck_attention_plans_)
       result.h3_ck_attentions.push_back(
@@ -3885,6 +4268,10 @@ public:
       result.pipeline_profile.non_kernel_device_timeline_milliseconds =
           std::max(0.0, total_device_timeline - kernel_total);
       streamed_prefetcher_->finish_profile(result.pipeline_profile);
+      result.pipeline_profile.streamed_weight_bytes +=
+          h3_w8a8_tail_streamed_bytes;
+      result.pipeline_profile.streamed_host_stage_milliseconds +=
+          h3_w8a8_tail_host_stage_milliseconds;
     }
 
     if (options.trace_operations && !options.profile_pipeline) {
@@ -3901,7 +4288,7 @@ public:
                 program_.operations.data());
             const auto ready = streamed_prefetcher_->prefetch(index, true);
             streamed_prefetcher_->wait(index, ready);
-            execute_operation(op);
+            execute_operation(op, false);
             streamed_prefetcher_->complete(index);
             check(cuEventRecord(stop.get(), context_.stream()),
                   "cuEventRecord operation stop");
@@ -3983,6 +4370,10 @@ private:
   std::unique_ptr<Workspace> workspace_;
   std::unique_ptr<Workspace> cudnn_workspace_;
   std::unique_ptr<Workspace> h3_w8a8_scratch_storage_;
+  std::unique_ptr<Workspace> h3_w8a8_tail_weight_storage_;
+  std::unique_ptr<PinnedHostWorkspace> h3_w8a8_tail_stage_;
+  std::array<std::unique_ptr<Event>, 2> h3_w8a8_tail_stage_events_;
+  std::array<bool, 2> h3_w8a8_tail_stage_armed_{};
   std::unique_ptr<Workspace> h3_groupwise_scratch_storage_;
   std::unique_ptr<Workspace> h3_modulation_storage_;
   std::unique_ptr<StreamedPrefetcher> streamed_prefetcher_;
@@ -4004,6 +4395,7 @@ private:
   std::vector<H3ModulationCachePlan> h3_modulation_cache_plans_;
   Tensor h3_modulation_expected_input_;
   std::filesystem::path h3_modulation_input_path_;
+  std::uint32_t h3_modulation_slices_{};
   H3W8A8Functions h3_w8a8_functions_;
   CUfunction h3_groupwise_dequant_function_{};
   std::shared_ptr<CkAttentionPlan> h3_ck_attention_plan_;
@@ -4018,6 +4410,11 @@ private:
   std::size_t workspace_bytes_{};
   std::size_t cudnn_workspace_bytes_{};
   std::uint64_t ck_attention_scratch_bytes_{};
+  std::uint64_t h3_w8a8_tail_attention_bytes_{};
+  std::uint64_t h3_w8a8_tail_mlp_bytes_{};
+  std::uint64_t h3_w8a8_tail_weight_bytes_{};
+  std::uint64_t h3_w8a8_tail_stage_half_bytes_{};
+  std::uint64_t h3_w8a8_tail_stage_turn_{};
   std::uint64_t resident_bytes_{};
   std::uint64_t resident_weight_bytes_{};
   std::uint64_t free_bytes_before_{};

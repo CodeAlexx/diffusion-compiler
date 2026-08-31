@@ -7,6 +7,7 @@
 !/docs/OPTIMIZER.md
 !/docs/PHASE2_READINESS.md
 !/docs/PHASE2_H3_BLOCK_RESULT_2026-08-29.md
+!/docs/PHASE3_H3_COMPLETE_INFERENCE_2026-08-30.md
 *.log
 *.safetensors
 *.ckpt

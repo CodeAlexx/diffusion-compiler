@@ -22,13 +22,23 @@ struct SafeTensorEntry {
   std::uint64_t byte_count{};
 };
 
+struct SafeTensorMetadataEntry {
+  std::string name;
+  std::string dtype;
+  std::vector<std::uint64_t> dims;
+  std::uint64_t file_offset{};
+  std::uint64_t byte_count{};
+};
+
 struct SafeTensorFile {
   std::filesystem::path path;
   std::uint64_t file_size{};
   std::uint64_t data_offset{};
   std::map<std::string, SafeTensorEntry, std::less<>> tensors;
+  std::map<std::string, SafeTensorMetadataEntry, std::less<>> metadata_tensors;
 
   const SafeTensorEntry *find(std::string_view name) const;
+  const SafeTensorMetadataEntry *find_metadata(std::string_view name) const;
 };
 
 struct SafeTensorIndex {
@@ -64,5 +74,7 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path);
 SafeTensorIndex read_safetensors_index(const std::filesystem::path &path);
 runtime::Tensor map_safetensor(const SafeTensorFile &file,
                                std::string_view name);
+std::vector<std::uint8_t>
+read_safetensor_metadata(const SafeTensorFile &file, std::string_view name);
 
 } // namespace dif::weights
