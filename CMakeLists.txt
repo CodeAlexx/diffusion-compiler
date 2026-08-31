@@ -24,6 +24,7 @@ add_library(difcore
   src/frontend/h3_latents.cpp
   src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
+  src/frontend/lora.cpp
   src/frontend/training.cpp
     src/ir/codec.cpp
     src/ir/verify.cpp
@@ -196,6 +197,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_tests tests/dif_tests.cpp)
   target_link_libraries(dif_tests PRIVATE difcore)
   add_test(NAME dif_tests COMMAND dif_tests)
+
+  add_executable(dif_lora_tests tests/lora_tests.cpp)
+  target_link_libraries(dif_lora_tests PRIVATE difcore)
+  add_test(NAME dif_lora_tests COMMAND dif_lora_tests)
 
   add_library(dif_mock_backend SHARED tests/mock_backend.cpp)
   target_include_directories(dif_mock_backend PRIVATE include)
