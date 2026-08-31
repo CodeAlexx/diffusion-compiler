@@ -103,6 +103,15 @@ struct RunOptions {
   // 62 GiB and a documented host-OOM incident: keep this modest.
   std::uint64_t streamed_pinned_budget_bytes{2ULL * 1024ULL * 1024ULL *
                                              1024ULL};
+  // Route the reusable W8A8 tail weight uploads over the copy stream with
+  // event fences instead of the compute stream (default false = historical
+  // compute-stream uploads).
+  bool h3_w8a8_tail_uploads_on_copy_stream{false};
+  // Stage dynamic input uploads and output readbacks through a pinned
+  // bounce buffer sized at prepare (default false = historical pageable
+  // transfers). Must be requested at prepare time; counted against
+  // streamed_pinned_budget_bytes.
+  bool pinned_io_staging{false};
 };
 
 struct OperationTiming {

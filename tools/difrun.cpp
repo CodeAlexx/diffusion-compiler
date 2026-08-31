@@ -79,7 +79,8 @@ void usage() {
                " [--profile-pipeline] [--serial-streaming] [--map-inputs]"
                " [--streamed-keep-pages] [--streamed-staging-buffers N]"
                " [--streamed-prefetch-depth N] [--streamed-stage-threads N]"
-               " [--streamed-pinned-budget-mib N]\n";
+               " [--streamed-pinned-budget-mib N] [--w8a8-tail-copy-stream]"
+               " [--pinned-io]\n";
   std::cerr << "input PATH may be FILE.diftensor or SHARD.safetensors::TENSOR_NAME\n";
 }
 
@@ -193,6 +194,10 @@ int main(int argc, char **argv) {
         options.streamed_pinned_budget_bytes =
             number(argv[++i], "streamed pinned budget MiB") * 1024ULL *
             1024ULL;
+      else if (option == "--w8a8-tail-copy-stream")
+        options.h3_w8a8_tail_uploads_on_copy_stream = true;
+      else if (option == "--pinned-io")
+        options.pinned_io_staging = true;
       else if (option == "--profile-pipeline")
         options.profile_pipeline = true;
       else if (option == "--serial-streaming")

@@ -3889,6 +3889,10 @@ public:
           static_cast<std::size_t>(2U * h3_w8a8_tail_stage_half_bytes_));
       for (auto &event : h3_w8a8_tail_stage_events_)
         event = std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+      h3_w8a8_tail_order_event_ =
+          std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+      h3_w8a8_tail_ready_event_ =
+          std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
     }
     h3_groupwise_scratch_storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(h3_groupwise_scratch_bytes));
@@ -3924,6 +3928,31 @@ public:
         program_, constants_, memory_plan_, buffers_, context_,
         options.streamed_staging_buffers, options.streamed_stage_threads,
         options.streamed_pinned_budget_bytes);
+    if (options.pinned_io_staging) {
+      auto input_bytes = std::uint64_t{0U};
+      auto output_bytes = std::uint64_t{0U};
+      for (const auto &description : program_.tensors) {
+        if (description.has_role(ir::TensorRole::Input)) {
+          if (input_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                description.byte_count())
+            fail("pinned I/O staging input size overflow");
+          input_bytes += description.byte_count();
+        }
+        if (description.has_role(ir::TensorRole::Output)) {
+          if (output_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                 description.byte_count())
+            fail("pinned I/O staging output size overflow");
+          output_bytes += description.byte_count();
+        }
+      }
+      const auto io_bytes = std::max(input_bytes, output_bytes);
+      if (io_bytes > options.streamed_pinned_budget_bytes)
+        fail("pinned I/O staging exceeds the pinned budget: io_bytes=" +
+             std::to_string(io_bytes) + " budget_bytes=" +
+             std::to_string(options.streamed_pinned_budget_bytes));
+      pinned_io_ = std::make_unique<PinnedHostWorkspace>(
+          static_cast<std::size_t>(io_bytes));
+    }
     for (const auto &op : program_.operations) {
       if (op.opcode == ir::Opcode::Linear &&
           !fused_launch_inputs_.contains(op.id) &&
@@ -4151,7 +4180,24 @@ public:
       select_h3_modulation_slice(h3_modulation_cache_plans_,
                                  options.h3_modulation_slice, buffers_);
     }
-    upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
+    if (options.pinned_io_staging && !pinned_io_)
+      fail("pinned I/O staging must be requested when the plan is prepared");
+    if (options.pinned_io_staging) {
+      auto *base = static_cast<std::uint8_t *>(pinned_io_->data());
+      std::size_t offset = 0U;
+      for (const auto &desc : program_.tensors) {
+        if (!desc.has_role(ir::TensorRole::Input))
+          continue;
+        const auto &tensor = bindings.at(desc.id);
+        std::memcpy(base + offset, tensor.data(), tensor.byte_size());
+        check(counted_memcpy_htod(buffers_.at(desc.id), base + offset,
+                                  tensor.byte_size(), context_.stream()),
+              "cuMemcpyHtoDAsync pinned dynamic input");
+        offset += tensor.byte_size();
+      }
+    } else {
+      upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
+    }
     check(counted_stream_synchronize(context_.stream()),
           "dynamic input upload synchronization");
 
@@ -4166,12 +4212,29 @@ public:
       if (h3_w8a8_tail_stage_armed_.at(half))
         check(counted_event_synchronize(h3_w8a8_tail_stage_events_.at(half)->get()),
               "cuEventSynchronize H3 W8A8 tail staging reuse");
+      const auto tail_copy_stream =
+          options.h3_w8a8_tail_uploads_on_copy_stream;
+      const auto tail_stream =
+          tail_copy_stream ? context_.copy_stream() : context_.stream();
+      if (tail_copy_stream) {
+        // The reusable tail device storage is shared by every tail layer:
+        // the copy stream must not overwrite it before the previous tail
+        // layer's kernels (already submitted on the compute stream) have
+        // consumed it. cuStreamWaitEvent snapshots the record at issue
+        // time, so one event object per fence direction suffices.
+        check(counted_event_record(h3_w8a8_tail_order_event_->get(),
+                                   context_.stream()),
+              "cuEventRecord H3 W8A8 tail upload order");
+        check(counted_stream_wait_event(context_.copy_stream(),
+                                        h3_w8a8_tail_order_event_->get(), 0U),
+              "cuStreamWaitEvent H3 W8A8 tail upload order");
+      }
       const auto stage_start = std::chrono::steady_clock::now();
       auto *staging = static_cast<std::uint8_t *>(
           h3_w8a8_tail_stage_->data()) +
           half * h3_w8a8_tail_stage_half_bytes_;
       const auto bytes = stage_h3_w8a8_weights(
-          plan, staging, h3_w8a8_tail_stage_half_bytes_, context_.stream());
+          plan, staging, h3_w8a8_tail_stage_half_bytes_, tail_stream);
       if (profile) {
         h3_w8a8_tail_streamed_bytes += bytes;
         h3_w8a8_tail_host_stage_milliseconds +=
@@ -4180,8 +4243,16 @@ public:
                 .count();
       }
       check(counted_event_record(h3_w8a8_tail_stage_events_.at(half)->get(),
-                          context_.stream()),
+                          tail_stream),
             "cuEventRecord H3 W8A8 tail staging copy");
+      if (tail_copy_stream) {
+        check(counted_event_record(h3_w8a8_tail_ready_event_->get(),
+                                   context_.copy_stream()),
+              "cuEventRecord H3 W8A8 tail weights ready");
+        check(counted_stream_wait_event(context_.stream(),
+                                        h3_w8a8_tail_ready_event_->get(), 0U),
+              "cuStreamWaitEvent H3 W8A8 tail weights ready");
+      }
       h3_w8a8_tail_stage_armed_.at(half) = true;
       ++h3_w8a8_tail_stage_turn_;
     };
@@ -4599,16 +4670,40 @@ public:
       }
     }
 
-    for (const auto &desc : program_.tensors) {
-      if (!desc.has_role(ir::TensorRole::Output))
-        continue;
-      auto tensor = zeros(desc);
-      check(counted_memcpy_dtoh(tensor.mutable_data(), buffers_.at(desc.id),
-                              tensor.byte_size(), context_.stream()),
-            "cuMemcpyDtoHAsync");
-      result.outputs.emplace(desc.id, std::move(tensor));
+    if (options.pinned_io_staging) {
+      auto *base = static_cast<std::uint8_t *>(pinned_io_->data());
+      std::size_t offset = 0U;
+      std::vector<std::pair<const ir::TensorDesc *, std::size_t>> staged;
+      for (const auto &desc : program_.tensors) {
+        if (!desc.has_role(ir::TensorRole::Output))
+          continue;
+        check(counted_memcpy_dtoh(base + offset, buffers_.at(desc.id),
+                                  desc.byte_count(), context_.stream()),
+              "cuMemcpyDtoHAsync pinned output");
+        staged.emplace_back(&desc, offset);
+        offset += desc.byte_count();
+      }
+      check(counted_stream_synchronize(context_.stream()),
+            "output copy synchronization");
+      for (const auto &[description, staged_offset] : staged) {
+        auto tensor = zeros(*description);
+        std::memcpy(tensor.mutable_data(), base + staged_offset,
+                    tensor.byte_size());
+        result.outputs.emplace(description->id, std::move(tensor));
+      }
+    } else {
+      for (const auto &desc : program_.tensors) {
+        if (!desc.has_role(ir::TensorRole::Output))
+          continue;
+        auto tensor = zeros(desc);
+        check(counted_memcpy_dtoh(tensor.mutable_data(), buffers_.at(desc.id),
+                                tensor.byte_size(), context_.stream()),
+              "cuMemcpyDtoHAsync");
+        result.outputs.emplace(desc.id, std::move(tensor));
+      }
+      check(counted_stream_synchronize(context_.stream()),
+            "output copy synchronization");
     }
-    check(counted_stream_synchronize(context_.stream()), "output copy synchronization");
 
     std::size_t free_after = 0;
     std::size_t total = 0;
@@ -4686,6 +4781,9 @@ private:
   std::unique_ptr<Workspace> h3_w8a8_tail_weight_storage_;
   std::unique_ptr<PinnedHostWorkspace> h3_w8a8_tail_stage_;
   std::array<std::unique_ptr<Event>, 2> h3_w8a8_tail_stage_events_;
+  std::unique_ptr<Event> h3_w8a8_tail_order_event_;
+  std::unique_ptr<Event> h3_w8a8_tail_ready_event_;
+  std::unique_ptr<PinnedHostWorkspace> pinned_io_;
   std::array<bool, 2> h3_w8a8_tail_stage_armed_{};
   std::unique_ptr<Workspace> h3_groupwise_scratch_storage_;
   std::unique_ptr<Workspace> h3_modulation_storage_;
