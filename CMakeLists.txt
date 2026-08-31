@@ -25,6 +25,7 @@ add_library(difcore
   src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
   src/frontend/dit_block.cpp
+  src/frontend/dit_lora.cpp
   src/frontend/lora.cpp
   src/frontend/training.cpp
     src/ir/codec.cpp
@@ -228,6 +229,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_dit_backward_tests tests/dit_backward_tests.cpp)
   target_link_libraries(dif_dit_backward_tests PRIVATE difcore)
   add_test(NAME dif_dit_backward_tests COMMAND dif_dit_backward_tests)
+
+  add_executable(dif_dit_lora_tests tests/dit_lora_tests.cpp)
+  target_link_libraries(dif_dit_lora_tests PRIVATE difcore)
+  add_test(NAME dif_dit_lora_tests COMMAND dif_dit_lora_tests)
 
   add_library(dif_mock_backend SHARED tests/mock_backend.cpp)
   target_include_directories(dif_mock_backend PRIVATE include)

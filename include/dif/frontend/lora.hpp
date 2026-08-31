@@ -102,6 +102,14 @@ void export_lora_adapters(const LoraFlowTrainingBuild &build,
                           const training::Checkpoint &checkpoint,
                           const std::filesystem::path &path);
 
+// Generalized form for any LoRA-carrying build (e.g. the DiT LoRA block):
+// the checkpoint must target `program`'s fingerprint and hold every
+// adapter's A/B state.
+void export_lora_adapters(const ir::Program &program,
+                          std::span<const LoraAdapterBinding> adapters,
+                          const training::Checkpoint &checkpoint,
+                          const std::filesystem::path &path);
+
 // Regression gate for the flame .alpha export lesson: fails unless every
 // adapter has lora_A.weight, lora_B.weight, and an F32 single-element
 // .alpha whose value matches the build's alpha.

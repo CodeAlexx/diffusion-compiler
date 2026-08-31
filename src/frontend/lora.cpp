@@ -253,17 +253,18 @@ default_lora_adapter_init(const LoraFlowTrainingBuild &build,
   return initial;
 }
 
-void export_lora_adapters(const LoraFlowTrainingBuild &build,
+void export_lora_adapters(const ir::Program &program,
+                          std::span<const LoraAdapterBinding> adapters,
                           const training::Checkpoint &checkpoint,
                           const std::filesystem::path &path) {
-  if (build.adapters.empty())
+  if (adapters.empty())
     fail("LoRA export requires at least one adapter");
-  if (checkpoint.program_fingerprint != ir::fingerprint(build.program))
+  if (checkpoint.program_fingerprint != ir::fingerprint(program))
     fail("LoRA export checkpoint targets a different program fingerprint");
   std::vector<weights::SafeTensorWriteSpec> specs;
-  for (const auto &adapter : build.adapters) {
-    const auto *a_description = build.program.tensor(adapter.lora_a);
-    const auto *b_description = build.program.tensor(adapter.lora_b);
+  for (const auto &adapter : adapters) {
+    const auto *a_description = program.tensor(adapter.lora_a);
+    const auto *b_description = program.tensor(adapter.lora_b);
     if (!a_description || !b_description)
       fail("LoRA export adapter tensor is not in the program");
     specs.push_back({adapter.name + ".lora_A.weight", ir::DType::F32,
@@ -275,7 +276,7 @@ void export_lora_adapters(const LoraFlowTrainingBuild &build,
     specs.push_back({adapter.name + ".alpha", ir::DType::F32, {1U}});
   }
   weights::SafeTensorWriter writer(path, std::move(specs));
-  for (const auto &adapter : build.adapters) {
+  for (const auto &adapter : adapters) {
     for (const auto &[suffix, id] :
          {std::pair<const char *, std::uint32_t>{".lora_A.weight",
                                                  adapter.lora_a},
@@ -294,6 +295,12 @@ void export_lora_adapters(const LoraFlowTrainingBuild &build,
     writer.append(adapter.name + ".alpha", alpha_bytes);
   }
   writer.finish();
+}
+
+void export_lora_adapters(const LoraFlowTrainingBuild &build,
+                          const training::Checkpoint &checkpoint,
+                          const std::filesystem::path &path) {
+  export_lora_adapters(build.program, build.adapters, checkpoint, path);
 }
 
 void validate_lora_export(const std::filesystem::path &path,
