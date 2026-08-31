@@ -50,29 +50,28 @@ architecture to evolve:
 ## 2. Flame module -> C++ equivalent port matrix
 
 Legend: DC = diffusion-compiler current state. Details per row in §3-§6.
-(Flame-side source anchors are being finalized from the flame-core
-extraction pass; rows marked ⏳ get source refs in the next revision.)
+Flame-side source anchors: FLAME_PORT_SOURCE_NOTES.md (ranked table sec 0).
 
 | Flame area | DC equivalent | Verdict | Gate | Perf reference |
 |---|---|---|---|---|
 | Tensor/storage/dtype (BF16 storage, F32 accumulate contract) | DiffIR dtypes + emitter dif_load/store macros (compiler.cpp:172-256) | EXISTING — keep; contract already matches | existing opcode tests | n/a |
 | cuBLASLt GEMM + epilogues | LinearPlan (cuda_executor.cpp:282-701), bias epilogue only | EXISTING/PARTIAL — extend epilogues, persist heuristics | bit-gates per epilogue | flame fused_linear3d parity work |
 | SDPA dispatch policy (cuDNN, fallback, budget tiling) | cuDNN forward plans + naive generated fallback | PARTIAL — no backward, naive fallback | cuDNN bwd gate + fallback parity | flame sdpa docs |
-| Backward equations (matmul/norm/act/rope/modulate) | autodiff has 6 rules, F32 only | PORTING — the core training port | per-op torch-oracle fixtures | flame autograd arms ⏳ |
-| RMSNorm/AdaLN/RoPE/SwiGLU fused fwd kernels | coarse opcodes, 1 NVRTC kernel each + 2 Serenity fast paths | EXISTING — good shape; extend fusion via skipped_operations hook | existing gates | flame fused_*.cu ⏳ |
-| Device alloc pool / scratch ring / pinned staging | per-slot cuMemAlloc + ~10 feature workspaces; pinned only in prefetcher/W8A8 | PORTING — arena + scratch frame + pinned pool | byte-identical outputs + alloc telemetry | flame cuda_alloc_pool / ring_alloc ⏳ |
+| Backward equations (matmul/norm/act/rope/modulate) | autodiff has 6 rules, F32 only | PORTING — the core training port | per-op torch-oracle fixtures | flame autograd arms -> FLAME_PORT_SOURCE_NOTES.md |
+| RMSNorm/AdaLN/RoPE/SwiGLU fused fwd kernels | coarse opcodes, 1 NVRTC kernel each + 2 Serenity fast paths | EXISTING — good shape; extend fusion via skipped_operations hook | existing gates | flame fused_*.cu -> FLAME_PORT_SOURCE_NOTES.md |
+| Device alloc pool / scratch ring / pinned staging | per-slot cuMemAlloc + ~10 feature workspaces; pinned only in prefetcher/W8A8 | PORTING — arena + scratch frame + pinned pool | byte-identical outputs + alloc telemetry | flame cuda_alloc_pool / ring_alloc -> FLAME_PORT_SOURCE_NOTES.md |
 | Weight offload/residency (BlockOffloader lessons) | program-wide Streamed bit; depth-1 prefetch; re-stage EVERY iteration + madvise(DONTNEED) | PORTING — top measured cost (157.5 s of 206 s wall) | byte-identical outputs + streamed-stage telemetry | H3_PIPELINE_PROFILE_2026-08-29 |
 | AdamW (incl. BF16 param / F32 moment split) | AdamWUpdate F32-uniform (verify.cpp:242-247) | PORTING — dtype split | 100-step torch parity re-run | existing training gates |
-| 8-bit Adam | none | MISSING — later wave | new opcode + parity | flame adam8bit ⏳ |
-| LoRA fwd/bwd/save | activation-path form expressible in F32 today; no runner | PORTING — LoRA vertical | grad-flow + torch parity + save/load round-trip | flame lora.rs lessons (alpha-scale export bug) ⏳ |
-| Gradient checkpointing / recompute | none (RematerializeProducer only) | MISSING — wave 2+ | loss-identical recompute gate | flame gradient_checkpointing ⏳ |
-| Grad clipping | none in-graph | MISSING — wave 2 | torch parity | flame grad_norm ⏳ |
+| 8-bit Adam | none | MISSING — later wave | new opcode + parity | flame adam8bit -> FLAME_PORT_SOURCE_NOTES.md |
+| LoRA fwd/bwd/save | activation-path form expressible in F32 today; no runner | PORTING — LoRA vertical | grad-flow + torch parity + save/load round-trip | flame lora.rs lessons (alpha-scale export bug) -> FLAME_PORT_SOURCE_NOTES.md |
+| Gradient checkpointing / recompute | none (RematerializeProducer only) | MISSING — wave 2+ | loss-identical recompute gate | flame gradient_checkpointing -> FLAME_PORT_SOURCE_NOTES.md |
+| Grad clipping | none in-graph | MISSING — wave 2 | torch parity | flame grad_norm -> FLAME_PORT_SOURCE_NOTES.md |
 | EMA | LinearBlend op is exactly the update | SCAFFOLD — frontend wiring only | state round-trip | n/a |
-| Mixed-precision training boundaries | Cast op fwd-only; no Cast backward | PORTING — Cast bwd is the choke point | mixed-precision MLP gate | flame mixed_precision ⏳ |
+| Mixed-precision training boundaries | Cast op fwd-only; no Cast backward | PORTING — Cast bwd is the choke point | mixed-precision MLP gate | flame mixed_precision -> FLAME_PORT_SOURCE_NOTES.md |
 | Quantization runtime | INT4/5 + W8A8 + groupwise already native | EXISTING — keep; W8A8 cache builder to nativize | existing gates | n/a |
-| Conv/GroupNorm/upsample (conv-VAE class) | none (H3 VAE is ViT) | MISSING — generality wave (FLUX/WAN) | torch conv parity | flame conv/cudnn ⏳ |
+| Conv/GroupNorm/upsample (conv-VAE class) | none (H3 VAE is ViT) | MISSING — generality wave (FLUX/WAN) | torch conv parity | flame conv/cudnn -> FLAME_PORT_SOURCE_NOTES.md |
 | Launch-count telemetry | none | PORTING — cheap, wave 1 | counter vs nsys spot-check | speed-contract discipline |
-| CUDA graph capture | none | MISSING — wave 3 (resident programs first) | byte-identical replay | flame cuda_graph ⏳ |
+| CUDA graph capture | none | MISSING — wave 3 (resident programs first) | byte-identical replay | flame cuda_graph -> FLAME_PORT_SOURCE_NOTES.md |
 
 ## 3. DC runtime findings that drive wave 1 (from the runtime audit)
 
