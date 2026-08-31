@@ -9,7 +9,7 @@ mkdir -p "$here/logs"
 log="$here/logs/$label.log"
 start=$(date +%s.%N)
 flock /tmp/dc-gpu.lock -c "${DIFRUN:-$here/../build/difrun} --backend cuda \
-  --program $here/gate-stack.difir \
+  --program ${PROGRAM:-$here/gate-stack.difir} \
   $(tr '\n' ' ' < "$here/tensors/difrun_inputs.txt") \
   $(tr '\n' ' ' < "$here/tensors/difrun_outputs.txt") \
   --map-inputs --warmups 1 --iterations 3 --profile-pipeline \
