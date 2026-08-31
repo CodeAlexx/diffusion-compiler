@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace dif::training {
 
@@ -23,6 +24,13 @@ AutodiffResult differentiate(const ir::Program &forward,
     if (!description || description->dtype != ir::DType::F32)
       fail("autodiff target must be an F32 tensor");
   }
+
+  const std::unordered_set<std::uint32_t> requested(with_respect_to.begin(),
+                                                    with_respect_to.end());
+  std::unordered_set<std::uint32_t> produced;
+  for (const auto &operation : forward.operations)
+    for (const auto output : operation.outputs)
+      produced.insert(output);
 
   AutodiffResult result;
   result.program = forward;
@@ -102,14 +110,23 @@ AutodiffResult differentiate(const ir::Program &forward,
     case ir::Opcode::Linear: {
       const auto grad_input =
           add_tensor(*result.program.tensor(operation.inputs[0]));
-      const auto grad_weight =
-          add_tensor(*result.program.tensor(operation.inputs[1]));
       add_operation(ir::Opcode::LinearBackwardInput,
                     {grad_output, operation.inputs[1]}, {grad_input});
-      add_operation(ir::Opcode::LinearBackwardWeight,
-                    {grad_output, operation.inputs[0]}, {grad_weight});
       accumulate(operation.inputs[0], grad_input);
-      accumulate(operation.inputs[1], grad_weight);
+      // Frozen-weight economy (flame lesson): the gradient of a leaf weight
+      // is a reverse-mode sink — nothing else consumes it.  Emit
+      // LinearBackwardWeight only when the weight is a differentiation
+      // target, or when the weight is produced by another operation (then
+      // its gradient is the path to earlier primals).  Graphs that request
+      // every parameter gradient are emitted unchanged.
+      const auto weight = operation.inputs[1];
+      if (requested.contains(weight) || produced.contains(weight)) {
+        const auto grad_weight =
+            add_tensor(*result.program.tensor(weight));
+        add_operation(ir::Opcode::LinearBackwardWeight,
+                      {grad_output, operation.inputs[0]}, {grad_weight});
+        accumulate(weight, grad_weight);
+      }
       if (operation.inputs.size() == 3U) {
         const auto grad_bias =
             add_tensor(*result.program.tensor(operation.inputs[2]));
