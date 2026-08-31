@@ -234,6 +234,22 @@ std::string_view opcode_name(Opcode opcode) {
     return "silu_backward";
   case Opcode::AdamWUpdate:
     return "adamw_update";
+  case Opcode::RmsNormBackward:
+    return "rms_norm_backward";
+  case Opcode::RmsNormModulateBackward:
+    return "rms_norm_modulate_backward";
+  case Opcode::SwiGluBackward:
+    return "swiglu_backward";
+  case Opcode::ResidualGateBackward:
+    return "residual_gate_backward";
+  case Opcode::LayerNormBackward:
+    return "layer_norm_backward";
+  case Opcode::QkNormPartialRopeBackward:
+    return "qk_norm_partial_rope_backward";
+  case Opcode::AttentionLse:
+    return "attention_lse";
+  case Opcode::AttentionBackward:
+    return "attention_backward";
   }
   return "invalid";
 }

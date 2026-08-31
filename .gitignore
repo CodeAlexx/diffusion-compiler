@@ -1,4 +1,5 @@
 /build/
+/local/
 /build-*/
 /artifacts/
 /.cache/
@@ -47,3 +48,5 @@
 .npmrc
 .pypirc
 !/docs/MIXED_PRECISION_TRAINING_GATE_2026-08-31.md
+!/docs/LORA_TRAINING_GATE_2026-08-31.md
+!/docs/DIT_BACKWARD_GATE_2026-08-31.md

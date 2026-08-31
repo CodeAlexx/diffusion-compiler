@@ -430,11 +430,13 @@ void emit_linear_backward_weight(std::ostringstream &out,
                                  const ir::Program &program,
                                  const ir::Operation &op) {
   const auto *input = program.tensor(op.inputs[1]);
-  const auto *grad_output = program.tensor(op.inputs[0]);
-  const auto count = program.tensor(op.outputs[0])->element_count();
-  const auto inner = input->dims.back();
+  const auto *grad_weight = program.tensor(op.outputs[0]);
+  const auto count = grad_weight->element_count();
+  // Geometry from the [N,K] weight gradient itself: rank-agnostic over both
+  // admitted operand forms (same-rank broadcast and flatten).
+  const auto outputs = grad_weight->dims[0];
+  const auto inner = grad_weight->dims[1];
   const auto rows = input->element_count() / inner;
-  const auto outputs = grad_output->dims.back();
   out << "extern \"C\" __global__ void " << function_name(op)
       << "(const dif_scalar* grad_output,const dif_scalar* input,dif_scalar* grad_weight){"
          "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
@@ -1216,6 +1218,370 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
       << "ULL+h)*" << dim << "ULL+d,acc);} }\n";
 }
 
+// DiT backward emitters.  Contract: generic launch (one thread per element
+// of output[0], no shared memory), F32 register math with serial F32
+// accumulators for every cross-element reduction, one typed rounding store
+// per output element (flame dtype contract).
+void emit_rms_norm_backward(std::ostringstream &out,
+                            const ir::Program &program,
+                            const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[1]);
+  const auto columns = input->dims.back();
+  const auto rows = input->element_count() / columns;
+  const auto count = rows * columns;
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const bool weight_grad = op.outputs.size() == 2U;
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,dif_scalar* grad_input"
+      << (weight_grad ? ",dif_scalar* grad_weight" : "")
+      << "){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << columns
+      << "ULL,base=row*" << columns
+      << "ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k){float value=dif_load(x,base+k);ss=fmaf(value,value,ss);}"
+         "float inv=rsqrtf(ss/"
+      << columns << ".0f+" << epsilon
+      << "f);float dot=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k)dot=fmaf(dif_load(grad_output,base+k)*dif_load(weight,k),"
+         "dif_load(x,base+k),dot);float value=dif_load(x,i);"
+         "float gradient=dif_load(grad_output,i)*dif_load(weight,i-base)*inv-"
+         "value*inv*inv*inv*dot/"
+      << columns << ".0f;dif_store(grad_input,i,gradient);";
+  if (weight_grad)
+    out << "if(i<" << columns
+        << "ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<" << rows
+        << "ULL;++r){unsigned long long rb=r*" << columns
+        << "ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<" << columns
+        << "ULL;++k){float rv=dif_load(x,rb+k);rss=fmaf(rv,rv,rss);}"
+           "float rinv=rsqrtf(rss/"
+        << columns << ".0f+" << epsilon
+        << "f);acc=fmaf(dif_load(grad_output,rb+i)*dif_load(x,rb+i),rinv,acc);}"
+           "dif_store(grad_weight,i,acc);}";
+  out << "}}\n" << std::defaultfloat;
+}
+
+void emit_rms_norm_modulate_backward(std::ostringstream &out,
+                                     const ir::Program &program,
+                                     const ir::Operation &op) {
+  const bool weighted = op.inputs.size() == 4U;
+  const auto *x = program.tensor(op.inputs[1]);
+  const auto rows = x->dims[0];
+  const auto columns = x->dims[1];
+  const auto count = rows * columns;
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << (weighted
+              ? "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,const dif_scalar* scale,dif_scalar* grad_input,dif_scalar* grad_scale,dif_scalar* grad_shift,dif_scalar* grad_weight){"
+              : "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* scale,dif_scalar* grad_input,dif_scalar* grad_scale,dif_scalar* grad_shift){")
+      << "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << columns
+      << "ULL,col=i%" << columns << "ULL,base=row*" << columns
+      << "ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k){float value=dif_load(x,base+k);ss=fmaf(value,value,ss);}"
+         "float inv=rsqrtf(ss/"
+      << columns << ".0f+" << epsilon
+      << "f);float dot=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k)dot=fmaf(dif_load(grad_output,base+k)*(1.0f+dif_load(scale,"
+         "base+k))"
+      << (weighted ? "*dif_load(weight,k)" : "")
+      << ",dif_load(x,base+k),dot);float value=dif_load(x,i);"
+         "float upstream=dif_load(grad_output,i);"
+         "float normed_gradient=upstream*(1.0f+dif_load(scale,i));"
+         "float weight_value="
+      << (weighted ? "dif_load(weight,col);" : "1.0f;")
+      << "dif_store(grad_input,i,normed_gradient*weight_value*inv-"
+         "value*inv*inv*inv*dot/"
+      << columns << ".0f);"
+         "dif_store(grad_scale,i,upstream*value*inv*weight_value);"
+         "dif_store(grad_shift,i,upstream);";
+  if (weighted)
+    out << "if(i<" << columns
+        << "ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<" << rows
+        << "ULL;++r){unsigned long long rb=r*" << columns
+        << "ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<" << columns
+        << "ULL;++k){float rv=dif_load(x,rb+k);rss=fmaf(rv,rv,rss);}"
+           "float rinv=rsqrtf(rss/"
+        << columns << ".0f+" << epsilon
+        << "f);acc=fmaf(dif_load(grad_output,rb+i)*(1.0f+dif_load(scale,rb+i))"
+           "*dif_load(x,rb+i),rinv,acc);}dif_store(grad_weight,i,acc);}";
+  out << "}}\n" << std::defaultfloat;
+}
+
+void emit_swiglu_backward(std::ostringstream &out, const ir::Program &program,
+                          const ir::Operation &op) {
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto width = grad_output->dims.back();
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
+  // Thread i owns one element of the packed [.., 2W] input gradient; the
+  // value half receives silu(gate)*g, the gate half dsilu(gate)*value*g.
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* grad_output,const dif_scalar* x,dif_scalar* grad_input){"
+         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << width * 2U
+      << "ULL,col=i%" << width * 2U << "ULL,cw=col<" << width
+      << "ULL?col:col-" << width << "ULL,base=row*" << width * 2U
+      << "ULL;float value=dif_load(x,base+" << (gate_first ? width : 0U)
+      << "ULL+cw);float gate=dif_load(x,base+" << (gate_first ? 0U : width)
+      << "ULL+cw);float sigmoid=1.0f/(1.0f+expf(-gate));"
+         "float upstream=dif_load(grad_output,row*"
+      << width << "ULL+cw);int is_value_slot=col"
+      << (gate_first ? ">=" : "<") << width
+      << "ULL;float gradient=is_value_slot?gate*sigmoid*upstream:"
+         "sigmoid*(1.0f+gate*(1.0f-sigmoid))*value*upstream;"
+         "dif_store(grad_input,i,gradient);}}\n";
+}
+
+void emit_qk_norm_rope_backward(std::ostringstream &out,
+                                const ir::Program &program,
+                                const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[1]);
+  const auto sequence = input->dims[0];
+  const auto heads = input->dims[1];
+  const auto dim = input->dims[2];
+  const auto count = sequence * heads * dim;
+  const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
+  const auto half = rotary / 2U;
+  const auto table_width = program.tensor(op.inputs[3])->dims[1];
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const bool weight_grad = op.outputs.size() == 2U;
+  // rot(k): the rotation-transpose of the upstream gradient at offset k of
+  // one head row (rb = row base, tb = table base), F32 registers.
+  const auto rotated = [&](const std::string &row_base,
+                           const std::string &table_base,
+                           const std::string &k) {
+    std::ostringstream expression;
+    expression << "(" << k << "<" << half << "ULL?"
+               << "dif_load(grad_output," << row_base << "+" << k
+               << ")*dif_load(cosv," << table_base << "+" << k
+               << ")+dif_load(grad_output," << row_base << "+" << k << "+"
+               << half << "ULL)*dif_load(sinv," << table_base << "+"
+               << (table_width == rotary ? k + "+" + std::to_string(half) +
+                                               "ULL"
+                                         : k)
+               << "):(" << k << "<" << rotary << "ULL?"
+               << "-dif_load(grad_output," << row_base << "+" << k << "-"
+               << half << "ULL)*dif_load(sinv," << table_base << "+" << k
+               << "-" << half << "ULL)+dif_load(grad_output," << row_base
+               << "+" << k << ")*dif_load(cosv," << table_base << "+"
+               << (table_width == rotary ? k
+                                         : k + "-" + std::to_string(half) +
+                                               "ULL")
+               << "):dif_load(grad_output," << row_base << "+" << k << ")))";
+    return expression.str();
+  };
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,const dif_scalar* cosv,const dif_scalar* sinv,dif_scalar* grad_input"
+      << (weight_grad ? ",dif_scalar* grad_weight" : "")
+      << "){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << dim
+      << "ULL,d=i%" << dim << "ULL,rb=row*" << dim
+      << "ULL,tb=(row/" << heads << "ULL)*" << table_width
+      << "ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<" << dim
+      << "ULL;++k){float value=dif_load(x,rb+k);ss=fmaf(value,value,ss);}"
+         "float inv=rsqrtf(ss/"
+      << dim << ".0f+" << epsilon
+      << "f);float dot=0.0f;for(unsigned long long k=0ULL;k<" << dim
+      << "ULL;++k){float rotated_gradient=" << rotated("rb", "tb", "k")
+      << ";dot=fmaf(rotated_gradient*dif_load(weight,k),dif_load(x,rb+k),"
+         "dot);}float own_rotated="
+      << rotated("rb", "tb", "d")
+      << ";float value=dif_load(x,i);"
+         "dif_store(grad_input,i,own_rotated*dif_load(weight,d)*inv-"
+         "value*inv*inv*inv*dot/"
+      << dim << ".0f);";
+  if (weight_grad)
+    out << "if(i<" << dim
+        << "ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<"
+        << sequence * heads << "ULL;++r){unsigned long long rrb=r*" << dim
+        << "ULL,rtb=(r/" << heads << "ULL)*" << table_width
+        << "ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<" << dim
+        << "ULL;++k){float rv=dif_load(x,rrb+k);rss=fmaf(rv,rv,rss);}"
+           "float rinv=rsqrtf(rss/"
+        << dim << ".0f+" << epsilon << "f);float rotated_gradient="
+        << rotated("rrb", "rtb", "i")
+        << ";acc=fmaf(rotated_gradient*dif_load(x,rrb+i),rinv,acc);}"
+           "dif_store(grad_weight,i,acc);}";
+  out << "}}\n" << std::defaultfloat;
+}
+
+void emit_layer_norm_backward(std::ostringstream &out,
+                              const ir::Program &program,
+                              const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[1]);
+  const auto columns = input->dims.back();
+  const auto rows = input->element_count() / columns;
+  const auto count = rows * columns;
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  // dx = inv*(gw - mean(gw) - xhat*mean(gw*xhat)), mean/inv recomputed from
+  // the original input in F32 (flame's non-affine-LN cancellation lesson).
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,dif_scalar* grad_input,dif_scalar* grad_weight,dif_scalar* grad_bias){"
+         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << columns
+      << "ULL,base=row*" << columns
+      << "ULL;float mean=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k)mean+=dif_load(x,base+k);mean/=" << columns
+      << ".0f;float variance=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k){float centered=dif_load(x,base+k)-mean;"
+         "variance=fmaf(centered,centered,variance);}float inv=rsqrtf(variance/"
+      << columns << ".0f+" << epsilon
+      << "f);float gradient_mean=0.0f,projected_mean=0.0f;"
+         "for(unsigned long long k=0ULL;k<"
+      << columns
+      << "ULL;++k){float weighted=dif_load(grad_output,base+k)*dif_load(weight,k);"
+         "float normalized=(dif_load(x,base+k)-mean)*inv;"
+         "gradient_mean+=weighted;projected_mean=fmaf(weighted,normalized,"
+         "projected_mean);}gradient_mean/="
+      << columns << ".0f;projected_mean/=" << columns
+      << ".0f;float upstream=dif_load(grad_output,i);"
+         "float weighted=upstream*dif_load(weight,i-base);"
+         "float normalized=(dif_load(x,i)-mean)*inv;"
+         "dif_store(grad_input,i,inv*(weighted-gradient_mean-normalized*"
+         "projected_mean));if(i<"
+      << columns
+      << "ULL){float weight_accumulator=0.0f,bias_accumulator=0.0f;"
+         "for(unsigned long long r=0ULL;r<"
+      << rows << "ULL;++r){unsigned long long rb=r*" << columns
+      << "ULL;float rmean=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k)rmean+=dif_load(x,rb+k);rmean/=" << columns
+      << ".0f;float rvariance=0.0f;for(unsigned long long k=0ULL;k<" << columns
+      << "ULL;++k){float centered=dif_load(x,rb+k)-rmean;"
+         "rvariance=fmaf(centered,centered,rvariance);}float rinv=rsqrtf("
+         "rvariance/"
+      << columns << ".0f+" << epsilon
+      << "f);float g=dif_load(grad_output,rb+i);"
+         "weight_accumulator=fmaf(g,(dif_load(x,rb+i)-rmean)*rinv,"
+         "weight_accumulator);bias_accumulator+=g;}"
+         "dif_store(grad_weight,i,weight_accumulator);"
+         "dif_store(grad_bias,i,bias_accumulator);}}}\n"
+      << std::defaultfloat;
+}
+
+void emit_residual_gate_backward(std::ostringstream &out,
+                                 const ir::Program &program,
+                                 const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* grad_output,const dif_scalar* branch,const dif_scalar* gate,dif_scalar* grad_branch,dif_scalar* grad_gate){"
+         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count
+      << "ULL){float upstream=dif_load(grad_output,i);"
+         "dif_store(grad_branch,i,upstream*dif_load(gate,i));"
+         "dif_store(grad_gate,i,upstream*dif_load(branch,i));}}\n";
+}
+
+void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
+                        const ir::Operation &op) {
+  const auto *q = program.tensor(op.inputs[0]);
+  const auto sequence = q->dims[0];
+  const auto heads = q->dims[1];
+  const auto dim = q->dims[2];
+  const auto count = sequence * heads;
+  const auto scale = static_cast<float>(op.f64(
+      ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
+  const bool causal = op.boolean(ir::AttrKey::Causal, false);
+  const auto *scalar = typed_scalar(q->dtype);
+  const auto *load = typed_load(q->dtype);
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op) << "(const "
+      << scalar << "* q,const " << scalar
+      << "* k,dif_f32* lse){unsigned long long i=(unsigned long long)"
+         "blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long qs=i/" << heads << "ULL,h=i%"
+      << heads << "ULL,qb=(qs*" << heads << "ULL+h)*" << dim
+      << "ULL,kend=" << (causal ? "qs+1ULL" : std::to_string(sequence) + "ULL")
+      << ";float maximum=-3.402823466e+38f;"
+         "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
+         "unsigned long long kb=(ks*"
+      << heads << "ULL+h)*" << dim
+      << "ULL;for(unsigned long long d=0ULL;d<" << dim
+      << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
+      << "(k,kb+d),score);score*=" << scale
+      << "f;maximum=fmaxf(maximum,score);}float denominator=0.0f;"
+         "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
+         "unsigned long long kb=(ks*"
+      << heads << "ULL+h)*" << dim
+      << "ULL;for(unsigned long long d=0ULL;d<" << dim
+      << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
+      << "(k,kb+d),score);denominator+=expf(score*" << scale
+      << "f-maximum);}dif_store_f32(lse,i,maximum+logf(denominator));}}\n"
+      << std::defaultfloat;
+}
+
+void emit_attention_backward(std::ostringstream &out,
+                             const ir::Program &program,
+                             const ir::Operation &op) {
+  const auto *q = program.tensor(op.inputs[1]);
+  const auto sequence = q->dims[0];
+  const auto heads = q->dims[1];
+  const auto dim = q->dims[2];
+  const auto count = sequence * heads * dim;
+  const auto scale = static_cast<float>(op.f64(
+      ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
+  const bool causal = op.boolean(ir::AttrKey::Causal, false);
+  const auto *scalar = typed_scalar(q->dtype);
+  const auto *load = typed_load(q->dtype);
+  const auto *store = typed_store(q->dtype);
+  // Thread i owns element (s,h,d) of ALL THREE gradients: dq for row s as a
+  // query, dk/dv for row s as a key.  P is recomputed from Q,K and the saved
+  // F32 logsumexp; delta = rowsum(dO*O) uses the forward output.  O(S) score
+  // recomputations per thread — the O(S^2) recompute path; acceptable at
+  // gate scale, cuDNN SDPA backward is the Wave-3 replacement.
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op) << "(const "
+      << scalar << "* grad_output,const " << scalar << "* q,const " << scalar
+      << "* k,const " << scalar << "* v,const " << scalar
+      << "* forward_output,const dif_f32* lse," << scalar << "* grad_q,"
+      << scalar << "* grad_k," << scalar
+      << "* grad_v){unsigned long long i=(unsigned long long)blockIdx.x*"
+         "blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << dim << "ULL,d=i%"
+      << dim << "ULL,s=row/" << heads << "ULL,h=row%" << heads
+      << "ULL,base=row*" << dim
+      << "ULL;"
+      // dq[s,h,d]: iterate keys ks<kend(s).
+         "float dq=0.0f;{unsigned long long qb=base,kend="
+      << (causal ? "s+1ULL" : std::to_string(sequence) + "ULL")
+      << ";float row_lse=dif_load_f32(lse,row);float delta=0.0f;"
+         "for(unsigned long long e=0ULL;e<"
+      << dim << "ULL;++e)delta=fmaf(" << load << "(grad_output,qb+e)," << load
+      << "(forward_output,qb+e),delta);"
+         "for(unsigned long long ks=0ULL;ks<kend;++ks){unsigned long long kb="
+         "(ks*"
+      << heads << "ULL+h)*" << dim
+      << "ULL;float score=0.0f,projected=0.0f;"
+         "for(unsigned long long e=0ULL;e<"
+      << dim << "ULL;++e){score=fmaf(" << load << "(q,qb+e)," << load
+      << "(k,kb+e),score);projected=fmaf(" << load << "(grad_output,qb+e),"
+      << load << "(v,kb+e),projected);}float probability=expf(score*" << scale
+      << "f-row_lse);dq=fmaf(probability*(projected-delta)*" << scale
+      << "f," << load << "(k,kb+d),dq);}}" << store
+      << "(grad_q,i,dq);"
+      // dk[s,h,d], dv[s,h,d]: iterate queries qs (qs>=s when causal).
+         "float dk=0.0f,dv=0.0f;{unsigned long long kb=base;"
+         "for(unsigned long long qs="
+      << (causal ? "s" : "0ULL") << ";qs<" << sequence
+      << "ULL;++qs){unsigned long long qb=(qs*" << heads << "ULL+h)*" << dim
+      << "ULL;float row_lse=dif_load_f32(lse,qs*" << heads
+      << "ULL+h);float score=0.0f,projected=0.0f,delta=0.0f;"
+         "for(unsigned long long e=0ULL;e<"
+      << dim << "ULL;++e){score=fmaf(" << load << "(q,qb+e)," << load
+      << "(k,kb+e),score);projected=fmaf(" << load << "(grad_output,qb+e),"
+      << load << "(v,kb+e),projected);delta=fmaf(" << load
+      << "(grad_output,qb+e)," << load
+      << "(forward_output,qb+e),delta);}float probability=expf(score*"
+      << scale << "f-row_lse);dk=fmaf(probability*(projected-delta)*" << scale
+      << "f," << load << "(q,qb+d),dk);dv=fmaf(probability," << load
+      << "(grad_output,qb+d),dv);}}" << store << "(grad_k,i,dk);" << store
+      << "(grad_v,i,dv);}}\n"
+      << std::defaultfloat;
+}
+
 } // namespace
 
 GeneratedCuda emit_cuda(const ir::Program &program) {
@@ -1377,6 +1743,30 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::DequantizeInt5:
       emit_dequantize_int5(source, program, op);
+      break;
+    case ir::Opcode::RmsNormBackward:
+      emit_rms_norm_backward(source, program, op);
+      break;
+    case ir::Opcode::RmsNormModulateBackward:
+      emit_rms_norm_modulate_backward(source, program, op);
+      break;
+    case ir::Opcode::SwiGluBackward:
+      emit_swiglu_backward(source, program, op);
+      break;
+    case ir::Opcode::ResidualGateBackward:
+      emit_residual_gate_backward(source, program, op);
+      break;
+    case ir::Opcode::LayerNormBackward:
+      emit_layer_norm_backward(source, program, op);
+      break;
+    case ir::Opcode::QkNormPartialRopeBackward:
+      emit_qk_norm_rope_backward(source, program, op);
+      break;
+    case ir::Opcode::AttentionLse:
+      emit_attention_lse(source, program, op);
+      break;
+    case ir::Opcode::AttentionBackward:
+      emit_attention_backward(source, program, op);
       break;
     }
     end_float_operation(source);

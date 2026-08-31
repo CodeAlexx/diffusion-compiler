@@ -22,7 +22,7 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::AdamWUpdate;
+  return opcode >= Opcode::Add && opcode <= Opcode::AttentionBackward;
 }
 
 bool valid_attr_key(AttrKey key) {
@@ -198,12 +198,25 @@ void verify_operation(const Program &program, const Operation &op) {
     if (!supported_float(grad_output.dtype) ||
         weight.dtype != grad_output.dtype ||
         grad_input.dtype != grad_output.dtype || grad_output.dims.empty() ||
-        grad_input.dims.empty() || weight.dims.size() != 2U ||
-        grad_output.dims.size() != grad_input.dims.size() ||
-        !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
-                    grad_input.dims.begin()) ||
-        grad_output.dims.back() != weight.dims[0] ||
-        grad_input.dims.back() != weight.dims[1])
+        grad_input.dims.empty() || weight.dims.size() != 2U)
+      fail("linear_backward_input has incompatible float dtypes or ranks");
+    // Two admitted geometries, mirroring the forward Linear contract:
+    // (a) same-rank leading-broadcast: [...,N] x [N,K] -> [...,K];
+    // (b) flatten form: rows = dims[0] and trailing dims flatten, exactly
+    //     the shapes forward Linear admits (e.g. grad of a [S,H,D]-declared
+    //     projection back to [S,H*D]).  The kernels index the flat
+    //     row-major view and are correct for both.
+    const bool same_rank_form =
+        grad_output.dims.size() == grad_input.dims.size() &&
+        std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
+                   grad_input.dims.begin()) &&
+        grad_output.dims.back() == weight.dims[0] &&
+        grad_input.dims.back() == weight.dims[1];
+    const bool flatten_form =
+        grad_output.dims[0] == grad_input.dims[0] &&
+        grad_output.element_count() / grad_output.dims[0] == weight.dims[0] &&
+        grad_input.element_count() / grad_input.dims[0] == weight.dims[1];
+    if (!same_rank_form && !flatten_form)
       fail("linear_backward_input has incompatible float shapes");
     return;
   }
@@ -217,12 +230,21 @@ void verify_operation(const Program &program, const Operation &op) {
     if (!supported_float(grad_output.dtype) ||
         input.dtype != grad_output.dtype ||
         grad_weight.dtype != grad_output.dtype || grad_output.dims.empty() ||
-        input.dims.empty() || grad_weight.dims.size() != 2U ||
-        grad_output.dims.size() != input.dims.size() ||
-        !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
-                    input.dims.begin()) ||
-        grad_weight.dims[0] != grad_output.dims.back() ||
-        grad_weight.dims[1] != input.dims.back())
+        input.dims.empty() || grad_weight.dims.size() != 2U)
+      fail("linear_backward_weight has incompatible float dtypes or ranks");
+    // Same two geometries as linear_backward_input (see the comment there).
+    const bool same_rank_form =
+        grad_output.dims.size() == input.dims.size() &&
+        std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
+                   input.dims.begin()) &&
+        grad_weight.dims[0] == grad_output.dims.back() &&
+        grad_weight.dims[1] == input.dims.back();
+    const bool flatten_form =
+        grad_output.dims[0] == input.dims[0] &&
+        grad_weight.dims[0] ==
+            grad_output.element_count() / grad_output.dims[0] &&
+        grad_weight.dims[1] == input.element_count() / input.dims[0];
+    if (!same_rank_form && !flatten_form)
       fail("linear_backward_weight has incompatible float shapes");
     return;
   }
@@ -233,10 +255,19 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_bias = tensor_or_fail(program, op.outputs[0], op);
     check_accumulator_f32(op);
     if (!supported_float(grad_output.dtype) || grad_output.dims.empty() ||
-        grad_bias.dtype != grad_output.dtype || grad_bias.dims.size() != 1U ||
-        grad_bias.dims[0] != grad_output.dims.back())
-      fail("bias_backward requires a float output gradient and matching "
-           "vector");
+        grad_bias.dtype != grad_output.dtype || grad_bias.dims.size() != 1U)
+      fail("bias_backward requires a float output gradient and a vector "
+           "gradient");
+    // The kernel sums the flat row-major view in rows of grad_bias's width.
+    // Two named widths are admitted: the final dimension (BiasAdd's
+    // broadcast-over-leading-dims contract) and the flattened row width
+    // (a Linear bias whose output was declared with split trailing dims,
+    // e.g. [S,H,D] with bias [H*D]).
+    if (grad_bias.dims[0] != grad_output.dims.back() &&
+        grad_bias.dims[0] !=
+            grad_output.element_count() / grad_output.dims[0])
+      fail("bias_backward gradient width must be the final dimension or "
+           "the flattened row width");
     return;
   }
 
@@ -772,6 +803,243 @@ void verify_operation(const Program &program, const Operation &op) {
           columns.dims[0] != out.dims[1])
         fail("dequantize_int5 column scales must match output dtype and [K]");
     }
+    return;
+  }
+
+  // DiT backward opcodes (flame backward-equation port).  The gradient of a
+  // tensor carries the dtype of its forward tensor (flame BF16_GRAD_DECISION
+  // Option A); every cross-element reduction inside these kernels is an F32
+  // accumulator, so an explicit AccumulatorDType must name F32 (fail-closed
+  // via check_accumulator_f32).
+
+  if (op.opcode == Opcode::RmsNormBackward) {
+    if (op.inputs.size() != 3U || op.outputs.empty() || op.outputs.size() > 2U)
+      fail("rms_norm_backward expects grad_output, input, weight and one or "
+           "two outputs");
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        weight.dtype != input.dtype || weight.dims.size() != 1U ||
+        weight.dims[0] != input.dims.back())
+      fail("rms_norm_backward requires float tensors and weight matching the "
+           "final dimension");
+    if (op.outputs.size() == 2U) {
+      const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);
+      if (grad_weight.dtype != weight.dtype || grad_weight.dims != weight.dims)
+        fail("rms_norm_backward weight gradient must match the weight");
+    }
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("rms_norm_backward epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("rms_norm_backward block size must be a power of two in [32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::RmsNormModulateBackward) {
+    const bool weighted = op.inputs.size() == 4U;
+    if ((op.inputs.size() != 3U && op.inputs.size() != 4U) ||
+        op.outputs.size() != op.inputs.size())
+      fail("rms_norm_modulate_backward expects grad_output, x, [weight], "
+           "scale and dx, dscale, dshift[, dweight]");
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &x = tensor_or_fail(program, op.inputs[1], op);
+    const auto &scale = tensor_or_fail(program, op.inputs[weighted ? 3U : 2U], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    const auto &grad_scale = tensor_or_fail(program, op.outputs[1], op);
+    const auto &grad_shift = tensor_or_fail(program, op.outputs[2], op);
+    same_shape_dtype(x, grad_output, op);
+    same_shape_dtype(x, scale, op);
+    same_shape_dtype(x, grad_input, op);
+    same_shape_dtype(x, grad_scale, op);
+    same_shape_dtype(x, grad_shift, op);
+    check_accumulator_f32(op);
+    if (!supported_float(x.dtype) || x.dims.size() != 2U)
+      fail("rms_norm_modulate_backward requires rank-2 float tensors");
+    if (weighted) {
+      const auto &weight = tensor_or_fail(program, op.inputs[2], op);
+      const auto &grad_weight = tensor_or_fail(program, op.outputs[3], op);
+      if (weight.dtype != x.dtype || weight.dims.size() != 1U ||
+          weight.dims[0] != x.dims[1] || grad_weight.dtype != weight.dtype ||
+          grad_weight.dims != weight.dims)
+        fail("rms_norm_modulate_backward weight and its gradient must match "
+             "[hidden]");
+    }
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("rms_norm_modulate_backward epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("rms_norm_modulate_backward block size must be a power of two in "
+           "[32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::SwiGluBackward) {
+    expect_counts(op, 2, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype) || grad_output.dtype != input.dtype ||
+        input.dims.empty() ||
+        grad_output.dims.size() != input.dims.size())
+      fail("swiglu_backward requires uniform float tensors");
+    auto expected = grad_output.dims;
+    expected.back() *= 2U;
+    if (input.dims != expected)
+      fail("swiglu_backward input final dimension must be twice the "
+           "grad_output final dimension");
+    return;
+  }
+
+  if (op.opcode == Opcode::ResidualGateBackward) {
+    expect_counts(op, 3, 2);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &branch = tensor_or_fail(program, op.inputs[1], op);
+    const auto &gate = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_branch = tensor_or_fail(program, op.outputs[0], op);
+    const auto &grad_gate = tensor_or_fail(program, op.outputs[1], op);
+    same_shape_dtype(grad_output, branch, op);
+    same_shape_dtype(grad_output, gate, op);
+    same_shape_dtype(grad_output, grad_branch, op);
+    same_shape_dtype(grad_output, grad_gate, op);
+    check_accumulator_f32(op);
+    if (!supported_float(grad_output.dtype))
+      fail("residual_gate_backward admits f32, bf16, or f16");
+    return;
+  }
+
+  if (op.opcode == Opcode::LayerNormBackward) {
+    expect_counts(op, 3, 3);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);
+    const auto &grad_bias = tensor_or_fail(program, op.outputs[2], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        weight.dtype != input.dtype || weight.dims.size() != 1U ||
+        weight.dims[0] != input.dims.back() ||
+        grad_weight.dtype != weight.dtype || grad_weight.dims != weight.dims ||
+        grad_bias.dtype != weight.dtype || grad_bias.dims != weight.dims)
+      fail("layer_norm_backward requires float tensors with affine "
+           "gradients matching the final dimension");
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("layer_norm_backward epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("layer_norm_backward block size must be a power of two in "
+           "[32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::QkNormPartialRopeBackward) {
+    // Backward of the fused per-head RMSNorm + partial halfsplit rotation.
+    // The rotation layout (RotaryDim, table width) is explicit in the op
+    // semantics, never inferred from shapes (flame's shape-sniff trap: the
+    // HiDream-O1 Q/K LoRA-B gradient collapse).
+    if (op.inputs.size() != 5U || op.outputs.empty() || op.outputs.size() > 2U)
+      fail("qk_norm_partial_rope_backward expects grad_output, input, "
+           "weight, cos, sin and one or two outputs");
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[2], op);
+    const auto &cos = tensor_or_fail(program, op.inputs[3], op);
+    const auto &sin = tensor_or_fail(program, op.inputs[4], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype) || input.dims.size() != 3U ||
+        weight.dtype != input.dtype || weight.dims.size() != 1U ||
+        weight.dims[0] != input.dims[2] || cos.dtype != input.dtype ||
+        sin.dtype != input.dtype || cos.dims != sin.dims ||
+        cos.dims.size() != 2U || cos.dims[0] != input.dims[0])
+      fail("qk_norm_partial_rope_backward requires grad/input [S,H,D], "
+           "weight [D], cos/sin [S,T]");
+    const auto head_dim = input.dims[2];
+    const auto rotary = op.u64(AttrKey::RotaryDim, head_dim);
+    if (rotary == 0U || rotary > head_dim || (rotary % 2U) != 0U ||
+        (cos.dims[1] != rotary && cos.dims[1] * 2U != rotary))
+      fail("qk_norm_partial_rope_backward rotary geometry is inconsistent");
+    if (op.outputs.size() == 2U) {
+      const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);
+      if (grad_weight.dtype != weight.dtype || grad_weight.dims != weight.dims)
+        fail("qk_norm_partial_rope_backward weight gradient must match the "
+             "weight");
+    }
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("qk_norm_partial_rope_backward epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("qk_norm_partial_rope_backward block size must be a power of two "
+           "in [32,1024]");
+    return;
+  }
+
+  if (op.opcode == Opcode::AttentionLse) {
+    // Per-(query,head) max-shifted logsumexp of the attention scores.  A
+    // cross-row reduction/accumulator, so the output is pinned F32
+    // regardless of the Q/K storage dtype (flame dtype contract).
+    expect_counts(op, 2, 1);
+    const auto &q = tensor_or_fail(program, op.inputs[0], op);
+    const auto &k = tensor_or_fail(program, op.inputs[1], op);
+    const auto &lse = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(q, k, op);
+    check_accumulator_f32(op);
+    if (!supported_float(q.dtype) || q.dims.size() != 3U)
+      fail("attention_lse requires f32, bf16, or f16 [S,H,D] inputs");
+    if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
+        lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
+      fail("attention_lse output must be F32 [S,H]");
+    if (q.dims[0] > 4096U)
+      fail("decomposed attention backward is admitted only for S<=4096");
+    return;
+  }
+
+  if (op.opcode == Opcode::AttentionBackward) {
+    // Decomposed recompute backward (flame section 2c): P is recomputed in
+    // F32 from Q,K and the saved logsumexp; delta = rowsum(dO*O) uses the
+    // forward output taken by DIRECT tensor id (flame's saved-O identity
+    // trap: a shape-found O destroyed the dO.O^T identity -> grad_norm=inf).
+    expect_counts(op, 6, 3);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &q = tensor_or_fail(program, op.inputs[1], op);
+    const auto &k = tensor_or_fail(program, op.inputs[2], op);
+    const auto &v = tensor_or_fail(program, op.inputs[3], op);
+    const auto &forward_output = tensor_or_fail(program, op.inputs[4], op);
+    const auto &lse = tensor_or_fail(program, op.inputs[5], op);
+    const auto &grad_q = tensor_or_fail(program, op.outputs[0], op);
+    const auto &grad_k = tensor_or_fail(program, op.outputs[1], op);
+    const auto &grad_v = tensor_or_fail(program, op.outputs[2], op);
+    same_shape_dtype(q, k, op);
+    same_shape_dtype(q, v, op);
+    same_shape_dtype(q, grad_output, op);
+    same_shape_dtype(q, forward_output, op);
+    same_shape_dtype(q, grad_q, op);
+    same_shape_dtype(q, grad_k, op);
+    same_shape_dtype(q, grad_v, op);
+    check_accumulator_f32(op);
+    if (!supported_float(q.dtype) || q.dims.size() != 3U)
+      fail("attention_backward requires f32, bf16, or f16 [S,H,D] tensors");
+    if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
+        lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
+      fail("attention_backward saved logsumexp must be F32 [S,H]");
+    if (q.dims[0] > 4096U)
+      fail("decomposed attention backward is admitted only for S<=4096");
     return;
   }
 

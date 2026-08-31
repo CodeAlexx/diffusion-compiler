@@ -4,6 +4,7 @@
 #include "dif/support/error.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -164,6 +165,177 @@ AutodiffResult differentiate(const ir::Program &forward,
                     {grad_output, operation.inputs[0]}, {grad_b});
       accumulate(operation.inputs[0], grad_a);
       accumulate(operation.inputs[1], grad_b);
+      break;
+    }
+    case ir::Opcode::RmsNorm: {
+      const auto weight = operation.inputs[1];
+      // Frozen-weight economy (mirrors Linear): the weight gradient is
+      // emitted only when the weight is a differentiation target or is
+      // produced by another operation.
+      const bool needs_weight =
+          requested.contains(weight) || produced.contains(weight);
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      std::vector<std::uint32_t> outputs{grad_input};
+      std::uint32_t grad_weight = 0U;
+      if (needs_weight) {
+        grad_weight = add_tensor(*result.program.tensor(weight));
+        outputs.push_back(grad_weight);
+      }
+      add_operation(ir::Opcode::RmsNormBackward,
+                    {grad_output, operation.inputs[0], weight},
+                    std::move(outputs),
+                    {ir::Attribute::f64(
+                        ir::AttrKey::Epsilon,
+                        operation.f64(ir::AttrKey::Epsilon, 1.0e-5))});
+      accumulate(operation.inputs[0], grad_input);
+      if (needs_weight)
+        accumulate(weight, grad_weight);
+      break;
+    }
+    case ir::Opcode::RmsNormModulate: {
+      const bool weighted = operation.inputs.size() == 4U;
+      const auto x = operation.inputs[0];
+      const auto scale = operation.inputs[weighted ? 2U : 1U];
+      const auto shift = operation.inputs[weighted ? 3U : 2U];
+      const auto grad_input = add_tensor(*result.program.tensor(x));
+      const auto grad_scale = add_tensor(*result.program.tensor(scale));
+      const auto grad_shift = add_tensor(*result.program.tensor(shift));
+      std::vector<std::uint32_t> inputs{grad_output, x};
+      std::vector<std::uint32_t> outputs{grad_input, grad_scale, grad_shift};
+      std::uint32_t grad_weight = 0U;
+      if (weighted) {
+        inputs.push_back(operation.inputs[1]);
+        grad_weight =
+            add_tensor(*result.program.tensor(operation.inputs[1]));
+      }
+      inputs.push_back(scale);
+      if (weighted)
+        outputs.push_back(grad_weight);
+      add_operation(ir::Opcode::RmsNormModulateBackward, std::move(inputs),
+                    std::move(outputs),
+                    {ir::Attribute::f64(
+                        ir::AttrKey::Epsilon,
+                        operation.f64(ir::AttrKey::Epsilon, 1.0e-5))});
+      accumulate(x, grad_input);
+      accumulate(scale, grad_scale);
+      accumulate(shift, grad_shift);
+      if (weighted)
+        accumulate(operation.inputs[1], grad_weight);
+      break;
+    }
+    case ir::Opcode::Attention: {
+      const auto q = operation.inputs[0];
+      const auto k = operation.inputs[1];
+      const auto v = operation.inputs[2];
+      const auto *q_description = result.program.tensor(q);
+      const auto head_dim = q_description->dims[2];
+      const auto scale = operation.f64(
+          ir::AttrKey::AttentionScale,
+          1.0 / std::sqrt(static_cast<double>(head_dim)));
+      const auto causal = operation.boolean(ir::AttrKey::Causal, false);
+      // Saved-stats recompute path: one AttentionLse op recomputes the
+      // per-(query,head) F32 logsumexp, then AttentionBackward recomputes P
+      // from Q,K,lse and consumes the forward output BY DIRECT TENSOR ID
+      // (operation.outputs[0]) for delta = rowsum(dO*O) — flame's saved-O
+      // identity lesson.  AttentionScale and Causal are stamped explicitly
+      // so forward and backward can never resolve different defaults.
+      const auto lse = next_tensor++;
+      result.program.tensors.push_back(
+          {lse, ir::DType::F32, ir::TensorRole::Internal,
+           {q_description->dims[0], q_description->dims[1]}});
+      add_operation(ir::Opcode::AttentionLse, {q, k}, {lse},
+                    {ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
+                     ir::Attribute::boolean(ir::AttrKey::Causal, causal)});
+      const auto grad_q = add_tensor(*result.program.tensor(q));
+      const auto grad_k = add_tensor(*result.program.tensor(k));
+      const auto grad_v = add_tensor(*result.program.tensor(v));
+      add_operation(ir::Opcode::AttentionBackward,
+                    {grad_output, q, k, v, operation.outputs[0], lse},
+                    {grad_q, grad_k, grad_v},
+                    {ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
+                     ir::Attribute::boolean(ir::AttrKey::Causal, causal)});
+      accumulate(q, grad_q);
+      accumulate(k, grad_k);
+      accumulate(v, grad_v);
+      break;
+    }
+    case ir::Opcode::QkNormPartialRope: {
+      const auto x = operation.inputs[0];
+      const auto weight = operation.inputs[1];
+      // cos/sin are precomputed non-differentiable tables; the rotation
+      // layout travels on the op as an explicit RotaryDim (stamped with the
+      // executor's default so forward and backward can never disagree).
+      const bool needs_weight =
+          requested.contains(weight) || produced.contains(weight);
+      const auto grad_input = add_tensor(*result.program.tensor(x));
+      std::vector<std::uint32_t> outputs{grad_input};
+      std::uint32_t grad_weight = 0U;
+      if (needs_weight) {
+        grad_weight = add_tensor(*result.program.tensor(weight));
+        outputs.push_back(grad_weight);
+      }
+      const auto head_dim = result.program.tensor(x)->dims[2];
+      add_operation(
+          ir::Opcode::QkNormPartialRopeBackward,
+          {grad_output, x, weight, operation.inputs[2],
+           operation.inputs[3]},
+          std::move(outputs),
+          {ir::Attribute::f64(ir::AttrKey::Epsilon,
+                              operation.f64(ir::AttrKey::Epsilon, 1.0e-5)),
+           ir::Attribute::u64(ir::AttrKey::RotaryDim,
+                              operation.u64(ir::AttrKey::RotaryDim,
+                                            head_dim))});
+      accumulate(x, grad_input);
+      if (needs_weight)
+        accumulate(weight, grad_weight);
+      break;
+    }
+    case ir::Opcode::LayerNorm: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      const auto grad_weight =
+          add_tensor(*result.program.tensor(operation.inputs[1]));
+      const auto grad_bias =
+          add_tensor(*result.program.tensor(operation.inputs[2]));
+      add_operation(ir::Opcode::LayerNormBackward,
+                    {grad_output, operation.inputs[0], operation.inputs[1]},
+                    {grad_input, grad_weight, grad_bias},
+                    {ir::Attribute::f64(
+                        ir::AttrKey::Epsilon,
+                        operation.f64(ir::AttrKey::Epsilon, 1.0e-5))});
+      accumulate(operation.inputs[0], grad_input);
+      accumulate(operation.inputs[1], grad_weight);
+      accumulate(operation.inputs[2], grad_bias);
+      break;
+    }
+    case ir::Opcode::SwiGlu: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::SwiGluBackward,
+                    {grad_output, operation.inputs[0]}, {grad_input},
+                    {ir::Attribute::boolean(
+                        ir::AttrKey::GateFirst,
+                        operation.boolean(ir::AttrKey::GateFirst, false))});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::ResidualGate: {
+      // d_residual = g (direct accumulation); one kernel produces the branch
+      // and gate gradients.  DiffIR's ResidualGate is fully elementwise
+      // (gate has the residual's shape), so d_gate = g*branch elementwise —
+      // flame's sum-over-sequence applies only to its broadcast [B,1,C]
+      // gate, which DiffIR expresses with explicitly expanded tensors.
+      accumulate(operation.inputs[0], grad_output);
+      const auto grad_branch =
+          add_tensor(*result.program.tensor(operation.inputs[1]));
+      const auto grad_gate =
+          add_tensor(*result.program.tensor(operation.inputs[2]));
+      add_operation(ir::Opcode::ResidualGateBackward,
+                    {grad_output, operation.inputs[1], operation.inputs[2]},
+                    {grad_branch, grad_gate});
+      accumulate(operation.inputs[1], grad_branch);
+      accumulate(operation.inputs[2], grad_gate);
       break;
     }
     case ir::Opcode::Cast: {

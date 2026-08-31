@@ -70,6 +70,14 @@ enum class Opcode : std::uint32_t {
   BiasBackward = 36,
   SiLUBackward = 37,
   AdamWUpdate = 38,
+  RmsNormBackward = 39,
+  RmsNormModulateBackward = 40,
+  SwiGluBackward = 41,
+  ResidualGateBackward = 42,
+  LayerNormBackward = 43,
+  QkNormPartialRopeBackward = 44,
+  AttentionLse = 45,
+  AttentionBackward = 46,
 };
 
 enum class AttrKey : std::uint32_t {
