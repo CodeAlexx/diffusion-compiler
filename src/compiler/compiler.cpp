@@ -441,6 +441,18 @@ void emit_silu(std::ostringstream &out, const ir::Program &program,
       << count << "ULL)dif_store(y,i,dif_silu(dif_load(x,i)));}\n";
 }
 
+void emit_gelu(std::ostringstream &out, const ir::Program &program,
+               const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count
+      << "ULL){float v=dif_load(x,i);float c=v*v*v;float z="
+         "7.978845608e-1f*(v+4.471500218e-2f*c);"
+         "dif_store(y,i,5.0e-1f*v*(1.0f+tanhf(z)));}}\n";
+}
+
 // The training ops below may legally mix storage dtypes across their
 // arguments (e.g. BF16 prediction into an F32 loss, BF16 parameters with F32
 // moments), so they bypass the per-operation dif_load/dif_store macro system
@@ -474,6 +486,156 @@ const char *typed_store(ir::DType dtype) {
   if (dtype == ir::DType::F16)
     return "dif_store_f16";
   fail("CUDA training emitter admits f32, bf16, or f16 storage");
+}
+
+void emit_sigmoid(std::ostringstream &out, const ir::Program &program,
+                  const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count
+      << "ULL){float v=dif_load(x,i);dif_store(y,i,1.0f/(1.0f+expf(-v)));}}\n";
+}
+
+void emit_reshape(std::ostringstream &out, const ir::Program &program,
+                  const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL)dif_store(y,i,dif_load(x,i));}\n";
+}
+
+void emit_broadcast_to(std::ostringstream &out, const ir::Program &program,
+                       const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto rank_pad = output->dims.size() - input->dims.size();
+  std::vector<std::uint64_t> strides(input->dims.size(), 1U);
+  for (std::size_t axis = input->dims.size(); axis-- > 1U;)
+    strides[axis - 1U] = strides[axis] * input->dims[axis];
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << output->element_count()
+      << "ULL){unsigned long long coordinate=i,source=0ULL,at=0ULL;";
+  for (std::size_t axis = output->dims.size(); axis-- > 0U;) {
+    out << "at=coordinate%" << output->dims[axis]
+        << "ULL;coordinate/=" << output->dims[axis] << "ULL;";
+    if (axis >= rank_pad && input->dims[axis - rank_pad] != 1U)
+      out << "source+=at*" << strides[axis - rank_pad] << "ULL;";
+  }
+  out << "dif_store(y,i,dif_load(x,source));}}\n";
+}
+
+void emit_slice(std::ostringstream &out, const ir::Program &program,
+                const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto selected =
+      static_cast<std::size_t>(op.u64(ir::AttrKey::Axis, 0U));
+  const auto start = op.u64(ir::AttrKey::Start, 0U);
+  std::vector<std::uint64_t> strides(input->dims.size(), 1U);
+  for (std::size_t axis = input->dims.size(); axis-- > 1U;)
+    strides[axis - 1U] = strides[axis] * input->dims[axis];
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << output->element_count()
+      << "ULL){unsigned long long coordinate=i,source=0ULL,at=0ULL;";
+  for (std::size_t axis = output->dims.size(); axis-- > 0U;) {
+    out << "at=coordinate%" << output->dims[axis]
+        << "ULL;coordinate/=" << output->dims[axis] << "ULL;";
+    if (axis == selected)
+      out << "at+=" << start << "ULL;";
+    out << "source+=at*" << strides[axis] << "ULL;";
+  }
+  out << "dif_store(y,i,dif_load(x,source));}}\n";
+}
+
+void emit_rotary_frequency(std::ostringstream &out,
+                           const ir::Program &program,
+                           const ir::Operation &op) {
+  const auto *positions = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto sequence = positions->dims[1];
+  const auto axes = positions->dims[2];
+  const auto pairs = output->dims[2];
+  out << std::setprecision(17)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_f32* positions,const int* pair_axes,const int* "
+         "pair_indices,const int* axis_dims,dif_f32* cosine,dif_f32* sine){"
+         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
+         "threadIdx.x;if(i<"
+      << output->element_count() << "ULL){unsigned long long pair=i%" << pairs
+      << "ULL,token=(i/" << pairs << "ULL)%" << sequence
+      << "ULL,batch=i/(" << pairs << "ULL*" << sequence
+      << "ULL);int axis=pair_axes[pair],component=pair_indices[pair],"
+         "axis_dim=axis_dims[axis];double scale=(2.0*(double)component)/"
+         "(double)axis_dim;double omega=1.0/pow("
+      << op.f64(ir::AttrKey::Theta, 10000.0) << "*"
+      << op.f64(ir::AttrKey::Ntk, 1.0)
+      << ",scale);double angle=(double)dif_load_f32(positions,(batch*"
+      << sequence << "ULL+token)*" << axes
+      << "ULL+(unsigned long long)axis)*omega;dif_store_f32(cosine,i,"
+         "(float)cos(angle));dif_store_f32(sine,i,(float)sin(angle));}}\n"
+      << std::defaultfloat;
+}
+
+void emit_rotary_apply(std::ostringstream &out, const ir::Program &program,
+                       const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *cosine = program.tensor(op.inputs[1]);
+  const auto sequence = input->dims[1];
+  const auto heads = input->dims[2];
+  const auto dim = input->dims[3];
+  const auto pairs = cosine->dims[2];
+  out << "extern \"C\" __global__ void " << function_name(op) << "(const "
+      << typed_scalar(input->dtype)
+      << "* x,const dif_f32* cosine,const dif_f32* sine,"
+      << typed_scalar(input->dtype)
+      << "* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
+         "threadIdx.x;if(i<"
+      << input->element_count() << "ULL){unsigned long long d=i%" << dim
+      << "ULL,outer=i/" << dim << "ULL,token=(outer/" << heads << "ULL)%"
+      << sequence << "ULL,batch=outer/(" << heads << "ULL*" << sequence
+      << "ULL);if(d<" << 2U * pairs
+      << "ULL){unsigned long long pair=d/2ULL,base=i-d,table=(batch*"
+      << sequence << "ULL+token)*" << pairs << "ULL+pair;float even="
+      << typed_load(input->dtype) << "(x,base+2ULL*pair),odd="
+      << typed_load(input->dtype)
+      << "(x,base+2ULL*pair+1ULL),c=dif_load_f32(cosine,table),"
+         "s=dif_load_f32(sine,table);"
+      << typed_store(input->dtype)
+      << "(y,i,(d&1ULL)?even*s+odd*c:even*c-odd*s);}else "
+      << typed_store(input->dtype) << "(y,i," << typed_load(input->dtype)
+      << "(x,i));}}\n";
+}
+
+void emit_boolean_mask_to_bias(std::ostringstream &out,
+                               const ir::Program &program,
+                               const ir::Operation &op) {
+  const auto *mask = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto sequence = output->dims[2];
+  const bool vector_mask = mask->dims.size() == 2U;
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const unsigned char* mask," << typed_scalar(output->dtype)
+      << "* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
+         "threadIdx.x;if(i<"
+      << output->element_count() << "ULL){unsigned long long key=i%"
+      << sequence << "ULL,query=(i/" << sequence << "ULL)%" << sequence
+      << "ULL,batch=i/(" << sequence << "ULL*" << sequence
+      << "ULL);bool valid=";
+  if (vector_mask)
+    out << "mask[batch*" << sequence << "ULL+query]&&mask[batch*" << sequence
+        << "ULL+key]";
+  else
+    out << "mask[(batch*" << sequence << "ULL+query)*" << sequence
+        << "ULL+key]";
+  out << ";" << typed_store(output->dtype)
+      << "(y,i,valid?0.0f:-__int_as_float(0x7f800000));}}\n";
 }
 
 void emit_mse_loss(std::ostringstream &out, const ir::Program &program,
@@ -808,6 +970,79 @@ void emit_flow_euler_step(std::ostringstream &out,
          "i,__fadd_rn(weighted_sample,weighted_denoised));}}\n";
 }
 
+void emit_euler_velocity_step(std::ostringstream &out,
+                              const ir::Program &program,
+                              const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* sample,const dif_scalar* velocity,const dif_f32* "
+         "current,const dif_f32* next,dif_scalar* output){unsigned long long "
+         "i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count
+      << "ULL){float dt=__fsub_rn(dif_load_f32(next,0ULL),"
+         "dif_load_f32(current,0ULL));float scaled=dif_round(__fmul_rn(dt,"
+         "dif_load(velocity,i)));dif_store(output,i,__fadd_rn("
+         "dif_load(sample,i),scaled));}}\n";
+}
+
+void emit_permute(std::ostringstream &out, const ir::Program &program,
+                  const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto rank = input->dims.size();
+  std::vector<std::uint64_t> input_strides(rank, 1U);
+  for (std::size_t axis = rank - 1U; axis > 0U; --axis)
+    input_strides[axis - 1U] = input_strides[axis] * input->dims[axis];
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* input,dif_scalar* output){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << output->element_count()
+      << "ULL){unsigned long long remaining=i,source=0ULL,coordinate;";
+  for (std::size_t reverse = rank; reverse-- > 0U;) {
+    const auto key = static_cast<ir::AttrKey>(
+        static_cast<std::uint32_t>(ir::AttrKey::Permutation0) + reverse);
+    const auto input_axis = op.u64(key, 0U);
+    out << "coordinate=remaining%" << output->dims[reverse]
+        << "ULL;remaining/=" << output->dims[reverse]
+        << "ULL;source+=coordinate*" << input_strides[input_axis] << "ULL;";
+  }
+  out << "dif_store(output,i,dif_load(input,source));}}\n";
+}
+
+void emit_concat(std::ostringstream &out, const ir::Program &program,
+                 const ir::Operation &op) {
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto axis = static_cast<std::size_t>(op.u64(ir::AttrKey::Axis, 0U));
+  std::uint64_t inner = 1U;
+  for (std::size_t dimension = axis + 1U; dimension < output->dims.size();
+       ++dimension)
+    inner *= output->dims[dimension];
+  out << "extern \"C\" __global__ void " << function_name(op) << "(";
+  for (std::size_t input = 0U; input < op.inputs.size(); ++input) {
+    if (input != 0U)
+      out << ',';
+    out << "const dif_scalar* input" << input;
+  }
+  out << ",dif_scalar* output){unsigned long long i=(unsigned long long)"
+         "blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << output->element_count()
+      << "ULL){unsigned long long inner_index=i%" << inner
+      << "ULL,axis_coordinate=(i/" << inner << "ULL)%"
+      << output->dims[axis] << "ULL,outer=i/(" << output->dims[axis]
+      << "ULL*" << inner << "ULL),source=0ULL;";
+  std::uint64_t offset = 0U;
+  for (std::size_t input = 0U; input < op.inputs.size(); ++input) {
+    const auto input_axis = program.tensor(op.inputs[input])->dims[axis];
+    out << (input == 0U ? "if" : "else if") << "(axis_coordinate<"
+        << offset + input_axis << "ULL){source=(outer*" << input_axis
+        << "ULL+(axis_coordinate-" << offset << "ULL))*" << inner
+        << "ULL+inner_index;dif_store(output,i,dif_load(input" << input
+        << ",source));}";
+    offset += input_axis;
+  }
+  out << "}}\n";
+}
+
 void emit_patchify_3d(std::ostringstream &out, const ir::Program &program,
                       const ir::Operation &op, bool inverse) {
   const auto *volume =
@@ -858,6 +1093,10 @@ void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
   const auto columns = input->dims.back();
   const auto rows = input->element_count() / columns;
   const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
+  const auto weight_offset = op.f64(ir::AttrKey::WeightOffset, 0.0);
+  std::ostringstream weight_offset_literal;
+  weight_offset_literal << std::scientific << std::setprecision(9)
+                        << static_cast<float>(weight_offset);
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
   out << std::setprecision(17) << "extern \"C\" __global__ void "
       << function_name(op)
@@ -892,7 +1131,8 @@ void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
       << static_cast<float>(epsilon)
       << "f);for(unsigned long long col=threadIdx.x;col<" << columns
       << "ULL;col+=blockDim.x){unsigned long long i=row*" << columns
-      << "ULL+col;dif_store(y,i,dif_load(x,i)*inv*dif_load(weight,col));}}\n";
+      << "ULL+col;dif_store(y,i,dif_load(x,i)*inv*(dif_load(weight,col)+"
+      << weight_offset_literal.str() << "f));}}\n";
 }
 
 void emit_layer_norm(std::ostringstream &out, const ir::Program &program,
@@ -2171,9 +2411,10 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
   for (const auto &tensor : program.tensors) {
     if (tensor.dtype != ir::DType::F32 && tensor.dtype != ir::DType::BF16 &&
         tensor.dtype != ir::DType::F16 &&
-        tensor.dtype != ir::DType::I32 && tensor.dtype != ir::DType::I8)
+        tensor.dtype != ir::DType::I32 && tensor.dtype != ir::DType::I8 &&
+        tensor.dtype != ir::DType::Bool)
       fail("CUDA source emitter admits mixed f32/bf16/f16 plus i32 indices "
-           "and packed i8 constants");
+           "and packed i8/bool constants");
   }
   emit_header(source);
   auto fusions = find_lowbit_linear_fusions(program, generated.skipped_operations);
@@ -2222,6 +2463,18 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       emit_rotary_position(source, program, op);
       continue;
     }
+    if (op.opcode == ir::Opcode::RotaryFrequency) {
+      emit_rotary_frequency(source, program, op);
+      continue;
+    }
+    if (op.opcode == ir::Opcode::RotaryApply) {
+      emit_rotary_apply(source, program, op);
+      continue;
+    }
+    if (op.opcode == ir::Opcode::BooleanMaskToBias) {
+      emit_boolean_mask_to_bias(source, program, op);
+      continue;
+    }
     begin_float_operation(source, operation_float_dtype(program, op));
     switch (op.opcode) {
     case ir::Opcode::Add:
@@ -2235,6 +2488,25 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::SiLU:
       emit_silu(source, program, op);
+      break;
+    case ir::Opcode::Gelu:
+      emit_gelu(source, program, op);
+      break;
+    case ir::Opcode::Sigmoid:
+      emit_sigmoid(source, program, op);
+      break;
+    case ir::Opcode::Reshape:
+      emit_reshape(source, program, op);
+      break;
+    case ir::Opcode::BroadcastTo:
+      emit_broadcast_to(source, program, op);
+      break;
+    case ir::Opcode::Slice:
+      emit_slice(source, program, op);
+      break;
+    case ir::Opcode::RotaryFrequency:
+    case ir::Opcode::RotaryApply:
+    case ir::Opcode::BooleanMaskToBias:
       break;
     case ir::Opcode::RmsNorm:
       emit_rms_norm(source, program, op);
@@ -2290,6 +2562,15 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::FlowEulerStep:
       emit_flow_euler_step(source, program, op);
+      break;
+    case ir::Opcode::EulerVelocityStep:
+      emit_euler_velocity_step(source, program, op);
+      break;
+    case ir::Opcode::Permute:
+      emit_permute(source, program, op);
+      break;
+    case ir::Opcode::Concat:
+      emit_concat(source, program, op);
       break;
     case ir::Opcode::Patchify3D:
       emit_patchify_3d(source, program, op, false);

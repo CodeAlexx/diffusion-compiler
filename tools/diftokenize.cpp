@@ -15,12 +15,15 @@
 #include "dif/support/json.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/text/qwen_bpe_tokenizer.hpp"
+#include "dif/weights/safetensors.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <variant>
@@ -36,7 +39,8 @@ namespace {
                "(--tokenizer-json <f> [--tokenizer-config <f>])\n"
             << "  --prompt-file <path> | --prompt <text> | --battery <json>\n"
             << "  [--strip-trailing-newline] [--ids-out <path>]\n"
-            << "  [--diftensor-out <path>] [--quiet]\n";
+            << "  [--diftensor-out <path>] [--krea2-inputs-out <path>] "
+               "[--quiet]\n";
   std::exit(2);
 }
 
@@ -93,6 +97,7 @@ int main(int argc, char **argv) {
     fs::path battery_file;
     fs::path ids_out;
     fs::path diftensor_out;
+    fs::path krea2_inputs_out;
     std::string prompt_text;
     bool have_prompt_text = false;
     bool strip_trailing_newline = false;
@@ -122,6 +127,8 @@ int main(int argc, char **argv) {
         ids_out = value("--ids-out");
       else if (option == "--diftensor-out")
         diftensor_out = value("--diftensor-out");
+      else if (option == "--krea2-inputs-out")
+        krea2_inputs_out = value("--krea2-inputs-out");
       else if (option == "--strip-trailing-newline")
         strip_trailing_newline = true;
       else if (option == "--quiet")
@@ -165,6 +172,49 @@ int main(int argc, char **argv) {
         prompt.pop_back();
 
     const std::vector<std::int32_t> ids = tokenizer.encode(prompt);
+
+    if (!krea2_inputs_out.empty()) {
+      constexpr std::string_view krea_prefix =
+          "<|im_start|>system\nDescribe the image by detailing the color, shape, "
+          "size, texture, quantity, text, spatial relationships of the objects "
+          "and background:<|im_end|>\n<|im_start|>user\n";
+      constexpr std::size_t prefix_length = 541U;
+      constexpr std::int32_t pad_id = 151643;
+      constexpr std::int32_t suffix[] = {151645, 198, 151644, 77091, 198};
+      auto krea_ids = tokenizer.encode(std::string(krea_prefix) + prompt);
+      if (krea_ids.size() > prefix_length)
+        krea_ids.resize(prefix_length);
+      const auto valid_prefix = krea_ids.size();
+      krea_ids.resize(prefix_length, pad_id);
+      krea_ids.insert(krea_ids.end(), std::begin(suffix), std::end(suffix));
+      std::vector<std::uint8_t> mask(krea_ids.size(), 0U);
+      std::fill(mask.begin(), mask.begin() + valid_prefix, 1U);
+      std::fill(mask.begin() + prefix_length, mask.end(), 1U);
+      std::vector<float> positions(krea_ids.size());
+      std::int32_t position = -1;
+      for (std::size_t index = 0U; index < krea_ids.size(); ++index) {
+        if (mask[index])
+          ++position;
+        positions[index] = mask[index] ? static_cast<float>(position) : 1.0F;
+      }
+      std::vector<dif::weights::SafeTensorWriteSpec> specs{
+          {"input_ids", dif::ir::DType::I32, {1U, krea_ids.size()}},
+          {"attention_mask", dif::ir::DType::Bool, {1U, mask.size()}},
+          {"position_ids", dif::ir::DType::F32, {positions.size(), 1U}},
+      };
+      dif::weights::SafeTensorWriter writer(krea2_inputs_out,
+                                             std::move(specs));
+      writer.append(
+          "input_ids",
+          {reinterpret_cast<const std::uint8_t *>(krea_ids.data()),
+           krea_ids.size() * sizeof(std::int32_t)});
+      writer.append("attention_mask", {mask.data(), mask.size()});
+      writer.append(
+          "position_ids",
+          {reinterpret_cast<const std::uint8_t *>(positions.data()),
+           positions.size() * sizeof(float)});
+      (void)writer.finish();
+    }
 
     if (!ids_out.empty()) {
       std::ofstream out(ids_out);

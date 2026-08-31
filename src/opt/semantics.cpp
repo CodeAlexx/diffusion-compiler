@@ -9,10 +9,12 @@ bool pinned_numeric_semantics(const ir::Operation &op) {
   // another precision or through another math mode is not admissible.
   case ir::Opcode::SinusoidalTimestep:
   case ir::Opcode::FlowEulerStep:
+  case ir::Opcode::EulerVelocityStep:
   case ir::Opcode::AdamWUpdate:
   case ir::Opcode::DequantizeInt4:
   case ir::Opcode::DequantizeInt5:
   case ir::Opcode::RotaryPosition:
+  case ir::Opcode::Gelu:
     return true;
   default:
     break;
@@ -50,6 +52,8 @@ bool bit_exact_data_movement(ir::Opcode opcode) {
   // Cast is admitted only when the discovery pass has established that the
   // conversion widens, which is exact; see rewrite.cpp.
   case ir::Opcode::Cast:
+  case ir::Opcode::Permute:
+  case ir::Opcode::Concat:
     return true;
   default:
     return false;
@@ -61,6 +65,7 @@ bool dtype_uniform(ir::Opcode opcode) {
   case ir::Opcode::Add:
   case ir::Opcode::Multiply:
   case ir::Opcode::SiLU:
+  case ir::Opcode::Gelu:
   case ir::Opcode::RmsNorm:
   case ir::Opcode::RmsNormModulate:
   case ir::Opcode::SwiGlu:

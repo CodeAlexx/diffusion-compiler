@@ -154,8 +154,27 @@ architecture. PROVEN-REAL-DIMS (accepted 175-frame natural-language video).
 H3-shaped IR to generalize in Wave 2: H3AdaLNSelect, H3DeinterleaveQkv*,
 FlowEulerStep (per OPTIMIZER.md: DeinterleaveGroups + ReshapeView, no new
 model-specific opcodes). Missing for FLUX/WAN class: Transpose/Permute,
-Concat/general Split, GELU, Conv/GroupNorm/upsample, batched/masked
+Concat/general Split, Conv/GroupNorm/upsample, batched/masked
 Attention.
+
+**Krea 2** (`include/dif/frontend/krea2.hpp`,
+`src/frontend/krea2.cpp`, `docs/KREA2_COMPILER_INTAKE.md`) — model family #2.
+The released 6144-wide/28-block architecture and default 1024 geometry are
+pinned. A real-dimension BF16/F32 timestep/modulation slice is verified as an
+8-operation DiffIR program (fingerprint
+`d8e0997e9fa8f75b648fccd2eb7c556a31373a8bbdceab46fc22414bed1817af`).
+Generic tanh GELU is bit-exact to the creator fixture on CPU and RTX 3090 Ti
+for F32/BF16/F16. Full-block admission is blocked on generic layout/broadcast,
+masked batched attention, and three-axis interleaved RoPE; Qwen-Image VAE
+primitives remain an image-path gap. SCAFFOLD / PROVEN-REAL-DIMS for the
+admitted slice only.
+
+**Qwen3-VL conditioner** (`include/dif/frontend/qwen3vl_conditioner.hpp`,
+`src/frontend/qwen3vl_conditioner.cpp`, `tools/difcondition.cpp`) — generic-op
+Qwen text tower frontend landed for H3. Krea reuses this architecture by
+configuration, but still needs its 4B geometry, explicit padding mask, exact
+prompt template, and 12 selected residual taps; it must not copy the executor.
+PROVEN-REAL-DIMS for H3; PORTING for Krea.
 
 ## Backends beyond CUDA
 
@@ -163,7 +182,8 @@ Attention.
 pure-C v2 ABI with v1 fallback; host-tensor views (zero-copy deferred by
 contract). **OpenCL reference** (`backends/opencl/`) — full current op set,
 real-device tested on the local NVIDIA OpenCL driver only; not a
-second-vendor claim. EXISTING/PROVEN at conformance scope.
+second-vendor claim. Tanh GELU and the existing audio opcodes fail closed
+pending separate parity gates. EXISTING/PROVEN at recorded conformance scope.
 
 ## Tools
 
@@ -171,7 +191,7 @@ second-vendor claim. EXISTING/PROVEN at conformance scope.
 `diftune`, `difcast`, `difschedule`, `difh3layout`, `difweights`,
 `difquant`, `difimage`, `difvaedecode`, `difh3infer` (joined H3 pipeline +
 diagnostic slicing flags), `diftrain`, `difh3media` (native RGB24 + ffmpeg
-mux), `difcompare`, `difopt`, `difslice`. Wave-1 adds: `difimport` (native
+mux), `difcompare`, `difopt`, `difslice`, `difcondition`. Wave-1 adds: `difimport` (native
 SafeTensors→diftensor, w1-deps), modcache builder (w1-deps), LoRA
 make/run/export modes (w1-lora).
 
@@ -184,5 +204,3 @@ native tokenizer -> native Qwen3-VL conditioner -> native denoise -> native
 video VAE -> native BigVGAN audio -> ffmpeg mux, proven at process level in
 an environment where `import torch` fails. cuDNN is vendored outside any
 Python tree. PyTorch survives only as a development oracle.
-PyTorch remains only in oracles (/home/alex/diffusion-fixtures) and
-evaluation tooling.

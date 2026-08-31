@@ -4,12 +4,14 @@
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/compiler/memory_plan.hpp"
+#include "dif/opt/gate.hpp"
 #include "dif/frontend/h3.hpp"
 #include "dif/frontend/h3_conditioning.hpp"
 #include "dif/frontend/h3_latents.hpp"
 #include "dif/frontend/h3_media.hpp"
 #include "dif/frontend/h3_vae.hpp"
 #include "dif/frontend/h3_audio_vae.hpp"
+#include "dif/frontend/krea2.hpp"
 #include "dif/frontend/training.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -75,6 +77,13 @@ dif::runtime::Tensor i32_tensor(std::vector<std::uint64_t> dims,
   dif::runtime::Tensor tensor{dif::ir::DType::I32, std::move(dims), {}};
   tensor.bytes.resize(values.size() * sizeof(std::int32_t));
   std::memcpy(tensor.bytes.data(), values.data(), tensor.bytes.size());
+  tensor.validate();
+  return tensor;
+}
+
+dif::runtime::Tensor bool_tensor(std::vector<std::uint64_t> dims,
+                                 const std::vector<std::uint8_t> &values) {
+  dif::runtime::Tensor tensor{dif::ir::DType::Bool, std::move(dims), values};
   tensor.validate();
   return tensor;
 }
@@ -296,6 +305,8 @@ dif::ir::Program all_opcodes_program(dif::ir::DType dtype) {
   program.tensors.push_back({76, dtype, input, {1, 2, 2, 2, 2}});
   program.tensors.push_back({77, dtype, output, {2, 8}});
   program.tensors.push_back({78, dtype, output, {1, 2, 2, 2, 2}});
+  program.tensors.push_back({79, dtype, input, {1, 2}});
+  program.tensors.push_back({80, dtype, output, {1, 2}});
   program.operations = {
       {1, Opcode::Add, {1, 2}, {3}, {}},
       {2, Opcode::Multiply, {1, 2}, {4}, {}},
@@ -345,6 +356,10 @@ dif::ir::Program all_opcodes_program(dif::ir::DType dtype) {
        {Attribute::u64(AttrKey::PatchT, 1U),
         Attribute::u64(AttrKey::PatchH, 2U),
         Attribute::u64(AttrKey::PatchW, 2U)}},
+      {26, Opcode::Gelu, {79}, {80},
+       {Attribute::u64(
+           AttrKey::Approximation,
+           static_cast<std::uint64_t>(GeluApproximation::Tanh))}},
   };
   return program;
 }
@@ -422,6 +437,7 @@ void test_cpu_all_opcodes_and_float_dtypes() {
     inputs.emplace(74, f32_tensor({2}, {0.75F, 0.5F}));
     bind(76, {1, 2, 2, 2, 2},
          {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    bind(79, {1, 2}, {-1.0F, 1.0F});
 
     auto executor = dif::runtime::make_cpu_executor();
     dif::runtime::RunOptions options;
@@ -477,7 +493,286 @@ void test_cpu_all_opcodes_and_float_dtypes() {
     check(78, {0, 1, 2, 3, 4, 5, 6, 7,
                8, 9, 10, 11, 12, 13, 14, 15},
           "CPU typed Unpatchify3D");
+    check(80, {-0.1588079929F, 0.8411920071F}, "CPU typed tanh Gelu");
   }
+}
+
+void test_krea2_gelu_creator_parity() {
+  using namespace dif::ir;
+  const std::vector<float> inputs{-8.0F, -5.0F, -3.0F, -1.0F, -0.5F,
+                                  -0.1F, 0.0F,  0.1F,  0.5F,  1.0F,
+                                  3.0F,  5.0F,  8.0F};
+  const std::vector<float> f32_expected = floats_from_bits(
+      {0x80000000U, 0xb4a00000U, 0xbb6e6200U, 0xbe229e90U, 0xbe1dfd26U,
+       0xbd3c7c95U, 0x00000000U, 0x3d5d1d05U, 0x3eb1016dU, 0x3f57585cU,
+       0x403fc468U, 0x409fffffU, 0x41000000U});
+  const std::vector<float> bf16_expected{
+      -0.0F,          -2.980232238769531e-7F, -0.003631591796875F,
+      -0.1591796875F, -0.154296875F,           -0.046142578125F,
+      0.0F,           0.053955078125F,          0.345703125F,
+      0.83984375F,    3.0F,                     5.0F,
+      8.0F};
+  const std::vector<float> f16_expected{
+      -0.0F,             -2.980232238769531e-7F,
+      -0.0036373138427734375F, -0.1588134765625F,
+      -0.154296875F,     -0.0460205078125F,
+      0.0F,              0.053955078125F,
+      0.345703125F,      0.84130859375F,
+      2.99609375F,       5.0F,
+      8.0F};
+
+  const auto run_gate = [&](DType dtype, const std::vector<float> &expected,
+                            const char *dtype_label) {
+    Program program;
+    program.tensors = {{1, dtype, TensorRole::Input, {inputs.size()}},
+                       {2, dtype, TensorRole::Output, {inputs.size()}}};
+    program.operations = {
+        {1, Opcode::Gelu, {1}, {2},
+         {Attribute::u64(
+             AttrKey::Approximation,
+             static_cast<std::uint64_t>(GeluApproximation::Tanh))}}};
+    verify(program);
+    dif::runtime::TensorMap bindings;
+    bindings.emplace(1, float_tensor(dtype, {inputs.size()}, inputs));
+    dif::runtime::TensorMap creator;
+    creator.emplace(2, float_tensor(dtype, {expected.size()}, expected));
+    dif::runtime::RunOptions options;
+    options.warmups = 0;
+    options.iterations = 1;
+    options.minimum_free_bytes = 0;
+    const auto cpu =
+        dif::runtime::make_cpu_executor()->run(program, bindings, options);
+    const dif::opt::AcceptanceBars bars{
+        dtype == DType::F32
+            ? 1.0e-6
+            : (dtype == DType::BF16 ? 7.8125e-3 : 9.765625e-4),
+        0.999999, 0.999, 1.001, 1.0e-3, ~std::uint64_t{0}};
+    const dif::opt::AcceptanceGate gate(bars);
+    const auto cpu_metrics = gate.measure(creator, cpu.outputs);
+    expect(gate.judge(cpu_metrics, 0U) == dif::opt::Verdict::Accepted,
+           "CPU tanh GELU matches the official Krea 2 creator fixture");
+    std::cout << "GATE krea2_gelu creator=krea-2@db3984f dtype="
+              << dtype_label << " backend=cpu"
+              << " cosine=" << cpu_metrics.cosine_similarity
+              << " rel_l2=" << cpu_metrics.relative_l2
+              << " max_abs=" << cpu_metrics.max_absolute_error
+              << " norm_ratio=" << cpu_metrics.norm_ratio
+              << " nonfinite=" << cpu_metrics.nonfinite_count
+              << " bit_mismatch=" << cpu_metrics.exact_mismatch_count
+              << "\n";
+    if (!dif::runtime::cuda_available())
+      return;
+    const auto cuda =
+        dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    const auto cuda_metrics = gate.measure(creator, cuda.outputs);
+    expect(gate.judge(cuda_metrics, 0U) == dif::opt::Verdict::Accepted,
+           "CUDA tanh GELU matches the official Krea 2 creator fixture");
+    std::cout << "GATE krea2_gelu creator=krea-2@db3984f dtype="
+              << dtype_label << " backend=" << cuda.backend_name
+              << " device=" << cuda.device_name
+              << " cosine=" << cuda_metrics.cosine_similarity
+              << " rel_l2=" << cuda_metrics.relative_l2
+              << " max_abs=" << cuda_metrics.max_absolute_error
+              << " norm_ratio=" << cuda_metrics.norm_ratio
+              << " nonfinite=" << cuda_metrics.nonfinite_count
+              << " bit_mismatch=" << cuda_metrics.exact_mismatch_count
+              << "\n";
+  };
+
+  run_gate(DType::F32, f32_expected, "f32");
+  run_gate(DType::BF16, bf16_expected, "bf16");
+  run_gate(DType::F16, f16_expected, "f16");
+
+  Program rejected;
+  rejected.tensors = {{1, DType::F32, TensorRole::Input, {1}},
+                      {2, DType::F32, TensorRole::Output, {1}}};
+  rejected.operations = {{1, Opcode::Gelu, {1}, {2}, {}}};
+  bool failed_closed = false;
+  try {
+    verify(rejected);
+  } catch (const dif::Error &) {
+    failed_closed = true;
+  }
+  expect(failed_closed,
+         "Gelu without an explicit source approximation fails closed");
+}
+
+void test_krea2_euler_velocity_creator_parity() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::BF16, TensorRole::Input, {16}},
+      {2, DType::BF16, TensorRole::Input, {16}},
+      {3, DType::F32, TensorRole::Input, {1}},
+      {4, DType::F32, TensorRole::Input, {1}},
+      {5, DType::BF16, TensorRole::Output, {16}},
+  };
+  program.operations = {
+      {1, Opcode::EulerVelocityStep, {1, 2, 3, 4}, {5}, {}},
+  };
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(
+      1, float_tensor(DType::BF16, {16},
+                      {-12.625F, -81.0F, 85.0F, 10.1875F, 55.75F,
+                       0.765625F, 40.25F, -92.0F, -130.0F, 1.8046875F,
+                       -60.5F, 67.0F, -20.125F, 42.5F, 86.5F, -127.5F}));
+  bindings.emplace(
+      2, float_tensor(DType::BF16, {16},
+                      {96.0F, 152.0F, -28.125F, 1.296875F, -32.0F, 55.5F,
+                       -124.0F, 10.5F, -38.0F, -1.890625F, -91.0F, 41.75F,
+                       -83.0F, -71.0F, -236.0F, -50.75F}));
+  // First two entries of the official Krea 2 Raw 1024/28 schedule. The
+  // creator converts these F32 schedule values to Python scalars, then runs
+  // eager BF16 multiply and add operations.
+  bindings.emplace(3, f32_tensor({1}, {1.0F}));
+  bindings.emplace(4, f32_tensor({1}, {0.9852563738822937F}));
+  dif::runtime::RunOptions options;
+  options.warmups = 0;
+  options.iterations = 1;
+  options.minimum_free_bytes = 0;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  const std::vector<std::uint16_t> creator_bits{
+      49505U, 49830U, 17067U, 16675U, 16993U, 48464U, 16936U, 49848U,
+      49921U, 16363U, 49773U, 17029U, 49559U, 16942U, 17076U, 49918U};
+  expect(cpu.outputs.at(5).byte_size() ==
+                 creator_bits.size() * sizeof(std::uint16_t) &&
+             std::memcmp(cpu.outputs.at(5).data(), creator_bits.data(),
+                         cpu.outputs.at(5).byte_size()) == 0,
+         "Krea 2 Euler velocity update preserves creator BF16 eager boundaries");
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cuda.outputs.at(5).bytes == cpu.outputs.at(5).bytes,
+         "CUDA Krea 2 Euler velocity update is bit-exact to creator oracle");
+  std::cout << "GATE krea2_euler bf16_bit_mismatch=0\n";
+}
+
+void test_krea2_real_dimension_frontend_scaffold() {
+  using namespace dif::frontend;
+  using namespace dif::ir;
+  const Krea2Config config;
+  const auto architecture = inspect_krea2_architecture(config);
+  expect(architecture.latent_height == 128U &&
+             architecture.latent_width == 128U &&
+             architecture.image_grid_height == 64U &&
+             architecture.image_grid_width == 64U &&
+             architecture.image_tokens == 4096U &&
+             architecture.combined_tokens == 4608U &&
+             architecture.padded_tokens == 4608U &&
+             architecture.patch_input_dim == 64U &&
+             architecture.patch_output_dim == 64U,
+         "Krea 2 default geometry matches the official 1024px architecture");
+  expect(Krea2Config::kFeatures == 6144U && Krea2Config::kHeads == 48U &&
+             Krea2Config::kKvHeads == 12U &&
+             Krea2Config::kHeadDim == 128U &&
+             Krea2Config::kMlpDim == 16384U &&
+             Krea2Config::kLayers == 28U &&
+             Krea2Config::kTextDim == 2560U &&
+             Krea2Config::kTextLayers == 12U,
+         "Krea 2 frontend pins released checkpoint dimensions");
+
+  const auto build = make_krea2_time_conditioning(config);
+  verify(build.program);
+  expect(build.program.tensors.size() == 15U &&
+             build.program.operations.size() == 8U &&
+             build.checkpoint_tensors.size() == 6U &&
+             build.checkpoint_names ==
+                 std::vector<std::string>{"tmlp.0.weight", "tmlp.0.bias",
+                                          "tmlp.2.weight", "tmlp.2.bias",
+                                          "tproj.1.weight", "tproj.1.bias"},
+         "Krea 2 time scaffold has the exact creator tensor inventory");
+  expect(build.program.tensor(build.timestep_input)->dtype == DType::BF16 &&
+             build.program.tensor(build.timestep_input)->dims ==
+                 std::vector<std::uint64_t>{1U} &&
+             build.program.tensor(build.timestep_embedding)->dtype ==
+                 DType::F32 &&
+             build.program.tensor(build.timestep_embedding)->dims ==
+                 std::vector<std::uint64_t>({1U, 256U}) &&
+             build.program.tensor(build.timestep_output)->dims ==
+                 std::vector<std::uint64_t>({1U, 6144U}) &&
+             build.program.tensor(build.modulation_output)->dims ==
+                 std::vector<std::uint64_t>({1U, 36864U}),
+         "Krea 2 time scaffold preserves source BF16/F32 boundaries and real dims");
+  std::uint64_t gelu_count = 0U;
+  std::uint64_t linear_count = 0U;
+  for (const auto &operation : build.program.operations) {
+    gelu_count += operation.opcode == Opcode::Gelu ? 1U : 0U;
+    linear_count += operation.opcode == Opcode::Linear ? 1U : 0U;
+    expect(operation.opcode != Opcode::H3AdaLNSelect &&
+               operation.opcode != Opcode::H3DeinterleaveQkv &&
+               operation.opcode != Opcode::H3DeinterleaveQkvWeight,
+           "Krea 2 scaffold does not reuse H3-only frontend semantics");
+  }
+  expect(gelu_count == 2U && linear_count == 3U,
+         "Krea 2 time scaffold matches creator operation ordering");
+  const auto fingerprint = dif::hex_digest(dif::ir::fingerprint(build.program));
+  const auto memory = dif::compiler::plan_memory(build.program, 256U);
+  expect(fingerprint ==
+             "d8e0997e9fa8f75b648fccd2eb7c556a31373a8bbdceab46fc22414bed1817af",
+         "Krea 2 real-dimension scaffold has a stable DiffIR fingerprint");
+  expect(memory.total_bytes == 531740672U,
+         "Krea 2 streamed time scaffold memory plan is stable");
+  std::cout << "GATE krea2_frontend source=krea-2@db3984f"
+            << " fingerprint=" << fingerprint
+            << " tensors=" << build.program.tensors.size()
+            << " operations=" << build.program.operations.size()
+            << " planned_bytes=" << memory.total_bytes << "\n";
+
+  const auto conditioner_config = make_krea2_conditioner_config();
+  const auto conditioner =
+      build_qwen3vl_conditioner_program(546U, conditioner_config);
+  verify(conditioner.program);
+  expect(conditioner.attention_mask_input_id != 0U &&
+             conditioner.position_ids_input_id != 0U &&
+             conditioner.conditioning_output_ids.size() == 12U &&
+             conditioner.bindings.size() == 397U &&
+             conditioner.attention_operations == 36U &&
+             conditioner.linear_operations == 252U,
+         "Krea 2 conditioner exposes the exact masked 36-layer 12-tap Qwen3-VL contract");
+  for (const auto output_id : conditioner.conditioning_output_ids) {
+    const auto *output = conditioner.program.tensor(output_id);
+    expect(output && output->dtype == DType::BF16 &&
+               output->dims ==
+                   std::vector<std::uint64_t>({512U, 2560U}),
+           "each Krea 2 conditioner tap is BF16 [512,2560]");
+  }
+
+  const auto text_fusion = make_krea2_text_fusion();
+  verify(text_fusion.program);
+  expect(text_fusion.checkpoint_tensors.size() == 54U &&
+             text_fusion.block_outputs.size() == 4U &&
+             text_fusion.program.operations.size() == 122U &&
+             text_fusion.program.tensor(text_fusion.conditioning_output)->dims ==
+                 std::vector<std::uint64_t>({1U, 512U, 6144U}),
+         "Krea 2 text fusion is a real-dimension shared DiffIR program");
+  for (const auto &operation : text_fusion.program.operations)
+    expect(operation.opcode != Opcode::H3AdaLNSelect &&
+               operation.opcode != Opcode::H3DeinterleaveQkv &&
+               operation.opcode != Opcode::H3DeinterleaveQkvWeight,
+           "Krea 2 text fusion contains no H3-only runtime operation");
+
+  const auto denoiser = make_krea2_denoiser();
+  verify(denoiser.program);
+  const auto *velocity = denoiser.program.tensor(denoiser.velocity_output);
+  expect(denoiser.checkpoint_tensors.size() == 376U &&
+             denoiser.block_outputs.size() == 28U &&
+             denoiser.program.operations.size() == 1738U && velocity &&
+             velocity->dtype == DType::BF16 &&
+             velocity->dims == std::vector<std::uint64_t>({1U,4096U,64U}),
+         "Krea 2 full denoiser is one real-dimension shared DiffIR program");
+  expect(std::count_if(denoiser.program.operations.begin(),
+                       denoiser.program.operations.end(),
+                       [](const auto &operation) {
+                         return operation.opcode == Opcode::Concat;
+                       }) == 1,
+         "Krea 2 full denoiser uses the generic text/image concat operation");
+  for (const auto &operation : denoiser.program.operations)
+    expect(operation.opcode != Opcode::H3AdaLNSelect &&
+               operation.opcode != Opcode::H3DeinterleaveQkv &&
+               operation.opcode != Opcode::H3DeinterleaveQkvWeight,
+           "Krea 2 full denoiser contains no H3-only runtime operation");
 }
 
 void test_backend_neutral_flow_scheduler() {
@@ -755,6 +1050,209 @@ void test_h3_conditioning_layout() {
              digest(plan.adaln_indices) ==
                  "c1dbd818693e1d201de0bd3ec8e87deaa2fb28cc8f7a1a0b2b2a297a9d96e019",
          "H3 row timestep and AdaLN plans are byte-exact to source");
+}
+
+void test_krea2_rotary_layout_mask_and_broadcast_oracle() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 4, 3}},
+      {2, DType::I32, TensorRole::Constant, {4}},
+      {3, DType::I32, TensorRole::Constant, {4}},
+      {4, DType::I32, TensorRole::Constant, {3}},
+      {5, DType::F32, TensorRole::Output, {1, 4, 4}},
+      {6, DType::F32, TensorRole::Output, {1, 4, 4}},
+      {7, DType::BF16, TensorRole::Input, {1, 4, 2, 8}},
+      {8, DType::BF16, TensorRole::Output, {1, 4, 2, 8}},
+      {9, DType::Bool, TensorRole::Input, {1, 4}},
+      {10, DType::BF16, TensorRole::Output, {1, 1, 4, 4}},
+      {11, DType::BF16, TensorRole::Input, {1, 12}},
+      {12, DType::BF16, TensorRole::Output, {1, 4}},
+      {13, DType::BF16, TensorRole::Output, {1, 1, 4}},
+      {14, DType::BF16, TensorRole::Output, {1, 4, 4}},
+      {15, DType::BF16, TensorRole::Output, {1, 4, 4}},
+      {16, DType::BF16, TensorRole::Input, {2, 3, 4}},
+      {17, DType::BF16, TensorRole::Output, {2, 4, 3}},
+      {18, DType::BF16, TensorRole::Input, {2, 1, 3}},
+      {19, DType::BF16, TensorRole::Input, {2, 2, 3}},
+      {20, DType::BF16, TensorRole::Output, {2, 3, 3}},
+  };
+  program.operations = {
+      {1, Opcode::RotaryFrequency, {1, 2, 3, 4}, {5, 6},
+       {Attribute::f64(AttrKey::Theta, 1000.0),
+        Attribute::f64(AttrKey::Ntk, 1.0)}},
+      {2, Opcode::RotaryApply, {7, 5, 6}, {8},
+       {Attribute::u64(
+           AttrKey::RotaryLayout,
+           static_cast<std::uint64_t>(RotaryLayout::Interleaved))}},
+      {3, Opcode::BooleanMaskToBias, {9}, {10}, {}},
+      {4, Opcode::Slice, {11}, {12},
+       {Attribute::u64(AttrKey::Axis, 1U),
+        Attribute::u64(AttrKey::Start, 4U)}},
+      {5, Opcode::Reshape, {12}, {13}, {}},
+      {6, Opcode::BroadcastTo, {13}, {14}, {}},
+      {7, Opcode::Sigmoid, {14}, {15}, {}},
+      {8, Opcode::Permute, {16}, {17},
+       {Attribute::u64(AttrKey::Permutation0, 0U),
+        Attribute::u64(AttrKey::Permutation1, 2U),
+        Attribute::u64(AttrKey::Permutation2, 1U)}},
+      {9, Opcode::Concat, {18, 19}, {20},
+       {Attribute::u64(AttrKey::Axis, 1U)}},
+  };
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1, f32_tensor(
+                          {1, 4, 3},
+                          {0, 0, 0, 0, 1, 2, 0, 2, 3, 0, 3, 4}));
+  bindings.emplace(2, i32_tensor({4}, {0, 1, 2, 2}));
+  bindings.emplace(3, i32_tensor({4}, {0, 0, 0, 1}));
+  bindings.emplace(4, i32_tensor({3}, {2, 2, 4}));
+  bindings.emplace(
+      7, float_tensor(
+             DType::BF16, {1, 4, 2, 8},
+             {.25F, -.5F, .75F, -1.F, 1.25F, -1.5F, 1.75F, -2.F,
+              .1F, .2F, .3F, .4F, .5F, .6F, .7F, .8F,
+              .2F, -.3F, .4F, -.5F, .6F, -.7F, .8F, -.9F,
+              .9F, -.8F, .7F, -.6F, .5F, -.4F, .3F, -.2F,
+              -.1F, .2F, -.3F, .4F, -.5F, .6F, -.7F, .8F,
+              .8F, .7F, .6F, .5F, .4F, .3F, .2F, .1F,
+              1.F, .5F, 0.F, -.5F, -1.F, -1.5F, -2.F, -2.5F,
+              -.2F, -.1F, 0.F, .1F, .2F, .3F, .4F, .5F}));
+  bindings.emplace(9, bool_tensor({1, 4}, {1, 1, 0, 1}));
+  bindings.emplace(11, float_tensor(DType::BF16, {1, 12},
+                                    {-4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6,
+                                     7}));
+  bindings.emplace(16, float_tensor(DType::BF16, {2, 3, 4},
+                                    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                                     12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                                     22, 23}));
+  bindings.emplace(18, float_tensor(DType::BF16, {2, 1, 3},
+                                    {1, 2, 3, 10, 11, 12}));
+  bindings.emplace(19, float_tensor(DType::BF16, {2, 2, 3},
+                                    {4, 5, 6, 7, 8, 9,
+                                     13, 14, 15, 16, 17, 18}));
+  dif::runtime::RunOptions options;
+  options.warmups = 0;
+  options.iterations = 1;
+  options.minimum_free_bytes = 0;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+
+  const std::vector<float> creator_cosine{
+      1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 0.5403022766113281F,
+      -0.416146844625473F, 0.9980006814002991F, 1.0F,
+      -0.416146844625473F, -0.9899924993515015F, 0.9955033659934998F,
+      1.0F, -0.9899924993515015F, -0.6536436080932617F,
+      0.9920106530189514F};
+  expect(float_values(cpu.outputs.at(5)) == creator_cosine,
+         "Krea 2 rotary frequencies are bit-exact to creator F64 construction");
+  const std::vector<std::uint16_t> creator_rotary_bits{
+      16000,48896,16192,49024,16288,49088,16352,49152,15821,15949,16026,
+      16077,16128,16154,16179,16205,15949,48794,16163,15753,16069,16215,
+      16219,48985,16230,48973,16226,16007,15904,16159,16032,48697,48589,
+      15949,48757,48865,16082,48939,48966,16187,16205,16179,48948,16046,
+      48865,48759,15938,15859,16256,16128,15761,16125,48887,16350,49110,
+      49199,48717,48589,48231,48587,15814,48818,16043,16140};
+  expect(cpu.outputs.at(8).byte_size() ==
+             creator_rotary_bits.size() * sizeof(std::uint16_t) &&
+             std::memcmp(cpu.outputs.at(8).data(), creator_rotary_bits.data(),
+                         cpu.outputs.at(8).byte_size()) == 0,
+         "Krea 2 interleaved rotary apply is BF16 bit-exact to creator");
+  const auto bias = float_values(cpu.outputs.at(10));
+  expect(bias[0] == 0.0F && std::isinf(bias[2]) && bias[2] < 0.0F &&
+             bias[3] == 0.0F && std::isinf(bias[8]) && bias[15] == 0.0F,
+         "Krea 2 vector validity mask expands across a padding gap");
+  expect(float_values(cpu.outputs.at(12)) ==
+             std::vector<float>({0, 1, 2, 3}) &&
+             float_values(cpu.outputs.at(14)) ==
+                 std::vector<float>({0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3}),
+         "slice, reshape, and right-aligned broadcast preserve creator layout");
+  expect(float_values(cpu.outputs.at(17)) ==
+             std::vector<float>({0,4,8,1,5,9,2,6,10,3,7,11,
+                                 12,16,20,13,17,21,14,18,22,15,19,23}),
+         "generic permute performs a bit-exact physical layout transform");
+  expect(float_values(cpu.outputs.at(20)) ==
+             std::vector<float>({1,2,3,4,5,6,7,8,9,
+                                 10,11,12,13,14,15,16,17,18}),
+         "generic concat joins row-major tensors along the selected axis");
+
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cuda.outputs.at(8).bytes == cpu.outputs.at(8).bytes,
+         "CUDA interleaved rotary is BF16 bit-exact to CPU creator gate");
+  expect(cuda.outputs.at(10).bytes == cpu.outputs.at(10).bytes &&
+             cuda.outputs.at(12).bytes == cpu.outputs.at(12).bytes &&
+             cuda.outputs.at(13).bytes == cpu.outputs.at(13).bytes &&
+             cuda.outputs.at(14).bytes == cpu.outputs.at(14).bytes &&
+             cuda.outputs.at(17).bytes == cpu.outputs.at(17).bytes &&
+             cuda.outputs.at(20).bytes == cpu.outputs.at(20).bytes,
+         "CUDA mask and layout operations are bit-exact to CPU semantics");
+}
+
+void test_krea2_cudnn_masked_gqa_creator_oracle() {
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::BF16, TensorRole::Input, {1, 4, 2, 8}},
+      {2, DType::BF16, TensorRole::Input, {1, 4, 1, 8}},
+      {3, DType::BF16, TensorRole::Input, {1, 4, 1, 8}},
+      {4, DType::Bool, TensorRole::Input, {1, 4}},
+      {5, DType::BF16, TensorRole::Internal, {1, 1, 4, 4}},
+      {6, DType::BF16, TensorRole::Output, {1, 4, 2, 8}},
+  };
+  program.operations = {
+      {1, Opcode::BooleanMaskToBias, {4}, {5}, {}},
+      {2, Opcode::Attention, {1, 2, 3, 5}, {6},
+       {Attribute::u64(AttrKey::KvHeads, 1U),
+        Attribute::u64(AttrKey::Implementation, 2U)}},
+  };
+  std::vector<float> q(64), k(32), v(32);
+  for (std::size_t index = 0; index < q.size(); ++index)
+    q[index] = (static_cast<float>(index % 17U) - 8.0F) / 8.0F;
+  for (std::size_t index = 0; index < k.size(); ++index)
+    k[index] = (static_cast<float>(index % 11U) - 5.0F) / 7.0F;
+  for (std::size_t index = 0; index < v.size(); ++index)
+    v[index] = (static_cast<float>(index % 13U) - 6.0F) / 9.0F;
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1, float_tensor(DType::BF16, {1, 4, 2, 8}, q));
+  bindings.emplace(2, float_tensor(DType::BF16, {1, 4, 1, 8}, k));
+  bindings.emplace(3, float_tensor(DType::BF16, {1, 4, 1, 8}, v));
+  bindings.emplace(4, bool_tensor({1, 4}, {1, 1, 0, 1}));
+  dif::runtime::RunOptions options;
+  options.warmups = 0;
+  options.iterations = 1;
+  options.minimum_free_bytes = 0;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  const std::vector<std::uint16_t> creator_bits{
+      48591,15424,48803,48723,48578,48794,48706,48545,15799,15951,48815,
+      48747,48627,48814,48745,48624,48254,15815,48686,48495,15706,48833,
+      48776,48671,15752,15928,48812,48742,48618,48812,48741,48616,48048,
+      15834,48200,15818,15960,48814,48744,48623,48414,15767,48785,48688,
+      48506,48728,48588,15416,15885,16000,15924,16018,16076,48908,48862,
+      48805,15522,15880,48808,48734,48601,48807,48733,48598};
+  const auto *actual = reinterpret_cast<const std::uint16_t *>(
+      cuda.outputs.at(6).data());
+  std::size_t mismatches = 0U;
+  bool only_masked_query_row = true;
+  for (std::size_t index = 0; index < creator_bits.size(); ++index) {
+    if (actual[index] == creator_bits[index])
+      continue;
+    ++mismatches;
+    only_masked_query_row =
+        only_masked_query_row && index >= 32U && index < 48U;
+  }
+  // PyTorch's cuDNN boolean-mask route emits nonzero values for an all-false
+  // query row, while direct cuDNN additive -inf bias emits zeros. Those rows
+  // are padding: they are masked as keys in every block and never selected as
+  // image output. Valid text/image query rows must remain bit-identical.
+  expect(mismatches == 16U && only_masked_query_row,
+         "native cuDNN masked GQA is bit-exact on every observable creator row and differs only on the all-false padding query");
+  std::cout << "GATE krea2_masked_gqa valid_row_bit_mismatch=0"
+            << " padded_query_bit_mismatch=" << mismatches << "\n";
 }
 
 void test_new_primitives_cuda_parity() {
@@ -2669,6 +3167,11 @@ int main() {
   test_cpu_linear_bias();
   test_float_storage_conversions();
   test_cpu_all_opcodes_and_float_dtypes();
+  test_krea2_gelu_creator_parity();
+  test_krea2_euler_velocity_creator_parity();
+  test_krea2_real_dimension_frontend_scaffold();
+  test_krea2_rotary_layout_mask_and_broadcast_oracle();
+  test_krea2_cudnn_masked_gqa_creator_oracle();
   test_new_primitives_cuda_parity();
   test_vae_normalization_primitives();
   test_h3_video_vae_frontend_contract();

@@ -85,6 +85,183 @@ void silu(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void gelu(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  constexpr float kSqrtTwoOverPi = 0.7978845608028654F;
+  constexpr float kCubicCoefficient = 0.044715F;
+  for (std::uint64_t i = 0; i < out.element_count(); ++i) {
+    const auto value = load_float(input, i);
+    const auto cubic = value * value * value;
+    const auto inner = kSqrtTwoOverPi *
+                       (value + kCubicCoefficient * cubic);
+    store_float(out, i, 0.5F * value * (1.0F + std::tanh(inner)));
+  }
+}
+
+void sigmoid(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  for (std::uint64_t index = 0; index < out.element_count(); ++index) {
+    const auto value = load_float(input, index);
+    store_float(out, index, 1.0F / (1.0F + std::exp(-value)));
+  }
+}
+
+void reshape(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  std::memcpy(out.mutable_data(), input.data(),
+              static_cast<std::size_t>(out.element_count() *
+                                       ir::dtype_size(out.dtype)));
+}
+
+void broadcast_to(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  std::vector<std::uint64_t> input_strides(input.dims.size(), 1U);
+  for (std::size_t axis = input.dims.size(); axis-- > 1U;)
+    input_strides[axis - 1U] = input_strides[axis] * input.dims[axis];
+  const auto rank_pad = out.dims.size() - input.dims.size();
+  for (std::uint64_t output_index = 0; output_index < out.element_count();
+       ++output_index) {
+    auto coordinate = output_index;
+    std::uint64_t input_index = 0U;
+    for (std::size_t axis = out.dims.size(); axis-- > 0U;) {
+      const auto at_axis = coordinate % out.dims[axis];
+      coordinate /= out.dims[axis];
+      if (axis >= rank_pad) {
+        const auto source_axis = axis - rank_pad;
+        if (input.dims[source_axis] != 1U)
+          input_index += at_axis * input_strides[source_axis];
+      }
+    }
+    store_float(out, output_index, load_float(input, input_index));
+  }
+}
+
+void slice_tensor(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto axis =
+      static_cast<std::size_t>(op.u64(ir::AttrKey::Axis, 0U));
+  const auto start = op.u64(ir::AttrKey::Start, 0U);
+  std::vector<std::uint64_t> input_strides(input.dims.size(), 1U);
+  for (std::size_t index = input.dims.size(); index-- > 1U;)
+    input_strides[index - 1U] = input_strides[index] * input.dims[index];
+  for (std::uint64_t output_index = 0; output_index < out.element_count();
+       ++output_index) {
+    auto coordinate = output_index;
+    std::uint64_t input_index = 0U;
+    for (std::size_t index = out.dims.size(); index-- > 0U;) {
+      auto at_axis = coordinate % out.dims[index];
+      coordinate /= out.dims[index];
+      if (index == axis)
+        at_axis += start;
+      input_index += at_axis * input_strides[index];
+    }
+    store_float(out, output_index, load_float(input, input_index));
+  }
+}
+
+void rotary_frequency(const ir::Operation &op, TensorMap &tensors) {
+  const auto &positions = tensors.at(op.inputs[0]);
+  const auto &pair_axes_tensor = tensors.at(op.inputs[1]);
+  const auto &pair_indices_tensor = tensors.at(op.inputs[2]);
+  const auto &axis_dims_tensor = tensors.at(op.inputs[3]);
+  auto &cosine = tensors.at(op.outputs[0]);
+  auto &sine = tensors.at(op.outputs[1]);
+  const auto *pair_axes =
+      reinterpret_cast<const std::int32_t *>(pair_axes_tensor.data());
+  const auto *pair_indices =
+      reinterpret_cast<const std::int32_t *>(pair_indices_tensor.data());
+  const auto *axis_dims =
+      reinterpret_cast<const std::int32_t *>(axis_dims_tensor.data());
+  const auto batch = positions.dims[0];
+  const auto sequence = positions.dims[1];
+  const auto axes = positions.dims[2];
+  const auto pairs = pair_axes_tensor.dims[0];
+  const auto theta = op.f64(ir::AttrKey::Theta, 10000.0);
+  const auto ntk = op.f64(ir::AttrKey::Ntk, 1.0);
+  for (std::uint64_t pair = 0; pair < pairs; ++pair) {
+    if (pair_axes[pair] < 0 ||
+        static_cast<std::uint64_t>(pair_axes[pair]) >= axes ||
+        pair_indices[pair] < 0 || axis_dims[pair_axes[pair]] <= 0 ||
+        (axis_dims[pair_axes[pair]] & 1) != 0 ||
+        2 * pair_indices[pair] >= axis_dims[pair_axes[pair]])
+      fail("rotary_frequency pair map is outside its declared axis");
+  }
+  for (std::uint64_t b = 0; b < batch; ++b) {
+    for (std::uint64_t token = 0; token < sequence; ++token) {
+      for (std::uint64_t pair = 0; pair < pairs; ++pair) {
+        const auto axis = static_cast<std::uint64_t>(pair_axes[pair]);
+        const auto scale = 2.0 * static_cast<double>(pair_indices[pair]) /
+                           static_cast<double>(axis_dims[axis]);
+        const auto omega = 1.0 / std::pow(theta * ntk, scale);
+        const auto position = static_cast<double>(
+            load_float(positions, (b * sequence + token) * axes + axis));
+        const auto angle = position * omega;
+        const auto index = (b * sequence + token) * pairs + pair;
+        store_float(cosine, index, static_cast<float>(std::cos(angle)));
+        store_float(sine, index, static_cast<float>(std::sin(angle)));
+      }
+    }
+  }
+}
+
+void rotary_apply(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &cosine = tensors.at(op.inputs[1]);
+  const auto &sine = tensors.at(op.inputs[2]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto batch = input.dims[0];
+  const auto sequence = input.dims[1];
+  const auto heads = input.dims[2];
+  const auto dim = input.dims[3];
+  const auto pairs = cosine.dims[2];
+  for (std::uint64_t b = 0; b < batch; ++b) {
+    for (std::uint64_t token = 0; token < sequence; ++token) {
+      const auto table_base = (b * sequence + token) * pairs;
+      for (std::uint64_t head = 0; head < heads; ++head) {
+        const auto base = ((b * sequence + token) * heads + head) * dim;
+        for (std::uint64_t pair = 0; pair < pairs; ++pair) {
+          const auto even = load_float(input, base + 2U * pair);
+          const auto odd = load_float(input, base + 2U * pair + 1U);
+          const auto c = load_float(cosine, table_base + pair);
+          const auto s = load_float(sine, table_base + pair);
+          store_float(out, base + 2U * pair, even * c - odd * s);
+          store_float(out, base + 2U * pair + 1U, even * s + odd * c);
+        }
+        for (std::uint64_t d = 2U * pairs; d < dim; ++d)
+          store_float(out, base + d, load_float(input, base + d));
+      }
+    }
+  }
+}
+
+void boolean_mask_to_bias(const ir::Operation &op, TensorMap &tensors) {
+  const auto &mask = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto *values = reinterpret_cast<const std::uint8_t *>(mask.data());
+  const auto batch = out.dims[0];
+  const auto sequence = out.dims[2];
+  const bool vector_mask = mask.dims.size() == 2U;
+  for (std::uint64_t b = 0; b < batch; ++b) {
+    for (std::uint64_t query = 0; query < sequence; ++query) {
+      for (std::uint64_t key = 0; key < sequence; ++key) {
+        const bool valid = vector_mask
+                               ? values[b * sequence + query] != 0U &&
+                                     values[b * sequence + key] != 0U
+                               : values[(b * sequence + query) * sequence +
+                                        key] != 0U;
+        store_float(out, (b * sequence + query) * sequence + key,
+                    valid ? 0.0F
+                          : -std::numeric_limits<float>::infinity());
+      }
+    }
+  }
+}
+
 void mse_loss(const ir::Operation &op, TensorMap &tensors) {
   const auto &prediction = tensors.at(op.inputs[0]);
   const auto &target = tensors.at(op.inputs[1]);
@@ -350,6 +527,85 @@ void flow_euler_step(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+float round_to_storage_dtype(float value, ir::DType dtype) {
+  if (dtype == ir::DType::F32)
+    return value;
+  if (dtype == ir::DType::BF16)
+    return bf16_to_float(float_to_bf16(value));
+  if (dtype == ir::DType::F16)
+    return f16_to_float(float_to_f16(value));
+  fail("Euler velocity storage dtype is not floating point");
+}
+
+void euler_velocity_step(const ir::Operation &op, TensorMap &tensors) {
+  const auto &sample = tensors.at(op.inputs[0]);
+  const auto &velocity = tensors.at(op.inputs[1]);
+  const auto current = load_float(tensors.at(op.inputs[2]), 0U);
+  const auto next = load_float(tensors.at(op.inputs[3]), 0U);
+  auto &output = tensors.at(op.outputs[0]);
+  // The creator performs two eager BF16 operations. Preserve the multiply's
+  // storage boundary before the residual add instead of contracting the
+  // expression into a single F32 FMA.
+  volatile float delta_t = next - current;
+  for (std::uint64_t index = 0; index < output.element_count(); ++index) {
+    volatile float scaled = delta_t * load_float(velocity, index);
+    const auto rounded = round_to_storage_dtype(scaled, sample.dtype);
+    volatile float updated = load_float(sample, index) + rounded;
+    store_float(output, index, updated);
+  }
+}
+
+void permute(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &output = tensors.at(op.outputs[0]);
+  const auto rank = input.dims.size();
+  std::vector<std::uint64_t> input_strides(rank, 1U);
+  for (std::size_t axis = rank - 1U; axis > 0U; --axis)
+    input_strides[axis - 1U] = input_strides[axis] * input.dims[axis];
+  for (std::uint64_t index = 0; index < output.element_count(); ++index) {
+    auto remainder = index;
+    std::uint64_t source = 0U;
+    for (std::size_t reverse = rank; reverse-- > 0U;) {
+      const auto coordinate = remainder % output.dims[reverse];
+      remainder /= output.dims[reverse];
+      const auto key = static_cast<ir::AttrKey>(
+          static_cast<std::uint32_t>(ir::AttrKey::Permutation0) + reverse);
+      source += coordinate * input_strides[op.u64(key, 0U)];
+    }
+    store_float(output, index, load_float(input, source));
+  }
+}
+
+void concat(const ir::Operation &op, TensorMap &tensors) {
+  auto &output = tensors.at(op.outputs[0]);
+  const auto axis = static_cast<std::size_t>(op.u64(ir::AttrKey::Axis, 0U));
+  const auto &first = tensors.at(op.inputs[0]);
+  std::uint64_t outer = 1U;
+  std::uint64_t inner = 1U;
+  for (std::size_t dimension = 0U; dimension < axis; ++dimension)
+    outer *= first.dims[dimension];
+  for (std::size_t dimension = axis + 1U; dimension < first.dims.size();
+       ++dimension)
+    inner *= first.dims[dimension];
+  const auto element_bytes = ir::dtype_size(first.dtype);
+  const auto output_axis = output.dims[axis];
+  for (std::uint64_t outer_index = 0U; outer_index < outer; ++outer_index) {
+    std::uint64_t output_axis_offset = 0U;
+    for (const auto input_id : op.inputs) {
+      const auto &input = tensors.at(input_id);
+      const auto input_axis = input.dims[axis];
+      const auto elements = input_axis * inner;
+      const auto source_offset = outer_index * elements;
+      const auto destination_offset =
+          (outer_index * output_axis + output_axis_offset) * inner;
+      std::memcpy(output.mutable_data() + destination_offset * element_bytes,
+                  input.data() + source_offset * element_bytes,
+                  elements * element_bytes);
+      output_axis_offset += input_axis;
+    }
+  }
+}
+
 void patchify_3d(const ir::Operation &op, TensorMap &tensors,
                  bool inverse) {
   const auto &input = tensors.at(op.inputs[0]);
@@ -407,6 +663,8 @@ void rms_norm(const ir::Operation &op, TensorMap &tensors) {
   const auto columns = input.dims.back();
   const auto rows = input.element_count() / columns;
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto weight_offset =
+      static_cast<float>(op.f64(ir::AttrKey::WeightOffset, 0.0));
   for (std::uint64_t row = 0; row < rows; ++row) {
     float sum = 0.0F;
     for (std::uint64_t column = 0; column < columns; ++column) {
@@ -418,7 +676,8 @@ void rms_norm(const ir::Operation &op, TensorMap &tensors) {
     for (std::uint64_t column = 0; column < columns; ++column) {
       const auto index = row * columns + column;
       store_float(out, index, load_float(input, index) * inverse *
-                                  load_float(weight, column));
+                                  (load_float(weight, column) +
+                                   weight_offset));
     }
   }
 }
@@ -1045,10 +1304,14 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
   const auto &q_tensor = tensors.at(op.inputs[0]);
   const auto &k = tensors.at(op.inputs[1]);
   const auto &v = tensors.at(op.inputs[2]);
+  const auto *bias =
+      op.inputs.size() == 4U ? &tensors.at(op.inputs[3]) : nullptr;
   auto &out = tensors.at(op.outputs[0]);
-  const auto sequence = q_tensor.dims[0];
-  const auto heads = q_tensor.dims[1];
-  const auto dim = q_tensor.dims[2];
+  const bool batched = q_tensor.dims.size() == 4U;
+  const auto batch = batched ? q_tensor.dims[0] : 1U;
+  const auto sequence = q_tensor.dims[batched ? 1U : 0U];
+  const auto heads = q_tensor.dims[batched ? 2U : 1U];
+  const auto dim = q_tensor.dims[batched ? 3U : 2U];
   // GQA: query head h reads kv head h/(H/KvHeads); KvHeads == H (the
   // default) reproduces the historical dense indexing exactly.
   const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
@@ -1057,21 +1320,34 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
   std::vector<float> probabilities(sequence);
-  for (std::uint64_t query = 0; query < sequence; ++query) {
-    const auto key_end = causal ? query + 1U : sequence;
-    for (std::uint64_t head = 0; head < heads; ++head) {
+  for (std::uint64_t b = 0; b < batch; ++b) {
+    for (std::uint64_t query = 0; query < sequence; ++query) {
+      const auto key_end = causal ? query + 1U : sequence;
+      for (std::uint64_t head = 0; head < heads; ++head) {
       const auto kv_head = head / group;
       float maximum = -std::numeric_limits<float>::infinity();
       for (std::uint64_t key = 0; key < key_end; ++key) {
         float score = 0.0F;
         for (std::uint64_t d = 0; d < dim; ++d) {
           score = std::fma(
-              load_float(q_tensor, (query * heads + head) * dim + d),
-              load_float(k, (key * kv_heads + kv_head) * dim + d), score);
+              load_float(q_tensor,
+                         ((b * sequence + query) * heads + head) * dim + d),
+              load_float(k,
+                         ((b * sequence + key) * kv_heads + kv_head) * dim + d),
+              score);
         }
         score *= scale;
+        if (bias)
+          score += load_float(*bias, (b * sequence + query) * sequence + key);
         probabilities[key] = score;
         maximum = std::max(maximum, score);
+      }
+      if (!std::isfinite(maximum)) {
+        for (std::uint64_t d = 0; d < dim; ++d)
+          store_float(out,
+                      ((b * sequence + query) * heads + head) * dim + d,
+                      0.0F);
+        continue;
       }
       float denominator = 0.0F;
       for (std::uint64_t key = 0; key < key_end; ++key) {
@@ -1084,11 +1360,16 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
           const auto probability = probabilities[key] / denominator;
           value = std::fma(
               probability,
-              load_float(v, (key * kv_heads + kv_head) * dim + d), value);
+              load_float(v,
+                         ((b * sequence + key) * kv_heads + kv_head) * dim + d),
+              value);
         }
-        store_float(out, (query * heads + head) * dim + d, value);
+        store_float(out,
+                    ((b * sequence + query) * heads + head) * dim + d,
+                    value);
       }
     }
+  }
   }
 }
 
@@ -1492,6 +1773,30 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
     case ir::Opcode::SiLU:
       silu(op, tensors);
       break;
+    case ir::Opcode::Gelu:
+      gelu(op, tensors);
+      break;
+    case ir::Opcode::Sigmoid:
+      sigmoid(op, tensors);
+      break;
+    case ir::Opcode::Reshape:
+      reshape(op, tensors);
+      break;
+    case ir::Opcode::BroadcastTo:
+      broadcast_to(op, tensors);
+      break;
+    case ir::Opcode::Slice:
+      slice_tensor(op, tensors);
+      break;
+    case ir::Opcode::RotaryFrequency:
+      rotary_frequency(op, tensors);
+      break;
+    case ir::Opcode::RotaryApply:
+      rotary_apply(op, tensors);
+      break;
+    case ir::Opcode::BooleanMaskToBias:
+      boolean_mask_to_bias(op, tensors);
+      break;
     case ir::Opcode::RmsNorm:
       rms_norm(op, tensors);
       break;
@@ -1548,6 +1853,15 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::FlowEulerStep:
       flow_euler_step(op, tensors);
+      break;
+    case ir::Opcode::EulerVelocityStep:
+      euler_velocity_step(op, tensors);
+      break;
+    case ir::Opcode::Permute:
+      permute(op, tensors);
+      break;
+    case ir::Opcode::Concat:
+      concat(op, tensors);
       break;
     case ir::Opcode::Patchify3D:
       patchify_3d(op, tensors, false);

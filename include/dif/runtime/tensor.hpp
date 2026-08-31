@@ -58,5 +58,10 @@ map_tensor_slices(const std::filesystem::path &path,
                   const std::vector<TensorSlice> &slices);
 void write_tensor(const Tensor &tensor, const std::filesystem::path &path);
 Tensor zeros(const ir::TensorDesc &desc);
+// Materialize a tensor in another floating storage dtype.  This is the shared
+// native checkpoint-load boundary used when creator code calls `.to(BF16)` on
+// an F32 SafeTensors parameter.  It deliberately performs no shape/layout
+// transformation and uses the runtime's round-to-nearest-even conversions.
+Tensor convert_float_tensor(const Tensor &source, ir::DType destination);
 
 } // namespace dif::runtime
