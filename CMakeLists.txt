@@ -163,6 +163,9 @@ target_link_libraries(difh3media PRIVATE difcore)
 add_executable(difslice tools/difslice.cpp)
 target_link_libraries(difslice PRIVATE difcore)
 
+add_executable(difimport tools/difimport.cpp)
+target_link_libraries(difimport PRIVATE difcore)
+
 if(DIF_ENABLE_OPENCL)
   find_path(DIF_OPENCL_INCLUDE_DIR CL/cl.h
             HINTS ${CUDAToolkit_INCLUDE_DIRS}
