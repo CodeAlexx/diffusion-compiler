@@ -130,6 +130,22 @@ PROVEN-REAL-DIMS: reproduces the accepted `audio.wav` at 86.87 dB SNR with
 a maximum one-LSB deviation, in 0.63 s. OpenCL execution of the two new
 opcodes is a recorded gap (fail-closed arms only).
 
+**Qwen3-VL text conditioner** (`include/dif/frontend/qwen3vl_conditioner.hpp`,
+`src/frontend/qwen3vl_conditioner.cpp`, `tools/difcondition.cpp`) — the
+MiniMax-H3 text tower as one DiffIR program built entirely from generic
+opcodes: `GatherRows` embedding, `RotaryPosition` tables, then per layer
+`RmsNorm` -> `Linear` q/k/v -> `QkNormPartialRope` -> causal grouped-query
+`Attention` -> `Linear` o -> `Add` -> `RmsNorm` -> `Linear` gate/up ->
+`SiLU` -> `Multiply` -> `Linear` down -> `Add`. No Qwen-specific opcode
+exists: the model's identity is the frontend plus its checkpoint weight
+names. Weights bind straight to the checkpoint's own `text_encoder` shards
+and stream through the plan-slot prefetcher (551 streamed tensors, ~0.98
+GiB/layer). Extraction is the RAW residual stream after 50 of 64 layers —
+`model.norm` is deliberately not applied. PROVEN-REAL-DIMS: rel-L2
+3.449e-03 vs the transformers oracle, inside that framework's own
+eager-vs-sdpa envelope
+(docs/H3_NATIVE_PROMPT_TO_MP4_GATE_2026-08-31.md).
+
 ## Frontends
 
 **H3** (`src/frontend/h3*.cpp`) — block/stack/denoiser/conditioning-layout/
@@ -163,8 +179,10 @@ make/run/export modes (w1-lora).
 
 Torch-free and Python-free at link level across every generation-path
 binary; ffmpeg subprocess for mux (retained by declaration); Mojo-dependent
-at ONE point — the Qwen3-VL text conditioner. The tokenizer, modulation
-cache, initial noise, importer and BigVGAN audio decode are all native and
-gated. cuDNN is vendored outside any Python tree.
+nowhere in the H3 path. The dependency chain is CLOSED: prompt text ->
+native tokenizer -> native Qwen3-VL conditioner -> native denoise -> native
+video VAE -> native BigVGAN audio -> ffmpeg mux, proven at process level in
+an environment where `import torch` fails. cuDNN is vendored outside any
+Python tree. PyTorch survives only as a development oracle.
 PyTorch remains only in oracles (/home/alex/diffusion-fixtures) and
 evaluation tooling.
