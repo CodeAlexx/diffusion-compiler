@@ -20,8 +20,14 @@ AutodiffResult differentiate(const ir::Program &forward,
     fail("autodiff requires at least one differentiation target");
   for (const auto tensor : with_respect_to) {
     const auto *description = forward.tensor(tensor);
-    if (!description || description->dtype != ir::DType::F32)
-      fail("autodiff target must be an F32 tensor");
+    // Targets may live in any supported float storage dtype (flame
+    // BF16_GRAD_DECISION Option A: a gradient tensor carries the dtype of
+    // its forward tensor; kernels accumulate in F32 internally).  The loss
+    // itself stays F32[1].
+    if (!description || (description->dtype != ir::DType::F32 &&
+                         description->dtype != ir::DType::BF16 &&
+                         description->dtype != ir::DType::F16))
+      fail("autodiff target must be a floating tensor");
   }
 
   AutodiffResult result;
@@ -141,6 +147,17 @@ AutodiffResult differentiate(const ir::Program &forward,
                     {grad_output, operation.inputs[0]}, {grad_b});
       accumulate(operation.inputs[0], grad_a);
       accumulate(operation.inputs[1], grad_b);
+      break;
+    }
+    case ir::Opcode::Cast: {
+      // Cast is the mixed-precision boundary op.  The gradient of
+      // Cast(x, dt) with upstream gradient g is Cast(g, dtype(x)):
+      // add_tensor copies the primal description, so the contribution lands
+      // in the source storage dtype.
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::Cast, {grad_output}, {grad_input});
+      accumulate(operation.inputs[0], grad_input);
       break;
     }
     case ir::Opcode::Fill:
