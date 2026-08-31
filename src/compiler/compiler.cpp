@@ -170,6 +170,114 @@ void emit_lowbit_linear(std::ostringstream &out, const ir::Program &program,
   (void)output;
 }
 
+
+// BigVGAN audio decode emitters (chunk 6 of docs/BIGVGAN_DECODE_PLAN.md).
+// Contract: generic launch — one thread per output element, geometry baked
+// as literals, F32 accumulation, dif_load/dif_store storage boundary. The
+// loop order mirrors the CPU reference exactly (forward: in-channel outer,
+// kernel-tap inner; transposed: gather with the padded input index
+// ascending — the same per-output add order as the CPU scatter), so
+// CPU-vs-CUDA differences stay at FP-contraction level.
+void emit_conv1d(std::ostringstream &out, const ir::Program &program,
+                 const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *weight = program.tensor(op.inputs[1]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const bool biased = op.inputs.size() == 3U;
+  const auto stride = op.u64(ir::AttrKey::Stride, 1U);
+  const auto dilation = op.u64(ir::AttrKey::Dilation, 1U);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto pad_left = op.u64(ir::AttrKey::PadLeft, 0U);
+  const auto pad_right = op.u64(ir::AttrKey::PadRight, 0U);
+  const auto replicate = op.u64(ir::AttrKey::PadMode, 0U) == 1U;
+  const auto transposed = op.boolean(ir::AttrKey::Transposed, false);
+  const auto trim_left = op.u64(ir::AttrKey::TrimLeft, 0U);
+  const auto in_channels = input->dims[1];
+  const auto length = input->dims[2];
+  const auto kernel = weight->dims[2];
+  const auto out_channels = output->dims[1];
+  const auto out_length = output->dims[2];
+  const auto count = output->element_count();
+  const auto in_per_group = in_channels / groups;
+  const auto out_per_group = out_channels / groups;
+  const auto padded = length + pad_left + pad_right;
+
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,const dif_scalar* w,"
+      << (biased ? "const dif_scalar* bias," : "") << "dif_scalar* y){"
+      << "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
+         "threadIdx.x;if(i<" << count << "ULL){"
+      << "unsigned long long o=i%" << out_length << "ULL;"
+      << "unsigned long long oc=(i/" << out_length << "ULL)%" << out_channels
+      << "ULL;"
+      << "unsigned long long b=i/" << out_channels * out_length << "ULL;"
+      << "unsigned long long group=oc/" << out_per_group << "ULL;"
+      << "float acc=0.0f;";
+  // Padded-coordinate sampler: position maps to input index pos-PadLeft,
+  // replicate-clamped or zero outside; emitted as a literal expression.
+  const auto clamped_sample = [&](const std::string &position) {
+    const auto shifted = "(" + position + "-" +
+                         std::to_string(pad_left) + "LL)";
+    if (!replicate)
+      return "((" + shifted + ">=0LL&&" + shifted + "<" +
+             std::to_string(length) +
+             "LL)?dif_load(xrow,(unsigned long long)" + shifted + "):0.0f)";
+    const auto last = std::to_string(length - 1U) + "LL";
+    return "dif_load(xrow,(unsigned long long)(" + shifted + "<0LL?0LL:(" +
+           shifted + ">" + last + "?" + last + ":" + shifted + ")))";
+  };
+  const std::string forward_sample = clamped_sample("p");
+  const std::string gather_sample = clamped_sample("pi");
+  if (!transposed) {
+    out << "for(unsigned long long ic=0;ic<" << in_per_group << "ULL;++ic){"
+        << "const dif_scalar* xrow=x+((b*" << in_channels
+        << "ULL)+(group*" << in_per_group << "ULL+ic))*" << length << "ULL;"
+        << "const dif_scalar* wrow=w+((oc*" << in_per_group << "ULL)+ic)*"
+        << kernel << "ULL;"
+        << "long long start=(long long)(o*" << stride << "ULL);"
+        << "for(unsigned long long k=0;k<" << kernel << "ULL;++k){"
+        << "long long p=start+(long long)(k*" << dilation << "ULL);"
+        << "acc+=" << forward_sample << "*dif_load(wrow,k);}}";
+  } else {
+    out << "unsigned long long ocg=oc%" << out_per_group << "ULL;"
+        << "long long ofull=(long long)o+" << trim_left << "LL;"
+        << "for(unsigned long long ic=0;ic<" << in_per_group << "ULL;++ic){"
+        << "const dif_scalar* xrow=x+((b*" << in_channels
+        << "ULL)+(group*" << in_per_group << "ULL+ic))*" << length << "ULL;"
+        << "const dif_scalar* wrow=w+(((group*" << in_per_group
+        << "ULL+ic)*" << out_per_group << "ULL)+ocg)*" << kernel << "ULL;"
+        << "long long imin=(ofull-" << kernel - 1U << "LL+" << stride
+        << "LL-1LL)/" << stride << "LL;if(imin<0LL)imin=0LL;"
+        << "long long imax=ofull/" << stride << "LL;if(imax>"
+        << padded - 1U << "LL)imax=" << padded - 1U << "LL;"
+        << "for(long long pi=imin;pi<=imax;++pi){"
+        << "long long k=ofull-pi*" << stride << "LL;"
+        << "if(k<0LL||k>=" << kernel << "LL)continue;"
+        << "acc+=" << gather_sample << "*dif_load(wrow,(unsigned long long)k);}}";
+  }
+  out << (biased ? "acc+=dif_load(bias,oc);" : "")
+      << "dif_store(y,i,acc);}}\n";
+}
+
+void emit_snake_beta(std::ostringstream &out, const ir::Program &program,
+                     const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto channels = input->dims[1];
+  const auto length = input->dims[2];
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-9));
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,const dif_scalar* la,const dif_scalar* lb,"
+         "dif_scalar* y){unsigned long long i=(unsigned long long)blockIdx.x*"
+         "blockDim.x+threadIdx.x;if(i<" << count << "ULL){"
+      << "unsigned long long c=(i/" << length << "ULL)%" << channels << "ULL;"
+      << "float alpha=expf(dif_load(la,c));"
+      << "float ib=1.0f/(expf(dif_load(lb,c))+" << epsilon << "f);"
+      << "float xv=dif_load(x,i);float s=sinf(alpha*xv);"
+      << "dif_store(y,i,xv+ib*s*s);}}\n" << std::defaultfloat;
+}
+
 void emit_header(std::ostringstream &out) {
   out << R"CUDA(
 typedef float dif_f32;
@@ -2251,10 +2359,10 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       emit_attention_backward(source, program, op);
       break;
     case ir::Opcode::Conv1d:
+      emit_conv1d(source, program, op);
+      break;
     case ir::Opcode::SnakeBeta:
-      // Integrator-approved fail-closed stub (chunk 6 of the audio decode
-      // plan lands the real emitters here).
-      fail("audio opcodes have no CUDA emitter yet");
+      emit_snake_beta(source, program, op);
       break;
     }
     end_float_operation(source);

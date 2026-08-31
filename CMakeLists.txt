@@ -44,6 +44,7 @@ add_library(difcore
     src/runtime/tensor_io.cpp
     src/sampling/rectified_flow.cpp
     src/support/sha256.cpp
+    src/support/wav.cpp
     src/support/json.cpp
     src/tune/database.cpp
     src/training/autodiff.cpp
@@ -175,6 +176,9 @@ target_link_libraries(difslice PRIVATE difcore)
 
 add_executable(difaudioops tools/difaudioops.cpp)
 target_link_libraries(difaudioops PRIVATE difcore)
+
+add_executable(difaudiodecode tools/difaudiodecode.cpp)
+target_link_libraries(difaudiodecode PRIVATE difcore)
 
 add_executable(difimport tools/difimport.cpp)
 target_link_libraries(difimport PRIVATE difcore)

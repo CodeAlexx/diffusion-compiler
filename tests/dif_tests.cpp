@@ -18,6 +18,7 @@
 #include "dif/support/error.hpp"
 #include "dif/support/json.hpp"
 #include "dif/support/sha256.hpp"
+#include "dif/support/wav.hpp"
 #include "dif/training/checkpoint.hpp"
 #include "dif/weights/bundle.hpp"
 #include "dif/weights/safetensors.hpp"
@@ -29,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <iterator>
 #include <fstream>
 #include <filesystem>
 #include <span>
@@ -2612,6 +2614,53 @@ void test_audio_bigvgan_frontend_contract() {
   }
 }
 
+
+// Chunk 7 of docs/BIGVGAN_DECODE_PLAN.md: the WAV writer must reproduce
+// serenitymojo/audio/wav.mojo:120-165 exactly — 44-byte RIFF/WAVE PCM
+// header, interleaved channels, clamp to [-1,1], then round half AWAY from
+// zero into int16 via Int(x*32767 +/- 0.5) (truncation toward zero after
+// the offset).  Header byte-identity is an artifact-gate bar, so it is
+// pinned here rather than only end to end.
+void test_wav_pcm16_writer_contract() {
+  const auto path =
+      std::filesystem::temp_directory_path() / "dif-wav-writer-contract.wav";
+  std::filesystem::remove(path);
+  // Channel-major [2, 5]: channel 0 then channel 1.
+  const std::vector<float> waveform{
+      0.0F, 1.0F, -1.0F, 2.0F, -2.0F,
+      0.5F, -0.5F, 1.0F / 32767.0F, -1.0F / 32767.0F, 0.25F};
+  dif::support::write_wav_pcm16(path, waveform, 2U, 5U, 32000U);
+  std::ifstream input(path, std::ios::binary);
+  std::vector<std::uint8_t> bytes(
+      (std::istreambuf_iterator<char>(input)),
+      std::istreambuf_iterator<char>());
+  const std::vector<std::uint8_t> expected_header{
+      'R', 'I', 'F', 'F', 56U, 0U, 0U, 0U,
+      'W', 'A', 'V', 'E',
+      'f', 'm', 't', ' ', 16U, 0U, 0U, 0U,
+      1U, 0U, 2U, 0U,
+      0x00U, 0x7DU, 0x00U, 0x00U,   // 32000 Hz
+      0x00U, 0xF4U, 0x01U, 0x00U,   // byte rate 32000*2*2 = 128000
+      4U, 0U, 16U, 0U,
+      'd', 'a', 't', 'a', 20U, 0U, 0U, 0U};
+  expect(bytes.size() == 44U + 20U, "wav writer emits 44-byte header + PCM");
+  expect(std::equal(expected_header.begin(), expected_header.end(),
+                    bytes.begin()),
+         "wav writer header is byte-identical to wav.mojo's layout");
+  std::vector<std::int16_t> samples(10U);
+  std::memcpy(samples.data(), bytes.data() + 44U, 20U);
+  // Interleaved L/R with wav.mojo's clamp-then-round-away-from-zero.
+  const std::vector<std::int16_t> expected_samples{
+      0, 16384,          // 0.0 ; 0.5*32767 = 16383.5 -> 16384
+      32767, -16384,     // 1.0 ; -0.5*32767 = -16383.5 -> -16384
+      -32767, 1,         // -1.0 ; (1/32767)*32767 = 1
+      32767, -1,         // clamp 2.0 -> 1.0 ; -(1/32767)*32767 = -1
+      -32767, 8192};     // clamp -2.0 -> -1.0 ; 0.25*32767 = 8191.75 -> 8192
+  expect(samples == expected_samples,
+         "wav writer quantizer matches wav.mojo sample for sample");
+  std::filesystem::remove(path);
+}
+
 int main() {
   test_sha256();
   test_json_parser();
@@ -2635,6 +2684,7 @@ int main() {
   test_verifier_rejects_multiple_writers();
   test_audio_opcode_verifier_contract();
   test_audio_bigvgan_frontend_contract();
+  test_wav_pcm16_writer_contract();
   test_attention_implementation_identity();
   test_h3_bf16_lowering_preserves_source_reduction_identity();
   test_h3_long_sequence_transformer_declares_backend_attention();

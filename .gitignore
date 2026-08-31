@@ -16,6 +16,7 @@
 !/docs/BIGVGAN_DECODE_PLAN.md
 !/docs/FLAME_PORT_EXPERIMENT_LEDGER.md
 !/docs/FLAME_PORT_HANDOFF_2026-08-31.md
+!/docs/H3_AUDIO_DECODE_GATE_2026-08-31.md
 *.log
 *.safetensors
 *.ckpt
