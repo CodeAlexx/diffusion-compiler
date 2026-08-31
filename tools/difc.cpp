@@ -351,7 +351,7 @@ void usage() {
             << "  difc make-h3-token-refiner-bf16 OUT.difir S HIDDEN HEADS DIM FFN LAYERS BLOCK resident|streamed\n"
             << "  difc make-h3-denoiser OUT.difir VIDEO_TOKENS AUDIO_TOKENS TEXT_TOKENS TIMESTEP_TABLES resident|streamed generated|cudnn [LAYERS REFINER_LAYERS]\n"
             << "  difc make-h3-video-vae OUT.difir LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
-            << "  difc make-mlp-training OUT.difir ROWS INPUT_WIDTH HIDDEN_WIDTH OUTPUT_WIDTH [LR BETA1 BETA2 EPS WEIGHT_DECAY]\n"
+            << "  difc make-mlp-training OUT.difir ROWS INPUT_WIDTH HIDDEN_WIDTH OUTPUT_WIDTH [LR BETA1 BETA2 EPS WEIGHT_DECAY] [f32|bf16]\n"
             << "  difc make-rectified-flow-training OUT.difir ROWS LATENT_WIDTH TIMESTEP_WIDTH HIDDEN_WIDTH ACCUMULATION_STEPS [LR BETA1 BETA2 EPS WEIGHT_DECAY]\n"
             << "  difc make-h3-block-raw-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY BLOCK resident|streamed\n"
             << "  difc set-linear-math IN.difir OUT.difir "
@@ -575,18 +575,28 @@ int main(int argc, char **argv) {
                 << "\n";
       return 0;
     }
-    if (command == "make-mlp-training" && (argc == 7 || argc == 12)) {
+    if (command == "make-mlp-training" &&
+        (argc == 7 || argc == 8 || argc == 12 || argc == 13)) {
       dif::frontend::MlpTrainingConfig config;
       config.rows = number(argv[3], "rows");
       config.input_width = number(argv[4], "input width");
       config.hidden_width = number(argv[5], "hidden width");
       config.output_width = number(argv[6], "output width");
-      if (argc == 12) {
+      if (argc >= 12) {
         config.learning_rate = floating_number(argv[7], "learning rate");
         config.beta1 = floating_number(argv[8], "beta1");
         config.beta2 = floating_number(argv[9], "beta2");
         config.epsilon = floating_number(argv[10], "epsilon");
         config.weight_decay = floating_number(argv[11], "weight decay");
+      }
+      if (argc == 8 || argc == 13) {
+        const std::string dtype = argv[argc - 1];
+        if (dtype == "f32")
+          config.compute_dtype = dif::ir::DType::F32;
+        else if (dtype == "bf16")
+          config.compute_dtype = dif::ir::DType::BF16;
+        else
+          dif::fail("make-mlp-training dtype must be f32 or bf16");
       }
       const auto build = dif::frontend::make_mlp_training(config);
       dif::ir::write_file(build.program, argv[2]);
@@ -595,6 +605,9 @@ int main(int argc, char **argv) {
                 << " input_width=" << config.input_width
                 << " hidden_width=" << config.hidden_width
                 << " output_width=" << config.output_width
+                << " compute_dtype="
+                << (config.compute_dtype == dif::ir::DType::BF16 ? "bf16"
+                                                                 : "f32")
                 << " features_input=" << build.features_input
                 << " target_input=" << build.target_input
                 << " step_input=" << build.step_input

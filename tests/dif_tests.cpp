@@ -1075,6 +1075,148 @@ void test_training_autodiff_optimizer_and_checkpoint() {
   std::filesystem::remove_all(temporary);
 }
 
+void test_mixed_precision_bf16_training_step() {
+  // The default-dtype builder must keep emitting the exact program recorded
+  // by the 2026-08-28 F32 training gate.
+  {
+    dif::frontend::MlpTrainingConfig canonical;
+    const auto build = dif::frontend::make_mlp_training(canonical);
+    expect(dif::hex_digest(dif::ir::fingerprint(build.program)) ==
+               "c33733354ed3be4b5147bb7e4e2fd150400d364a3f4ad00a2c996ae1b54db95f",
+           "default F32 MLP training program keeps the recorded gate "
+           "fingerprint");
+  }
+
+  dif::frontend::MlpTrainingConfig config;
+  config.rows = 2U;
+  config.input_width = 2U;
+  config.hidden_width = 3U;
+  config.output_width = 1U;
+  config.learning_rate = 1.0e-2;
+  config.weight_decay = 1.0e-2;
+  config.compute_dtype = dif::ir::DType::BF16;
+  const auto build = dif::frontend::make_mlp_training(config);
+  bool has_cast = false;
+  for (const auto &operation : build.program.operations)
+    has_cast |= operation.opcode == dif::ir::Opcode::Cast;
+  expect(has_cast &&
+             build.program.tensor(build.loss_output)->dtype ==
+                 dif::ir::DType::F32 &&
+             build.program.tensor(build.features_input)->dtype ==
+                 dif::ir::DType::BF16,
+         "BF16 training graph carries a Cast boundary into an F32 loss");
+  for (const auto &binding : build.optimizer_bindings) {
+    expect(build.program.tensor(binding.gradient_output)->dtype ==
+                   dif::ir::DType::BF16 &&
+               build.program.tensor(binding.first_moment_input)->dtype ==
+                   dif::ir::DType::F32 &&
+               build.program.tensor(binding.second_moment_output)->dtype ==
+                   dif::ir::DType::F32 &&
+               build.program.tensor(binding.parameter_output)->dtype ==
+                   dif::ir::DType::BF16,
+           "BF16 parameters keep BF16 gradients/outputs and F32 moments");
+  }
+
+  dif::runtime::TensorMap inputs;
+  inputs.emplace(build.features_input,
+                 float_tensor(dif::ir::DType::BF16, {2U, 2U},
+                              {-1.0F, 0.5F, 0.25F, 1.0F}));
+  inputs.emplace(build.target_input, f32_tensor({2U, 1U}, {0.5F, -0.25F}));
+  const std::array<std::vector<float>, 4> parameter_values = {
+      std::vector<float>{-0.2F, -0.1F, 0.0F, 0.1F, 0.2F, 0.3F},
+      std::vector<float>{-0.05F, 0.0F, 0.05F},
+      std::vector<float>{-0.1F, 0.0F, 0.1F},
+      std::vector<float>{0.02F},
+  };
+  for (std::size_t index = 0U; index < build.optimizer_bindings.size();
+       ++index) {
+    const auto &binding = build.optimizer_bindings[index];
+    const auto *parameter = build.program.tensor(binding.parameter_input);
+    inputs.emplace(binding.parameter_input,
+                   float_tensor(dif::ir::DType::BF16, parameter->dims,
+                                parameter_values[index]));
+    inputs.emplace(binding.first_moment_input,
+                   dif::runtime::zeros(
+                       *build.program.tensor(binding.first_moment_input)));
+    inputs.emplace(binding.second_moment_input,
+                   dif::runtime::zeros(
+                       *build.program.tensor(binding.second_moment_input)));
+  }
+  inputs.emplace(build.step_input, i32_tensor({1U}, {0}));
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto reference =
+      dif::runtime::make_cpu_executor()->run(build.program, inputs, options);
+  const auto loss = reference.outputs.at(build.loss_output).f32()[0];
+  expect(std::isfinite(loss) && loss > 0.0F,
+         "BF16 training graph produces a finite F32 scalar loss on CPU");
+  for (const auto &binding : build.optimizer_bindings) {
+    const auto gradient =
+        float_values(reference.outputs.at(binding.gradient_output));
+    expect(std::all_of(gradient.begin(), gradient.end(),
+                       [](float value) { return std::isfinite(value); }),
+           "BF16 gradients are finite on CPU");
+  }
+  if (dif::runtime::cuda_available()) {
+    const auto candidate =
+        dif::runtime::make_cuda_executor()->run(build.program, inputs, options);
+    float maximum_absolute_error = 0.0F;
+    for (const auto &[id, expected_tensor] : reference.outputs) {
+      const auto expected = float_values(expected_tensor);
+      const auto actual = float_values(candidate.outputs.at(id));
+      for (std::size_t index = 0U; index < expected.size(); ++index)
+        maximum_absolute_error =
+            std::max(maximum_absolute_error,
+                     std::abs(expected[index] - actual[index]));
+    }
+    // Both executors accumulate in F32 and round only at BF16 stores; a few
+    // BF16 ULPs (~0.0078 relative at unit magnitude) covers reduction-order
+    // differences at this geometry.
+    expect(maximum_absolute_error <= 4.0e-3F,
+           "CUDA BF16 training step matches CPU semantics");
+    std::cout << "GATE bf16_training_one_step backend="
+              << candidate.backend_name << " device=" << candidate.device_name
+              << " max_abs=" << maximum_absolute_error << "\n";
+  }
+
+  // Dtype-contract negatives: BF16 moments and non-F32 accumulators fail
+  // closed.
+  {
+    auto broken = build.program;
+    for (auto &tensor : broken.tensors) {
+      if (tensor.id == build.optimizer_bindings.front().first_moment_input)
+        tensor.dtype = dif::ir::DType::BF16;
+    }
+    bool rejected = false;
+    try {
+      dif::ir::verify(broken);
+    } catch (const dif::Error &) {
+      rejected = true;
+    }
+    expect(rejected, "adamw_update rejects BF16 first moments");
+  }
+  {
+    auto broken = build.program;
+    for (auto &operation : broken.operations) {
+      if (operation.opcode == dif::ir::Opcode::AdamWUpdate) {
+        operation.attributes.push_back(dif::ir::Attribute::u64(
+            dif::ir::AttrKey::AccumulatorDType,
+            static_cast<std::uint64_t>(dif::ir::DType::BF16)));
+        break;
+      }
+    }
+    bool rejected = false;
+    try {
+      dif::ir::verify(broken);
+    } catch (const dif::Error &) {
+      rejected = true;
+    }
+    expect(rejected, "training ops reject a non-F32 AccumulatorDType");
+  }
+}
+
 void test_rectified_flow_training_vertical() {
   dif::frontend::RectifiedFlowTrainingConfig config;
   config.rows = 2U;
@@ -2265,6 +2407,7 @@ int main() {
   test_vae_normalization_primitives();
   test_h3_video_vae_frontend_contract();
   test_training_autodiff_optimizer_and_checkpoint();
+  test_mixed_precision_bf16_training_step();
   test_rectified_flow_training_vertical();
   test_backend_neutral_diffusion_preprocessing();
   test_backend_neutral_flow_scheduler();

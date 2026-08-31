@@ -13,6 +13,9 @@ MlpTrainingBuild make_mlp_training(const MlpTrainingConfig &config) {
   if (config.rows == 0U || config.input_width == 0U ||
       config.hidden_width == 0U || config.output_width == 0U)
     fail("MLP training dimensions must be positive");
+  if (config.compute_dtype != ir::DType::F32 &&
+      config.compute_dtype != ir::DType::BF16)
+    fail("MLP training compute dtype must be F32 or BF16");
   MlpTrainingBuild build;
   auto &forward = build.program;
   constexpr auto input = ir::TensorRole::Input;
@@ -21,25 +24,26 @@ MlpTrainingBuild make_mlp_training(const MlpTrainingConfig &config) {
   build.features_input = 1U;
   build.target_input = 2U;
   const std::array<std::uint32_t, 4> parameters = {3U, 4U, 5U, 6U};
+  const auto compute = config.compute_dtype;
+  const bool mixed = compute != ir::DType::F32;
   forward.tensors = {
-      {1U, ir::DType::F32, input, {config.rows, config.input_width}},
+      {1U, compute, input, {config.rows, config.input_width}},
       {2U, ir::DType::F32, input, {config.rows, config.output_width}},
-      {3U, ir::DType::F32, parameter,
+      {3U, compute, parameter,
        {config.hidden_width, config.input_width}},
-      {4U, ir::DType::F32, parameter, {config.hidden_width}},
-      {5U, ir::DType::F32, parameter,
+      {4U, compute, parameter, {config.hidden_width}},
+      {5U, compute, parameter,
        {config.output_width, config.hidden_width}},
-      {6U, ir::DType::F32, parameter, {config.output_width}},
-      {7U, ir::DType::F32, ir::TensorRole::Internal,
+      {6U, compute, parameter, {config.output_width}},
+      {7U, compute, ir::TensorRole::Internal,
        {config.rows, config.hidden_width}},
-      {8U, ir::DType::F32, ir::TensorRole::Internal,
+      {8U, compute, ir::TensorRole::Internal,
        {config.rows, config.hidden_width}},
-      {9U, ir::DType::F32, ir::TensorRole::Internal,
+      {9U, compute, ir::TensorRole::Internal,
        {config.rows, config.hidden_width}},
-      {10U, ir::DType::F32, ir::TensorRole::Internal,
+      {10U, compute, ir::TensorRole::Internal,
        {config.rows, config.output_width}},
-      {11U, ir::DType::F32, output, {config.rows, config.output_width}},
-      {12U, ir::DType::F32, output, {1U}},
+      {11U, compute, output, {config.rows, config.output_width}},
   };
   forward.operations = {
       {1U, ir::Opcode::Linear, {1U, 3U}, {7U}, {}},
@@ -47,11 +51,26 @@ MlpTrainingBuild make_mlp_training(const MlpTrainingConfig &config) {
       {3U, ir::Opcode::SiLU, {8U}, {9U}, {}},
       {4U, ir::Opcode::Linear, {9U, 5U}, {10U}, {}},
       {5U, ir::Opcode::BiasAdd, {10U, 6U}, {11U}, {}},
-      {6U, ir::Opcode::MseLoss, {11U, 2U}, {12U}, {}},
   };
   build.prediction_output = 11U;
-  build.loss_output = 12U;
-  const auto differentiated = training::differentiate(forward, 12U, parameters);
+  if (mixed) {
+    // The BF16 prediction crosses an explicit Cast boundary into the F32
+    // loss; autodiff mirrors the boundary with a Cast back to BF16.
+    forward.tensors.push_back({12U, ir::DType::F32, ir::TensorRole::Internal,
+                               {config.rows, config.output_width}});
+    forward.tensors.push_back({13U, ir::DType::F32, output, {1U}});
+    forward.operations.push_back({6U, ir::Opcode::Cast, {11U}, {12U}, {}});
+    forward.operations.push_back(
+        {7U, ir::Opcode::MseLoss, {12U, 2U}, {13U}, {}});
+    build.loss_output = 13U;
+  } else {
+    forward.tensors.push_back({12U, ir::DType::F32, output, {1U}});
+    forward.operations.push_back(
+        {6U, ir::Opcode::MseLoss, {11U, 2U}, {12U}, {}});
+    build.loss_output = 12U;
+  }
+  const auto differentiated =
+      training::differentiate(forward, build.loss_output, parameters);
   build.program = differentiated.program;
 
   std::uint32_t next_tensor = 1U;
@@ -85,7 +104,7 @@ MlpTrainingBuild make_mlp_training(const MlpTrainingConfig &config) {
          ir::TensorRole::Input | ir::TensorRole::OptimizerState,
          parameter_dims});
     build.program.tensors.push_back(
-        {binding.parameter_output, ir::DType::F32,
+        {binding.parameter_output, description->dtype,
          ir::TensorRole::Output | ir::TensorRole::Parameter,
          parameter_dims});
     build.program.tensors.push_back(
