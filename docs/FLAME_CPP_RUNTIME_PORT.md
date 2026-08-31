@@ -132,13 +132,18 @@ Torch-free TODAY at link level: every compiler binary in the accepted chain
 (ldd-verified: CUDA + cuDNN + libstdc++/glibc only; no libtorch, no
 libpython; only subprocess is ffmpeg).
 
-Honest current claim (updated 2026-08-31, after Waves 1-3): the generation
-path is torch-free and Python-free, and **Mojo is now required at exactly
-ONE point: the Qwen3-VL text conditioner** (prompt -> [439,5120] embedding).
-Everything else that was Mojo-dependent is native and gated: the tokenizer
-(439-token golden gate), the modulation cache (byte-identical builder), the
-initial noise (byte-identical seeds), the importer, and the BigVGAN audio
-decode (SNR 86.87 dB, 5.2x faster). ffmpeg remains, by declaration, for mux.
+**CLOSED 2026-08-31 — H3 prompt-to-MP4 needs nothing but the native stack.**
+The Qwen3-VL text conditioner, the last non-native stage, now runs as a
+DiffIR program over generic opcodes (docs/H3_NATIVE_PROMPT_TO_MP4_GATE_2026-08-31.md).
+The full chain — prompt text -> native tokenizer -> native conditioner ->
+native denoise -> native video VAE -> native BigVGAN audio -> mux — was
+executed in an environment where `python3 -c "import torch"` fails, with
+`strace` showing the only binaries exec'd are the native tools plus
+`ffmpeg` (the declared mux boundary). Every binary links CUDA + cuDNN +
+glibc only. Conditioner parity: rel-L2 3.449e-03 vs the torch oracle,
+inside the oracle's own eager-vs-sdpa envelope (3.805e-03). The produced
+video preserves the accepted natural-language quality on inspection.
+PyTorch is now strictly a development oracle for H3.
 
 Removal order (S/M/L/XL = effort):
 1. S — vendor `mem_safe_runtime.sh` into compiler `scripts/` (exists at
