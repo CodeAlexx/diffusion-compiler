@@ -958,6 +958,13 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::Attention:
       emit_attention(source, program, operation);
       break;
+    case Opcode::RmsNormBackward:
+    case Opcode::RmsNormModulateBackward:
+    case Opcode::SwiGluBackward:
+    case Opcode::ResidualGateBackward:
+      dif::fail("OpenCL reference backend does not implement the DiT "
+                "backward opcodes");
+      break;
     case Opcode::Barrier:
       break;
     case Opcode::BiasAdd:

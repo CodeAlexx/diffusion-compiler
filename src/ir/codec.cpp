@@ -234,6 +234,14 @@ std::string_view opcode_name(Opcode opcode) {
     return "silu_backward";
   case Opcode::AdamWUpdate:
     return "adamw_update";
+  case Opcode::RmsNormBackward:
+    return "rms_norm_backward";
+  case Opcode::RmsNormModulateBackward:
+    return "rms_norm_modulate_backward";
+  case Opcode::SwiGluBackward:
+    return "swiglu_backward";
+  case Opcode::ResidualGateBackward:
+    return "residual_gate_backward";
   }
   return "invalid";
 }
