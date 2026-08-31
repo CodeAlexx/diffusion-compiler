@@ -265,6 +265,8 @@ struct LaunchTelemetry {
   std::uint64_t stream_wait_events{};
   std::uint64_t host_event_synchronizes{};
   std::uint64_t host_stream_synchronizes{};
+  std::uint64_t device_mem_allocs{};
+  std::uint64_t pinned_mem_allocs{};
 };
 
 // Profiling values describe the timed iterations of one prepared CUDA run.

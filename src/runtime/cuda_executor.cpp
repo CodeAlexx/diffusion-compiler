@@ -146,6 +146,19 @@ CUresult counted_stream_synchronize(CUstream stream) {
   return cuStreamSynchronize(stream);
 }
 
+CUresult counted_mem_alloc(CUdeviceptr *pointer, std::size_t bytes) {
+  if (active_telemetry)
+    ++active_telemetry->device_mem_allocs;
+  return cuMemAlloc(pointer, bytes);
+}
+
+CUresult counted_mem_host_alloc(void **pointer, std::size_t bytes,
+                                unsigned flags) {
+  if (active_telemetry)
+    ++active_telemetry->pinned_mem_allocs;
+  return cuMemHostAlloc(pointer, bytes, flags);
+}
+
 void count_cublaslt_matmul() {
   if (active_telemetry)
     ++active_telemetry->cublaslt_matmuls;
@@ -265,9 +278,53 @@ private:
   CUevent event_{};
 };
 
+// One device reservation backing every prepare-time allocation (memory-plan
+// slots plus the feature workspaces). Carved front-to-back at 256-byte
+// granularity; nothing is freed or relocated until the prepared execution
+// is destroyed (CUTLASS freezes device pointers at plan build, so all
+// carving happens before any plan is built against the pointers).
+class DeviceArena {
+public:
+  explicit DeviceArena(std::uint64_t capacity) : capacity_(capacity) {
+    if (capacity_ != 0U)
+      check(counted_mem_alloc(&base_, static_cast<std::size_t>(capacity_)),
+            "cuMemAlloc device arena");
+  }
+  ~DeviceArena() {
+    if (base_)
+      (void)cuMemFree(base_);
+  }
+  DeviceArena(const DeviceArena &) = delete;
+  DeviceArena &operator=(const DeviceArena &) = delete;
+
+  CUdeviceptr take(std::uint64_t bytes, const char *label) {
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - 255U)
+      fail("device arena alignment overflow");
+    const auto aligned = (bytes + 255U) & ~std::uint64_t{255U};
+    if (aligned > capacity_ - offset_)
+      fail(std::string("device arena exhausted taking ") + label +
+           ": requested=" + std::to_string(bytes) +
+           " used=" + std::to_string(offset_) +
+           " capacity=" + std::to_string(capacity_));
+    const auto pointer = base_ + offset_;
+    offset_ += aligned;
+    return pointer;
+  }
+
+  std::uint64_t capacity() const { return capacity_; }
+  std::uint64_t used() const { return offset_; }
+
+private:
+  CUdeviceptr base_{};
+  std::uint64_t capacity_{};
+  std::uint64_t offset_{};
+};
+
 class DeviceBuffers {
 public:
   ~DeviceBuffers() {
+    if (!owns_)
+      return;
     for (const auto pointer : allocations_) {
       if (pointer)
         (void)cuMemFree(pointer);
@@ -276,12 +333,17 @@ public:
 
   void allocate(
       const ir::Program &program, const compiler::MemoryPlan &plan,
-      const std::unordered_set<std::uint32_t> &excluded_tensors = {}) {
+      const std::unordered_set<std::uint32_t> &excluded_tensors = {},
+      DeviceArena *arena = nullptr) {
+    owns_ = arena == nullptr;
     allocations_.resize(plan.slots.size());
     for (const auto &slot : plan.slots) {
       CUdeviceptr pointer{};
-      check(cuMemAlloc(&pointer, static_cast<std::size_t>(slot.bytes)),
-            "cuMemAlloc");
+      if (arena)
+        pointer = arena->take(slot.bytes, "memory-plan slot");
+      else
+        check(counted_mem_alloc(&pointer, static_cast<std::size_t>(slot.bytes)),
+              "cuMemAlloc");
       allocations_.at(slot.id) = pointer;
     }
     for (const auto &desc : program.tensors) {
@@ -313,16 +375,25 @@ private:
   std::vector<CUdeviceptr> allocations_;
   std::unordered_map<std::uint32_t, CUdeviceptr> pointers_;
   std::unordered_set<std::uint32_t> external_;
+  bool owns_{true};
 };
 
 class Workspace {
 public:
-  explicit Workspace(std::size_t bytes) : bytes_(bytes) {
-    if (bytes_ != 0U)
-      check(cuMemAlloc(&pointer_, bytes_), "cuMemAlloc cuBLASLt workspace");
+  explicit Workspace(std::size_t bytes, DeviceArena *arena = nullptr)
+      : bytes_(bytes) {
+    if (bytes_ == 0U)
+      return;
+    if (arena) {
+      pointer_ = arena->take(bytes_, "feature workspace");
+      owns_ = false;
+    } else {
+      check(counted_mem_alloc(&pointer_, bytes_),
+            "cuMemAlloc cuBLASLt workspace");
+    }
   }
   ~Workspace() {
-    if (pointer_)
+    if (pointer_ && owns_)
       (void)cuMemFree(pointer_);
   }
   Workspace(const Workspace &) = delete;
@@ -334,13 +405,14 @@ public:
 private:
   CUdeviceptr pointer_{};
   std::size_t bytes_{};
+  bool owns_{true};
 };
 
 class PinnedHostWorkspace {
 public:
   explicit PinnedHostWorkspace(std::size_t bytes) : bytes_(bytes) {
     if (bytes_ != 0U)
-      check(cuMemHostAlloc(&pointer_, bytes_, CU_MEMHOSTALLOC_PORTABLE),
+      check(counted_mem_host_alloc(&pointer_, bytes_, CU_MEMHOSTALLOC_PORTABLE),
             "cuMemHostAlloc streamed staging");
   }
   ~PinnedHostWorkspace() {
@@ -1314,7 +1386,7 @@ public:
                      align_256(heads * sizeof(std::int32_t));
   }
 
-  void allocate() {
+  void allocate(DeviceArena *arena) {
     if (storage_)
       return;
     const auto sequence = static_cast<std::uint64_t>(sequence_);
@@ -1324,8 +1396,8 @@ public:
     const auto q_scale_elements = heads * ((sequence + 127U) / 128U) * 32U;
     const auto k_scale_elements = heads * ((sequence + 127U) / 128U) * 4U;
     const auto v_elements = heads * 128U * padded_sequence;
-    storage_ =
-        std::make_unique<Workspace>(static_cast<std::size_t>(scratch_bytes_));
+    storage_ = std::make_unique<Workspace>(
+        static_cast<std::size_t>(scratch_bytes_), arena);
     auto offset = std::uint64_t{0U};
     auto assign = [&](CUdeviceptr &target, std::uint64_t bytes) {
       target = storage_->pointer() + offset;
@@ -1904,9 +1976,10 @@ extern "C" __global__ void dif_h3_groupwise_dequant(
 )CUDA";
 }
 
-void allocate_h3_groupwise_weights(H3GroupwiseBlockPlan &plan) {
+void allocate_h3_groupwise_weights(H3GroupwiseBlockPlan &plan,
+                                   DeviceArena *arena) {
   plan.weight_storage =
-      std::make_unique<Workspace>(plan.weight_storage_bytes);
+      std::make_unique<Workspace>(plan.weight_storage_bytes, arena);
   auto pointer = plan.weight_storage->pointer();
   for (auto &projection : plan.projections) {
     projection.weight_device = pointer;
@@ -2510,9 +2583,9 @@ void assign_h3_w8a8_weights(H3W8A8MlpPlan &plan, CUdeviceptr base) {
     fail("H3 W8A8 weight-storage layout mismatch");
 }
 
-void allocate_h3_w8a8_weights(H3W8A8MlpPlan &plan) {
+void allocate_h3_w8a8_weights(H3W8A8MlpPlan &plan, DeviceArena *arena) {
   plan.weight_storage = std::make_unique<Workspace>(
-      static_cast<std::size_t>(plan.weight_storage_bytes));
+      static_cast<std::size_t>(plan.weight_storage_bytes), arena);
   assign_h3_w8a8_weights(plan, plan.weight_storage->pointer());
 }
 
@@ -2590,9 +2663,10 @@ void assign_h3_w8a8_weights(H3W8A8AttentionPlan &plan, CUdeviceptr base) {
     fail("H3 W8A8 attention weight-storage layout mismatch");
 }
 
-void allocate_h3_w8a8_weights(H3W8A8AttentionPlan &plan) {
+void allocate_h3_w8a8_weights(H3W8A8AttentionPlan &plan,
+                              DeviceArena *arena) {
   plan.weight_storage = std::make_unique<Workspace>(
-      static_cast<std::size_t>(plan.weight_storage_bytes));
+      static_cast<std::size_t>(plan.weight_storage_bytes), arena);
   assign_h3_w8a8_weights(plan, plan.weight_storage->pointer());
 }
 
@@ -3873,6 +3947,11 @@ public:
            std::to_string(free_before) + " minimum_free=" +
            std::to_string(options.minimum_free_bytes));
     resident_bytes_ = required;
+    // Single device reservation backing every prepare-time allocation
+    // below (memory-plan slots + all feature workspaces). The slack
+    // absorbs the per-take 256-byte alignment padding; take() fails
+    // closed if the accounting above ever under-covers.
+    arena_ = std::make_unique<DeviceArena>(required + 64U * 1024U);
 
     fused_launch_inputs_ = generated.launch_inputs;
     skipped_operations_ = generated.skipped_operations;
@@ -3929,13 +4008,14 @@ public:
             "cuModuleGetFunction H3 groupwise INT8 dequant");
     excluded_tensors.insert(replaced_constant_tensors.begin(),
                             replaced_constant_tensors.end());
-    buffers_.allocate(program_, memory_plan_, excluded_tensors);
-    workspace_ = std::make_unique<Workspace>(workspace_bytes_);
-    cudnn_workspace_ = std::make_unique<Workspace>(cudnn_workspace_bytes_);
+    buffers_.allocate(program_, memory_plan_, excluded_tensors, arena_.get());
+    workspace_ = std::make_unique<Workspace>(workspace_bytes_, arena_.get());
+    cudnn_workspace_ =
+        std::make_unique<Workspace>(cudnn_workspace_bytes_, arena_.get());
     h3_w8a8_scratch_storage_ = std::make_unique<Workspace>(
-        static_cast<std::size_t>(h3_w8a8_scratch_bytes));
+        static_cast<std::size_t>(h3_w8a8_scratch_bytes), arena_.get());
     h3_w8a8_tail_weight_storage_ = std::make_unique<Workspace>(
-        static_cast<std::size_t>(h3_w8a8_tail_weight_bytes_));
+        static_cast<std::size_t>(h3_w8a8_tail_weight_bytes_), arena_.get());
     if (h3_w8a8_tail_stage_half_bytes_ != 0U) {
       if (h3_w8a8_tail_stage_half_bytes_ >
           std::numeric_limits<std::size_t>::max() / 2U)
@@ -3950,13 +4030,13 @@ public:
           std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
     }
     h3_groupwise_scratch_storage_ = std::make_unique<Workspace>(
-        static_cast<std::size_t>(h3_groupwise_scratch_bytes));
+        static_cast<std::size_t>(h3_groupwise_scratch_bytes), arena_.get());
     h3_modulation_storage_ = std::make_unique<Workspace>(
-        static_cast<std::size_t>(h3_modulation_bytes));
+        static_cast<std::size_t>(h3_modulation_bytes), arena_.get());
     assign_h3_modulation_storage(h3_modulation_cache_plans_,
                                  h3_modulation_storage_->pointer(), buffers_);
     promoted_constant_storage_ = std::make_unique<Workspace>(
-        static_cast<std::size_t>(promoted_constant_bytes_));
+        static_cast<std::size_t>(promoted_constant_bytes_), arena_.get());
     {
       auto promoted_offset = std::uint64_t{0U};
       for (const auto id : promoted_streamed_constants_) {
@@ -3968,10 +4048,10 @@ public:
         fail("promoted streamed-constant storage layout mismatch");
     }
     if (h3_ck_attention_plan_)
-      h3_ck_attention_plan_->allocate();
+      h3_ck_attention_plan_->allocate(arena_.get());
     for (auto &plan : h3_w8a8_mlp_plans_) {
       if (plan.resident)
-        allocate_h3_w8a8_weights(plan);
+        allocate_h3_w8a8_weights(plan, arena_.get());
       else
         assign_h3_w8a8_weights(
             plan, h3_w8a8_tail_weight_storage_->pointer() +
@@ -3980,14 +4060,14 @@ public:
     }
     for (auto &plan : h3_w8a8_attention_plans_) {
       if (plan.resident)
-        allocate_h3_w8a8_weights(plan);
+        allocate_h3_w8a8_weights(plan, arena_.get());
       else
         assign_h3_w8a8_weights(
             plan, h3_w8a8_tail_weight_storage_->pointer());
       assign_h3_w8a8_scratch(plan, h3_w8a8_scratch_storage_->pointer());
     }
     for (auto &plan : h3_groupwise_plans_) {
-      allocate_h3_groupwise_weights(plan);
+      allocate_h3_groupwise_weights(plan, arena_.get());
       assign_h3_groupwise_scratch(
           plan, h3_groupwise_scratch_storage_->pointer(), buffers_);
     }
@@ -4810,6 +4890,8 @@ public:
                   << " stream_wait_events=" << t.stream_wait_events
                   << " host_event_syncs=" << t.host_event_synchronizes
                   << " host_stream_syncs=" << t.host_stream_synchronizes
+                  << " device_mem_allocs=" << t.device_mem_allocs
+                  << " pinned_mem_allocs=" << t.pinned_mem_allocs
                   << '\n';
       };
       print("prepare", preparation_telemetry_);
@@ -4854,6 +4936,7 @@ private:
   Context context_;
   std::unique_ptr<Module> module_;
   compiler::MemoryPlan memory_plan_;
+  std::unique_ptr<DeviceArena> arena_;
   DeviceBuffers buffers_;
   std::unique_ptr<Workspace> workspace_;
   std::unique_ptr<Workspace> cudnn_workspace_;
