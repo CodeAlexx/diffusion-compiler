@@ -132,11 +132,13 @@ Torch-free TODAY at link level: every compiler binary in the accepted chain
 (ldd-verified: CUDA + cuDNN + libstdc++/glibc only; no libtorch, no
 libpython; only subprocess is ffmpeg).
 
-Honest current claim: torch-free generation path; Python-free except a
-stdlib-only one-time importer; **Mojo-dependent at three points** —
-(1) tokenizer + Qwen3-VL conditioner (prompt -> embedding), (2) modulation-
-cache provenance (Serenity generates; compiler only validates), (3) BigVGAN
-audio decode.
+Honest current claim (updated 2026-08-31, after Waves 1-3): the generation
+path is torch-free and Python-free, and **Mojo is now required at exactly
+ONE point: the Qwen3-VL text conditioner** (prompt -> [439,5120] embedding).
+Everything else that was Mojo-dependent is native and gated: the tokenizer
+(439-token golden gate), the modulation cache (byte-identical builder), the
+initial noise (byte-identical seeds), the importer, and the BigVGAN audio
+decode (SNR 86.87 dB, 5.2x faster). ffmpeg remains, by declaration, for mux.
 
 Removal order (S/M/L/XL = effort):
 1. S — vendor `mem_safe_runtime.sh` into compiler `scripts/` (exists at
@@ -253,6 +255,35 @@ branches w1-* cut from 5eb5f13; GPU tests serialized on /tmp/dc-gpu.lock):**
   W8A8 byte-replay claims suspect until resolved. Arena consolidation NOT DONE
   (deferred). Warm-cache boundary: measured wins should grow on the >RAM H3
   checkpoint case — unmeasured, needs an H3-scale rerun decision.
+
+**Wave 3 landed (2026-08-31):**
+- w3-gqa MERGED — GQA `KvHeads` on the Attention family (attr 39): q [S,H,D],
+  k/v [S,KvH,D], absent attr == KvH==H with byte-identical fingerprints;
+  grouped dK/dV accumulation in F32; cuDNN grouped K/V descriptors with
+  plan-key separation. Gate: 184/184 torch comparisons (80 GQA, incl. the
+  conditioner's 64/8 at D=128, F32+BF16, CPU+CUDA); cuDNN GQA in-tree
+  max_abs 0.0039 (one BF16 ulp) under a 3.2e-2 bar. Finding recorded:
+  absolute-error bars are shape-dependent (reduction width), relative bars
+  unchanged — docs/GQA_ATTENTION_GATE_2026-08-31.md. **Unblocks the
+  Qwen3-VL conditioner build.**
+- w3-epilogue MERGED — cuBLASLt bias-epilogue absorption
+  (`--absorb-linear-bias`, default off, write-early alias safety enforced):
+  F32 byte-identical, BF16 max_abs 0.125 under a frozen 0.25 bar (single
+  vs double rounding, by design), launches drop by the site count with
+  cuBLASLt dispatches unchanged, honest zero census on LoRA/DiT/H3.
+  Activation epilogues declined with evidence (cuBLASLt has no SiLU/SwiGLU;
+  no GELU opcode exists). Heuristic persistence
+  (`--persist-linear-heuristics`, default off): inert when off, every Linear
+  plan restored on a second prepare with rejected=0, byte-identical outputs
+  — docs/EPILOGUE_PERSISTENCE_2026-08-31.md.
+- w3-audio MERGED — **native BigVGAN audio decode**: Conv1d(47)/SnakeBeta(48)
+  opcodes, CPU reference, bit-exact float64 weight-norm fold (914->779),
+  603-op program (391 Conv1d + 127 SnakeBeta), CUDA emitters, difaudiodecode
+  + native WAV writer. Artifact gate vs the accepted audio.wav: header
+  byte-identical, max int16 delta 1, 370/467,200 samples differing (0.079%),
+  SNR 86.87 dB; perf 0.63 s fresh process vs the 3.27 s Serenity bar and the
+  5.25 s bridge — docs/H3_AUDIO_DECODE_GATE_2026-08-31.md. **Removal-order
+  step 4 complete: Mojo is out of the output half.**
 
 **Wave 2 landed (2026-08-31):**
 - w2-backward MERGED — DiT backward opcodes 39-46 PROVEN (FD gradchecks;
