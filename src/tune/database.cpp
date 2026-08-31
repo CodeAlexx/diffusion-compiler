@@ -17,7 +17,7 @@ namespace dif::tune {
 namespace {
 
 constexpr std::array<std::uint8_t, 8> kMagic = {'D', 'I', 'F', 'T', 'U', 'N', 'E', '1'};
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 4;
 constexpr std::size_t kDigestBytes = 32;
 constexpr std::uint32_t kMaxRecords = 1U << 20U;
 constexpr std::uint32_t kMaxString = 1U << 20U;
@@ -128,6 +128,28 @@ void save(const Store &store) {
     writer.u64(value.nonfinite_count);
     writer.string(value.status);
     writer.u64(std::bit_cast<std::uint64_t>(value.created_unix));
+    writer.string(value.candidate_program_hash);
+    writer.string(value.recipe_hash);
+    writer.string(value.recipe_text);
+    if (value.trial_mean_milliseconds.size() > kMaxRecords)
+      fail("tuning measurement has too many timing trials");
+    writer.u32(static_cast<std::uint32_t>(
+        value.trial_mean_milliseconds.size()));
+    for (const auto timing : value.trial_mean_milliseconds)
+      writer.f64(timing);
+    writer.f64(value.preparation_milliseconds);
+    writer.u64(value.planned_device_bytes);
+    writer.u64(value.measured_resident_bytes);
+    writer.u64(value.memory_limit_bytes);
+    writer.string(value.rejection_reason);
+    if (value.iteration_milliseconds.size() > kMaxRecords)
+      fail("tuning measurement has too many iteration timings");
+    writer.u32(static_cast<std::uint32_t>(
+        value.iteration_milliseconds.size()));
+    for (const auto timing : value.iteration_milliseconds)
+      writer.f64(timing);
+    writer.string(value.objective_name);
+    writer.f64(value.objective_milliseconds);
   }
   const auto digest = sha256(writer.bytes);
   writer.bytes.insert(writer.bytes.end(), digest.begin(), digest.end());
@@ -162,7 +184,8 @@ void load(Store &store) {
   if (!std::equal(kMagic.begin(), kMagic.end(), magic.begin()))
     fail("invalid tuning database magic");
   const auto version = reader.u32();
-  if (version != 1U && version != kVersion)
+  if (version != 1U && version != 2U && version != 3U &&
+      version != kVersion)
     fail("unsupported tuning database version");
   const auto count = reader.u32();
   if (count > kMaxRecords)
@@ -188,6 +211,38 @@ void load(Store &store) {
     }
     value.status = reader.string();
     value.created_unix = std::bit_cast<std::int64_t>(reader.u64());
+    if (version >= 3U) {
+      value.candidate_program_hash = reader.string();
+      value.recipe_hash = reader.string();
+      value.recipe_text = reader.string();
+      const auto trial_count = reader.u32();
+      if (trial_count > kMaxRecords)
+        fail("tuning measurement timing-trial count is unreasonable");
+      value.trial_mean_milliseconds.reserve(trial_count);
+      for (std::uint32_t trial = 0U; trial < trial_count; ++trial)
+        value.trial_mean_milliseconds.push_back(reader.f64());
+      value.preparation_milliseconds = reader.f64();
+      value.planned_device_bytes = reader.u64();
+      value.measured_resident_bytes = reader.u64();
+      value.memory_limit_bytes = reader.u64();
+      value.rejection_reason = reader.string();
+    } else {
+      value.candidate_program_hash = value.candidate_hash;
+    }
+    if (version >= 4U) {
+      const auto iteration_count = reader.u32();
+      if (iteration_count > kMaxRecords)
+        fail("tuning measurement iteration count is unreasonable");
+      value.iteration_milliseconds.reserve(iteration_count);
+      for (std::uint32_t iteration = 0U; iteration < iteration_count;
+           ++iteration)
+        value.iteration_milliseconds.push_back(reader.f64());
+      value.objective_name = reader.string();
+      value.objective_milliseconds = reader.f64();
+    } else {
+      value.objective_name = "mean";
+      value.objective_milliseconds = value.mean_milliseconds;
+    }
     store.measurements.push_back(std::move(value));
   }
   if (!reader.done())
@@ -233,8 +288,9 @@ std::vector<Measurement> Database::results(const std::string &program_hash) cons
                std::back_inserter(output), [&](const Measurement &value) {
                  return value.program_hash == program_hash;
                });
-  std::sort(output.begin(), output.end(), [](const Measurement &a, const Measurement &b) {
-    return a.mean_milliseconds < b.mean_milliseconds;
+  std::sort(output.begin(), output.end(), [](const Measurement &a,
+                                             const Measurement &b) {
+    return a.objective_milliseconds < b.objective_milliseconds;
   });
   return output;
 }

@@ -23,6 +23,8 @@ add_library(difcore
   src/frontend/training.cpp
     src/ir/codec.cpp
     src/ir/verify.cpp
+    src/opt/optimizer.cpp
+    src/opt/plan.cpp
     src/runtime/cpu_executor.cpp
     src/runtime/executor.cpp
     src/runtime/scalar.cpp
@@ -88,6 +90,9 @@ target_link_libraries(difinspect PRIVATE difcore)
 add_executable(diftune tools/diftune.cpp)
 target_link_libraries(diftune PRIVATE difcore)
 
+add_executable(difopt tools/difopt.cpp)
+target_link_libraries(difopt PRIVATE difcore)
+
 add_executable(difcast tools/difcast.cpp)
 target_link_libraries(difcast PRIVATE difcore)
 
@@ -143,7 +148,7 @@ else()
   message(STATUS "Diffusion compiler OpenCL backend: disabled")
 endif()
 
-install(TARGETS difc difrun difinspect diftune difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer
+install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer
         RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)
@@ -151,6 +156,14 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_tests tests/dif_tests.cpp)
   target_link_libraries(dif_tests PRIVATE difcore)
   add_test(NAME dif_tests COMMAND dif_tests)
+
+  add_test(
+      NAME difopt_cli_tests
+      COMMAND ${CMAKE_COMMAND}
+              -DDIFC=$<TARGET_FILE:difc>
+              -DDIFOPT=$<TARGET_FILE:difopt>
+              -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/difopt-cli-test
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/difopt_cli_test.cmake)
 
   add_library(dif_mock_backend SHARED tests/mock_backend.cpp)
   target_include_directories(dif_mock_backend PRIVATE include)

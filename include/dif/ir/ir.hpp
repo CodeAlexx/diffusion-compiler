@@ -29,6 +29,7 @@ enum TensorRole : std::uint32_t {
   Streamed = 1U << 3U,
   Parameter = 1U << 4U,
   OptimizerState = 1U << 5U,
+  RecomputeCandidate = 1U << 6U,
 };
 
 enum class Opcode : std::uint32_t {
@@ -102,6 +103,7 @@ enum class AttrKey : std::uint32_t {
   Beta1 = 27,
   Beta2 = 28,
   WeightDecay = 29,
+  Algorithm = 30,
 };
 
 enum class AttrKind : std::uint32_t { U64 = 1, I64 = 2, F64 = 3, Bool = 4 };

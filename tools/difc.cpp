@@ -98,6 +98,30 @@ dif::ir::Program make_linear_blend(std::uint64_t rows, std::uint64_t columns,
   return program;
 }
 
+dif::ir::Program make_residual_gate(std::uint64_t rows,
+                                    std::uint64_t columns,
+                                    std::uint64_t block,
+                                    dif::ir::DType dtype) {
+  using namespace dif::ir;
+  if (rows == 0U || columns == 0U)
+    dif::fail("residual gate dimensions must be nonzero");
+  Program program;
+  program.tensors = {
+      {1, dtype, TensorRole::Input, {rows, columns}},
+      {2, dtype, TensorRole::Input, {rows, columns}},
+      {3, dtype, TensorRole::Input, {rows, columns}},
+      {4, dtype, TensorRole::Output, {rows, columns}},
+  };
+  program.operations = {
+      {1,
+       Opcode::ResidualGate,
+       {1, 2, 3},
+       {4},
+       {Attribute::u64(AttrKey::BlockSize, block)}},
+  };
+  return program;
+}
+
 dif::ir::Program make_flow_euler_trajectory(std::uint64_t rows,
                                             std::uint64_t columns,
                                             std::uint64_t steps,
@@ -339,6 +363,7 @@ void usage() {
   std::cerr << "usage:\n"
             << "  difc make-rms OUT.difir ROWS COLS BLOCK\n"
             << "  difc make-linear-blend OUT.difir ROWS COLS f32|bf16|f16\n"
+            << "  difc make-residual-gate OUT.difir ROWS COLS BLOCK f32|bf16|f16\n"
             << "  difc make-flow-euler-trajectory OUT.difir ROWS COLS STEPS f32|bf16|f16\n"
             << "  difc make-patchify3d OUT.difir B C T H W PT PH PW f32|bf16|f16\n"
             << "  difc make-unpatchify3d OUT.difir B C T H W PT PH PW f32|bf16|f16\n"
@@ -388,6 +413,17 @@ int main(int argc, char **argv) {
       dif::ir::write_file(program, argv[2]);
       std::cout << "PROGRAM path=" << argv[2]
                 << " operation=linear_blend dtype=" << argv[5]
+                << " fingerprint="
+                << dif::hex_digest(dif::ir::fingerprint(program)) << "\n";
+      return 0;
+    }
+    if (command == "make-residual-gate" && argc == 7) {
+      const auto program = make_residual_gate(
+          number(argv[3], "rows"), number(argv[4], "columns"),
+          number(argv[5], "block size"), float_dtype(argv[6]));
+      dif::ir::write_file(program, argv[2]);
+      std::cout << "PROGRAM path=" << argv[2]
+                << " operation=residual_gate dtype=" << argv[6]
                 << " fingerprint="
                 << dif::hex_digest(dif::ir::fingerprint(program)) << "\n";
       return 0;

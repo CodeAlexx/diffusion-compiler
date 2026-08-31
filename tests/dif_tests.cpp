@@ -3,6 +3,8 @@
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/compiler/memory_plan.hpp"
+#include "dif/opt/optimizer.hpp"
+#include "dif/opt/plan.hpp"
 #include "dif/frontend/h3.hpp"
 #include "dif/frontend/h3_conditioning.hpp"
 #include "dif/frontend/h3_vae.hpp"
@@ -15,6 +17,7 @@
 #include "dif/support/json.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/training/checkpoint.hpp"
+#include "dif/tune/database.hpp"
 #include "dif/weights/bundle.hpp"
 #include "dif/weights/safetensors.hpp"
 
@@ -1583,6 +1586,398 @@ void test_memory_plan_reserves_prefetch_storage() {
          "prefetch storage is explicit in the memory budget");
 }
 
+void test_optimization_recipes_and_weight_placement() {
+  using namespace dif::ir;
+  using namespace dif::opt;
+
+  const auto rms = rms_program(1U, 64U);
+  const Recipe block_128{{"unit.block"},
+                         {Transformation::set_u64(
+                             1U, AttrKey::BlockSize, 128U)}};
+  const Recipe block_256{{"unit.block"},
+                         {Transformation::set_u64(
+                             1U, AttrKey::BlockSize, 256U)}};
+  expect(block_128.canonical_text() == block_128.canonical_text(),
+         "optimization recipe canonical text is deterministic");
+  expect(block_128.fingerprint() != block_256.fingerprint(),
+         "optimization recipe hash changes with a transformation value");
+  const auto changed = apply_recipe(rms, block_128);
+  expect(changed.operations.front().u64(AttrKey::BlockSize, 0U) == 128U,
+         "typed operation transformation changes verified DiffIR");
+
+  Program linear;
+  linear.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 2}},
+      {2, DType::F32, TensorRole::Constant, {2, 2}},
+      {3, DType::F32, TensorRole::Output, {1, 2}},
+  };
+  linear.operations = {{1, Opcode::Linear, {1, 2}, {3}, {}}};
+  const Recipe algorithm_one{{"unit.linear-algorithm"},
+                             {Transformation::set_u64(
+                                 1U, AttrKey::Algorithm, 1U)}};
+  const auto alternate_algorithm = apply_recipe(linear, algorithm_one);
+  expect(alternate_algorithm.operations.front().u64(AttrKey::Algorithm, 0U) ==
+                 1U &&
+             dif::ir::fingerprint(alternate_algorithm) !=
+                 dif::ir::fingerprint(linear),
+         "Linear algorithm schedule is explicit verified candidate identity");
+
+  bool rejected = false;
+  try {
+    const Recipe invalid_algorithm{{"unit.linear-algorithm"},
+                                   {Transformation::set_u64(
+                                       1U, AttrKey::Algorithm, 32U)}};
+    (void)apply_recipe(linear, invalid_algorithm);
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "verifier rejects an unreasonable Linear algorithm rank");
+
+  rejected = false;
+  try {
+    const Recipe missing{{"unit.invalid"},
+                         {Transformation::set_u64(
+                             99U, AttrKey::BlockSize, 128U)}};
+    (void)apply_recipe(rms, missing);
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "optimization recipe rejects a missing operation target");
+
+  rejected = false;
+  try {
+    const Recipe duplicate{
+        {"unit.invalid"},
+        {Transformation::set_u64(1U, AttrKey::BlockSize, 64U),
+         Transformation::set_u64(1U, AttrKey::BlockSize, 128U)}};
+    (void)duplicate.fingerprint();
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "optimization recipe rejects duplicate target settings");
+
+  const OperationU64AttributePass block_pass(
+      1U, AttrKey::BlockSize, {64U, 128U, 128U});
+  const auto candidates = compose_candidates(rms, {&block_pass});
+  expect(candidates.size() == 2U,
+         "optimization candidate composer keeps identity and deduplicates");
+  for (const auto &candidate : candidates)
+    dif::ir::verify(candidate.program);
+  rejected = false;
+  try {
+    (void)compose_candidates(rms, {&block_pass}, {.maximum_candidates = 1U});
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "optimization candidate limit fails closed");
+
+  Program gate;
+  gate.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 4}},
+      {2, DType::F32, TensorRole::Input, {1, 4}},
+      {3, DType::F32, TensorRole::Input, {1, 4}},
+      {4, DType::F32, TensorRole::Output, {1, 4}},
+  };
+  gate.operations = {{1,
+                      Opcode::ResidualGate,
+                      {1, 2, 3},
+                      {4},
+                      {Attribute::u64(AttrKey::BlockSize, 32U)}}};
+  dif::ir::verify(gate);
+  const Recipe decompose{{"unit.split"},
+                         {Transformation::split_residual_gate(1U)}};
+  const auto decomposed = apply_recipe(gate, decompose);
+  expect(decomposed.operations.size() == 2U &&
+             decomposed.operations[0].opcode == Opcode::Multiply &&
+             decomposed.operations[1].opcode == Opcode::Add &&
+             decomposed.tensors.size() == 5U,
+         "semantic split materializes residual gate as Multiply plus Add");
+  const RecomputeCandidatePass recompute_pass;
+  const auto recompute_candidates =
+      compose_candidates(decomposed, {&recompute_pass});
+  expect(recompute_candidates.size() == 2U &&
+             recompute_candidates[1].program.tensor(5U)->has_role(
+                 TensorRole::RecomputeCandidate),
+         "optimizer explicitly marks a verified internal recomputation candidate");
+  const Recipe refuse_wrong_split{{"unit.split"},
+                                  {Transformation::split_residual_gate(2U)}};
+  rejected = false;
+  try {
+    (void)apply_recipe(gate, refuse_wrong_split);
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "semantic split fails closed on an incompatible target");
+
+  const Recipe fuse{{"unit.fuse"},
+                    {Transformation::fuse_multiply_add(2U)}};
+  const auto fused = apply_recipe(decomposed, fuse);
+  expect(fused.operations.size() == 1U &&
+             fused.operations.front().opcode == Opcode::ResidualGate &&
+             fused.tensors.size() == 4U,
+         "semantic fusion removes an exclusive Multiply plus Add intermediate");
+
+  const MatchingOperationU64AttributePass gate_blocks(
+      "unit.gate-block", Opcode::ResidualGate, AttrKey::BlockSize,
+      {32U, 64U}, true);
+  const SplitResidualGatePass split_gate;
+  const auto graph_candidates =
+      compose_candidates(gate, {&gate_blocks, &split_gate});
+  expect(graph_candidates.size() == 4U,
+         "candidate composition crosses schedule and semantic split choices");
+  const StreamPrefetchPass prefetch({0U, 1U});
+  const auto policy_candidates = compose_candidates(gate, {&prefetch});
+  expect(policy_candidates.size() == 2U &&
+             policy_candidates[0].program_fingerprint ==
+                 policy_candidates[1].program_fingerprint &&
+             policy_candidates[0].candidate_fingerprint !=
+                 policy_candidates[1].candidate_fingerprint &&
+             policy_candidates[1].policy.stream_prefetch_distance == 0U,
+         "execution policy candidates retain one DiffIR with distinct identity");
+
+  Program cast_boundary;
+  cast_boundary.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 4}},
+      {2, DType::BF16, TensorRole::Internal, {1, 4}},
+      {3, DType::F32, TensorRole::Output, {1, 4}},
+  };
+  cast_boundary.operations = {
+      {1, Opcode::Cast, {1}, {2}, {}},
+      {2, Opcode::Cast, {2}, {3}, {}},
+  };
+  dif::ir::verify(cast_boundary);
+  const CastStoragePrecisionPass storage_precision(
+      {DType::BF16, DType::F16});
+  const auto precision_candidates =
+      compose_candidates(cast_boundary, {&storage_precision});
+  expect(precision_candidates.size() == 2U &&
+             precision_candidates[1].program.tensor(2U)->dtype == DType::F16,
+         "precision pass changes only an explicit Cast-bounded internal tensor");
+
+  dif::runtime::TensorMap gate_bindings;
+  gate_bindings.emplace(1, f32_tensor({1, 4}, {1, 2, 3, 4}));
+  gate_bindings.emplace(2, f32_tensor({1, 4}, {5, 6, 7, 8}));
+  gate_bindings.emplace(3, f32_tensor({1, 4}, {-1, 0.5F, -2, 2}));
+  auto graph_cpu = dif::runtime::make_cpu_executor();
+  dif::runtime::RunOptions graph_options;
+  graph_options.warmups = 0U;
+  graph_options.iterations = 1U;
+  const auto gate_output =
+      graph_cpu->run(gate, gate_bindings, graph_options).outputs.at(4).bytes;
+  expect(graph_cpu->run(decomposed, gate_bindings, graph_options)
+                 .outputs.at(4)
+                 .bytes == gate_output &&
+             graph_cpu->run(fused, gate_bindings, graph_options)
+                     .outputs.at(4)
+                     .bytes == gate_output,
+         "split and fused semantic regions preserve fixed CPU output bytes");
+
+  constexpr auto streamed = TensorRole::Constant | TensorRole::Streamed;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 4}},
+      {2, DType::F32, streamed, {1, 4}},
+      {3, DType::F32, TensorRole::Internal, {1, 4}},
+      {4, DType::F32, streamed, {1, 4}},
+      {5, DType::F32, TensorRole::Output, {1, 4}},
+  };
+  program.operations = {
+      {1, Opcode::Add, {1, 2}, {3}, {}},
+      {2, Opcode::Add, {3, 4}, {5}, {}},
+  };
+  dif::ir::verify(program);
+  const auto baseline_plan =
+      dif::compiler::plan_memory(program, 256U, 1U);
+  const WeightPlacementOptions placement_options{
+      baseline_plan.total_bytes, 4U, 256U, 1U};
+  const auto placement = place_weights(program, placement_options);
+  const auto repeated = place_weights(program, placement_options);
+  expect(placement.candidate.program_fingerprint ==
+             repeated.candidate.program_fingerprint &&
+             placement.candidate.recipe.fingerprint() ==
+                 repeated.candidate.recipe.fingerprint(),
+         "weight placement is reproducible");
+  expect(placement.stats.planned_device_bytes <=
+             placement.stats.device_budget_bytes &&
+             placement.stats.all_streamed_planned_bytes ==
+                 baseline_plan.total_bytes,
+         "weight placement respects the complete planned-memory budget");
+  expect(placement.stats.resident_weight_bytes +
+                 placement.stats.streamed_weight_bytes ==
+             placement.stats.total_weight_bytes &&
+             placement.stats.resident_weights +
+                 placement.stats.streamed_weights ==
+             2U,
+         "weight placement accounts for every immutable constant");
+  expect(placement.stats.estimated_repeated_transfer_bytes_saved ==
+             placement.stats.resident_weight_bytes * 3U,
+         "weight placement reports repeated transfer savings consistently");
+
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto plan_path = std::filesystem::temp_directory_path() /
+                         ("dif-plan-test-" + std::to_string(nonce) +
+                          ".difplan");
+  const auto plan = make_plan(program, placement.candidate);
+  write_plan(plan, plan_path);
+  const auto loaded_plan = read_plan(plan_path);
+  const auto replayed = replay_plan(program, loaded_plan);
+  expect(dif::ir::fingerprint(replayed) ==
+             placement.candidate.program_fingerprint &&
+             loaded_plan.recipe.fingerprint() ==
+                 placement.candidate.recipe.fingerprint(),
+         "fingerprint-bound optimization plan roundtrips and replays");
+  auto wrong_base = program;
+  wrong_base.tensors.front().dims = {1, 8};
+  wrong_base.tensors.at(2).dims = {1, 8};
+  wrong_base.tensors.at(4).dims = {1, 8};
+  rejected = false;
+  try {
+    (void)replay_plan(wrong_base, loaded_plan);
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "optimization plan rejects a different base fingerprint");
+  std::filesystem::remove(plan_path);
+
+  const auto policy_plan_path =
+      std::filesystem::temp_directory_path() /
+      ("dif-policy-plan-test-" + std::to_string(nonce) + ".difplan");
+  const auto policy_plan = make_plan(gate, policy_candidates[1]);
+  write_plan(policy_plan, policy_plan_path);
+  const auto replayed_policy =
+      replay_candidate(gate, read_plan(policy_plan_path));
+  expect(replayed_policy.policy.stream_prefetch_distance == 0U &&
+             replayed_policy.candidate_fingerprint ==
+                 policy_candidates[1].candidate_fingerprint &&
+             replayed_policy.program_fingerprint ==
+                 policy_candidates[1].program_fingerprint,
+         "optimization plan replays non-DiffIR execution policy identity");
+  std::filesystem::remove(policy_plan_path);
+
+  rejected = false;
+  try {
+    auto impossible = placement_options;
+    impossible.device_budget_bytes = baseline_plan.total_bytes - 1U;
+    (void)place_weights(program, impossible);
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "weight placement rejects an infeasible streamed baseline");
+
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1, f32_tensor({1, 4}, {1, 2, 3, 4}));
+  bindings.emplace(2, f32_tensor({1, 4}, {5, 6, 7, 8}));
+  bindings.emplace(4, f32_tensor({1, 4}, {-1, 1, -2, 2}));
+  auto cpu = dif::runtime::make_cpu_executor();
+  dif::runtime::RunOptions run_options;
+  run_options.warmups = 0U;
+  run_options.iterations = 1U;
+  const auto base_cpu = cpu->run(program, bindings, run_options);
+  const auto optimized_cpu =
+      cpu->run(placement.candidate.program, bindings, run_options);
+  expect(base_cpu.outputs.at(5).bytes == optimized_cpu.outputs.at(5).bytes,
+         "placement-only optimization is byte-identical on fixed CPU input");
+
+  const Recipe split_recipe{
+      {"unit.cuda-placement"},
+      {Transformation::make_resident(2U),
+       Transformation::make_streamed(4U)}};
+  const auto split_program = apply_recipe(program, split_recipe);
+  if (dif::runtime::cuda_available()) {
+    run_options.profile_pipeline = true;
+    run_options.minimum_free_bytes = 64ULL * 1024ULL * 1024ULL;
+    const auto base_cuda =
+        dif::runtime::make_cuda_executor()->run(program, bindings, run_options);
+    const auto split_cuda = dif::runtime::make_cuda_executor()->run(
+        split_program, bindings, run_options);
+    expect(base_cuda.outputs.at(5).bytes == split_cuda.outputs.at(5).bytes,
+           "placement-only optimization is byte-identical on fixed CUDA input");
+    expect(split_cuda.pipeline_profile.resident_weight_bytes == 16U &&
+               split_cuda.pipeline_profile.streamed_weight_bytes == 16U,
+           "CUDA profile reports recipe resident and streamed weight bytes");
+  }
+}
+
+void test_tuning_database_candidate_provenance() {
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("dif-tuning-v4-test-" + std::to_string(nonce) +
+                     ".diftune");
+  dif::tune::Measurement expected;
+  expected.candidate_hash = "candidate-plan-hash";
+  expected.candidate_program_hash = "candidate-program-hash";
+  expected.program_hash = "base-program-hash";
+  expected.recipe_hash = "recipe-hash";
+  expected.recipe_text = "dif-optimization-recipe-v1\npass=unit.test\n";
+  expected.backend = "test-backend";
+  expected.device = "test-device";
+  expected.trial_mean_milliseconds = {1.25, 1.5};
+  expected.iteration_milliseconds = {1.0, 1.5, 1.25, 2.0};
+  expected.objective_name = "median-iteration";
+  expected.objective_milliseconds = 1.375;
+  expected.preparation_milliseconds = 3.5;
+  expected.mean_milliseconds = 1.375;
+  expected.minimum_milliseconds = 1.0;
+  expected.maximum_milliseconds = 2.0;
+  expected.max_absolute_error = 0.001;
+  expected.cosine_similarity = 0.99999;
+  expected.norm_ratio = 1.00001;
+  expected.nonfinite_count = 0U;
+  expected.planned_device_bytes = 1024U;
+  expected.measured_resident_bytes = 2048U;
+  expected.memory_limit_bytes = 4096U;
+  expected.status = "rejected-performance";
+  expected.rejection_reason = "fixed slowdown gate failed";
+  expected.created_unix = 123456789;
+  {
+    dif::tune::Database database(path);
+    database.record(expected);
+  }
+  {
+    dif::tune::Database database(path);
+    const auto results = database.results(expected.program_hash);
+    expect(results.size() == 1U,
+           "tuning database reloads one candidate record");
+    if (results.size() == 1U) {
+      const auto &actual = results.front();
+      expect(actual.candidate_hash == expected.candidate_hash &&
+                 actual.candidate_program_hash ==
+                     expected.candidate_program_hash &&
+                 actual.recipe_hash == expected.recipe_hash &&
+                 actual.recipe_text == expected.recipe_text &&
+                 actual.backend == expected.backend &&
+                 actual.device == expected.device,
+             "tuning database preserves candidate identity and recipe provenance");
+      expect(actual.trial_mean_milliseconds ==
+                     expected.trial_mean_milliseconds &&
+                 actual.iteration_milliseconds ==
+                     expected.iteration_milliseconds &&
+                 actual.objective_name == expected.objective_name &&
+                 actual.objective_milliseconds ==
+                     expected.objective_milliseconds &&
+                 actual.preparation_milliseconds ==
+                     expected.preparation_milliseconds &&
+                 actual.mean_milliseconds == expected.mean_milliseconds &&
+                 actual.planned_device_bytes ==
+                     expected.planned_device_bytes &&
+                 actual.measured_resident_bytes ==
+                     expected.measured_resident_bytes &&
+                 actual.memory_limit_bytes == expected.memory_limit_bytes,
+             "tuning database preserves timing and memory evidence");
+      expect(actual.max_absolute_error == expected.max_absolute_error &&
+                 actual.cosine_similarity == expected.cosine_similarity &&
+                 actual.norm_ratio == expected.norm_ratio &&
+                 actual.nonfinite_count == expected.nonfinite_count &&
+                 actual.status == expected.status &&
+                 actual.rejection_reason == expected.rejection_reason,
+             "tuning database preserves numerical and rejection evidence");
+    }
+  }
+  std::filesystem::remove(path);
+}
+
 void test_weight_bundle_roundtrip() {
   using namespace dif::ir;
   const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1896,6 +2291,8 @@ int main() {
   test_memory_plan_reuses_dead_internal_storage();
   test_memory_plan_pages_streamed_constants();
   test_memory_plan_reserves_prefetch_storage();
+  test_optimization_recipes_and_weight_placement();
+  test_tuning_database_candidate_provenance();
   test_weight_bundle_roundtrip();
   test_safetensors_streaming_writer();
   test_int4_weight_rewrite_and_cpu_execution();

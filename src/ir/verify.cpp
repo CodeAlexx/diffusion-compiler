@@ -26,7 +26,7 @@ bool valid_opcode(Opcode opcode) {
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::WeightDecay;
+  return key >= AttrKey::Epsilon && key <= AttrKey::Algorithm;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -556,6 +556,8 @@ void verify_operation(const Program &program, const Operation &op) {
            "(direct packed INT5)");
     if (input.dtype != DType::F32 && implementation == 2U)
       fail("tf32 Linear implementation requires f32 storage");
+    if (op.u64(AttrKey::Algorithm, 0U) > 31U)
+      fail("linear backend algorithm rank must be in [0,31]");
     return;
   }
 
@@ -756,7 +758,7 @@ void verify(const Program &program) {
     constexpr std::uint32_t valid_roles =
         TensorRole::Input | TensorRole::Output | TensorRole::Constant |
         TensorRole::Streamed | TensorRole::Parameter |
-        TensorRole::OptimizerState;
+        TensorRole::OptimizerState | TensorRole::RecomputeCandidate;
     if ((tensor.roles & ~valid_roles) != 0U)
       fail("DiffIR tensor has unknown role flags");
     if (tensor.has_role(TensorRole::Streamed) &&
@@ -774,6 +776,10 @@ void verify(const Program &program) {
          tensor.has_role(TensorRole::OptimizerState)) &&
         tensor.has_role(TensorRole::Constant))
       fail("DiffIR mutable training state cannot be constant");
+    if (tensor.has_role(TensorRole::RecomputeCandidate) &&
+        (tensor.roles & ~static_cast<std::uint32_t>(
+                            TensorRole::RecomputeCandidate)) != 0U)
+      fail("DiffIR recomputation candidate must be an internal tensor");
     (void)tensor.byte_count();
   }
 

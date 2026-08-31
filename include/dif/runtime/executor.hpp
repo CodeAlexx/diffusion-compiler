@@ -56,6 +56,10 @@ struct PipelineProfile {
 struct RunResult {
   TensorMap outputs;
   double preparation_milliseconds{};
+  // Individual timed-iteration samples in execution order. Backends that can
+  // expose their native timing samples populate this so tuning objectives do
+  // not have to infer a distribution from only mean/min/max summaries.
+  std::vector<double> iteration_milliseconds;
   double mean_milliseconds{};
   double minimum_milliseconds{};
   double maximum_milliseconds{};

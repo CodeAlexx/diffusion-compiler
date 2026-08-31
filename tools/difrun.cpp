@@ -1,5 +1,6 @@
 #include "dif/backend/plugin.hpp"
 #include "dif/ir/codec.hpp"
+#include "dif/opt/plan.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
@@ -14,6 +15,7 @@
 #include <numeric>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <sys/resource.h>
 
 namespace {
@@ -40,6 +42,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 void usage() {
   std::cerr << "usage: difrun --backend cpu|cuda --program FILE.difir"
                " [--backend-plugin FILE.so]"
+               " [--optimization-plan FILE.difplan]"
                " [--weight-bundle FILE.difbind] [--verify-shards]"
                " --input ID=FILE [--input ...] --output ID=FILE [--output ...]"
                " [--warmups N] [--iterations N] [--min-free-mib N]"
@@ -55,6 +58,7 @@ int main(int argc, char **argv) {
     std::string backend = "cpu";
     std::filesystem::path program_path;
     std::filesystem::path backend_plugin;
+    std::filesystem::path optimization_plan;
     std::filesystem::path weight_bundle;
     std::unordered_map<std::uint32_t, std::filesystem::path> input_paths;
     std::unordered_map<std::uint32_t, std::filesystem::path> output_paths;
@@ -68,6 +72,8 @@ int main(int argc, char **argv) {
         backend = argv[++i];
       else if (option == "--backend-plugin" && i + 1 < argc)
         backend_plugin = argv[++i];
+      else if (option == "--optimization-plan" && i + 1 < argc)
+        optimization_plan = argv[++i];
       else if (option == "--weight-bundle" && i + 1 < argc)
         weight_bundle = argv[++i];
       else if (option == "--program" && i + 1 < argc)
@@ -109,7 +115,20 @@ int main(int argc, char **argv) {
     }
     if (session_runs == 0U)
       dif::fail("session runs must be nonzero");
-    const auto program = dif::ir::read_file(program_path);
+    auto program = dif::ir::read_file(program_path);
+    std::string optimization_candidate = "none";
+    std::uint64_t optimization_prefetch_distance =
+        options.overlap_streaming ? 1U : 0U;
+    if (!optimization_plan.empty()) {
+      const auto plan = dif::opt::read_plan(optimization_plan);
+      auto candidate = dif::opt::replay_candidate(program, plan);
+      optimization_candidate =
+          dif::hex_digest(candidate.candidate_fingerprint);
+      optimization_prefetch_distance =
+          candidate.policy.stream_prefetch_distance;
+      options.overlap_streaming = optimization_prefetch_distance != 0U;
+      program = std::move(candidate.program);
+    }
     dif::runtime::TensorMap inputs;
     if (!weight_bundle.empty()) {
       const auto bundle = dif::weights::read_weight_bundle(weight_bundle);
@@ -183,6 +202,11 @@ int main(int argc, char **argv) {
               << " session_mean_ms=" << session_mean
               << " host_max_rss_kib=" << usage.ru_maxrss
               << " source_hash=" << result.generated_source_hash << "\n";
+    if (!optimization_plan.empty())
+      std::cout << "OPTIMIZATION_PLAN path=" << optimization_plan.string()
+                << " candidate_fingerprint=" << optimization_candidate
+                << " prefetch_distance="
+                << optimization_prefetch_distance << "\n";
     if (result.pipeline_profile.enabled) {
       const auto &profile = result.pipeline_profile;
       std::cout << "PIPELINE_PROFILE iterations="

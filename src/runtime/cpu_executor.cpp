@@ -989,6 +989,7 @@ public:
     result.maximum_milliseconds = *std::max_element(elapsed.begin(), elapsed.end());
     result.mean_milliseconds =
         std::accumulate(elapsed.begin(), elapsed.end(), 0.0) / elapsed.size();
+    result.iteration_milliseconds = std::move(elapsed);
     for (const auto &desc : program_.tensors) {
       if (desc.has_role(ir::TensorRole::Output))
         result.outputs.emplace(desc.id, std::move(final_tensors.at(desc.id)));

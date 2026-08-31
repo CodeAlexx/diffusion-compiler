@@ -373,16 +373,22 @@ public:
                     preference, attribute, &alignment, sizeof(alignment)),
                 "cublasLtMatmulPreferenceSetAttribute alignment");
       }
+      const auto algorithm_rank = op.u64(ir::AttrKey::Algorithm, 0U);
+      const auto requested = static_cast<int>(algorithm_rank + 1U);
+      std::vector<cublasLtMatmulHeuristicResult_t> heuristics(
+          static_cast<std::size_t>(requested));
       int returned = 0;
       const auto matrix_a = has_bias_ ? weight_ : input_;
       const auto matrix_b = has_bias_ ? input_ : weight_;
       check(cublasLtMatmulAlgoGetHeuristic(handle, operation_, matrix_a,
                                             matrix_b, output_, output_,
-                                            preference, 1, &heuristic_,
+                                            preference, requested,
+                                            heuristics.data(),
                                             &returned),
             "cublasLtMatmulAlgoGetHeuristic");
-      if (returned != 1)
-        fail("cuBLASLt found no admitted Linear algorithm");
+      if (returned <= static_cast<int>(algorithm_rank))
+        fail("cuBLASLt did not return the requested Linear algorithm rank");
+      heuristic_ = heuristics.at(static_cast<std::size_t>(algorithm_rank));
     } catch (...) {
       (void)cublasLtMatmulPreferenceDestroy(preference);
       throw;
@@ -1164,6 +1170,7 @@ public:
     result.maximum_milliseconds = *std::max_element(elapsed.begin(), elapsed.end());
     result.mean_milliseconds =
         std::accumulate(elapsed.begin(), elapsed.end(), 0.0) / elapsed.size();
+    result.iteration_milliseconds = elapsed;
 
     if (options.profile_pipeline) {
       result.pipeline_profile.enabled = true;
