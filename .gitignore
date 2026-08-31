@@ -44,3 +44,4 @@
 .netrc
 .npmrc
 .pypirc
+!/docs/MIXED_PRECISION_TRAINING_GATE_2026-08-31.md
