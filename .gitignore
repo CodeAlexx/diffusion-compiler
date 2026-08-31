@@ -14,6 +14,7 @@
 !/docs/FLAME_PORT_SOURCE_NOTES.md
 !/docs/RUNTIME_MODULES.md
 !/docs/BIGVGAN_DECODE_PLAN.md
+!/docs/FLAME_PORT_EXPERIMENT_LEDGER.md
 *.log
 *.safetensors
 *.ckpt
