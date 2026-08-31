@@ -86,6 +86,23 @@ struct RunOptions {
   // byte-identical either way; only host paging behavior changes. Any
   // non-default choice must enter difopt candidate identity.
   bool streamed_release_mapped_pages_per_copy{true};
+  // Pinned staging ring for streamed constants and how many operations
+  // ahead the overlapped scheduler prefetches. Defaults (2 buffers,
+  // depth 1) are the historical double-buffer policy, byte-for-byte.
+  // Depth is fixed at prepare time: the memory plan widens every streamed
+  // interval by the same distance, which is what makes a deeper prefetch
+  // hazard-free. Buffers must be >= 2 and >= depth + 1.
+  std::uint32_t streamed_staging_buffers{2};
+  std::uint32_t streamed_prefetch_depth{1};
+  // Worker threads for the mmap->pinned staging copy (1 = the historical
+  // single-threaded memcpy on the submitting thread).
+  std::uint32_t streamed_stage_threads{1};
+  // Upper bound on pinned host memory the streamed staging ring may
+  // allocate. The historical two-buffer footprint is always admitted; a
+  // larger ring that would exceed the budget fails closed. This host has
+  // 62 GiB and a documented host-OOM incident: keep this modest.
+  std::uint64_t streamed_pinned_budget_bytes{2ULL * 1024ULL * 1024ULL *
+                                             1024ULL};
 };
 
 struct OperationTiming {

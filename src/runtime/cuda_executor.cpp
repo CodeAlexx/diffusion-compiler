@@ -20,9 +20,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
@@ -30,9 +32,11 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -3027,13 +3031,114 @@ void validate_inputs(const ir::Program &program, const TensorMap &inputs) {
   }
 }
 
+// Fixed staging granule: page-aligned, large enough that per-chunk atomic
+// overhead vanishes, small enough that participants stay load-balanced.
+constexpr std::size_t kStageChunkBytes = 4U * 1024U * 1024U;
+
+// One mmap->pinned staging copy split across a persistent worker pool.
+// Each copy() publishes an immutable job object; workers pull 4 MiB chunks
+// through the job's atomic cursor. A straggler that wakes late only ever
+// sees its own job's exhausted cursor, so consecutive jobs cannot tear.
+// With one thread (the default) copy() degrades to plain memcpy — the
+// historical behavior.
+class StagingPool {
+public:
+  explicit StagingPool(std::uint32_t threads) {
+    for (std::uint32_t index = 1U; index < threads; ++index)
+      workers_.emplace_back([this] { work(); });
+  }
+
+  ~StagingPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    available_.notify_all();
+    for (auto &worker : workers_)
+      worker.join();
+  }
+
+  StagingPool(const StagingPool &) = delete;
+  StagingPool &operator=(const StagingPool &) = delete;
+
+  void copy(std::uint8_t *destination, const std::uint8_t *source,
+            std::size_t bytes) {
+    if (workers_.empty() || bytes < 2U * kStageChunkBytes) {
+      std::memcpy(destination, source, bytes);
+      return;
+    }
+    auto job = std::make_shared<StageJob>();
+    job->destination = destination;
+    job->source = source;
+    job->bytes = bytes;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      job_ = job;
+      ++generation_;
+    }
+    available_.notify_all();
+    participate(*job);
+    while (job->completed_bytes.load(std::memory_order_acquire) != bytes)
+      std::this_thread::yield();
+  }
+
+private:
+  struct StageJob {
+    std::uint8_t *destination{};
+    const std::uint8_t *source{};
+    std::size_t bytes{};
+    std::atomic<std::size_t> next_chunk{0U};
+    std::atomic<std::size_t> completed_bytes{0U};
+  };
+
+  static void participate(StageJob &job) {
+    while (true) {
+      const auto chunk =
+          job.next_chunk.fetch_add(1U, std::memory_order_relaxed);
+      const auto offset = chunk * kStageChunkBytes;
+      if (offset >= job.bytes)
+        return;
+      const auto count = std::min(kStageChunkBytes, job.bytes - offset);
+      std::memcpy(job.destination + offset, job.source + offset, count);
+      job.completed_bytes.fetch_add(count, std::memory_order_release);
+    }
+  }
+
+  void work() {
+    std::uint64_t seen = 0U;
+    while (true) {
+      std::shared_ptr<StageJob> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        available_.wait(lock,
+                        [&] { return stopping_ || generation_ != seen; });
+        if (stopping_)
+          return;
+        seen = generation_;
+        job = job_;
+      }
+      if (job)
+        participate(*job);
+    }
+  }
+
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable available_;
+  std::shared_ptr<StageJob> job_;
+  std::uint64_t generation_{};
+  bool stopping_{};
+};
+
 class StreamedPrefetcher {
 public:
   StreamedPrefetcher(const ir::Program &program, const TensorMap &constants,
                      const compiler::MemoryPlan &plan, DeviceBuffers &buffers,
-                     Context &context)
+                     Context &context, std::uint32_t staging_buffers,
+                     std::uint32_t stage_threads,
+                     std::uint64_t pinned_budget_bytes)
       : program_(program), constants_(constants), plan_(plan), buffers_(buffers),
-        context_(context) {
+        context_(context), staging_pool_(stage_threads) {
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
@@ -3051,12 +3156,26 @@ public:
     }
     if (maximum > std::numeric_limits<std::size_t>::max())
       fail("streamed prefetch staging size is not representable");
+    // The historical two-buffer footprint is always admitted; growing the
+    // ring beyond it must fit the pinned budget (fail-closed: this host
+    // has a documented host-OOM incident, pinned staging stays bounded).
+    if (staging_buffers < 2U)
+      fail("streamed staging ring needs at least two buffers");
+    if (staging_buffers > 2U && maximum != 0U &&
+        static_cast<std::uint64_t>(staging_buffers) >
+            pinned_budget_bytes / maximum)
+      fail("streamed staging ring exceeds the pinned budget: buffers=" +
+           std::to_string(staging_buffers) + " buffer_bytes=" +
+           std::to_string(maximum) + " budget_bytes=" +
+           std::to_string(pinned_budget_bytes));
+    staging_.resize(staging_buffers);
+    copy_done_.resize(staging_buffers);
     for (auto &staging : staging_)
       staging = std::make_unique<PinnedHostWorkspace>(
           static_cast<std::size_t>(maximum));
     for (auto &event : copy_done_)
       event = std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
-    copy_recorded_.fill(false);
+    copy_recorded_.assign(staging_buffers, false);
     ready_events_.reserve(program_.operations.size());
     completion_events_.reserve(program_.operations.size());
     for (std::size_t index = 0; index < program_.operations.size(); ++index) {
@@ -3177,7 +3296,7 @@ public:
       auto *destination = static_cast<std::uint8_t *>(staging_[parity]->data()) +
                           offset;
       const auto host_stage_start = std::chrono::steady_clock::now();
-      std::memcpy(destination, tensor.data(), tensor.byte_size());
+      staging_pool_.copy(destination, tensor.data(), tensor.byte_size());
       if (profiling_) {
         host_stage_milliseconds_ +=
             std::chrono::duration<double, std::milli>(
@@ -3252,9 +3371,10 @@ private:
   const compiler::MemoryPlan &plan_;
   DeviceBuffers &buffers_;
   Context &context_;
-  std::array<std::unique_ptr<PinnedHostWorkspace>, 2> staging_;
-  std::array<std::unique_ptr<Event>, 2> copy_done_;
-  std::array<bool, 2> copy_recorded_{};
+  StagingPool staging_pool_;
+  std::vector<std::unique_ptr<PinnedHostWorkspace>> staging_;
+  std::vector<std::unique_ptr<Event>> copy_done_;
+  std::vector<bool> copy_recorded_;
   std::vector<std::unique_ptr<Event>> ready_events_;
   std::vector<std::unique_ptr<Event>> completion_events_;
   std::vector<bool> completion_recorded_;
@@ -3566,8 +3686,19 @@ public:
         fail("DiffIR requests cuDNN attention but this CUDA backend was built without cuDNN");
     }
 #endif
+    if (options.streamed_prefetch_depth == 0U)
+      fail("streamed prefetch depth must be nonzero");
+    if (options.streamed_staging_buffers <
+        options.streamed_prefetch_depth + 1U)
+      fail("streamed staging ring must exceed the prefetch depth");
+    streamed_prefetch_depth_ = options.streamed_prefetch_depth;
+    // The plan widens every streamed interval by the prefetch depth, so a
+    // prefetch issued depth operations ahead can only overwrite a slot
+    // whose previous tenant has already been submitted (safety argument
+    // in the run loop below).
     memory_plan_ = compiler::plan_memory(
-        program_, 256U, options.overlap_streaming ? 1U : 0U,
+        program_, 256U,
+        options.overlap_streaming ? streamed_prefetch_depth_ : 0U,
         excluded_tensors, replaced_constant_tensors);
     const auto tensor_bytes = memory_plan_.total_bytes;
     if (tensor_bytes > std::numeric_limits<std::uint64_t>::max() - workspace_bytes_ ||
@@ -3790,7 +3921,9 @@ public:
           plan, h3_groupwise_scratch_storage_->pointer(), buffers_);
     }
     streamed_prefetcher_ = std::make_unique<StreamedPrefetcher>(
-        program_, constants_, memory_plan_, buffers_, context_);
+        program_, constants_, memory_plan_, buffers_, context_,
+        options.streamed_staging_buffers, options.streamed_stage_threads,
+        options.streamed_pinned_budget_bytes);
     for (const auto &op : program_.operations) {
       if (op.opcode == ir::Opcode::Linear &&
           !fused_launch_inputs_.contains(op.id) &&
@@ -3991,6 +4124,8 @@ public:
     TelemetryScope telemetry_scope(run_telemetry);
     streamed_prefetcher_->set_release_mapped_pages_per_copy(
         options.streamed_release_mapped_pages_per_copy);
+    if (options.streamed_prefetch_depth != streamed_prefetch_depth_)
+      fail("streamed prefetch depth is fixed when the plan is prepared");
     TensorMap bindings = constants_;
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Input))
@@ -4205,10 +4340,15 @@ public:
         }
         return;
       }
-      auto ready = streamed_prefetcher_->prefetch(0U);
-      for (std::size_t index = 0; index < program_.operations.size(); ++index) {
+      const auto operation_count = program_.operations.size();
+      const auto depth = static_cast<std::size_t>(streamed_prefetch_depth_);
+      std::vector<bool> prefetched(operation_count, false);
+      for (std::size_t ahead = 0U; ahead < depth && ahead < operation_count;
+           ++ahead)
+        prefetched[ahead] = streamed_prefetcher_->prefetch(ahead);
+      for (std::size_t index = 0; index < operation_count; ++index) {
         const auto &op = program_.operations[index];
-        streamed_prefetcher_->wait(index, ready);
+        streamed_prefetcher_->wait(index, prefetched[index]);
         OperationEventPair *timing = nullptr;
         if (profile && !skipped_operations_.contains(op.id)) {
           timing = &profile_operation_events.at(
@@ -4223,9 +4363,15 @@ public:
           check(counted_event_record(timing->stop->get(), context_.stream()),
                 "cuEventRecord profiled operation stop");
         streamed_prefetcher_->complete(index);
-        ready = index + 1U < program_.operations.size()
-                    ? streamed_prefetcher_->prefetch(index + 1U)
-                    : false;
+        // The completion record above is what makes prefetching depth
+        // operations ahead safe: the memory plan widened every streamed
+        // interval by the same depth, so the overwrite-wait target of
+        // operation index+depth is at most index and its completion event
+        // is guaranteed recorded before the copy stream is asked to wait
+        // on it.
+        if (index + depth < operation_count)
+          prefetched[index + depth] =
+              streamed_prefetcher_->prefetch(index + depth);
       }
     };
 
@@ -4585,6 +4731,7 @@ private:
   std::uint64_t resident_bytes_{};
   std::uint64_t resident_weight_bytes_{};
   std::uint64_t free_bytes_before_{};
+  std::uint32_t streamed_prefetch_depth_{1};
   LaunchTelemetry preparation_telemetry_;
   double preparation_milliseconds_{};
   double resident_upload_milliseconds_{};

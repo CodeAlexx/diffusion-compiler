@@ -77,7 +77,9 @@ void usage() {
                " [--h3-modulation-total-layers N]"
                " [--h3-ck-attention-dso FILE.so]"
                " [--profile-pipeline] [--serial-streaming] [--map-inputs]"
-               " [--streamed-keep-pages]\n";
+               " [--streamed-keep-pages] [--streamed-staging-buffers N]"
+               " [--streamed-prefetch-depth N] [--streamed-stage-threads N]"
+               " [--streamed-pinned-budget-mib N]\n";
   std::cerr << "input PATH may be FILE.diftensor or SHARD.safetensors::TENSOR_NAME\n";
 }
 
@@ -178,6 +180,19 @@ int main(int argc, char **argv) {
         options.trace_operations = true;
       else if (option == "--streamed-keep-pages")
         options.streamed_release_mapped_pages_per_copy = false;
+      else if (option == "--streamed-staging-buffers" && i + 1 < argc)
+        options.streamed_staging_buffers = static_cast<std::uint32_t>(
+            number(argv[++i], "streamed staging buffers"));
+      else if (option == "--streamed-prefetch-depth" && i + 1 < argc)
+        options.streamed_prefetch_depth = static_cast<std::uint32_t>(
+            number(argv[++i], "streamed prefetch depth"));
+      else if (option == "--streamed-stage-threads" && i + 1 < argc)
+        options.streamed_stage_threads = static_cast<std::uint32_t>(
+            number(argv[++i], "streamed stage threads"));
+      else if (option == "--streamed-pinned-budget-mib" && i + 1 < argc)
+        options.streamed_pinned_budget_bytes =
+            number(argv[++i], "streamed pinned budget MiB") * 1024ULL *
+            1024ULL;
       else if (option == "--profile-pipeline")
         options.profile_pipeline = true;
       else if (option == "--serial-streaming")
