@@ -1,0 +1,4 @@
+streamed_host_stage_ms=25104.693
+streamed_host_wait_ms=104652.873
+streamed_h2d_ms=9449.806
+non_kernel_device_ms=1539.932

@@ -67,6 +67,14 @@ struct Options {
   std::uint64_t minimum_free_bytes{4096ULL * 1024ULL * 1024ULL};
   bool verify_shards{false};
   bool profile_pipeline{false};
+  // Shared streamed-weight staging policy (Wave-1 runtime knobs). Defaults
+  // mirror RunOptions exactly, so an unflagged run is the historical path.
+  bool streamed_keep_pages{false};
+  std::uint32_t streamed_staging_buffers{};
+  std::uint32_t streamed_prefetch_depth{};
+  std::uint32_t streamed_stage_threads{};
+  std::uint64_t streamed_pinned_budget_mib{};
+  bool pinned_io{false};
   bool denoise_only{false};
 };
 
@@ -80,7 +88,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N --keyframes none|first|last|first-last --output-latent FILE.diftensor --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-resident-layers N] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--cache-dir DIR] [--min-free-mib N]\n";
+      << "usage: difh3infer --backend cpu|cuda --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N --keyframes none|first|last|first-last --output-latent FILE.diftensor --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-resident-layers N] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -210,6 +218,22 @@ Options parse(int argc, char **argv) {
       options.verify_shards = true;
     else if (option == "--profile-pipeline")
       options.profile_pipeline = true;
+    else if (option == "--streamed-keep-pages")
+      options.streamed_keep_pages = true;
+    else if (option == "--streamed-staging-buffers")
+      options.streamed_staging_buffers = static_cast<std::uint32_t>(
+          number(value("--streamed-staging-buffers"), "staging buffers"));
+    else if (option == "--streamed-prefetch-depth")
+      options.streamed_prefetch_depth = static_cast<std::uint32_t>(
+          number(value("--streamed-prefetch-depth"), "prefetch depth"));
+    else if (option == "--streamed-stage-threads")
+      options.streamed_stage_threads = static_cast<std::uint32_t>(
+          number(value("--streamed-stage-threads"), "stage threads"));
+    else if (option == "--streamed-pinned-budget-mib")
+      options.streamed_pinned_budget_mib =
+          number(value("--streamed-pinned-budget-mib"), "pinned budget MiB");
+    else if (option == "--pinned-io")
+      options.pinned_io = true;
     else if (option == "--denoise-only")
       options.denoise_only = true;
     else {
@@ -472,6 +496,19 @@ int main(int argc, char **argv) {
     run_options.minimum_free_bytes = options.minimum_free_bytes;
     run_options.cache_directory = options.cache_directory;
     run_options.profile_pipeline = options.profile_pipeline;
+    if (options.streamed_keep_pages)
+      run_options.streamed_release_mapped_pages_per_copy = false;
+    if (options.streamed_staging_buffers != 0U)
+      run_options.streamed_staging_buffers = options.streamed_staging_buffers;
+    if (options.streamed_prefetch_depth != 0U)
+      run_options.streamed_prefetch_depth = options.streamed_prefetch_depth;
+    if (options.streamed_stage_threads != 0U)
+      run_options.streamed_stage_threads = options.streamed_stage_threads;
+    if (options.streamed_pinned_budget_mib != 0U)
+      run_options.streamed_pinned_budget_bytes =
+          options.streamed_pinned_budget_mib * 1024ULL * 1024ULL;
+    if (options.pinned_io)
+      run_options.pinned_io_staging = true;
     auto denoiser_run_options = run_options;
     denoiser_run_options.h3_w8a8_cache = options.h3_w8a8_cache;
     denoiser_run_options.h3_w8a8_resident_layers =
