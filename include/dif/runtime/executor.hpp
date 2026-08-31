@@ -78,6 +78,40 @@ struct RunOptions {
   bool trace_operations{false};
   bool overlap_streaming{true};
   bool profile_pipeline{false};
+  // W1-R streamed-transport policy. Default preserves the historical
+  // behavior exactly: mapped streamed constants madvise(MADV_DONTNEED)
+  // their source pages after every staging copy, which forces a refault
+  // on every warmup and iteration. When false, pages are kept across the
+  // passes of one run and dropped once at run end instead. Outputs are
+  // byte-identical either way; only host paging behavior changes. Any
+  // non-default choice must enter difopt candidate identity.
+  bool streamed_release_mapped_pages_per_copy{true};
+  // Pinned staging ring for streamed constants and how many operations
+  // ahead the overlapped scheduler prefetches. Defaults (2 buffers,
+  // depth 1) are the historical double-buffer policy, byte-for-byte.
+  // Depth is fixed at prepare time: the memory plan widens every streamed
+  // interval by the same distance, which is what makes a deeper prefetch
+  // hazard-free. Buffers must be >= 2 and >= depth + 1.
+  std::uint32_t streamed_staging_buffers{2};
+  std::uint32_t streamed_prefetch_depth{1};
+  // Worker threads for the mmap->pinned staging copy (1 = the historical
+  // single-threaded memcpy on the submitting thread).
+  std::uint32_t streamed_stage_threads{1};
+  // Upper bound on pinned host memory the streamed staging ring may
+  // allocate. The historical two-buffer footprint is always admitted; a
+  // larger ring that would exceed the budget fails closed. This host has
+  // 62 GiB and a documented host-OOM incident: keep this modest.
+  std::uint64_t streamed_pinned_budget_bytes{2ULL * 1024ULL * 1024ULL *
+                                             1024ULL};
+  // Route the reusable W8A8 tail weight uploads over the copy stream with
+  // event fences instead of the compute stream (default false = historical
+  // compute-stream uploads).
+  bool h3_w8a8_tail_uploads_on_copy_stream{false};
+  // Stage dynamic input uploads and output readbacks through a pinned
+  // bounce buffer sized at prepare (default false = historical pageable
+  // transfers). Must be requested at prepare time; counted against
+  // streamed_pinned_budget_bytes.
+  bool pinned_io_staging{false};
 };
 
 struct OperationTiming {
@@ -209,6 +243,30 @@ struct H3ModulationCacheResult {
   std::string input_path;
 };
 
+// Dispatch and transfer counters for one execution phase of the CUDA
+// backend. Counters are incremented at the centralized submission sites
+// (kernel launches, library GEMM/attention dispatches, every cuMemcpy*, and
+// the host-blocking synchronization calls), so they census exactly what the
+// runtime submitted -- including profiling-only event records when
+// profile_pipeline is enabled. They are always collected; the cost is a
+// host-side increment per call.
+struct LaunchTelemetry {
+  std::uint64_t kernel_launches{};
+  std::uint64_t cublaslt_matmuls{};
+  std::uint64_t cublas_gemms{};
+  std::uint64_t cudnn_attention_dispatches{};
+  std::uint64_t cutlass_launches{};
+  std::uint64_t ck_attention_dispatches{};
+  std::uint64_t h2d_copies{};
+  std::uint64_t h2d_bytes{};
+  std::uint64_t d2h_copies{};
+  std::uint64_t d2h_bytes{};
+  std::uint64_t event_records{};
+  std::uint64_t stream_wait_events{};
+  std::uint64_t host_event_synchronizes{};
+  std::uint64_t host_stream_synchronizes{};
+};
+
 // Profiling values describe the timed iterations of one prepared CUDA run.
 // Host staging is the memcpy from mapped/owned constants into pinned memory;
 // for mapped checkpoints it includes any page-fault and storage wait incurred
@@ -261,6 +319,12 @@ struct RunResult {
   std::vector<H3GroupwiseInt8Result> h3_groupwise_int8;
   std::vector<H3ModulationCacheResult> h3_modulation_caches;
   PipelineProfile pipeline_profile;
+  // CUDA backend only; other executors leave these zeroed. The preparation
+  // phase counters describe the one-time prepare() of the executing plan;
+  // the run counters describe exactly this run() call (warmups, timed
+  // iterations, input upload, and output readback included).
+  LaunchTelemetry preparation_telemetry;
+  LaunchTelemetry run_telemetry;
 };
 
 class PreparedExecution {

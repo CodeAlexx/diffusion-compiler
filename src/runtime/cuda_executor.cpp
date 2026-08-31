@@ -20,9 +20,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
@@ -30,9 +32,11 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -64,6 +68,110 @@ void check(cublasStatus_t result, const char *action) {
   if (result == CUBLAS_STATUS_SUCCESS)
     return;
   fail(std::string(action) + ": " + cublasGetStatusString(result));
+}
+
+// --- Launch/transfer telemetry ---------------------------------------------
+// One accumulator is active per execution phase (preparation, or one run).
+// CUDA work submission in this backend is single-threaded, so a plain
+// pointer suffices. Every wrapper forwards unchanged to the driver/library
+// call it counts; telemetry can never alter execution.
+LaunchTelemetry *active_telemetry = nullptr;
+
+class TelemetryScope {
+public:
+  explicit TelemetryScope(LaunchTelemetry &telemetry)
+      : previous_(active_telemetry) {
+    active_telemetry = &telemetry;
+  }
+  ~TelemetryScope() { active_telemetry = previous_; }
+  TelemetryScope(const TelemetryScope &) = delete;
+  TelemetryScope &operator=(const TelemetryScope &) = delete;
+
+private:
+  LaunchTelemetry *previous_;
+};
+
+CUresult counted_launch_kernel(CUfunction function, unsigned grid_x,
+                               unsigned grid_y, unsigned grid_z,
+                               unsigned block_x, unsigned block_y,
+                               unsigned block_z, unsigned shared_bytes,
+                               CUstream stream, void **parameters,
+                               void **extra) {
+  if (active_telemetry)
+    ++active_telemetry->kernel_launches;
+  return cuLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y,
+                        block_z, shared_bytes, stream, parameters, extra);
+}
+
+CUresult counted_memcpy_htod(CUdeviceptr destination, const void *source,
+                             std::size_t bytes, CUstream stream) {
+  if (active_telemetry) {
+    ++active_telemetry->h2d_copies;
+    active_telemetry->h2d_bytes += bytes;
+  }
+  return cuMemcpyHtoDAsync(destination, source, bytes, stream);
+}
+
+CUresult counted_memcpy_dtoh(void *destination, CUdeviceptr source,
+                             std::size_t bytes, CUstream stream) {
+  if (active_telemetry) {
+    ++active_telemetry->d2h_copies;
+    active_telemetry->d2h_bytes += bytes;
+  }
+  return cuMemcpyDtoHAsync(destination, source, bytes, stream);
+}
+
+CUresult counted_event_record(CUevent event, CUstream stream) {
+  if (active_telemetry)
+    ++active_telemetry->event_records;
+  return cuEventRecord(event, stream);
+}
+
+CUresult counted_stream_wait_event(CUstream stream, CUevent event,
+                                   unsigned flags) {
+  if (active_telemetry)
+    ++active_telemetry->stream_wait_events;
+  return cuStreamWaitEvent(stream, event, flags);
+}
+
+CUresult counted_event_synchronize(CUevent event) {
+  if (active_telemetry)
+    ++active_telemetry->host_event_synchronizes;
+  return cuEventSynchronize(event);
+}
+
+CUresult counted_stream_synchronize(CUstream stream) {
+  if (active_telemetry)
+    ++active_telemetry->host_stream_synchronizes;
+  return cuStreamSynchronize(stream);
+}
+
+void count_cublaslt_matmul() {
+  if (active_telemetry)
+    ++active_telemetry->cublaslt_matmuls;
+}
+
+void count_cudnn_attention_dispatch() {
+  if (active_telemetry)
+    ++active_telemetry->cudnn_attention_dispatches;
+}
+
+void count_cutlass_launch() {
+  if (active_telemetry)
+    ++active_telemetry->cutlass_launches;
+}
+
+// One dispatch = the DSO's quantize-QK + quantize-V + attend launcher trio.
+void count_ck_attention_dispatch() {
+  if (active_telemetry)
+    ++active_telemetry->ck_attention_dispatches;
+}
+
+template <typename... Arguments>
+cublasStatus_t counted_cublas_gemm_ex(Arguments &&...arguments) {
+  if (active_telemetry)
+    ++active_telemetry->cublas_gemms;
+  return cublasGemmEx(std::forward<Arguments>(arguments)...);
 }
 
 class Context {
@@ -507,7 +615,7 @@ public:
           continue;
         Event start;
         Event stop;
-        check(cuEventRecord(start.get(), stream),
+        check(counted_event_record(start.get(), stream),
               "cuEventRecord Linear tuning start");
         for (std::uint32_t iteration = 0U; iteration < iterations;
              ++iteration) {
@@ -517,9 +625,9 @@ public:
             break;
           }
         }
-        check(cuEventRecord(stop.get(), stream),
+        check(counted_event_record(stop.get(), stream),
               "cuEventRecord Linear tuning stop");
-        check(cuEventSynchronize(stop.get()),
+        check(counted_event_synchronize(stop.get()),
               "cuEventSynchronize Linear tuning");
         if (!admitted[index])
           continue;
@@ -635,6 +743,7 @@ private:
     const auto matrix_b_pointer = has_bias_ ? input_pointer : weight_pointer;
     const auto matrix_a = has_bias_ ? weight_ : input_;
     const auto matrix_b = has_bias_ ? input_ : weight_;
+    count_cublaslt_matmul();
     return cublasLtMatmul(
         handle, operation_, &alpha, matrix_a_pointer, matrix_a,
         matrix_b_pointer, matrix_b, &beta, output_pointer, output_,
@@ -939,7 +1048,7 @@ void launch_fused_linear_swiglu(const FusedLinearSwiGluPlan &plan,
   std::array<void *, 3> arguments = {&input, &weight, &output};
   const auto grid_x = static_cast<unsigned>((plan.width + 63U) / 64U);
   const auto grid_y = static_cast<unsigned>((plan.rows + 63U) / 64U);
-  check(cuLaunchKernel(plan.function, grid_x, grid_y, 1U, 256U, 1U, 1U, 0U,
+  check(counted_launch_kernel(plan.function, grid_x, grid_y, 1U, 256U, 1U, 1U, 0U,
                        stream, arguments.data(), nullptr),
         "cuLaunchKernel fused Linear->SwiGlu");
 }
@@ -1561,7 +1670,7 @@ void select_h3_modulation_slice(
 void upload_h3_modulation_cache(
     const std::vector<H3ModulationCachePlan> &plans, CUstream stream) {
   for (const auto &plan : plans)
-    check(cuMemcpyHtoDAsync(plan.modulation_device, plan.modulation.data(),
+    check(counted_memcpy_htod(plan.modulation_device, plan.modulation.data(),
                             plan.modulation.byte_size(), stream),
           "cuMemcpyHtoDAsync H3 modulation cache");
 }
@@ -1824,10 +1933,10 @@ void assign_h3_groupwise_scratch(H3GroupwiseBlockPlan &plan,
 void upload_h3_groupwise_weights(const H3GroupwiseBlockPlan &plan,
                                  CUstream stream) {
   for (const auto &projection : plan.projections) {
-    check(cuMemcpyHtoDAsync(projection.weight_device, projection.weight.data(),
+    check(counted_memcpy_htod(projection.weight_device, projection.weight.data(),
                             projection.weight.byte_size(), stream),
           "cuMemcpyHtoDAsync H3 groupwise INT8 weight");
-    check(cuMemcpyHtoDAsync(projection.scale_device, projection.scale.data(),
+    check(counted_memcpy_htod(projection.scale_device, projection.scale.data(),
                             projection.scale.byte_size(), stream),
           "cuMemcpyHtoDAsync H3 groupwise F16 scale");
   }
@@ -1848,7 +1957,7 @@ void launch_h3_groupwise_dequant(const H3GroupwiseProjection &projection,
       65535U, (elements + 255U) / 256U));
   std::array<void *, 7> arguments = {&weight, &scale, &output, &rows,
                                      &columns, &group_size, &swap};
-  check(cuLaunchKernel(function, grid, 1U, 1U, 256U, 1U, 1U, 0U, stream,
+  check(counted_launch_kernel(function, grid, 1U, 1U, 256U, 1U, 1U, 0U, stream,
                        arguments.data(), nullptr),
         "cuLaunchKernel H3 groupwise INT8 dequant");
 }
@@ -2431,7 +2540,7 @@ void assign_h3_w8a8_scratch(H3W8A8MlpPlan &plan, CUdeviceptr scratch) {
 
 void upload_h3_w8a8_weights(const H3W8A8MlpPlan &plan, CUstream stream) {
   const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
-    check(cuMemcpyHtoDAsync(destination, tensor.data(), tensor.byte_size(),
+    check(counted_memcpy_htod(destination, tensor.data(), tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 weight");
   };
@@ -2451,7 +2560,7 @@ std::uint64_t stage_h3_w8a8_weights(const H3W8A8MlpPlan &plan,
     if (tensor.byte_size() > staging_bytes - cursor)
       fail("H3 W8A8 MLP tail staging overflow");
     std::memcpy(base + cursor, tensor.data(), tensor.byte_size());
-    check(cuMemcpyHtoDAsync(destination, base + cursor, tensor.byte_size(),
+    check(counted_memcpy_htod(destination, base + cursor, tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 MLP tail weight");
     cursor += tensor.byte_size();
@@ -2514,7 +2623,7 @@ void assign_h3_w8a8_scratch(H3W8A8AttentionPlan &plan,
 void upload_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
                              CUstream stream) {
   const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
-    check(cuMemcpyHtoDAsync(destination, tensor.data(), tensor.byte_size(),
+    check(counted_memcpy_htod(destination, tensor.data(), tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 attention weight");
   };
@@ -2538,7 +2647,7 @@ std::uint64_t stage_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
     if (tensor.byte_size() > staging_bytes - cursor)
       fail("H3 W8A8 attention tail staging overflow");
     std::memcpy(base + cursor, tensor.data(), tensor.byte_size());
-    check(cuMemcpyHtoDAsync(destination, base + cursor, tensor.byte_size(),
+    check(counted_memcpy_htod(destination, base + cursor, tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 attention tail weight");
     cursor += tensor.byte_size();
@@ -2563,7 +2672,7 @@ unsigned h3_w8a8_grid(std::uint64_t elements) {
 void launch_h3_w8a8_kernel(CUfunction function, unsigned grid,
                            std::array<void *, 5> &arguments,
                            CUstream stream, const char *label) {
-  check(cuLaunchKernel(function, grid, 1U, 1U, 256U, 1U, 1U, 0U, stream,
+  check(counted_launch_kernel(function, grid, 1U, 1U, 256U, 1U, 1U, 0U, stream,
                        arguments.data(), nullptr),
         label);
 }
@@ -2586,7 +2695,7 @@ void launch_h3_w8a8_qkv(const H3W8A8AttentionPlan &plan,
   auto encoded = plan.activation_i8_device;
   std::array<void *, 6> encode_arguments = {
       &input, &scale, &encoded, &zero, &rows, &hidden};
-  check(cuLaunchKernel(functions.encode,
+  check(counted_launch_kernel(functions.encode,
                        h3_w8a8_grid(plan.rows * plan.hidden), 1U, 1U, 256U,
                        1U, 1U, 0U, stream, encode_arguments.data(), nullptr),
         "cuLaunchKernel H3 W8A8 QKV encode");
@@ -2600,7 +2709,7 @@ void launch_h3_w8a8_qkv(const H3W8A8AttentionPlan &plan,
     auto chunk_rows = static_cast<int>(std::min<std::uint64_t>(
         kH3W8A8ProjectionChunkRows, plan.rows - row_start));
     auto chunk_input = plan.activation_i8_device + row_start * plan.hidden;
-    check(cublasGemmEx(
+    check(counted_cublas_gemm_ex(
               cublas, CUBLAS_OP_T, CUBLAS_OP_N, packed_inner, chunk_rows,
               hidden, &alpha,
               reinterpret_cast<const void *>(plan.qkv_weight_device),
@@ -2619,7 +2728,7 @@ void launch_h3_w8a8_qkv(const H3W8A8AttentionPlan &plan,
     std::array<void *, 9> arguments = {
         &accumulator, &scale, &weight_scale, &q, &k, &v,
         &row_start_i32, &chunk_rows, &inner};
-    check(cuLaunchKernel(functions.qkv,
+    check(counted_launch_kernel(functions.qkv,
                          h3_w8a8_grid(static_cast<std::uint64_t>(chunk_rows) *
                                      plan.inner),
                          1U, 1U, 256U, 1U, 1U, 0U, stream, arguments.data(),
@@ -2654,13 +2763,13 @@ void launch_h3_w8a8_output(const H3W8A8AttentionPlan &plan,
     auto encoded = plan.activation_i8_device;
     std::array<void *, 6> encode_arguments = {
         &input, &scale, &encoded, &row_start_i32, &rows, &inner};
-    check(cuLaunchKernel(functions.encode,
+    check(counted_launch_kernel(functions.encode,
                          h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
                                      plan.inner),
                          1U, 1U, 256U, 1U, 1U, 0U, stream,
                          encode_arguments.data(), nullptr),
           "cuLaunchKernel H3 W8A8 output encode");
-    check(cublasGemmEx(
+    check(counted_cublas_gemm_ex(
               cublas, CUBLAS_OP_T, CUBLAS_OP_N, hidden, rows, inner, &alpha,
               reinterpret_cast<const void *>(plan.output_weight_device),
               CUDA_R_8I, inner,
@@ -2674,7 +2783,7 @@ void launch_h3_w8a8_output(const H3W8A8AttentionPlan &plan,
     std::array<void *, 9> residual_arguments = {
         &accumulator, &scale, &weight_scale, &residual, &gate, &output,
         &row_start_i32, &rows, &hidden};
-    check(cuLaunchKernel(functions.residual,
+    check(counted_launch_kernel(functions.residual,
                          h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
                                      plan.hidden),
                          1U, 1U, 256U, 1U, 1U, 0U, stream,
@@ -2700,7 +2809,7 @@ void launch_h3_w8a8_mlp(const H3W8A8MlpPlan &plan,
   auto gemm = [&](CUdeviceptr activation, CUdeviceptr weight,
                   CUdeviceptr accumulator, int rows, int columns,
                   int contraction) {
-    check(cublasGemmEx(
+    check(counted_cublas_gemm_ex(
               cublas, CUBLAS_OP_T, CUBLAS_OP_N, columns, rows, contraction,
               &alpha, reinterpret_cast<const void *>(weight), CUDA_R_8I,
               contraction, reinterpret_cast<const void *>(activation),
@@ -2730,7 +2839,7 @@ void launch_h3_w8a8_mlp(const H3W8A8MlpPlan &plan,
     std::array<void *, 6> full_encode_arguments = {
         &encode_input, &encode_scale, &encode_output,
         &row_start_i32, &rows, &hidden};
-    check(cuLaunchKernel(functions.encode,
+    check(counted_launch_kernel(functions.encode,
                          h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
                                      plan.hidden),
                          1U, 1U, 256U, 1U, 1U, 0U, stream,
@@ -2747,7 +2856,7 @@ void launch_h3_w8a8_mlp(const H3W8A8MlpPlan &plan,
     std::array<void *, 6> swiglu_arguments = {
         &swiglu_accumulator, &swiglu_input_scale, &swiglu_weight_scale,
         &swiglu_output, &rows, &ffn};
-    check(cuLaunchKernel(functions.swiglu,
+    check(counted_launch_kernel(functions.swiglu,
                          h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
                                      plan.ffn),
                          1U, 1U, 256U, 1U, 1U, 0U, stream,
@@ -2769,7 +2878,7 @@ void launch_h3_w8a8_mlp(const H3W8A8MlpPlan &plan,
     std::array<void *, 6> activation_encode_arguments = {
         &rowscale_activation, &activation_scale, &activation_i8,
         &zero, &rows, &ffn};
-    check(cuLaunchKernel(functions.encode,
+    check(counted_launch_kernel(functions.encode,
                          h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
                                      plan.ffn),
                          1U, 1U, 256U, 1U, 1U, 0U, stream,
@@ -2789,7 +2898,7 @@ void launch_h3_w8a8_mlp(const H3W8A8MlpPlan &plan,
         &residual_accumulator, &residual_scale, &residual_weight_scale,
         &residual_input, &residual_gate, &residual_output,
         &row_start_i32, &rows, &hidden};
-    check(cuLaunchKernel(functions.residual,
+    check(counted_launch_kernel(functions.residual,
                          h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
                                      plan.hidden),
                          1U, 1U, 256U, 1U, 1U, 0U, stream,
@@ -2922,13 +3031,114 @@ void validate_inputs(const ir::Program &program, const TensorMap &inputs) {
   }
 }
 
+// Fixed staging granule: page-aligned, large enough that per-chunk atomic
+// overhead vanishes, small enough that participants stay load-balanced.
+constexpr std::size_t kStageChunkBytes = 4U * 1024U * 1024U;
+
+// One mmap->pinned staging copy split across a persistent worker pool.
+// Each copy() publishes an immutable job object; workers pull 4 MiB chunks
+// through the job's atomic cursor. A straggler that wakes late only ever
+// sees its own job's exhausted cursor, so consecutive jobs cannot tear.
+// With one thread (the default) copy() degrades to plain memcpy — the
+// historical behavior.
+class StagingPool {
+public:
+  explicit StagingPool(std::uint32_t threads) {
+    for (std::uint32_t index = 1U; index < threads; ++index)
+      workers_.emplace_back([this] { work(); });
+  }
+
+  ~StagingPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    available_.notify_all();
+    for (auto &worker : workers_)
+      worker.join();
+  }
+
+  StagingPool(const StagingPool &) = delete;
+  StagingPool &operator=(const StagingPool &) = delete;
+
+  void copy(std::uint8_t *destination, const std::uint8_t *source,
+            std::size_t bytes) {
+    if (workers_.empty() || bytes < 2U * kStageChunkBytes) {
+      std::memcpy(destination, source, bytes);
+      return;
+    }
+    auto job = std::make_shared<StageJob>();
+    job->destination = destination;
+    job->source = source;
+    job->bytes = bytes;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      job_ = job;
+      ++generation_;
+    }
+    available_.notify_all();
+    participate(*job);
+    while (job->completed_bytes.load(std::memory_order_acquire) != bytes)
+      std::this_thread::yield();
+  }
+
+private:
+  struct StageJob {
+    std::uint8_t *destination{};
+    const std::uint8_t *source{};
+    std::size_t bytes{};
+    std::atomic<std::size_t> next_chunk{0U};
+    std::atomic<std::size_t> completed_bytes{0U};
+  };
+
+  static void participate(StageJob &job) {
+    while (true) {
+      const auto chunk =
+          job.next_chunk.fetch_add(1U, std::memory_order_relaxed);
+      const auto offset = chunk * kStageChunkBytes;
+      if (offset >= job.bytes)
+        return;
+      const auto count = std::min(kStageChunkBytes, job.bytes - offset);
+      std::memcpy(job.destination + offset, job.source + offset, count);
+      job.completed_bytes.fetch_add(count, std::memory_order_release);
+    }
+  }
+
+  void work() {
+    std::uint64_t seen = 0U;
+    while (true) {
+      std::shared_ptr<StageJob> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        available_.wait(lock,
+                        [&] { return stopping_ || generation_ != seen; });
+        if (stopping_)
+          return;
+        seen = generation_;
+        job = job_;
+      }
+      if (job)
+        participate(*job);
+    }
+  }
+
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable available_;
+  std::shared_ptr<StageJob> job_;
+  std::uint64_t generation_{};
+  bool stopping_{};
+};
+
 class StreamedPrefetcher {
 public:
   StreamedPrefetcher(const ir::Program &program, const TensorMap &constants,
                      const compiler::MemoryPlan &plan, DeviceBuffers &buffers,
-                     Context &context)
+                     Context &context, std::uint32_t staging_buffers,
+                     std::uint32_t stage_threads,
+                     std::uint64_t pinned_budget_bytes)
       : program_(program), constants_(constants), plan_(plan), buffers_(buffers),
-        context_(context) {
+        context_(context), staging_pool_(stage_threads) {
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
@@ -2946,12 +3156,26 @@ public:
     }
     if (maximum > std::numeric_limits<std::size_t>::max())
       fail("streamed prefetch staging size is not representable");
+    // The historical two-buffer footprint is always admitted; growing the
+    // ring beyond it must fit the pinned budget (fail-closed: this host
+    // has a documented host-OOM incident, pinned staging stays bounded).
+    if (staging_buffers < 2U)
+      fail("streamed staging ring needs at least two buffers");
+    if (staging_buffers > 2U && maximum != 0U &&
+        static_cast<std::uint64_t>(staging_buffers) >
+            pinned_budget_bytes / maximum)
+      fail("streamed staging ring exceeds the pinned budget: buffers=" +
+           std::to_string(staging_buffers) + " buffer_bytes=" +
+           std::to_string(maximum) + " budget_bytes=" +
+           std::to_string(pinned_budget_bytes));
+    staging_.resize(staging_buffers);
+    copy_done_.resize(staging_buffers);
     for (auto &staging : staging_)
       staging = std::make_unique<PinnedHostWorkspace>(
           static_cast<std::size_t>(maximum));
     for (auto &event : copy_done_)
       event = std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
-    copy_recorded_.fill(false);
+    copy_recorded_.assign(staging_buffers, false);
     ready_events_.reserve(program_.operations.size());
     completion_events_.reserve(program_.operations.size());
     for (std::size_t index = 0; index < program_.operations.size(); ++index) {
@@ -3035,7 +3259,7 @@ public:
       return false;
     const auto host_wait_start = std::chrono::steady_clock::now();
     if (copy_recorded_[parity])
-      check(cuEventSynchronize(copy_done_[parity]->get()),
+      check(counted_event_synchronize(copy_done_[parity]->get()),
             "cuEventSynchronize streamed staging reuse");
     if (profiling_)
       host_wait_milliseconds_ +=
@@ -3053,7 +3277,7 @@ public:
       const auto wait = overwrite_wait_operation_.at(id);
       if (wait != std::numeric_limits<std::size_t>::max() &&
           completion_recorded_.at(wait))
-        check(cuStreamWaitEvent(
+        check(counted_stream_wait_event(
                   context_.copy_stream(), completion_events_.at(wait)->get(), 0U),
               "cuStreamWaitEvent streamed slot release");
     }
@@ -3072,7 +3296,7 @@ public:
       auto *destination = static_cast<std::uint8_t *>(staging_[parity]->data()) +
                           offset;
       const auto host_stage_start = std::chrono::steady_clock::now();
-      std::memcpy(destination, tensor.data(), tensor.byte_size());
+      staging_pool_.copy(destination, tensor.data(), tensor.byte_size());
       if (profiling_) {
         host_stage_milliseconds_ +=
             std::chrono::duration<double, std::milli>(
@@ -3082,40 +3306,55 @@ public:
         if (next_copy_timing_ >= copy_timings_.size())
           fail("streamed pipeline profile observed an unexpected weight copy");
         auto &timing = copy_timings_.at(next_copy_timing_++);
-        check(cuEventRecord(timing.start->get(), context_.copy_stream()),
+        check(counted_event_record(timing.start->get(), context_.copy_stream()),
               "cuEventRecord streamed H2D start");
-        check(cuMemcpyHtoDAsync(buffers_.at(id), destination,
+        check(counted_memcpy_htod(buffers_.at(id), destination,
                                 tensor.byte_size(), context_.copy_stream()),
               "cuMemcpyHtoDAsync profiled constant");
-        check(cuEventRecord(timing.stop->get(), context_.copy_stream()),
+        check(counted_event_record(timing.stop->get(), context_.copy_stream()),
               "cuEventRecord streamed H2D stop");
       } else {
-        check(cuMemcpyHtoDAsync(buffers_.at(id), destination,
+        check(counted_memcpy_htod(buffers_.at(id), destination,
                                 tensor.byte_size(), context_.copy_stream()),
               "cuMemcpyHtoDAsync prefetched constant");
       }
       offset += tensor.byte_size();
-      tensor.discard_mapped_pages();
+      if (release_mapped_pages_per_copy_)
+        tensor.discard_mapped_pages();
     }
-    check(cuEventRecord(ready_events_.at(operation_index)->get(),
+    check(counted_event_record(ready_events_.at(operation_index)->get(),
                         context_.copy_stream()),
           "cuEventRecord streamed readiness");
-    check(cuEventRecord(copy_done_[parity]->get(), context_.copy_stream()),
+    check(counted_event_record(copy_done_[parity]->get(), context_.copy_stream()),
           "cuEventRecord streamed staging copy");
     copy_recorded_[parity] = true;
     return true;
   }
 
+  void set_release_mapped_pages_per_copy(bool release_per_copy) {
+    release_mapped_pages_per_copy_ = release_per_copy;
+  }
+
+  // Run-end page drop for the release-at-end policy: return every mapped
+  // streamed constant's pages to the kernel once, instead of after each
+  // staging copy inside the run.
+  void release_mapped_pages() const {
+    for (const auto &[id, first] : first_consumer_) {
+      (void)first;
+      constants_.at(id).discard_mapped_pages();
+    }
+  }
+
   void wait(std::size_t operation_index, bool ready) {
     if (!ready)
       return;
-    check(cuStreamWaitEvent(context_.stream(),
+    check(counted_stream_wait_event(context_.stream(),
                             ready_events_.at(operation_index)->get(), 0U),
           "cuStreamWaitEvent prefetched constant");
   }
 
   void complete(std::size_t operation_index) {
-    check(cuEventRecord(completion_events_.at(operation_index)->get(),
+    check(counted_event_record(completion_events_.at(operation_index)->get(),
                         context_.stream()),
           "cuEventRecord operation completion");
     completion_recorded_.at(operation_index) = true;
@@ -3132,14 +3371,16 @@ private:
   const compiler::MemoryPlan &plan_;
   DeviceBuffers &buffers_;
   Context &context_;
-  std::array<std::unique_ptr<PinnedHostWorkspace>, 2> staging_;
-  std::array<std::unique_ptr<Event>, 2> copy_done_;
-  std::array<bool, 2> copy_recorded_{};
+  StagingPool staging_pool_;
+  std::vector<std::unique_ptr<PinnedHostWorkspace>> staging_;
+  std::vector<std::unique_ptr<Event>> copy_done_;
+  std::vector<bool> copy_recorded_;
   std::vector<std::unique_ptr<Event>> ready_events_;
   std::vector<std::unique_ptr<Event>> completion_events_;
   std::vector<bool> completion_recorded_;
   std::unordered_map<std::uint32_t, std::size_t> first_consumer_;
   std::unordered_map<std::uint32_t, std::size_t> overwrite_wait_operation_;
+  bool release_mapped_pages_per_copy_{true};
   bool profiling_{};
   std::uint64_t streamed_bytes_{};
   double host_stage_milliseconds_{};
@@ -3159,7 +3400,7 @@ void upload_resident_constants(const ir::Program &program,
     if (!buffers.contains(desc.id))
       continue;
     const auto &tensor = inputs.at(desc.id);
-    check(cuMemcpyHtoDAsync(buffers.at(desc.id), tensor.data(),
+    check(counted_memcpy_htod(buffers.at(desc.id), tensor.data(),
                             tensor.byte_size(), stream),
           "cuMemcpyHtoDAsync");
   }
@@ -3171,7 +3412,7 @@ void upload_dynamic_inputs(const ir::Program &program, const TensorMap &inputs,
     if (!desc.has_role(ir::TensorRole::Input))
       continue;
     const auto &tensor = inputs.at(desc.id);
-    check(cuMemcpyHtoDAsync(buffers.at(desc.id), tensor.data(),
+    check(counted_memcpy_htod(buffers.at(desc.id), tensor.data(),
                             tensor.byte_size(), stream),
           "cuMemcpyHtoDAsync dynamic input");
   }
@@ -3181,7 +3422,7 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
             DeviceBuffers &buffers, CUstream stream,
             const std::vector<std::uint32_t> *input_override = nullptr) {
   if (op.opcode == ir::Opcode::Barrier) {
-    check(cuStreamSynchronize(stream), "cuStreamSynchronize barrier");
+    check(counted_stream_synchronize(stream), "cuStreamSynchronize barrier");
     return;
   }
   std::array<CUdeviceptr, 16> pointers{};
@@ -3235,7 +3476,7 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     grid = static_cast<unsigned>((count + block - 1U) / block);
   }
 
-  check(cuLaunchKernel(function, grid, 1, 1, block, 1, 1, shared, stream,
+  check(counted_launch_kernel(function, grid, 1, 1, block, 1, 1, shared, stream,
                        arguments.data(), nullptr),
         "cuLaunchKernel");
 }
@@ -3246,6 +3487,7 @@ public:
                         const RunOptions &options, int device_ordinal)
       : program_(std::move(program)), context_(device_ordinal) {
     const auto preparation_start = std::chrono::steady_clock::now();
+    TelemetryScope telemetry_scope(preparation_telemetry_);
     ir::verify(program_);
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Constant))
@@ -3444,8 +3686,19 @@ public:
         fail("DiffIR requests cuDNN attention but this CUDA backend was built without cuDNN");
     }
 #endif
+    if (options.streamed_prefetch_depth == 0U)
+      fail("streamed prefetch depth must be nonzero");
+    if (options.streamed_staging_buffers <
+        options.streamed_prefetch_depth + 1U)
+      fail("streamed staging ring must exceed the prefetch depth");
+    streamed_prefetch_depth_ = options.streamed_prefetch_depth;
+    // The plan widens every streamed interval by the prefetch depth, so a
+    // prefetch issued depth operations ahead can only overwrite a slot
+    // whose previous tenant has already been submitted (safety argument
+    // in the run loop below).
     memory_plan_ = compiler::plan_memory(
-        program_, 256U, options.overlap_streaming ? 1U : 0U,
+        program_, 256U,
+        options.overlap_streaming ? streamed_prefetch_depth_ : 0U,
         excluded_tensors, replaced_constant_tensors);
     const auto tensor_bytes = memory_plan_.total_bytes;
     if (tensor_bytes > std::numeric_limits<std::uint64_t>::max() - workspace_bytes_ ||
@@ -3636,6 +3889,10 @@ public:
           static_cast<std::size_t>(2U * h3_w8a8_tail_stage_half_bytes_));
       for (auto &event : h3_w8a8_tail_stage_events_)
         event = std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+      h3_w8a8_tail_order_event_ =
+          std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+      h3_w8a8_tail_ready_event_ =
+          std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
     }
     h3_groupwise_scratch_storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(h3_groupwise_scratch_bytes));
@@ -3668,7 +3925,34 @@ public:
           plan, h3_groupwise_scratch_storage_->pointer(), buffers_);
     }
     streamed_prefetcher_ = std::make_unique<StreamedPrefetcher>(
-        program_, constants_, memory_plan_, buffers_, context_);
+        program_, constants_, memory_plan_, buffers_, context_,
+        options.streamed_staging_buffers, options.streamed_stage_threads,
+        options.streamed_pinned_budget_bytes);
+    if (options.pinned_io_staging) {
+      auto input_bytes = std::uint64_t{0U};
+      auto output_bytes = std::uint64_t{0U};
+      for (const auto &description : program_.tensors) {
+        if (description.has_role(ir::TensorRole::Input)) {
+          if (input_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                description.byte_count())
+            fail("pinned I/O staging input size overflow");
+          input_bytes += description.byte_count();
+        }
+        if (description.has_role(ir::TensorRole::Output)) {
+          if (output_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                 description.byte_count())
+            fail("pinned I/O staging output size overflow");
+          output_bytes += description.byte_count();
+        }
+      }
+      const auto io_bytes = std::max(input_bytes, output_bytes);
+      if (io_bytes > options.streamed_pinned_budget_bytes)
+        fail("pinned I/O staging exceeds the pinned budget: io_bytes=" +
+             std::to_string(io_bytes) + " budget_bytes=" +
+             std::to_string(options.streamed_pinned_budget_bytes));
+      pinned_io_ = std::make_unique<PinnedHostWorkspace>(
+          static_cast<std::size_t>(io_bytes));
+    }
     for (const auto &op : program_.operations) {
       if (op.opcode == ir::Opcode::Linear &&
           !fused_launch_inputs_.contains(op.id) &&
@@ -3785,7 +4069,7 @@ public:
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
-    check(cuStreamSynchronize(context_.stream()),
+    check(counted_stream_synchronize(context_.stream()),
           "resident constant upload synchronization");
     if (resident_weight_bytes_ != 0U) {
       resident_h2d_milliseconds_ =
@@ -3799,7 +4083,7 @@ public:
     }
     if (!options.tune_linear_operations.empty()) {
       upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
-      check(cuStreamSynchronize(context_.stream()),
+      check(counted_stream_synchronize(context_.stream()),
             "Linear tuning input upload synchronization");
       std::unordered_set<std::uint32_t> tuned;
       for (const auto operation_id : options.tune_linear_operations) {
@@ -3865,6 +4149,12 @@ public:
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
     if (options.iterations == 0)
       fail("run iterations must be nonzero");
+    LaunchTelemetry run_telemetry;
+    TelemetryScope telemetry_scope(run_telemetry);
+    streamed_prefetcher_->set_release_mapped_pages_per_copy(
+        options.streamed_release_mapped_pages_per_copy);
+    if (options.streamed_prefetch_depth != streamed_prefetch_depth_)
+      fail("streamed prefetch depth is fixed when the plan is prepared");
     TensorMap bindings = constants_;
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Input))
@@ -3890,8 +4180,25 @@ public:
       select_h3_modulation_slice(h3_modulation_cache_plans_,
                                  options.h3_modulation_slice, buffers_);
     }
-    upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
-    check(cuStreamSynchronize(context_.stream()),
+    if (options.pinned_io_staging && !pinned_io_)
+      fail("pinned I/O staging must be requested when the plan is prepared");
+    if (options.pinned_io_staging) {
+      auto *base = static_cast<std::uint8_t *>(pinned_io_->data());
+      std::size_t offset = 0U;
+      for (const auto &desc : program_.tensors) {
+        if (!desc.has_role(ir::TensorRole::Input))
+          continue;
+        const auto &tensor = bindings.at(desc.id);
+        std::memcpy(base + offset, tensor.data(), tensor.byte_size());
+        check(counted_memcpy_htod(buffers_.at(desc.id), base + offset,
+                                  tensor.byte_size(), context_.stream()),
+              "cuMemcpyHtoDAsync pinned dynamic input");
+        offset += tensor.byte_size();
+      }
+    } else {
+      upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
+    }
+    check(counted_stream_synchronize(context_.stream()),
           "dynamic input upload synchronization");
 
     auto h3_w8a8_tail_streamed_bytes = std::uint64_t{0U};
@@ -3903,14 +4210,31 @@ public:
         fail("H3 W8A8 tail plan lacks reusable host staging");
       const auto half = h3_w8a8_tail_stage_turn_ % 2U;
       if (h3_w8a8_tail_stage_armed_.at(half))
-        check(cuEventSynchronize(h3_w8a8_tail_stage_events_.at(half)->get()),
+        check(counted_event_synchronize(h3_w8a8_tail_stage_events_.at(half)->get()),
               "cuEventSynchronize H3 W8A8 tail staging reuse");
+      const auto tail_copy_stream =
+          options.h3_w8a8_tail_uploads_on_copy_stream;
+      const auto tail_stream =
+          tail_copy_stream ? context_.copy_stream() : context_.stream();
+      if (tail_copy_stream) {
+        // The reusable tail device storage is shared by every tail layer:
+        // the copy stream must not overwrite it before the previous tail
+        // layer's kernels (already submitted on the compute stream) have
+        // consumed it. cuStreamWaitEvent snapshots the record at issue
+        // time, so one event object per fence direction suffices.
+        check(counted_event_record(h3_w8a8_tail_order_event_->get(),
+                                   context_.stream()),
+              "cuEventRecord H3 W8A8 tail upload order");
+        check(counted_stream_wait_event(context_.copy_stream(),
+                                        h3_w8a8_tail_order_event_->get(), 0U),
+              "cuStreamWaitEvent H3 W8A8 tail upload order");
+      }
       const auto stage_start = std::chrono::steady_clock::now();
       auto *staging = static_cast<std::uint8_t *>(
           h3_w8a8_tail_stage_->data()) +
           half * h3_w8a8_tail_stage_half_bytes_;
       const auto bytes = stage_h3_w8a8_weights(
-          plan, staging, h3_w8a8_tail_stage_half_bytes_, context_.stream());
+          plan, staging, h3_w8a8_tail_stage_half_bytes_, tail_stream);
       if (profile) {
         h3_w8a8_tail_streamed_bytes += bytes;
         h3_w8a8_tail_host_stage_milliseconds +=
@@ -3918,9 +4242,17 @@ public:
                 std::chrono::steady_clock::now() - stage_start)
                 .count();
       }
-      check(cuEventRecord(h3_w8a8_tail_stage_events_.at(half)->get(),
-                          context_.stream()),
+      check(counted_event_record(h3_w8a8_tail_stage_events_.at(half)->get(),
+                          tail_stream),
             "cuEventRecord H3 W8A8 tail staging copy");
+      if (tail_copy_stream) {
+        check(counted_event_record(h3_w8a8_tail_ready_event_->get(),
+                                   context_.copy_stream()),
+              "cuEventRecord H3 W8A8 tail weights ready");
+        check(counted_stream_wait_event(context_.stream(),
+                                        h3_w8a8_tail_ready_event_->get(), 0U),
+              "cuStreamWaitEvent H3 W8A8 tail weights ready");
+      }
       h3_w8a8_tail_stage_armed_.at(half) = true;
       ++h3_w8a8_tail_stage_turn_;
     };
@@ -4008,19 +4340,24 @@ public:
                &fused->second);
 #if DIF_HAS_CUTLASS
       else if (const auto cutlass = cutlass_linear_plans_.find(op.id);
-               cutlass != cutlass_linear_plans_.end())
+               cutlass != cutlass_linear_plans_.end()) {
+        count_cutlass_launch();
         cutlass->second->launch(context_.stream());
+      }
 #endif
       else if (op.opcode == ir::Opcode::Linear)
         linear_plans_.at(op.id)->launch(op, buffers_, context_.cublas_lt(),
                                         *workspace_, context_.stream());
       else if (op.opcode == ir::Opcode::Attention &&
-               h3_ck_attention_plans_.contains(op.id))
+               h3_ck_attention_plans_.contains(op.id)) {
+        count_ck_attention_dispatch();
         h3_ck_attention_plans_.at(op.id)->execute(op, buffers_,
                                                   context_.stream());
+      }
 #if DIF_HAS_CUDNN
       else if (op.opcode == ir::Opcode::Attention &&
                op.u64(ir::AttrKey::Implementation, 1U) == 2U) {
+        count_cudnn_attention_dispatch();
         cudnn_attention_plans_.at(op.id)->execute(
             static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
             static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
@@ -4063,44 +4400,55 @@ public:
                 static_cast<std::size_t>(iteration) *
                     program_.operations.size() +
                 index);
-            check(cuEventRecord(timing->start->get(), context_.stream()),
+            check(counted_event_record(timing->start->get(), context_.stream()),
                   "cuEventRecord profiled operation start");
           }
           execute_operation(op, profile);
           if (timing)
-            check(cuEventRecord(timing->stop->get(), context_.stream()),
+            check(counted_event_record(timing->stop->get(), context_.stream()),
                   "cuEventRecord profiled operation stop");
           streamed_prefetcher_->complete(index);
         }
         return;
       }
-      auto ready = streamed_prefetcher_->prefetch(0U);
-      for (std::size_t index = 0; index < program_.operations.size(); ++index) {
+      const auto operation_count = program_.operations.size();
+      const auto depth = static_cast<std::size_t>(streamed_prefetch_depth_);
+      std::vector<bool> prefetched(operation_count, false);
+      for (std::size_t ahead = 0U; ahead < depth && ahead < operation_count;
+           ++ahead)
+        prefetched[ahead] = streamed_prefetcher_->prefetch(ahead);
+      for (std::size_t index = 0; index < operation_count; ++index) {
         const auto &op = program_.operations[index];
-        streamed_prefetcher_->wait(index, ready);
+        streamed_prefetcher_->wait(index, prefetched[index]);
         OperationEventPair *timing = nullptr;
         if (profile && !skipped_operations_.contains(op.id)) {
           timing = &profile_operation_events.at(
               static_cast<std::size_t>(iteration) *
                   program_.operations.size() +
               index);
-          check(cuEventRecord(timing->start->get(), context_.stream()),
+          check(counted_event_record(timing->start->get(), context_.stream()),
                 "cuEventRecord profiled operation start");
         }
         execute_operation(op, profile);
         if (timing)
-          check(cuEventRecord(timing->stop->get(), context_.stream()),
+          check(counted_event_record(timing->stop->get(), context_.stream()),
                 "cuEventRecord profiled operation stop");
         streamed_prefetcher_->complete(index);
-        ready = index + 1U < program_.operations.size()
-                    ? streamed_prefetcher_->prefetch(index + 1U)
-                    : false;
+        // The completion record above is what makes prefetching depth
+        // operations ahead safe: the memory plan widened every streamed
+        // interval by the same depth, so the overwrite-wait target of
+        // operation index+depth is at most index and its completion event
+        // is guaranteed recorded before the copy stream is asked to wait
+        // on it.
+        if (index + depth < operation_count)
+          prefetched[index + depth] =
+              streamed_prefetcher_->prefetch(index + depth);
       }
     };
 
     for (std::uint32_t warmup = 0; warmup < options.warmups; ++warmup) {
       execute(0U, false);
-      check(cuStreamSynchronize(context_.stream()), "warmup synchronization");
+      check(counted_stream_synchronize(context_.stream()), "warmup synchronization");
     }
     if (options.profile_pipeline)
       streamed_prefetcher_->begin_profile(options.iterations);
@@ -4202,10 +4550,10 @@ public:
     for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
         Event start;
         Event stop;
-        check(cuEventRecord(start.get(), context_.stream()), "cuEventRecord start");
+        check(counted_event_record(start.get(), context_.stream()), "cuEventRecord start");
         execute(iteration, options.profile_pipeline);
-        check(cuEventRecord(stop.get(), context_.stream()), "cuEventRecord stop");
-        check(cuEventSynchronize(stop.get()), "cuEventSynchronize");
+        check(counted_event_record(stop.get(), context_.stream()), "cuEventRecord stop");
+        check(counted_event_synchronize(stop.get()), "cuEventSynchronize");
         float milliseconds = 0.0F;
         check(cuEventElapsedTime(&milliseconds, start.get(), stop.get()),
               "cuEventElapsedTime");
@@ -4292,7 +4640,7 @@ public:
                ++iteration) {
             Event start;
             Event stop;
-            check(cuEventRecord(start.get(), context_.stream()),
+            check(counted_event_record(start.get(), context_.stream()),
                   "cuEventRecord operation start");
             const auto index = static_cast<std::size_t>(&op -
                 program_.operations.data());
@@ -4300,9 +4648,9 @@ public:
             streamed_prefetcher_->wait(index, ready);
             execute_operation(op, false);
             streamed_prefetcher_->complete(index);
-            check(cuEventRecord(stop.get(), context_.stream()),
+            check(counted_event_record(stop.get(), context_.stream()),
                   "cuEventRecord operation stop");
-            check(cuEventSynchronize(stop.get()),
+            check(counted_event_synchronize(stop.get()),
                   "cuEventSynchronize operation");
             float milliseconds = 0.0F;
             check(cuEventElapsedTime(&milliseconds, start.get(), stop.get()),
@@ -4322,21 +4670,71 @@ public:
       }
     }
 
-    for (const auto &desc : program_.tensors) {
-      if (!desc.has_role(ir::TensorRole::Output))
-        continue;
-      auto tensor = zeros(desc);
-      check(cuMemcpyDtoHAsync(tensor.mutable_data(), buffers_.at(desc.id),
-                              tensor.byte_size(), context_.stream()),
-            "cuMemcpyDtoHAsync");
-      result.outputs.emplace(desc.id, std::move(tensor));
+    if (options.pinned_io_staging) {
+      auto *base = static_cast<std::uint8_t *>(pinned_io_->data());
+      std::size_t offset = 0U;
+      std::vector<std::pair<const ir::TensorDesc *, std::size_t>> staged;
+      for (const auto &desc : program_.tensors) {
+        if (!desc.has_role(ir::TensorRole::Output))
+          continue;
+        check(counted_memcpy_dtoh(base + offset, buffers_.at(desc.id),
+                                  desc.byte_count(), context_.stream()),
+              "cuMemcpyDtoHAsync pinned output");
+        staged.emplace_back(&desc, offset);
+        offset += desc.byte_count();
+      }
+      check(counted_stream_synchronize(context_.stream()),
+            "output copy synchronization");
+      for (const auto &[description, staged_offset] : staged) {
+        auto tensor = zeros(*description);
+        std::memcpy(tensor.mutable_data(), base + staged_offset,
+                    tensor.byte_size());
+        result.outputs.emplace(description->id, std::move(tensor));
+      }
+    } else {
+      for (const auto &desc : program_.tensors) {
+        if (!desc.has_role(ir::TensorRole::Output))
+          continue;
+        auto tensor = zeros(desc);
+        check(counted_memcpy_dtoh(tensor.mutable_data(), buffers_.at(desc.id),
+                                tensor.byte_size(), context_.stream()),
+              "cuMemcpyDtoHAsync");
+        result.outputs.emplace(desc.id, std::move(tensor));
+      }
+      check(counted_stream_synchronize(context_.stream()),
+            "output copy synchronization");
     }
-    check(cuStreamSynchronize(context_.stream()), "output copy synchronization");
 
     std::size_t free_after = 0;
     std::size_t total = 0;
     check(cuMemGetInfo(&free_after, &total), "cuMemGetInfo after");
     result.free_bytes_after = free_after;
+    if (!options.streamed_release_mapped_pages_per_copy)
+      streamed_prefetcher_->release_mapped_pages();
+    result.preparation_telemetry = preparation_telemetry_;
+    result.run_telemetry = run_telemetry;
+    if (options.profile_pipeline) {
+      const auto print = [](const char *phase, const LaunchTelemetry &t) {
+        std::cerr << "CUDA_LAUNCH_TELEMETRY phase=" << phase
+                  << " kernel_launches=" << t.kernel_launches
+                  << " cublaslt_matmuls=" << t.cublaslt_matmuls
+                  << " cublas_gemms=" << t.cublas_gemms
+                  << " cudnn_attention=" << t.cudnn_attention_dispatches
+                  << " cutlass=" << t.cutlass_launches
+                  << " ck_attention=" << t.ck_attention_dispatches
+                  << " h2d_copies=" << t.h2d_copies
+                  << " h2d_bytes=" << t.h2d_bytes
+                  << " d2h_copies=" << t.d2h_copies
+                  << " d2h_bytes=" << t.d2h_bytes
+                  << " event_records=" << t.event_records
+                  << " stream_wait_events=" << t.stream_wait_events
+                  << " host_event_syncs=" << t.host_event_synchronizes
+                  << " host_stream_syncs=" << t.host_stream_synchronizes
+                  << '\n';
+      };
+      print("prepare", preparation_telemetry_);
+      print("run", run_telemetry);
+    }
     return result;
   }
 
@@ -4383,6 +4781,9 @@ private:
   std::unique_ptr<Workspace> h3_w8a8_tail_weight_storage_;
   std::unique_ptr<PinnedHostWorkspace> h3_w8a8_tail_stage_;
   std::array<std::unique_ptr<Event>, 2> h3_w8a8_tail_stage_events_;
+  std::unique_ptr<Event> h3_w8a8_tail_order_event_;
+  std::unique_ptr<Event> h3_w8a8_tail_ready_event_;
+  std::unique_ptr<PinnedHostWorkspace> pinned_io_;
   std::array<bool, 2> h3_w8a8_tail_stage_armed_{};
   std::unique_ptr<Workspace> h3_groupwise_scratch_storage_;
   std::unique_ptr<Workspace> h3_modulation_storage_;
@@ -4428,6 +4829,8 @@ private:
   std::uint64_t resident_bytes_{};
   std::uint64_t resident_weight_bytes_{};
   std::uint64_t free_bytes_before_{};
+  std::uint32_t streamed_prefetch_depth_{1};
+  LaunchTelemetry preparation_telemetry_;
   double preparation_milliseconds_{};
   double resident_upload_milliseconds_{};
   double resident_host_prefault_milliseconds_{};
