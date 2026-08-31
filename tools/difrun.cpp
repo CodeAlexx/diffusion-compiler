@@ -64,6 +64,8 @@ void usage() {
                " [--expand-linear-algorithms]"
                " [--select-linear-algorithm OP_ID:HEURISTIC_RANK]"
                " [--fuse-linear-swiglu OP_ID]"
+               " [--absorb-linear-bias OP_ID]"
+               " [--persist-linear-heuristics]"
                " [--cutlass-linear OP_ID:SCHEDULE_ID]"
                " [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-layer N]"
                " [--h3-w8a8-resident-layers N]"
@@ -144,6 +146,12 @@ int main(int argc, char **argv) {
         options.fuse_linear_swiglu_operations.push_back(
             static_cast<std::uint32_t>(
                 number(argv[++i], "fused Linear operation id")));
+      else if (option == "--absorb-linear-bias" && i + 1 < argc)
+        options.absorb_linear_bias_operations.push_back(
+            static_cast<std::uint32_t>(
+                number(argv[++i], "absorbed Linear operation id")));
+      else if (option == "--persist-linear-heuristics")
+        options.persist_linear_heuristics = true;
       else if (option == "--cutlass-linear" && i + 1 < argc)
         options.cutlass_linear_operations.push_back(
             cutlass_choice(argv[++i]));
@@ -333,6 +341,24 @@ int main(int argc, char **argv) {
                 << " eliminated_intermediate_bytes="
                 << fusion.eliminated_intermediate_bytes
                 << " implementation=" << fusion.implementation << "\n";
+    for (const auto &fusion : result.linear_bias_fusions)
+      std::cout << "LINEAR_BIAS_FUSION linear_op="
+                << fusion.linear_operation_id
+                << " bias_op=" << fusion.bias_operation_id
+                << " eliminated_intermediate_bytes="
+                << fusion.eliminated_intermediate_bytes
+                << " implementation=" << fusion.implementation << "\n";
+    if (result.linear_heuristic_cache.restored != 0U ||
+        result.linear_heuristic_cache.rejected != 0U ||
+        result.linear_heuristic_cache.saved_passive != 0U ||
+        result.linear_heuristic_cache.saved_tuned != 0U)
+      std::cout << "LINEAR_HEURISTIC_CACHE restored="
+                << result.linear_heuristic_cache.restored
+                << " rejected=" << result.linear_heuristic_cache.rejected
+                << " saved_passive="
+                << result.linear_heuristic_cache.saved_passive
+                << " saved_tuned="
+                << result.linear_heuristic_cache.saved_tuned << "\n";
     for (const auto &primitive : result.gemm_primitives)
       std::cout << "GEMM_PRIMITIVE op=" << primitive.operation_id
                 << " schedule=" << primitive.schedule

@@ -36,6 +36,15 @@ struct RunOptions {
   // exact Linear->SwiGlu chains to lower as a fused CUDA primitive.
   std::vector<std::uint32_t> tune_linear_operations;
   std::vector<std::uint32_t> fuse_linear_swiglu_operations;
+  // Absorb an unbiased Linear's exclusive, immediately-adjacent BiasAdd into
+  // the cuBLASLt bias epilogue: one library launch, no materialized
+  // intermediate. Ids name the Linear operations (explicit = candidate
+  // identity; malformed patterns fail closed). The absorbed launch follows
+  // the biased-Linear plan form, whose layouts differ from the unbiased
+  // plan, so byte-identity against the separate BiasAdd kernel is
+  // program-dependent and must be gated (difopt acceptance discipline)
+  // before a candidate is accepted.
+  std::vector<std::uint32_t> absorb_linear_bias_operations;
   std::vector<CutlassLinearChoice> cutlass_linear_operations;
   std::vector<LinearAlgorithmChoice> linear_algorithm_choices;
   // Accepted MiniMax-H3 W8A8 precision route. The cache is the Serenity
@@ -75,6 +84,14 @@ struct RunOptions {
   std::uint32_t linear_tuning_iterations{10};
   std::uint32_t linear_tuning_sessions{3};
   bool expand_linear_algorithms{false};
+  // Persist cuBLASLt Linear algorithm selections under cache_directory
+  // (PTX-cache style), keyed on the full problem identity (shape, storage
+  // and compute types, bias form, preference workspace, cuBLASLt version,
+  // device arch) with distinct namespaces for passively selected and tuned
+  // algorithms. Restores are validated through cublasLtMatmulAlgoCheck and
+  // fail open to fresh heuristics. Default OFF; enabling is an execution-
+  // policy choice and enters difopt candidate identity.
+  bool persist_linear_heuristics{false};
   bool trace_operations{false};
   bool overlap_streaming{true};
   bool profile_pipeline{false};
@@ -156,6 +173,24 @@ struct PrimitiveFusionResult {
   std::uint32_t swiglu_operation_id{};
   std::uint64_t eliminated_intermediate_bytes{};
   std::string implementation;
+};
+
+struct LinearBiasFusionResult {
+  std::uint32_t linear_operation_id{};
+  std::uint32_t bias_operation_id{};
+  std::uint64_t eliminated_intermediate_bytes{};
+  std::string implementation;
+};
+
+// Counters for the persisted cuBLASLt Linear algorithm store: how many plans
+// restored a validated cached selection, how many cached entries failed
+// AlgoCheck and fell open to fresh heuristics, and how many selections were
+// written (passive namespace at plan build, tuned namespace after tuning).
+struct LinearHeuristicCacheStats {
+  std::uint64_t restored{};
+  std::uint64_t rejected{};
+  std::uint64_t saved_passive{};
+  std::uint64_t saved_tuned{};
 };
 
 struct GemmPrimitiveResult {
@@ -314,6 +349,8 @@ struct RunResult {
   std::vector<LinearTuningResult> linear_tuning_results;
   std::vector<LinearAlgorithmChoice> selected_linear_algorithms;
   std::vector<PrimitiveFusionResult> primitive_fusions;
+  std::vector<LinearBiasFusionResult> linear_bias_fusions;
+  LinearHeuristicCacheStats linear_heuristic_cache;
   std::vector<GemmPrimitiveResult> gemm_primitives;
   std::vector<H3W8A8MlpResult> h3_w8a8_mlps;
   std::vector<H3W8A8AttentionResult> h3_w8a8_attentions;
