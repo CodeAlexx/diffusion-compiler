@@ -269,10 +269,12 @@ capture for resident programs; device-resident optimizer loop; gradient
 checkpointing; native tokenizer + Qwen3-VL conditioner (long pole).
 
 **Milestone gates:** (M1) golden-artifact-matched H3 run through the
-consolidated runtime, byte-identical latents; (M2) BF16 LoRA training
-proof (forward -> DiffIR backward -> AdamW -> checkpoint resume) with no
-torch at runtime; (M3) torch/Mojo dependency-removal ledger complete
-through step 4 of §5.
+consolidated runtime, byte-identical latents — PENDING; (M2) BF16 LoRA
+training proof with no torch at runtime — ACHIEVED 2026-08-31 at composed
+DiT-block scope (2+4 blocks, 100 steps, CPU+CUDA, byte-identical resume;
+docs/M2_DIT_LORA_TRAINING_GATE_2026-08-31.md; real-H3-geometry LoRA remains
+Wave 3); (M3) torch/Mojo dependency-removal ledger complete through step 4
+of §5 — steps 1-3 done + tokenizer half of step 5; BigVGAN (step 4) planned.
 
 ## 8. Testing discipline
 
