@@ -4,7 +4,7 @@ One paragraph per module: what it is, where it lives, its entry points, and
 its current status. Companion to REPOSITORY_MAP.md (tables) and
 FLAME_CPP_RUNTIME_PORT.md (port matrix). Status vocabulary: EXISTING |
 PORTING | SCAFFOLD | PROVEN | PROVEN-REAL-DIMS | PERFORMANCE-GATED | BLOCKED.
-Last updated: 2026-08-31 (Wave 1 in flight).
+Last updated: 2026-08-31 (Waves 1-3 merged).
 
 ## IR and verification
 
@@ -75,9 +75,11 @@ Known limits: no arena/pool consolidation, no CUDA graphs, forward-only
 attention, heuristics not persisted across prepares.
 
 **cuDNN attention** (`src/runtime/cudnn_attention.cpp`) — cudnn_frontend
-SDPA graph, BF16/F16 with F32 compute, stats off (forward-only). Wave-3
-target: train-forward (Stats/LSE) + backward with flame's bail-condition
-list and saved-O identity discipline. EXISTING.
+SDPA graph, BF16/F16 with F32 compute, stats off (forward-only). Now
+supports GQA natively: K/V are declared with their own head count and the
+plan key carries `kv_heads`, so dense and grouped plans over the same query
+geometry cannot collide. cuDNN SDPA *backward* remains open work; the
+decomposed `AttentionBackward` opcode is its parity reference. EXISTING.
 
 **Tensor I/O** (`src/runtime/tensor_io.cpp`, `include/dif/runtime/tensor.hpp`)
 — owned or mmap-backed host tensors, checksummed `.diftensor` container,
@@ -118,6 +120,16 @@ host-mediated step loop (outputs moved back to inputs per step). Wave-1:
 generalized LoRA mode (w1-lora). Device-resident optimizer loop is a Wave-3
 target.
 
+**Audio VAE / BigVGAN** (`include/dif/frontend/h3_audio_vae.hpp`,
+`src/frontend/h3_audio_vae.cpp`, `tools/difaudiodecode.cpp`,
+`src/support/wav.cpp`) — the released DAC/BigVGAN decoder as a 603-op DiffIR
+program (391 `Conv1d`, 127 `SnakeBeta`), rank-3 `[B=2,C,L]` with stereo as
+batch, in-program latent denormalization, float64 weight-norm folding at
+import, and a native int16 WAV writer matching the reference quantizer.
+PROVEN-REAL-DIMS: reproduces the accepted `audio.wav` at 86.87 dB SNR with
+a maximum one-LSB deviation, in 0.63 s. OpenCL execution of the two new
+opcodes is a recorded gap (fail-closed arms only).
+
 ## Frontends
 
 **H3** (`src/frontend/h3*.cpp`) — block/stack/denoiser/conditioning-layout/
@@ -151,7 +163,8 @@ make/run/export modes (w1-lora).
 
 Torch-free and Python-free at link level across every generation-path
 binary; ffmpeg subprocess for mux (retained by declaration); Mojo-dependent
-at three points — tokenizer+Qwen3-VL conditioner (XL), modulation-cache
-provenance (Wave-1 removal in flight), BigVGAN audio decode (Wave-3).
+at ONE point — the Qwen3-VL text conditioner. The tokenizer, modulation
+cache, initial noise, importer and BigVGAN audio decode are all native and
+gated. cuDNN is vendored outside any Python tree.
 PyTorch remains only in oracles (/home/alex/diffusion-fixtures) and
 evaluation tooling.
