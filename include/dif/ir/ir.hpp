@@ -78,6 +78,8 @@ enum class Opcode : std::uint32_t {
   QkNormPartialRopeBackward = 44,
   AttentionLse = 45,
   AttentionBackward = 46,
+  Conv1d = 47,
+  SnakeBeta = 48,
 };
 
 enum class AttrKey : std::uint32_t {
@@ -110,6 +112,15 @@ enum class AttrKey : std::uint32_t {
   Beta1 = 27,
   Beta2 = 28,
   WeightDecay = 29,
+  Stride = 30,
+  Dilation = 31,
+  Groups = 32,
+  PadLeft = 33,
+  PadRight = 34,
+  PadMode = 35,
+  Transposed = 36,
+  TrimLeft = 37,
+  TrimRight = 38,
 };
 
 enum class AttrKind : std::uint32_t { U64 = 1, I64 = 2, F64 = 3, Bool = 4 };
