@@ -338,6 +338,33 @@ GradientCase swiglu_case(dif::ir::DType dtype, bool gate_first) {
   return grad_case;
 }
 
+GradientCase layer_norm_case(dif::ir::DType dtype) {
+  using namespace dif::ir;
+  GradientCase grad_case;
+  grad_case.name =
+      std::string("layer_norm_") + std::string(dtype_name(dtype));
+  const std::uint64_t rows = 5U;
+  const std::uint64_t cols = 6U;
+  grad_case.forward.tensors = {
+      {1U, dtype, TensorRole::Input, {rows, cols}},
+      {2U, dtype, TensorRole::Input, {cols}},
+      {3U, dtype, TensorRole::Input, {cols}},
+      {4U, dtype, TensorRole::Internal, {rows, cols}},
+  };
+  grad_case.forward.operations = {
+      {1U, Opcode::LayerNorm, {1U, 2U, 3U}, {4U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-5),
+        Attribute::u64(AttrKey::BlockSize, 32U)}},
+  };
+  grad_case.targets = {1U, 2U, 3U};
+  grad_case.bindings.emplace(1U, random_tensor(dtype, {rows, cols}, 61U));
+  grad_case.bindings.emplace(
+      2U, random_tensor(dtype, {cols}, 62U, 0.5F, 1.0F));
+  grad_case.bindings.emplace(3U, random_tensor(dtype, {cols}, 63U, 0.3F));
+  append_loss(grad_case, 4U, 64U);
+  return grad_case;
+}
+
 GradientCase residual_gate_case(dif::ir::DType dtype) {
   using namespace dif::ir;
   GradientCase grad_case;
@@ -415,6 +442,7 @@ void test_group1_finite_differences() {
   finite_difference_check(swiglu_case(dif::ir::DType::F32, true));
   finite_difference_check(swiglu_case(dif::ir::DType::F32, false));
   finite_difference_check(residual_gate_case(dif::ir::DType::F32));
+  finite_difference_check(layer_norm_case(dif::ir::DType::F32));
   finite_difference_check(composed_group1_case());
 }
 
@@ -429,12 +457,14 @@ void test_group1_backend_parity() {
   backend_cross_check(swiglu_case(dif::ir::DType::F32, true), f32_bar);
   backend_cross_check(swiglu_case(dif::ir::DType::F32, false), f32_bar);
   backend_cross_check(residual_gate_case(dif::ir::DType::F32), f32_bar);
+  backend_cross_check(layer_norm_case(dif::ir::DType::F32), f32_bar);
   backend_cross_check(composed_group1_case(), f32_bar);
   backend_cross_check(rms_norm_case(dif::ir::DType::BF16), bf16_bar);
   backend_cross_check(rms_norm_modulate_case(dif::ir::DType::BF16, true),
                       bf16_bar);
   backend_cross_check(swiglu_case(dif::ir::DType::BF16, true), bf16_bar);
   backend_cross_check(residual_gate_case(dif::ir::DType::BF16), bf16_bar);
+  backend_cross_check(layer_norm_case(dif::ir::DType::BF16), bf16_bar);
 }
 
 void test_group1_frozen_weight_economy() {
@@ -546,6 +576,23 @@ void test_group1_verifier_negatives() {
     };
     expect_rejected(mismatch,
                     "residual_gate_backward rejects a single output");
+  }
+  {
+    // LayerNormBackward affine gradients must match the affine vectors.
+    Program mismatch;
+    mismatch.tensors = {
+        {1U, DType::F32, TensorRole::Input, {2U, 4U}},
+        {2U, DType::F32, TensorRole::Input, {2U, 4U}},
+        {3U, DType::F32, TensorRole::Input, {4U}},
+        {4U, DType::F32, TensorRole::Output, {2U, 4U}},
+        {5U, DType::F32, TensorRole::Output, {4U}},
+        {6U, DType::F32, TensorRole::Output, {2U}},
+    };
+    mismatch.operations = {
+        {1U, Opcode::LayerNormBackward, {1U, 2U, 3U}, {4U, 5U, 6U}, {}},
+    };
+    expect_rejected(mismatch,
+                    "layer_norm_backward rejects a mismatched bias gradient");
   }
   {
     // RmsNormBackward weight-gradient shape must match the weight.

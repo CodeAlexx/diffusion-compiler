@@ -223,6 +223,24 @@ AutodiffResult differentiate(const ir::Program &forward,
         accumulate(operation.inputs[1], grad_weight);
       break;
     }
+    case ir::Opcode::LayerNorm: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      const auto grad_weight =
+          add_tensor(*result.program.tensor(operation.inputs[1]));
+      const auto grad_bias =
+          add_tensor(*result.program.tensor(operation.inputs[2]));
+      add_operation(ir::Opcode::LayerNormBackward,
+                    {grad_output, operation.inputs[0], operation.inputs[1]},
+                    {grad_input, grad_weight, grad_bias},
+                    {ir::Attribute::f64(
+                        ir::AttrKey::Epsilon,
+                        operation.f64(ir::AttrKey::Epsilon, 1.0e-5))});
+      accumulate(operation.inputs[0], grad_input);
+      accumulate(operation.inputs[1], grad_weight);
+      accumulate(operation.inputs[2], grad_bias);
+      break;
+    }
     case ir::Opcode::SwiGlu: {
       const auto grad_input =
           add_tensor(*result.program.tensor(operation.inputs[0]));

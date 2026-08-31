@@ -817,6 +817,63 @@ void swiglu_backward(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void layer_norm_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &input = tensors.at(op.inputs[1]);
+  const auto &weight = tensors.at(op.inputs[2]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  auto &grad_weight = tensors.at(op.outputs[1]);
+  auto &grad_bias = tensors.at(op.outputs[2]);
+  const auto columns = input.dims.back();
+  const auto rows = input.element_count() / columns;
+  const auto epsilon =
+      static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  std::vector<float> weight_accumulator(columns, 0.0F);
+  std::vector<float> bias_accumulator(columns, 0.0F);
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    const auto base = row * columns;
+    float mean = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column)
+      mean += load_float(input, base + column);
+    mean /= static_cast<float>(columns);
+    float variance = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto centered = load_float(input, base + column) - mean;
+      variance += centered * centered;
+    }
+    const auto inverse =
+        1.0F / std::sqrt(variance / static_cast<float>(columns) + epsilon);
+    float gradient_mean = 0.0F;
+    float projected_mean = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto weighted_gradient = load_float(grad_output, base + column) *
+                                     load_float(weight, column);
+      const auto normalized =
+          (load_float(input, base + column) - mean) * inverse;
+      gradient_mean += weighted_gradient;
+      projected_mean += weighted_gradient * normalized;
+    }
+    gradient_mean /= static_cast<float>(columns);
+    projected_mean /= static_cast<float>(columns);
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto index = base + column;
+      const auto upstream = load_float(grad_output, index);
+      const auto weighted_gradient =
+          upstream * load_float(weight, column);
+      const auto normalized = (load_float(input, index) - mean) * inverse;
+      store_float(grad_input, index,
+                  inverse * (weighted_gradient - gradient_mean -
+                             normalized * projected_mean));
+      weight_accumulator[column] += upstream * normalized;
+      bias_accumulator[column] += upstream;
+    }
+  }
+  for (std::uint64_t column = 0U; column < columns; ++column) {
+    store_float(grad_weight, column, weight_accumulator[column]);
+    store_float(grad_bias, column, bias_accumulator[column]);
+  }
+}
+
 void residual_gate_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto &grad_output = tensors.at(op.inputs[0]);
   const auto &branch = tensors.at(op.inputs[1]);
@@ -1082,6 +1139,9 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::ResidualGateBackward:
       residual_gate_backward(op, tensors);
+      break;
+    case ir::Opcode::LayerNormBackward:
+      layer_norm_backward(op, tensors);
       break;
     }
   }

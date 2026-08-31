@@ -242,6 +242,8 @@ std::string_view opcode_name(Opcode opcode) {
     return "swiglu_backward";
   case Opcode::ResidualGateBackward:
     return "residual_gate_backward";
+  case Opcode::LayerNormBackward:
+    return "layer_norm_backward";
   }
   return "invalid";
 }
