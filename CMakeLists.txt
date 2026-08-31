@@ -260,3 +260,24 @@ if(DIF_BUILD_TESTS)
     set_tests_properties(dif_opencl_plugin_tests PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 endif()
+
+# --- native text tokenizer (w3-conditioner) ---------------------------------
+add_library(dif_text STATIC
+    src/text/unicode.cpp
+    src/text/qwen_bpe_tokenizer.cpp)
+target_include_directories(dif_text PUBLIC include)
+target_compile_options(
+    dif_text PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>)
+target_link_libraries(dif_text PUBLIC difcore)
+
+add_executable(diftokenize tools/diftokenize.cpp)
+target_link_libraries(diftokenize PRIVATE dif_text)
+install(TARGETS diftokenize RUNTIME DESTINATION bin)
+
+if(DIF_BUILD_TESTS)
+  add_executable(dif_tokenizer_tests tests/tokenizer_tests.cpp)
+  target_link_libraries(dif_tokenizer_tests PRIVATE dif_text)
+  add_test(NAME dif_tokenizer_tests COMMAND dif_tokenizer_tests)
+  set_tests_properties(dif_tokenizer_tests PROPERTIES SKIP_RETURN_CODE 77)
+endif()
