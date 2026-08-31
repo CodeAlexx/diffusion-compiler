@@ -21,4 +21,19 @@ struct GeneratedCuda {
 
 GeneratedCuda emit_cuda(const ir::Program &program);
 
+// Opt-in elementwise region fusion census.  Counts the single-consumer
+// pointwise regions -- operations stamped Implementation=2 by
+// `difc set-elementwise-fusion` -- that emit_cuda would collapse into one
+// kernel each.  Pure analysis; no source is generated.  Unstamped programs
+// always report zero regions (fusion is a fingerprinted candidate property,
+// never silent global behavior).
+struct ElementwiseFusionCensus {
+  std::uint64_t regions{};
+  std::uint64_t fused_operations{};
+  std::uint64_t eliminated_launches{};
+};
+
+ElementwiseFusionCensus
+census_elementwise_fusion(const ir::Program &program);
+
 } // namespace dif::compiler

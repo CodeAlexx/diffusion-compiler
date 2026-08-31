@@ -234,6 +234,10 @@ if(DIF_BUILD_TESTS)
   target_link_libraries(dif_dit_lora_tests PRIVATE difcore)
   add_test(NAME dif_dit_lora_tests COMMAND dif_dit_lora_tests)
 
+  add_executable(dif_fusion_tests tests/fusion_tests.cpp)
+  target_link_libraries(dif_fusion_tests PRIVATE difcore)
+  add_test(NAME dif_fusion_tests COMMAND dif_fusion_tests)
+
   add_library(dif_mock_backend SHARED tests/mock_backend.cpp)
   target_include_directories(dif_mock_backend PRIVATE include)
   target_compile_options(dif_mock_backend PRIVATE -Wall -Wextra -Wpedantic -Werror)

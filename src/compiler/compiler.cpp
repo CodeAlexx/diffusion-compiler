@@ -3,6 +3,7 @@
 #include "dif/ir/verify.hpp"
 #include "dif/support/error.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <array>
 #include <iomanip>
@@ -1582,6 +1583,446 @@ void emit_attention_backward(std::ostringstream &out,
       << std::defaultfloat;
 }
 
+// ---------------------------------------------------------------------------
+// Elementwise region fusion (opt-in candidate property).
+//
+// A region is a single-consumer tree of pointwise operations {Add, Multiply,
+// SiLU, Clamp, Cast, BiasAdd, ResidualGate, SwiGlu} collapsed into ONE kernel
+// launched at the region's terminal ("anchor") operation; every interior
+// operation is subsumed via skipped_operations and its output never touches
+// global memory.  Fusion is a deliberate candidate property, not silent
+// global behavior: an operation participates only when it carries
+// Implementation=2 (stamped by `difc set-elementwise-fusion`, a fingerprinted
+// transform).  Unstamped programs emit byte-identically to the pre-fusion
+// compiler.
+//
+// Numerics contract: BYTE-IDENTICAL to unfused execution.  Each stage is
+// computed in F32 registers and rounded to that intermediate's storage dtype
+// in-register (dif_round_*) exactly where the unfused kernel rounds at its
+// store.  Cross-boundary FMA contraction is prevented where it can occur --
+// a mul-topped stage (Multiply, SwiGlu) feeding a consumer's add -- by
+// emitting that top-level multiply as __fmul_rn, which is bit-identical to
+// the lone rn-rounded FMUL of the unfused kernel and is never contracted
+// (an identity mul.rn barrier was algebraically eliminated by ptxas and an
+// empty asm barrier only stops front-end contraction; both measured by the
+// multiply->add byte gate).  Intra-stage expression trees are structural
+// copies of the unfused emitters, so intra-stage contraction stays
+// identical on both sides.
+//
+// Memory-safety contract (the planner places tensors at slot base and
+// best-fit-reuses non-dedicated slots by liveness): an external input still
+// live at the anchor's position -- or holding a dedicated slot (Input,
+// Output, resident Constant) -- can never alias the anchor's output.  An
+// input that dies inside the region is admitted only when the program has no
+// streamed constants, the region is contiguous in program order, and one of:
+// (a) its aligned size is smaller than the output's (the planner cannot hand
+// its slot to the output), (b) the anchor output is dedicated (nothing
+// writes the dead slot before the anchor), or (c) every region read of it is
+// at the thread's own output element index with equal element count and
+// dtype size (per-thread read-before-write on identical bytes).  Anything
+// else fails safe to per-op emission.
+//
+// Launch-geometry contract: the executor derives geometry from the anchor's
+// opcode, so the anchor must be an element-per-thread pointwise operation.
+// This is why the RmsNorm family cannot HEAD a fused region here: its
+// one-block-per-row reduction structure is unreachable from a pointwise
+// anchor without O(columns) redundant work per thread, so such candidates
+// fail safe to per-op emission (recorded design boundary).
+// ---------------------------------------------------------------------------
+
+constexpr std::uint64_t kElementwiseFusionOptIn = 2U;
+
+bool elementwise_fusable(ir::Opcode opcode) {
+  switch (opcode) {
+  case ir::Opcode::Add:
+  case ir::Opcode::Multiply:
+  case ir::Opcode::SiLU:
+  case ir::Opcode::Clamp:
+  case ir::Opcode::Cast:
+  case ir::Opcode::BiasAdd:
+  case ir::Opcode::ResidualGate:
+  case ir::Opcode::SwiGlu:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Whether the operation reads this input slot at the same element index it
+// writes its output (SwiGlu remaps rows/columns; BiasAdd's bias broadcasts).
+bool elementwise_identity_slot(ir::Opcode opcode, std::size_t input_slot) {
+  if (opcode == ir::Opcode::SwiGlu)
+    return false;
+  if (opcode == ir::Opcode::BiasAdd)
+    return input_slot == 0U;
+  return true;
+}
+
+struct ElementwiseRegion {
+  const ir::Operation *anchor{};
+  std::vector<const ir::Operation *> members; // program order, anchor last
+  std::unordered_map<std::uint32_t, const ir::Operation *> produced_by;
+};
+
+std::unordered_map<std::uint32_t, ElementwiseRegion>
+find_elementwise_regions(const ir::Program &program,
+                         std::unordered_set<std::uint32_t> &skipped) {
+  std::unordered_map<std::uint32_t, const ir::Operation *> producer;
+  std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>>
+      consumers;
+  std::unordered_map<std::uint32_t, std::uint64_t> position;
+  bool streamed_program = false;
+  for (const auto &tensor : program.tensors)
+    if (tensor.has_role(ir::TensorRole::Streamed))
+      streamed_program = true;
+  for (std::uint64_t index = 0; index < program.operations.size(); ++index) {
+    const auto &operation =
+        program.operations[static_cast<std::size_t>(index)];
+    position.emplace(operation.id, index);
+    for (const auto output : operation.outputs)
+      producer.emplace(output, &operation);
+    for (const auto input : operation.inputs)
+      consumers[input].push_back(&operation);
+  }
+  const auto eligible = [&](const ir::Operation &operation) {
+    return elementwise_fusable(operation.opcode) &&
+           operation.u64(ir::AttrKey::Implementation, 1U) ==
+               kElementwiseFusionOptIn &&
+           !skipped.contains(operation.id) && operation.outputs.size() == 1U;
+  };
+  // Merge edge P -> C: P's single output is a role-free internal value with
+  // exactly one consumer, and both operations opted in.
+  std::unordered_map<std::uint32_t, const ir::Operation *> merge_consumer;
+  for (const auto &operation : program.operations) {
+    if (!eligible(operation))
+      continue;
+    const auto output = operation.outputs[0];
+    const auto &uses = consumers[output];
+    if (program.tensor(output)->roles != 0U || uses.size() != 1U ||
+        !eligible(*uses.front()))
+      continue;
+    merge_consumer.emplace(operation.id, uses.front());
+  }
+  std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>> groups;
+  for (const auto &operation : program.operations) {
+    if (!eligible(operation))
+      continue;
+    const auto *terminal = &operation;
+    while (true) {
+      const auto next = merge_consumer.find(terminal->id);
+      if (next == merge_consumer.end())
+        break;
+      terminal = next->second;
+    }
+    groups[terminal->id].push_back(&operation);
+  }
+
+  std::unordered_map<std::uint32_t, ElementwiseRegion> regions;
+  // Deterministic acceptance order: iterate terminals in program order.
+  std::vector<std::uint32_t> terminals;
+  terminals.reserve(groups.size());
+  for (const auto &[terminal_id, members] : groups)
+    if (members.size() >= 2U)
+      terminals.push_back(terminal_id);
+  std::sort(terminals.begin(), terminals.end(),
+            [&](std::uint32_t a, std::uint32_t b) {
+              return position.at(a) < position.at(b);
+            });
+  for (const auto terminal_id : terminals) {
+    auto members = groups.at(terminal_id);
+    std::sort(members.begin(), members.end(),
+              [&](const ir::Operation *a, const ir::Operation *b) {
+                return position.at(a->id) < position.at(b->id);
+              });
+    const auto *anchor = members.back();
+    if (anchor->id != terminal_id)
+      continue; // defensive: the terminal must be last in program order
+    const auto anchor_position = position.at(anchor->id);
+    const auto *anchor_output = program.tensor(anchor->outputs[0]);
+    std::unordered_set<std::uint32_t> in_region;
+    for (const auto *member : members)
+      in_region.insert(member->id);
+    // Identity-index propagation from the anchor toward producers.
+    std::unordered_map<std::uint32_t, bool> identity;
+    identity.emplace(anchor->id, true);
+    for (auto it = members.rbegin(); it != members.rend(); ++it) {
+      const auto *member = *it;
+      const auto member_identity = identity.at(member->id);
+      for (std::size_t slot = 0; slot < member->inputs.size(); ++slot) {
+        const auto found = producer.find(member->inputs[slot]);
+        if (found == producer.end() ||
+            !in_region.contains(found->second->id))
+          continue;
+        identity.emplace(found->second->id,
+                         member_identity &&
+                             elementwise_identity_slot(member->opcode, slot));
+      }
+    }
+    // External inputs and how they are read.
+    std::vector<std::uint32_t> external_order;
+    std::unordered_map<std::uint32_t, bool> external_identity;
+    bool eligible_region = true;
+    for (const auto *member : members) {
+      for (std::size_t slot = 0; slot < member->inputs.size(); ++slot) {
+        const auto input = member->inputs[slot];
+        const auto found = producer.find(input);
+        if (found != producer.end() &&
+            in_region.contains(found->second->id))
+          continue;
+        if (found != producer.end() && skipped.contains(found->second->id)) {
+          eligible_region = false; // produced by another lowering's interior
+          break;
+        }
+        const bool read_identity =
+            identity.at(member->id) &&
+            elementwise_identity_slot(member->opcode, slot);
+        const auto emplaced = external_identity.emplace(input, read_identity);
+        if (emplaced.second)
+          external_order.push_back(input);
+        else
+          emplaced.first->second = emplaced.first->second && read_identity;
+      }
+      if (!eligible_region)
+        break;
+    }
+    // The executor marshals launch arguments into a fixed 16-pointer array
+    // (launch_inputs plus the anchor's one output).
+    if (!eligible_region || external_order.size() > 15U)
+      continue;
+    const auto dedicated = [](const ir::TensorDesc &tensor) {
+      return tensor.has_role(ir::TensorRole::Input) ||
+             tensor.has_role(ir::TensorRole::Output) ||
+             (tensor.has_role(ir::TensorRole::Constant) &&
+              !tensor.has_role(ir::TensorRole::Streamed));
+    };
+    const auto align256 = [](std::uint64_t bytes) {
+      return (bytes + 255U) & ~static_cast<std::uint64_t>(255U);
+    };
+    const bool contiguous = anchor_position -
+                                position.at(members.front()->id) + 1U ==
+                            members.size();
+    for (const auto input : external_order) {
+      const auto *description = program.tensor(input);
+      if (dedicated(*description))
+        continue;
+      std::uint64_t last_use = 0U;
+      for (const auto *use : consumers[input])
+        last_use = std::max(last_use, position.at(use->id));
+      if (last_use >= anchor_position)
+        continue; // live at the anchor: the planner keeps its slot
+      if (streamed_program || !contiguous) {
+        eligible_region = false;
+        break;
+      }
+      if (align256(description->byte_count()) <
+          align256(anchor_output->byte_count()))
+        continue; // slot too small for the planner to hand to the output
+      if (dedicated(*anchor_output))
+        continue; // nothing writes the dead slot before the anchor
+      if (external_identity.at(input) &&
+          description->element_count() == anchor_output->element_count() &&
+          ir::dtype_size(description->dtype) ==
+              ir::dtype_size(anchor_output->dtype))
+        continue; // per-thread read-before-write on identical bytes
+      eligible_region = false;
+      break;
+    }
+    if (!eligible_region)
+      continue;
+    ElementwiseRegion region;
+    region.anchor = anchor;
+    region.members = members;
+    for (const auto *member : members) {
+      if (member == anchor)
+        continue;
+      region.produced_by.emplace(member->outputs[0], member);
+      skipped.insert(member->id);
+    }
+    regions.emplace(anchor->id, std::move(region));
+  }
+  return regions;
+}
+
+const char *typed_round(ir::DType dtype) {
+  if (dtype == ir::DType::F32)
+    return "dif_round_f32";
+  if (dtype == ir::DType::BF16)
+    return "dif_round_bf16";
+  if (dtype == ir::DType::F16)
+    return "dif_round_f16";
+  fail("CUDA elementwise fusion admits f32, bf16, or f16 storage");
+}
+
+std::string formatted_float(double value) {
+  std::ostringstream text;
+  text << std::scientific << std::setprecision(9)
+       << static_cast<float>(value) << "f";
+  return text.str();
+}
+
+struct ElementwiseFusionEmitter {
+  ElementwiseFusionEmitter(const ir::Program &program_reference,
+                           const ElementwiseRegion &region_reference)
+      : program(program_reference), region(region_reference) {}
+
+  const ir::Program &program;
+  const ElementwiseRegion &region;
+  std::ostringstream body;
+  std::vector<std::uint32_t> arguments;
+  std::unordered_map<std::uint32_t, std::size_t> argument_index;
+  std::unordered_map<std::string, std::string> stage_variables;
+  std::unordered_map<std::string, std::pair<std::string, std::string>>
+      row_variables;
+  std::size_t next_variable{};
+
+  std::string argument(std::uint32_t tensor) {
+    auto found = argument_index.find(tensor);
+    if (found == argument_index.end()) {
+      found = argument_index.emplace(tensor, arguments.size()).first;
+      arguments.push_back(tensor);
+    }
+    return "a" + std::to_string(found->second);
+  }
+
+  std::string value(std::uint32_t tensor, const std::string &index) {
+    const auto member = region.produced_by.find(tensor);
+    if (member == region.produced_by.end())
+      return std::string(typed_load(program.tensor(tensor)->dtype)) + "(" +
+             argument(tensor) + "," + index + ")";
+    return stage(*member->second, index);
+  }
+
+  // A rounded, barriered stage value: the in-register equivalent of the
+  // unfused kernel's store followed by the consumer's load.  The barrier
+  // pins the rounded value so FMA contraction cannot cross the boundary.
+  std::string stage(const ir::Operation &op, const std::string &index) {
+    const auto key = std::to_string(op.id) + "|" + index;
+    const auto found = stage_variables.find(key);
+    if (found != stage_variables.end())
+      return found->second;
+    const auto expression = stage_expression(op, index);
+    const auto name = "s" + std::to_string(next_variable++);
+    body << "float " << name << "="
+         << typed_round(program.tensor(op.outputs[0])->dtype) << "("
+         << expression << ");asm(\"\" : \"+f\"(" << name << "));";
+    stage_variables.emplace(key, name);
+    return name;
+  }
+
+  std::pair<std::string, std::string> row_column(const ir::Operation &op,
+                                                 const std::string &index,
+                                                 std::uint64_t width) {
+    const auto key = std::to_string(op.id) + "|" + index;
+    auto found = row_variables.find(key);
+    if (found == row_variables.end()) {
+      const auto suffix = std::to_string(next_variable++);
+      const auto row = "r" + suffix;
+      const auto column = "c" + suffix;
+      body << "unsigned long long " << row << "=(" << index << ")/" << width
+           << "ULL," << column << "=(" << index << ")%" << width << "ULL;";
+      found = row_variables.emplace(key, std::make_pair(row, column)).first;
+    }
+    return found->second;
+  }
+
+  // The unrounded value the unfused kernel would pass to dif_store,
+  // structurally mirroring each per-op emitter (same operand order, same
+  // interior dif_round placement) so intra-stage codegen matches.  Operands
+  // are evaluated into locals in input-slot order so argument registration
+  // (and therefore launch_inputs and the generated source) is deterministic.
+  //
+  // Boundary-contraction rule: FMA contraction merges a multiply into the
+  // add that consumes it.  A stage whose TOP-LEVEL operation is a bare
+  // multiply (Multiply, SwiGlu) is a lone rn-rounded FMUL in the unfused
+  // kernel, so it is emitted through __fmul_rn -- bit-identical to that
+  // FMUL and guaranteed never contracted into the consumer's add (ptxas
+  // eliminated a mul.rn-by-1.0 barrier and contracted anyway; measured by
+  // the multiply->add byte gate).  Add-topped stages cannot fuse outward
+  // (there is no add->mul or add->add fusion), and interior expression
+  // trees are left verbatim so intra-stage contraction stays identical to
+  // the unfused kernels (e.g. ResidualGate's gate*branch may fuse with its
+  // own residual add on BOTH sides).
+  std::string stage_expression(const ir::Operation &op,
+                               const std::string &index) {
+    const auto *output = program.tensor(op.outputs[0]);
+    switch (op.opcode) {
+    case ir::Opcode::Add: {
+      const auto left = value(op.inputs[0], index);
+      const auto right = value(op.inputs[1], index);
+      return left + "+" + right;
+    }
+    case ir::Opcode::Multiply: {
+      const auto left = value(op.inputs[0], index);
+      const auto right = value(op.inputs[1], index);
+      return "__fmul_rn(" + left + "," + right + ")";
+    }
+    case ir::Opcode::SiLU:
+      return "dif_silu(" + value(op.inputs[0], index) + ")";
+    case ir::Opcode::Cast:
+      return value(op.inputs[0], index);
+    case ir::Opcode::Clamp:
+      return "fminf(" + formatted_float(op.f64(ir::AttrKey::Upper, 1.0)) +
+             ",fmaxf(" + formatted_float(op.f64(ir::AttrKey::Lower, 0.0)) +
+             "," + value(op.inputs[0], index) + "))";
+    case ir::Opcode::BiasAdd: {
+      const auto width = program.tensor(op.inputs[1])->dims[0];
+      const auto left = value(op.inputs[0], index);
+      const auto right =
+          value(op.inputs[1], "(" + index + ")%" + std::to_string(width) +
+                                  "ULL");
+      return left + "+" + right;
+    }
+    case ir::Opcode::ResidualGate: {
+      const auto residual = value(op.inputs[0], index);
+      const auto branch = value(op.inputs[1], index);
+      const auto gate = value(op.inputs[2], index);
+      return residual + "+" + std::string(typed_round(output->dtype)) + "(" +
+             gate + "*" + branch + ")";
+    }
+    case ir::Opcode::SwiGlu: {
+      const auto width = output->dims.back();
+      const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
+      const auto [row, column] = row_column(op, index, width);
+      const auto lane = [&](std::uint64_t offset) {
+        return row + "*" + std::to_string(width * 2U) + "ULL+" +
+               std::to_string(offset) + "ULL+" + column;
+      };
+      const auto value_lane =
+          value(op.inputs[0], lane(gate_first ? width : 0U));
+      const auto gate_lane =
+          value(op.inputs[0], lane(gate_first ? 0U : width));
+      return "__fmul_rn(" + value_lane + "," +
+             std::string(typed_round(output->dtype)) + "(dif_silu(" +
+             gate_lane + ")))";
+    }
+    default:
+      fail("elementwise fusion emitter received an unsupported opcode");
+    }
+  }
+};
+
+void emit_fused_elementwise(std::ostringstream &out,
+                            const ir::Program &program,
+                            const ElementwiseRegion &region,
+                            std::vector<std::uint32_t> &launch_arguments) {
+  ElementwiseFusionEmitter emitter(program, region);
+  const auto *output = program.tensor(region.anchor->outputs[0]);
+  const auto terminal = emitter.stage_expression(*region.anchor, "i");
+  out << "extern \"C\" __global__ void " << function_name(*region.anchor)
+      << "(";
+  for (std::size_t argument = 0; argument < emitter.arguments.size();
+       ++argument)
+    out << "const "
+        << typed_scalar(program.tensor(emitter.arguments[argument])->dtype)
+        << "* a" << argument << ",";
+  out << typed_scalar(output->dtype)
+      << "* y){unsigned long long i=(unsigned long long)blockIdx.x*"
+         "blockDim.x+threadIdx.x;if(i<"
+      << output->element_count() << "ULL){" << emitter.body.str()
+      << typed_store(output->dtype) << "(y,i," << terminal << ");}}\n";
+  launch_arguments = emitter.arguments;
+}
+
 } // namespace
 
 GeneratedCuda emit_cuda(const ir::Program &program) {
@@ -1597,6 +2038,8 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
   }
   emit_header(source);
   auto fusions = find_lowbit_linear_fusions(program, generated.skipped_operations);
+  const auto elementwise_regions =
+      find_elementwise_regions(program, generated.skipped_operations);
   for (const auto &op : program.operations) {
     if (generated.skipped_operations.contains(op.id))
       continue;
@@ -1623,6 +2066,14 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
         (op.opcode == ir::Opcode::Attention &&
          op.u64(ir::AttrKey::Implementation, 1U) == 2U))
       continue;
+    if (const auto region = elementwise_regions.find(op.id);
+        region != elementwise_regions.end()) {
+      generated.entrypoints.emplace(op.id, function_name(op));
+      std::vector<std::uint32_t> arguments;
+      emit_fused_elementwise(source, program, region->second, arguments);
+      generated.launch_inputs.emplace(op.id, std::move(arguments));
+      continue;
+    }
     generated.entrypoints.emplace(op.id, function_name(op));
     if (op.opcode == ir::Opcode::Cast) {
       emit_cast(source, program, op);
@@ -1773,6 +2224,20 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
   }
   generated.source = source.str();
   return generated;
+}
+
+ElementwiseFusionCensus
+census_elementwise_fusion(const ir::Program &program) {
+  ir::verify(program);
+  std::unordered_set<std::uint32_t> skipped;
+  find_lowbit_linear_fusions(program, skipped);
+  const auto regions = find_elementwise_regions(program, skipped);
+  ElementwiseFusionCensus census;
+  census.regions = regions.size();
+  for (const auto &[anchor, region] : regions)
+    census.fused_operations += region.members.size();
+  census.eliminated_launches = census.fused_operations - census.regions;
+  return census;
 }
 
 } // namespace dif::compiler
