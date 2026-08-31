@@ -150,9 +150,14 @@ Removal order (S/M/L/XL = effort):
    existing evidence only).
 4. L — native BigVGAN audio decode as a DiffIR program (conv + snake +
    upsample; weights `audio_vae/model.safetensors`).
-5. XL — native tokenizer (BPE over checkpoint `processor/tokenizer.json`)
-   + Qwen3-VL-32B hidden-layer-50 conditioner as a streamed DiffIR
-   program (MRoPE collapses to 1-D for all-text prompts). Long pole.
+5. XL — native tokenizer + Qwen3-VL-32B conditioner. TOKENIZER HALF DONE
+   (2026-08-31, merged db56584): native Qwen BPE reproduces the golden
+   439 tokens and a 3,564-case oracle battery with 0 mismatches
+   (dif_tokenizer_tests; note the 7 config-only special tokens —
+   bare tokenizer.json is NOT the H3 tokenizer). Conditioner: build plan
+   at docs/QWEN3VL_CONDITIONER_PLAN.md — single IR gap = GQA; decision:
+   KvHeads attr on Attention (cuDNN native), after w2-backward merges.
+   BigVGAN plan: docs/BIGVGAN_DECODE_PLAN.md (two new opcodes).
 6. Declare ffmpeg retained for mux (recommended) — external native binary,
    no torch/python.
 
