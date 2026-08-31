@@ -186,7 +186,8 @@ Ownership is per-file-region to avoid collisions; agents work in
 worktrees; one integrator merges; one GPU-heavy test owner at a time;
 compile parallelism bounded (machine: 12 CPU, 62 GiB, one RTX 3090 Ti).
 
-**Wave 1 (in flight):**
+**Wave 1 (in flight — worktrees /home/alex/dc-w1-{runtime,training,lora,deps},
+branches w1-* cut from 5eb5f13; GPU tests serialized on /tmp/dc-gpu.lock):**
 - W1-R "runtime-streaming": overhaul streamed-weight pipeline (drop
   DONTNEED between iterations, stage-once policy knobs, deeper prefetch,
   threaded staging, tail H2D onto copy stream) + arena allocator behind
