@@ -9,10 +9,13 @@
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
+#include "dif/support/json.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,7 +37,9 @@ void usage() {
                "      swiglu_gatefirst | swiglu_valuefirst | residual_gate |"
                " layer_norm |\n"
                "      qk_norm_rope_fulltable | qk_norm_rope_halftable |\n"
-               "      attention_full | attention_causal\n";
+               "      attention_full | attention_causal |\n"
+               "      attention_gqa<H>x<KvH>[_causal]\n"
+               "Semantic attributes are read from FIXTURE/attrs.json.\n";
 }
 
 struct Builder {
@@ -82,7 +87,29 @@ struct Builder {
   const dif::ir::TensorDesc &describe(std::uint32_t id) {
     return *program.tensor(id);
   }
+
+  // Semantic attributes come from the fixture's own attrs.json, never from
+  // the case name.  `causal` is not derivable from the tensor shapes, so a
+  // name-sniffed flag can silently build the wrong program (it did: the
+  // causal 64/8 GQA fixture was run non-causally until 2026-08-31).  A
+  // missing file or key is a hard failure, not a default.
+  dif::json::Value attributes() {
+    std::ifstream stream(fixture / "attrs.json");
+    if (!stream)
+      dif::fail("fixture is missing attrs.json: " +
+                (fixture / "attrs.json").string());
+    std::stringstream buffer;
+    buffer << stream.rdbuf();
+    return dif::json::parse(buffer.str());
+  }
 };
+
+bool required_boolean(const dif::json::Value &attributes, const char *key) {
+  const auto *value = attributes.find(key);
+  if (value == nullptr)
+    dif::fail(std::string("fixture attrs.json is missing ") + key);
+  return value->boolean();
+}
 
 constexpr double kEpsilon = 1.0e-5;
 
@@ -191,29 +218,45 @@ Builder build_case(const Arguments &arguments) {
                       {epsilon, Attribute::u64(AttrKey::RotaryDim, rotary)});
     return builder;
   }
-  if (name == "attention_full" || name == "attention_causal") {
-    const bool causal = name == "attention_causal";
+  if (name.rfind("attention_", 0U) == 0U) {
+    const bool causal = required_boolean(builder.attributes(), "causal");
     const auto grad_output = builder.input("grad-output");
     const auto q = builder.input("q");
     const auto k = builder.input("k");
     const auto v = builder.input("v");
     const auto &q_description = builder.describe(q);
+    const auto &k_description = builder.describe(k);
     const auto dtype = q_description.dtype;
     const auto dims = q_description.dims;
-    const auto forward_output = builder.internal(dtype, dims);
+    const auto kv_dims = k_description.dims;
+    const bool grouped = kv_dims[1] != dims[1];
+    // KvHeads is derived from the fixture k tensor (unambiguous) and
+    // cross-checked against the fixture's declaration when it carries one,
+    // so a fixture/program disagreement fails closed here rather than
+    // producing a silently different comparison.
+    if (const auto *declared = builder.attributes().find("kv_heads");
+        declared != nullptr &&
+        static_cast<std::uint64_t>(declared->number()) != kv_dims[1])
+      dif::fail("fixture attrs.json kv_heads does not match the k tensor "
+                "head count");
+    std::vector<Attribute> attributes{
+        Attribute::boolean(AttrKey::Causal, causal)};
+    if (grouped)
+      attributes.push_back(Attribute::u64(AttrKey::KvHeads, kv_dims[1]));
+    const auto forward_output =
+        grouped ? builder.output("output", dtype, dims)
+                : builder.internal(dtype, dims);
     const auto lse = builder.internal(dif::ir::DType::F32,
                                       {dims[0], dims[1]});
     const auto grad_q = builder.output("q", dtype, dims);
-    const auto grad_k = builder.output("k", dtype, dims);
-    const auto grad_v = builder.output("v", dtype, dims);
-    const auto causal_attribute = Attribute::boolean(AttrKey::Causal, causal);
+    const auto grad_k = builder.output("k", dtype, kv_dims);
+    const auto grad_v = builder.output("v", dtype, kv_dims);
     builder.operation(Opcode::Attention, {q, k, v}, {forward_output},
-                      {causal_attribute});
-    builder.operation(Opcode::AttentionLse, {q, k}, {lse},
-                      {causal_attribute});
+                      attributes);
+    builder.operation(Opcode::AttentionLse, {q, k}, {lse}, attributes);
     builder.operation(Opcode::AttentionBackward,
                       {grad_output, q, k, v, forward_output, lse},
-                      {grad_q, grad_k, grad_v}, {causal_attribute});
+                      {grad_q, grad_k, grad_v}, attributes);
     return builder;
   }
   usage();
