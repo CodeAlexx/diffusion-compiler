@@ -243,7 +243,21 @@ branches w1-* cut from 5eb5f13; GPU tests serialized on /tmp/dc-gpu.lock):**
   (deferred). Warm-cache boundary: measured wins should grow on the >RAM H3
   checkpoint case — unmeasured, needs an H3-scale rerun decision.
 
-**Wave 2 (in flight):** w2-backward (DiT backward-opcode set + composed-block gate) and w3-conditioner (native tokenizer + Qwen3-VL conditioner plan) are running. Queued: W8A8-nondeterminism root-cause (reproducer in gate-w1r/), arena consolidation, backward opcodes for the DiT set (flame equations + torch
+**Wave 2 landed (2026-08-31):**
+- w2-backward MERGED — DiT backward opcodes 39-46 PROVEN (FD gradchecks;
+  104/104 per-op torch fixtures; composed 2-block 322/322 and 4-block
+  642/642 hundred-step AdamW training gates vs PyTorch on CPU+CUDA; depth
+  measurement: param drift 1.8e-6 -> 2.4e-4 from 2 to 4 blocks — bars frozen
+  from 4-block worst; docs/DIT_BACKWARD_GATE_2026-08-31.md). Includes a
+  Linear-backward flatten-form primitive fix. Recorded exceptions: OpenCL
+  carries fail-closed arms only for the new ops; decomposed AttentionBackward
+  is a correctness reference, not a perf path (cuDNN SDPA bwd = Wave 3).
+- w3-conditioner MERGED — native tokenizer PROVEN (439-token golden gate,
+  0/3564 oracle mismatches); conditioner plan committed, single gap = GQA
+  (decision: KvHeads attr on Attention).
+- In flight: W8A8-nondeterminism root-cause + arena (w2-runtime branch).
+  Remaining Wave-2 queue: fused elementwise regions, cuBLASLt epilogues +
+  heuristic persistence, grad clipping, EMA wiring, IR generality ops for the DiT set (flame equations + torch
 fixtures); fused elementwise region emission via skipped_operations;
 cuBLASLt epilogue extension + heuristic persistence; grad clipping; EMA
 wiring; IR generality ops (DeinterleaveGroups, ReshapeView, Transpose,
