@@ -11,6 +11,7 @@
 !/docs/H3_NATURAL_LANGUAGE_QUALITY_GATE_2026-08-30.md
 !/docs/FLAME_CPP_RUNTIME_PORT.md
 !/docs/FLAME_PORT_SOURCE_NOTES.md
+!/docs/RUNTIME_MODULES.md
 *.log
 *.safetensors
 *.ckpt
