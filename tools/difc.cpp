@@ -1,3 +1,4 @@
+#include "dif/compiler/compiler.hpp"
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/frontend/h3.hpp"
@@ -6,6 +7,7 @@
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
@@ -357,6 +359,7 @@ void usage() {
             << "  difc set-linear-math IN.difir OUT.difir "
                "strict|tf32|direct-int5\n"
             << "  difc set-attention-implementation IN.difir OUT.difir generated|cudnn\n"
+            << "  difc set-elementwise-fusion IN.difir OUT.difir on|off\n"
             << "  difc set-constant-residency IN.difir OUT.difir resident|streamed\n"
             << "  difc expose-tensors IN.difir OUT.difir ID [ID ...]\n"
             << "  difc verify FILE.difir\n"
@@ -759,6 +762,61 @@ int main(int argc, char **argv) {
       std::cout << "PROGRAM path=" << argv[3]
                 << " attention_implementation=" << mode
                 << " attention_ops=" << changed << " fingerprint="
+                << dif::hex_digest(dif::ir::fingerprint(program)) << "\n";
+      return 0;
+    }
+    if (command == "set-elementwise-fusion" && argc == 5) {
+      auto program = dif::ir::read_file(argv[2]);
+      const std::string mode = argv[4];
+      if (mode != "on" && mode != "off")
+        dif::fail("elementwise fusion mode must be on or off");
+      const auto fusable = [](dif::ir::Opcode opcode) {
+        using dif::ir::Opcode;
+        return opcode == Opcode::Add || opcode == Opcode::Multiply ||
+               opcode == Opcode::SiLU || opcode == Opcode::Clamp ||
+               opcode == Opcode::Cast || opcode == Opcode::BiasAdd ||
+               opcode == Opcode::ResidualGate || opcode == Opcode::SwiGlu;
+      };
+      std::size_t family = 0;
+      std::size_t changed = 0;
+      for (auto &operation : program.operations) {
+        if (!fusable(operation.opcode))
+          continue;
+        ++family;
+        auto *attribute = const_cast<dif::ir::Attribute *>(
+            operation.find(dif::ir::AttrKey::Implementation));
+        if (mode == "on") {
+          if (attribute)
+            *attribute = dif::ir::Attribute::u64(
+                dif::ir::AttrKey::Implementation, 2U);
+          else
+            operation.attributes.push_back(dif::ir::Attribute::u64(
+                dif::ir::AttrKey::Implementation, 2U));
+          ++changed;
+        } else if (attribute) {
+          auto &attributes = operation.attributes;
+          attributes.erase(
+              std::remove_if(attributes.begin(), attributes.end(),
+                             [](const dif::ir::Attribute &value) {
+                               return value.key ==
+                                      dif::ir::AttrKey::Implementation;
+                             }),
+              attributes.end());
+          ++changed;
+        }
+      }
+      if (family == 0U)
+        dif::fail("program contains no elementwise-fusable operations");
+      dif::ir::verify(program);
+      const auto census = dif::compiler::census_elementwise_fusion(program);
+      dif::ir::write_file(program, argv[3]);
+      std::cout << "PROGRAM path=" << argv[3]
+                << " elementwise_fusion=" << mode
+                << " stamped_ops=" << changed
+                << " regions=" << census.regions
+                << " fused_ops=" << census.fused_operations
+                << " eliminated_launches=" << census.eliminated_launches
+                << " fingerprint="
                 << dif::hex_digest(dif::ir::fingerprint(program)) << "\n";
       return 0;
     }
