@@ -6,9 +6,13 @@
 #
 # usage: bash tools/run_audio_stage_parity_gate.sh WORKDIR [--measure]
 #
-# Bars: PROVISIONAL from the plan (per-stage rel-L2 <= 5e-5,
-# cos >= 0.9999999, zero nonfinite) until the first recorded --measure run;
-# frozen with provenance afterwards, never lowered to pass.
+# Bars FROZEN after the recorded --measure run (2026-08-31, torch
+# 2.10.0+cu128 CPU oracle, real [584,32] rows, 9/9 boundaries, zero
+# nonfinite everywhere): worst rel-L2 1.97e-5 (stage3), worst cosine
+# 0.9999999998 (stage0..tail all >= 0.99999999980), worst max_abs 7.95e-4
+# (stage3, activation magnitudes), norm_ratio within 1 +/- 1.9e-7. The
+# plan's provisional bars (rel-L2 <= 5e-5, cos >= 0.9999999) hold with
+# >2.5x margin and are frozen as-is; never lowered to pass.
 set -euo pipefail
 
 WORKDIR="${1:?usage: run_audio_stage_parity_gate.sh WORKDIR [--measure]}"
@@ -59,7 +63,7 @@ for index in "${!BOUNDARIES[@]}"; do
     "$BUILD/difcompare" "$oracle" "$dir/actual.diftensor" --min-cos -1 \
       --max-rel-l2 1e9 --min-norm-ratio 0 --max-norm-ratio 1e9 || status=1
   else
-    # PROVISIONAL plan bars (see header).
+    # FROZEN bars (see header provenance).
     "$BUILD/difcompare" "$oracle" "$dir/actual.diftensor" \
       --min-cos 0.9999999 --max-rel-l2 5e-5 \
       --min-norm-ratio 0.9999 --max-norm-ratio 1.0001 || status=1
