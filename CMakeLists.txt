@@ -24,6 +24,7 @@ add_library(difcore
   src/frontend/h3_latents.cpp
   src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
+  src/frontend/h3_audio_vae.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
   src/frontend/lora.cpp

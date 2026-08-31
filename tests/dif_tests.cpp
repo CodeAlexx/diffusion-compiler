@@ -9,6 +9,7 @@
 #include "dif/frontend/h3_latents.hpp"
 #include "dif/frontend/h3_media.hpp"
 #include "dif/frontend/h3_vae.hpp"
+#include "dif/frontend/h3_audio_vae.hpp"
 #include "dif/frontend/training.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -2395,6 +2396,222 @@ void test_cuda_cutlass_linear_primitive() {
 
 } // namespace
 
+
+dif::ir::Program audio_conv_probe(bool transposed) {
+  using namespace dif::ir;
+  Program program;
+  program.tensors.push_back(
+      {1, DType::F32, static_cast<std::uint32_t>(TensorRole::Input),
+       {1, 4, 8}});
+  if (transposed)
+    program.tensors.push_back(
+        {2, DType::F32, static_cast<std::uint32_t>(TensorRole::Constant),
+         {4, 6, 4}});
+  else
+    program.tensors.push_back(
+        {2, DType::F32, static_cast<std::uint32_t>(TensorRole::Constant),
+         {6, 4, 3}});
+  program.tensors.push_back(
+      {3, DType::F32, static_cast<std::uint32_t>(TensorRole::Constant), {6}});
+  // plain: pad 1/1, stride 1, dilation 1, K=3 -> L_out = 8.
+  // transposed: padded 10, full = (10-1)*2+4 = 22, trim 3/3 -> L_out = 16.
+  program.tensors.push_back(
+      {4, DType::F32, static_cast<std::uint32_t>(TensorRole::Output),
+       {1, 6, transposed ? std::uint64_t{16} : std::uint64_t{8}}});
+  Operation op;
+  op.id = 1;
+  op.opcode = Opcode::Conv1d;
+  op.inputs = {1, 2, 3};
+  op.outputs = {4};
+  op.attributes.push_back(Attribute::u64(AttrKey::PadLeft, 1));
+  op.attributes.push_back(Attribute::u64(AttrKey::PadRight, 1));
+  if (transposed) {
+    op.attributes.push_back(Attribute::u64(AttrKey::Stride, 2));
+    op.attributes.push_back(Attribute::boolean(AttrKey::Transposed, true));
+    op.attributes.push_back(Attribute::u64(AttrKey::TrimLeft, 3));
+    op.attributes.push_back(Attribute::u64(AttrKey::TrimRight, 3));
+    op.attributes.push_back(Attribute::u64(AttrKey::PadMode, 1));
+  }
+  program.operations.push_back(op);
+  return program;
+}
+
+dif::ir::Program audio_snake_probe() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors.push_back(
+      {1, DType::F32, static_cast<std::uint32_t>(TensorRole::Input),
+       {1, 4, 8}});
+  program.tensors.push_back(
+      {2, DType::F32, static_cast<std::uint32_t>(TensorRole::Constant), {4}});
+  program.tensors.push_back(
+      {3, DType::F32, static_cast<std::uint32_t>(TensorRole::Constant), {4}});
+  program.tensors.push_back(
+      {4, DType::F32, static_cast<std::uint32_t>(TensorRole::Output),
+       {1, 4, 8}});
+  Operation op;
+  op.id = 1;
+  op.opcode = Opcode::SnakeBeta;
+  op.inputs = {1, 2, 3};
+  op.outputs = {4};
+  program.operations.push_back(op);
+  return program;
+}
+
+void expect_verifier_rejects(dif::ir::Program program, const char *message) {
+  bool rejected = false;
+  try {
+    dif::ir::verify(program);
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, message);
+}
+
+void test_audio_opcode_verifier_contract() {
+  using namespace dif::ir;
+  // Positive: both conv modes and snake_beta verify, and survive the codec.
+  for (const auto transposed : {false, true}) {
+    auto program = audio_conv_probe(transposed);
+    dif::ir::verify(program);
+    const auto decoded = dif::ir::decode(dif::ir::encode(program));
+    expect(decoded.operations.size() == 1 &&
+               decoded.operations[0].opcode == Opcode::Conv1d &&
+               decoded.operations[0].attributes.size() ==
+                   program.operations[0].attributes.size(),
+           "conv1d survives the DiffIR codec round-trip");
+  }
+  {
+    auto program = audio_snake_probe();
+    dif::ir::verify(program);
+    const auto decoded = dif::ir::decode(dif::ir::encode(program));
+    expect(decoded.operations.size() == 1 &&
+               decoded.operations[0].opcode == Opcode::SnakeBeta,
+           "snake_beta survives the DiffIR codec round-trip");
+  }
+
+  // The classic port bug, both directions: forward weight layout used in
+  // transposed mode and vice versa must be rejected fail-closed.
+  {
+    auto program = audio_conv_probe(false);
+    program.tensors[1].dims = {4, 6, 3};  // transposed layout in forward mode
+    program.tensors[3].dims = {1, 4, 8};
+    expect_verifier_rejects(std::move(program),
+                            "conv1d rejects transposed weight layout in "
+                            "forward mode");
+  }
+  {
+    auto program = audio_conv_probe(true);
+    program.tensors[1].dims = {6, 4, 4};  // forward layout in transposed mode
+    expect_verifier_rejects(std::move(program),
+                            "conv1d rejects forward weight layout in "
+                            "transposed mode");
+  }
+  {
+    auto program = audio_conv_probe(true);
+    program.operations[0].attributes.push_back(
+        Attribute::u64(AttrKey::Dilation, 3));
+    expect_verifier_rejects(std::move(program),
+                            "conv1d rejects dilation in transposed mode");
+  }
+  {
+    auto program = audio_conv_probe(false);
+    program.operations[0].attributes.push_back(
+        Attribute::u64(AttrKey::Groups, 3));
+    expect_verifier_rejects(std::move(program),
+                            "conv1d rejects groups not dividing channels");
+  }
+  {
+    auto program = audio_conv_probe(false);
+    program.operations[0].attributes.push_back(
+        Attribute::u64(AttrKey::TrimLeft, 1));
+    expect_verifier_rejects(std::move(program),
+                            "conv1d rejects trim outside transposed mode");
+  }
+  {
+    auto program = audio_conv_probe(false);
+    program.operations[0].attributes.push_back(
+        Attribute::u64(AttrKey::PadMode, 2));
+    expect_verifier_rejects(std::move(program),
+                            "conv1d rejects an unknown pad mode");
+  }
+  {
+    auto program = audio_conv_probe(false);
+    program.tensors[3].dims = {1, 6, 9};  // wrong L_out
+    expect_verifier_rejects(std::move(program),
+                            "conv1d rejects mismatched output length");
+  }
+  {
+    auto program = audio_conv_probe(false);
+    program.operations[0].attributes.push_back(
+        Attribute::u64(AttrKey::Stride, 0));
+    expect_verifier_rejects(std::move(program), "conv1d rejects stride zero");
+  }
+  {
+    auto program = audio_snake_probe();
+    program.tensors[1].dims = {5};
+    expect_verifier_rejects(std::move(program),
+                            "snake_beta rejects alpha not matching channels");
+  }
+  {
+    auto program = audio_snake_probe();
+    program.operations[0].attributes.push_back(
+        Attribute::f64(AttrKey::Epsilon, 0.0));
+    expect_verifier_rejects(std::move(program),
+                            "snake_beta rejects a non-positive epsilon");
+  }
+}
+
+
+void test_audio_bigvgan_frontend_contract() {
+  using namespace dif::frontend;
+  // Full program at the accepted geometry (B=2 stereo batch, T=292).
+  const auto build = build_audio_bigvgan_program(2U, 292U, 8U);
+  dif::ir::verify(build.program);
+  // Census derivation (docs/BIGVGAN_DECODE_PLAN.md §3): Conv1d = denorm 1 +
+  // dec_in_proj 1 + conv_pre 1 + 7 stages x (ups 1 + 3 blocks x 3 dilations
+  // x (2 alias-free resamplers x 2 + 2 convs) = 54) + post resamplers 2 +
+  // conv_post 1 = 391. SnakeBeta = 7 x 3 x 3 x 2 + activation_post = 127.
+  expect(build.conv1d_operations == 391U,
+         "audio frontend emits exactly 391 conv1d operations");
+  expect(build.snake_beta_operations == 127U,
+         "audio frontend emits exactly 127 snake_beta operations");
+  const auto *output = build.program.tensor(build.waveform_output_id);
+  expect(output && output->dims ==
+             std::vector<std::uint64_t>{2U, 1U, 292U * 800U},
+         "audio frontend output is [2,1,800*T]");
+  std::size_t conv_count = 0, snake_count = 0;
+  for (const auto &operation : build.program.operations) {
+    conv_count += operation.opcode == dif::ir::Opcode::Conv1d;
+    snake_count += operation.opcode == dif::ir::Opcode::SnakeBeta;
+  }
+  expect(conv_count == build.conv1d_operations &&
+             snake_count == build.snake_beta_operations,
+         "audio frontend census counters match the emitted program");
+  // Determinism: the same build twice encodes to identical bytes.
+  const auto second = build_audio_bigvgan_program(2U, 292U, 8U);
+  expect(dif::ir::encode(build.program) == dif::ir::encode(second.program),
+         "audio frontend build is deterministic");
+
+  // Truncated boundaries: pre (stages=0) and each stage keep verifying and
+  // land on the documented lengths (292 * prod(rates[:i])).
+  const std::vector<std::uint64_t> rates{5U, 5U, 2U, 2U, 2U, 2U, 2U};
+  std::uint64_t length = 292U;
+  for (std::uint64_t stages = 0U; stages <= 7U; ++stages) {
+    const auto truncated = build_audio_bigvgan_program(2U, 292U, stages);
+    dif::ir::verify(truncated.program);
+    const auto *boundary =
+        truncated.program.tensor(truncated.waveform_output_id);
+    const auto expected_channels =
+        stages == 0U ? 1024U : (1024U >> stages);
+    expect(boundary && boundary->dims ==
+               std::vector<std::uint64_t>{2U, expected_channels, length},
+           "audio frontend truncated boundary geometry");
+    if (stages < 7U)
+      length *= rates[stages];
+  }
+}
+
 int main() {
   test_sha256();
   test_json_parser();
@@ -2416,6 +2633,8 @@ int main() {
   test_h3_media_handoff();
   test_prepared_execution_reuses_constants();
   test_verifier_rejects_multiple_writers();
+  test_audio_opcode_verifier_contract();
+  test_audio_bigvgan_frontend_contract();
   test_attention_implementation_identity();
   test_h3_bf16_lowering_preserves_source_reduction_identity();
   test_h3_long_sequence_transformer_declares_backend_attention();
