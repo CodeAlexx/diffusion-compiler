@@ -25,6 +25,7 @@ add_library(difcore
   src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
   src/frontend/h3_audio_vae.cpp
+  src/frontend/qwen3vl_conditioner.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
   src/frontend/lora.cpp
@@ -182,6 +183,9 @@ target_link_libraries(difaudiodecode PRIVATE difcore)
 
 add_executable(difimport tools/difimport.cpp)
 target_link_libraries(difimport PRIVATE difcore)
+
+add_executable(difcondition tools/difcondition.cpp)
+target_link_libraries(difcondition PRIVATE difcore)
 
 add_executable(difmodcache tools/difmodcache.cpp)
 target_link_libraries(difmodcache PRIVATE difcore)
