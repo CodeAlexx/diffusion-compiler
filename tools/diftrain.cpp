@@ -132,6 +132,9 @@ recover_mlp_build(const dif::ir::Program &program) {
   config.input_width = features->dims[1];
   config.hidden_width = weight1->dims[0];
   config.output_width = weight2->dims[0];
+  // The features dtype carries the builder's compute dtype (F32 or BF16
+  // mixed precision); the fingerprint comparison below stays the authority.
+  config.compute_dtype = features->dtype;
   config.learning_rate =
       optimizer->f64(dif::ir::AttrKey::LearningRate, 1.0e-3);
   config.beta1 = optimizer->f64(dif::ir::AttrKey::Beta1, 0.9);

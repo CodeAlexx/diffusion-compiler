@@ -17,6 +17,12 @@ struct MlpTrainingConfig {
   double beta2{0.999};
   double epsilon{1.0e-8};
   double weight_decay{1.0e-2};
+  // Storage dtype for parameters and activations.  F32 keeps the historical
+  // graph byte-for-byte (fingerprint-stable).  BF16 builds the flame-style
+  // mixed-precision graph: BF16 storage crossing a Cast boundary into an
+  // F32 loss, BF16 gradients (F32 accumulation inside kernels), and F32
+  // optimizer moments.
+  ir::DType compute_dtype{ir::DType::F32};
 };
 
 struct OptimizerBinding {
