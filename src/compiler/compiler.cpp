@@ -332,28 +332,79 @@ void emit_silu(std::ostringstream &out, const ir::Program &program,
       << count << "ULL)dif_store(y,i,dif_silu(dif_load(x,i)));}\n";
 }
 
+// The training ops below may legally mix storage dtypes across their
+// arguments (e.g. BF16 prediction into an F32 loss, BF16 parameters with F32
+// moments), so they bypass the per-operation dif_load/dif_store macro system
+// and name the typed load/store helpers per argument.  All arithmetic stays
+// in F32 registers; rounding happens only at the typed store.
+const char *typed_scalar(ir::DType dtype) {
+  if (dtype == ir::DType::F32)
+    return "dif_f32";
+  if (dtype == ir::DType::BF16)
+    return "dif_bf16";
+  if (dtype == ir::DType::F16)
+    return "dif_f16";
+  fail("CUDA training emitter admits f32, bf16, or f16 storage");
+}
+
+const char *typed_load(ir::DType dtype) {
+  if (dtype == ir::DType::F32)
+    return "dif_load_f32";
+  if (dtype == ir::DType::BF16)
+    return "dif_load_bf16";
+  if (dtype == ir::DType::F16)
+    return "dif_load_f16";
+  fail("CUDA training emitter admits f32, bf16, or f16 storage");
+}
+
+const char *typed_store(ir::DType dtype) {
+  if (dtype == ir::DType::F32)
+    return "dif_store_f32";
+  if (dtype == ir::DType::BF16)
+    return "dif_store_bf16";
+  if (dtype == ir::DType::F16)
+    return "dif_store_f16";
+  fail("CUDA training emitter admits f32, bf16, or f16 storage");
+}
+
 void emit_mse_loss(std::ostringstream &out, const ir::Program &program,
                    const ir::Operation &op) {
-  const auto count = program.tensor(op.inputs[0])->element_count();
+  const auto *prediction = program.tensor(op.inputs[0]);
+  const auto *loss = program.tensor(op.outputs[0]);
+  const auto count = prediction->element_count();
+  const auto *scalar = typed_scalar(prediction->dtype);
+  const auto *load = typed_load(prediction->dtype);
   out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* prediction,const dif_scalar* target,dif_scalar* loss){"
+      << "(const " << scalar << "* prediction,const " << scalar
+      << "* target," << typed_scalar(loss->dtype) << "* loss){"
          "if(blockIdx.x==0U&&threadIdx.x==0U){float sum=0.0f;for(unsigned long long i=0ULL;i<"
       << count
-      << "ULL;++i){float d=dif_load(prediction,i)-dif_load(target,i);sum=fmaf(d,d,sum);}"
-         "dif_store(loss,0ULL,sum/"
-      << count << ".0f);}}\n";
+      << "ULL;++i){float d=" << load << "(prediction,i)-" << load
+      << "(target,i);sum=fmaf(d,d,sum);}" << typed_store(loss->dtype)
+      << "(loss,0ULL,sum/" << count << ".0f);}}\n";
 }
 
 void emit_mse_loss_backward(std::ostringstream &out,
                             const ir::Program &program,
                             const ir::Operation &op) {
-  const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto *prediction = program.tensor(op.inputs[0]);
+  const auto *grad_loss = program.tensor(op.inputs[2]);
+  const auto *grad_prediction = program.tensor(op.outputs[0]);
+  const auto count = grad_prediction->element_count();
+  const auto *scalar = typed_scalar(prediction->dtype);
+  const auto *load = typed_load(prediction->dtype);
   out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* prediction,const dif_scalar* target,const dif_scalar* grad_loss,dif_scalar* grad_prediction){"
+      << "(const " << scalar << "* prediction,const " << scalar
+      << "* target,const " << typed_scalar(grad_loss->dtype)
+      << "* grad_loss," << typed_scalar(grad_prediction->dtype)
+      << "* grad_prediction){"
          "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
       << count
-      << "ULL){float factor=2.0f*dif_load(grad_loss,0ULL)/" << count
-      << ".0f;dif_store(grad_prediction,i,(dif_load(prediction,i)-dif_load(target,i))*factor);}}\n";
+      << "ULL){float factor=2.0f*" << typed_load(grad_loss->dtype)
+      << "(grad_loss,0ULL)/" << count << ".0f;"
+      << typed_store(grad_prediction->dtype) << "(grad_prediction,i,("
+      << load << "(prediction,i)-" << load
+      << "(target,i))*factor);}}\n";
 }
 
 void emit_linear_backward_input(std::ostringstream &out,
@@ -423,6 +474,8 @@ void emit_silu_backward(std::ostringstream &out, const ir::Program &program,
 
 void emit_adamw_update(std::ostringstream &out, const ir::Program &program,
                        const ir::Operation &op) {
+  const auto *parameter = program.tensor(op.inputs[0]);
+  const auto *gradient = program.tensor(op.inputs[1]);
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto learning_rate =
       static_cast<float>(op.f64(ir::AttrKey::LearningRate, 1.0e-3));
@@ -431,20 +484,34 @@ void emit_adamw_update(std::ostringstream &out, const ir::Program &program,
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-8));
   const auto weight_decay =
       static_cast<float>(op.f64(ir::AttrKey::WeightDecay, 0.0));
+  // Parameter and gradient storage are typed independently (verifier admits
+  // F32/BF16 for each); moments are F32 always.  Every intermediate is an
+  // F32 register; the decoupled decay multiplies the parameter BEFORE the
+  // moment-based update is subtracted, and weight decay is never folded
+  // into the gradient ahead of the moment updates (flame's measured LoRA-A
+  // "unlearning" runaway).
+  const auto *parameter_scalar = typed_scalar(parameter->dtype);
   out << std::scientific << std::setprecision(9)
       << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* parameter,const dif_scalar* gradient,const dif_scalar* first,const dif_scalar* second,const int* completed_steps,dif_scalar* updated,dif_scalar* updated_first,dif_scalar* updated_second){"
+      << "(const " << parameter_scalar << "* parameter,const "
+      << typed_scalar(gradient->dtype)
+      << "* gradient,const dif_f32* first,const dif_f32* second,const int* completed_steps,"
+      << parameter_scalar
+      << "* updated,dif_f32* updated_first,dif_f32* updated_second){"
          "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
       << count << "ULL){float step=(float)(completed_steps[0]+1),beta1="
       << beta1 << "f,beta2=" << beta2
-      << "f;float grad=dif_load(gradient,i);float m=beta1*dif_load(first,i)+(1.0f-beta1)*grad;"
-         "float v=beta2*dif_load(second,i)+(1.0f-beta2)*grad*grad;float bias1=1.0f-powf(beta1,step);"
-         "float bias2_sqrt=sqrtf(1.0f-powf(beta2,step));float decayed=dif_load(parameter,i)*(1.0f-"
+      << "f;float grad=" << typed_load(gradient->dtype)
+      << "(gradient,i);float m=beta1*dif_load_f32(first,i)+(1.0f-beta1)*grad;"
+         "float v=beta2*dif_load_f32(second,i)+(1.0f-beta2)*grad*grad;float bias1=1.0f-powf(beta1,step);"
+         "float bias2_sqrt=sqrtf(1.0f-powf(beta2,step));float decayed="
+      << typed_load(parameter->dtype) << "(parameter,i)*(1.0f-"
       << learning_rate << "f*" << weight_decay
       << "f);float denominator=sqrtf(v)/bias2_sqrt+" << epsilon
       << "f;float value=decayed-(" << learning_rate
-      << "f/bias1)*m/denominator;dif_store(updated,i,value);dif_store(updated_first,i,m);"
-         "dif_store(updated_second,i,v);}}\n"
+      << "f/bias1)*m/denominator;" << typed_store(parameter->dtype)
+      << "(updated,i,value);dif_store_f32(updated_first,i,m);"
+         "dif_store_f32(updated_second,i,v);}}\n"
       << std::defaultfloat;
 }
 

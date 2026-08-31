@@ -46,6 +46,20 @@ void same_shape_dtype(const TensorDesc &a, const TensorDesc &b,
     fail("DiffIR op " + std::to_string(op.id) + " requires equal shape/dtype");
 }
 
+// Training kernels accumulate in F32 unconditionally (the flame dtype
+// contract: storage may be BF16/F16, opmath is F32).  An explicit
+// AccumulatorDType attribute is honored by requiring it to name F32; any
+// other requested accumulator is an unsupported semantic and fails closed.
+void check_accumulator_f32(const Operation &op) {
+  const auto *attribute = op.find(AttrKey::AccumulatorDType);
+  if (attribute == nullptr)
+    return;
+  if (attribute->kind != AttrKind::U64 ||
+      attribute->bits != static_cast<std::uint64_t>(DType::F32))
+    fail("DiffIR op " + std::to_string(op.id) +
+         " requests a non-F32 accumulator; training ops accumulate in F32");
+}
+
 const TensorDesc &tensor_or_fail(const Program &program, std::uint32_t id,
                                  const Operation &op) {
   const auto *tensor = program.tensor(id);
@@ -152,9 +166,10 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &target = tensor_or_fail(program, op.inputs[1], op);
     const auto &loss = tensor_or_fail(program, op.outputs[0], op);
     same_shape_dtype(prediction, target, op);
-    if (prediction.dtype != DType::F32 || loss.dtype != DType::F32 ||
+    check_accumulator_f32(op);
+    if (!supported_float(prediction.dtype) || loss.dtype != DType::F32 ||
         loss.dims != std::vector<std::uint64_t>{1U})
-      fail("mse_loss requires equal F32 inputs and F32[1] output");
+      fail("mse_loss requires equal float inputs and an F32[1] output");
     return;
   }
 
@@ -166,9 +181,11 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_prediction = tensor_or_fail(program, op.outputs[0], op);
     same_shape_dtype(prediction, target, op);
     same_shape_dtype(prediction, grad_prediction, op);
-    if (prediction.dtype != DType::F32 || grad_loss.dtype != DType::F32 ||
+    check_accumulator_f32(op);
+    if (!supported_float(prediction.dtype) ||
+        grad_loss.dtype != DType::F32 ||
         grad_loss.dims != std::vector<std::uint64_t>{1U})
-      fail("mse_loss_backward requires F32 tensors and F32[1] grad_loss");
+      fail("mse_loss_backward requires float tensors and F32[1] grad_loss");
     return;
   }
 
@@ -177,15 +194,17 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
     const auto &weight = tensor_or_fail(program, op.inputs[1], op);
     const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
-    if (grad_output.dtype != DType::F32 || weight.dtype != DType::F32 ||
-        grad_input.dtype != DType::F32 || grad_output.dims.empty() ||
+    check_accumulator_f32(op);
+    if (!supported_float(grad_output.dtype) ||
+        weight.dtype != grad_output.dtype ||
+        grad_input.dtype != grad_output.dtype || grad_output.dims.empty() ||
         grad_input.dims.empty() || weight.dims.size() != 2U ||
         grad_output.dims.size() != grad_input.dims.size() ||
         !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
                     grad_input.dims.begin()) ||
         grad_output.dims.back() != weight.dims[0] ||
         grad_input.dims.back() != weight.dims[1])
-      fail("linear_backward_input has incompatible F32 shapes");
+      fail("linear_backward_input has incompatible float shapes");
     return;
   }
 
@@ -194,15 +213,17 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
     const auto &input = tensor_or_fail(program, op.inputs[1], op);
     const auto &grad_weight = tensor_or_fail(program, op.outputs[0], op);
-    if (grad_output.dtype != DType::F32 || input.dtype != DType::F32 ||
-        grad_weight.dtype != DType::F32 || grad_output.dims.empty() ||
+    check_accumulator_f32(op);
+    if (!supported_float(grad_output.dtype) ||
+        input.dtype != grad_output.dtype ||
+        grad_weight.dtype != grad_output.dtype || grad_output.dims.empty() ||
         input.dims.empty() || grad_weight.dims.size() != 2U ||
         grad_output.dims.size() != input.dims.size() ||
         !std::equal(grad_output.dims.begin(), grad_output.dims.end() - 1,
                     input.dims.begin()) ||
         grad_weight.dims[0] != grad_output.dims.back() ||
         grad_weight.dims[1] != input.dims.back())
-      fail("linear_backward_weight has incompatible F32 shapes");
+      fail("linear_backward_weight has incompatible float shapes");
     return;
   }
 
@@ -210,10 +231,12 @@ void verify_operation(const Program &program, const Operation &op) {
     expect_counts(op, 1, 1);
     const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
     const auto &grad_bias = tensor_or_fail(program, op.outputs[0], op);
-    if (grad_output.dtype != DType::F32 || grad_output.dims.empty() ||
-        grad_bias.dtype != DType::F32 || grad_bias.dims.size() != 1U ||
+    check_accumulator_f32(op);
+    if (!supported_float(grad_output.dtype) || grad_output.dims.empty() ||
+        grad_bias.dtype != grad_output.dtype || grad_bias.dims.size() != 1U ||
         grad_bias.dims[0] != grad_output.dims.back())
-      fail("bias_backward requires F32 output gradient and matching vector");
+      fail("bias_backward requires a float output gradient and matching "
+           "vector");
     return;
   }
 
@@ -224,8 +247,9 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
     same_shape_dtype(input, grad_output, op);
     same_shape_dtype(input, grad_input, op);
-    if (input.dtype != DType::F32)
-      fail("silu_backward currently requires F32 tensors");
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype))
+      fail("silu_backward admits f32, bf16, or f16 tensors");
     return;
   }
 
@@ -239,23 +263,38 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &updated = tensor_or_fail(program, op.outputs[0], op);
     const auto &updated_first = tensor_or_fail(program, op.outputs[1], op);
     const auto &updated_second = tensor_or_fail(program, op.outputs[2], op);
-    same_shape_dtype(parameter, gradient, op);
-    same_shape_dtype(parameter, first, op);
-    same_shape_dtype(parameter, second, op);
-    same_shape_dtype(parameter, updated, op);
-    same_shape_dtype(parameter, updated_first, op);
-    same_shape_dtype(parameter, updated_second, op);
+    check_accumulator_f32(op);
+    // Flame AdamW kernel matrix: parameter and gradient storage may be F32
+    // or BF16 independently ({BF16p/BF16g, BF16p/F32g, F32p/F32g,
+    // F32p/BF16g}); both moments are F32 ALWAYS, and the updated parameter
+    // keeps the parameter's storage dtype.
+    const auto adamw_storage = [](DType dtype) {
+      return dtype == DType::F32 || dtype == DType::BF16;
+    };
+    if (!adamw_storage(parameter.dtype) || !adamw_storage(gradient.dtype))
+      fail("adamw_update parameter and gradient must be F32 or BF16");
+    if (gradient.dims != parameter.dims || first.dims != parameter.dims ||
+        second.dims != parameter.dims || updated.dims != parameter.dims ||
+        updated_first.dims != parameter.dims ||
+        updated_second.dims != parameter.dims)
+      fail("adamw_update state must share the parameter shape");
+    if (first.dtype != DType::F32 || second.dtype != DType::F32 ||
+        updated_first.dtype != DType::F32 ||
+        updated_second.dtype != DType::F32)
+      fail("adamw_update moments must be F32");
+    if (updated.dtype != parameter.dtype)
+      fail("adamw_update output must match the parameter dtype");
     const auto learning_rate = op.f64(AttrKey::LearningRate, 1.0e-3);
     const auto beta1 = op.f64(AttrKey::Beta1, 0.9);
     const auto beta2 = op.f64(AttrKey::Beta2, 0.999);
     const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-8);
     const auto weight_decay = op.f64(AttrKey::WeightDecay, 0.0);
-    if (parameter.dtype != DType::F32 || step.dtype != DType::I32 ||
+    if (step.dtype != DType::I32 ||
         step.dims != std::vector<std::uint64_t>{1U} ||
         !(learning_rate > 0.0) || beta1 < 0.0 || beta1 >= 1.0 ||
         beta2 < 0.0 || beta2 >= 1.0 || !(epsilon > 0.0) ||
         weight_decay < 0.0)
-      fail("adamw_update has invalid F32 state, step, or hyperparameters");
+      fail("adamw_update has an invalid step or hyperparameters");
     return;
   }
 
