@@ -1049,6 +1049,10 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
   const auto sequence = q_tensor.dims[0];
   const auto heads = q_tensor.dims[1];
   const auto dim = q_tensor.dims[2];
+  // GQA: query head h reads kv head h/(H/KvHeads); KvHeads == H (the
+  // default) reproduces the historical dense indexing exactly.
+  const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
+  const auto group = heads / kv_heads;
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
@@ -1056,13 +1060,14 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
   for (std::uint64_t query = 0; query < sequence; ++query) {
     const auto key_end = causal ? query + 1U : sequence;
     for (std::uint64_t head = 0; head < heads; ++head) {
+      const auto kv_head = head / group;
       float maximum = -std::numeric_limits<float>::infinity();
       for (std::uint64_t key = 0; key < key_end; ++key) {
         float score = 0.0F;
         for (std::uint64_t d = 0; d < dim; ++d) {
           score = std::fma(
               load_float(q_tensor, (query * heads + head) * dim + d),
-              load_float(k, (key * heads + head) * dim + d), score);
+              load_float(k, (key * kv_heads + kv_head) * dim + d), score);
         }
         score *= scale;
         probabilities[key] = score;
@@ -1079,7 +1084,7 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
           const auto probability = probabilities[key] / denominator;
           value = std::fma(
               probability,
-              load_float(v, (key * heads + head) * dim + d), value);
+              load_float(v, (key * kv_heads + kv_head) * dim + d), value);
         }
         store_float(out, (query * heads + head) * dim + d, value);
       }
@@ -1097,9 +1102,12 @@ void attention_lse(const ir::Operation &op, TensorMap &tensors) {
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
+  const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
+  const auto group = heads / kv_heads;
   for (std::uint64_t query = 0U; query < sequence; ++query) {
     const auto key_end = causal ? query + 1U : sequence;
     for (std::uint64_t head = 0U; head < heads; ++head) {
+      const auto kv_head = head / group;
       float maximum = -std::numeric_limits<float>::infinity();
       std::vector<float> scores(key_end);
       for (std::uint64_t key = 0U; key < key_end; ++key) {
@@ -1107,7 +1115,7 @@ void attention_lse(const ir::Operation &op, TensorMap &tensors) {
         for (std::uint64_t d = 0U; d < dim; ++d)
           score = std::fma(
               load_float(q_tensor, (query * heads + head) * dim + d),
-              load_float(k, (key * heads + head) * dim + d), score);
+              load_float(k, (key * kv_heads + kv_head) * dim + d), score);
         scores[key] = score * scale;
         maximum = std::max(maximum, scores[key]);
       }
@@ -1136,15 +1144,18 @@ void attention_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
-  // Zero-initialize: causal masking leaves untouched grad slots for keys
-  // beyond every query.
-  for (std::uint64_t i = 0U; i < grad_q.element_count(); ++i) {
-    store_float(grad_q, i, 0.0F);
-    store_float(grad_k, i, 0.0F);
-    store_float(grad_v, i, 0.0F);
-  }
+  const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
+  const auto group = heads / kv_heads;
+  // dK/dV accumulate across every query AND every query head sharing the kv
+  // head, in F32 accumulators (flame dtype contract: cross-element
+  // accumulation never round-trips through storage precision); one rounding
+  // store per element at the end.  Causal masking leaves the accumulators'
+  // zeros for keys beyond every query.
+  std::vector<float> key_gradient(grad_k.element_count(), 0.0F);
+  std::vector<float> value_gradient(grad_v.element_count(), 0.0F);
   std::vector<float> row_gradient(sequence);
   for (std::uint64_t head = 0U; head < heads; ++head) {
+    const auto kv_head = head / group;
     for (std::uint64_t query = 0U; query < sequence; ++query) {
       const auto key_end = causal ? query + 1U : sequence;
       const auto query_base = (query * heads + head) * dim;
@@ -1154,7 +1165,7 @@ void attention_backward(const ir::Operation &op, TensorMap &tensors) {
         delta = std::fma(load_float(grad_output, query_base + d),
                          load_float(forward_output, query_base + d), delta);
       for (std::uint64_t key = 0U; key < key_end; ++key) {
-        const auto key_base = (key * heads + head) * dim;
+        const auto key_base = (key * kv_heads + kv_head) * dim;
         float score = 0.0F;
         float projected = 0.0F;
         for (std::uint64_t d = 0U; d < dim; ++d) {
@@ -1168,25 +1179,28 @@ void attention_backward(const ir::Operation &op, TensorMap &tensors) {
             probability * (projected - delta) * scale;
         row_gradient[key] = score_gradient;
         for (std::uint64_t d = 0U; d < dim; ++d) {
-          store_float(grad_k, key_base + d,
-                      load_float(grad_k, key_base + d) +
-                          score_gradient *
-                              load_float(q_tensor, query_base + d));
-          store_float(grad_v, key_base + d,
-                      load_float(grad_v, key_base + d) +
-                          probability *
-                              load_float(grad_output, query_base + d));
+          key_gradient[key_base + d] =
+              std::fma(score_gradient, load_float(q_tensor, query_base + d),
+                       key_gradient[key_base + d]);
+          value_gradient[key_base + d] =
+              std::fma(probability, load_float(grad_output, query_base + d),
+                       value_gradient[key_base + d]);
         }
       }
       for (std::uint64_t d = 0U; d < dim; ++d) {
         float accumulator = 0.0F;
         for (std::uint64_t key = 0U; key < key_end; ++key)
-          accumulator = std::fma(row_gradient[key],
-                                 load_float(k, (key * heads + head) * dim + d),
-                                 accumulator);
+          accumulator =
+              std::fma(row_gradient[key],
+                       load_float(k, (key * kv_heads + kv_head) * dim + d),
+                       accumulator);
         store_float(grad_q, query_base + d, accumulator);
       }
     }
+  }
+  for (std::uint64_t i = 0U; i < grad_k.element_count(); ++i) {
+    store_float(grad_k, i, key_gradient[i]);
+    store_float(grad_v, i, value_gradient[i]);
   }
 }
 

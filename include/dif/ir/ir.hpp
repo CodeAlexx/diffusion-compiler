@@ -121,6 +121,7 @@ enum class AttrKey : std::uint32_t {
   Transposed = 36,
   TrimLeft = 37,
   TrimRight = 38,
+  KvHeads = 39,
 };
 
 enum class AttrKind : std::uint32_t { U64 = 1, I64 = 2, F64 = 3, Bool = 4 };

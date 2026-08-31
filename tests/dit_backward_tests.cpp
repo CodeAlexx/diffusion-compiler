@@ -402,6 +402,41 @@ GradientCase attention_case(dif::ir::DType dtype, bool causal) {
   return grad_case;
 }
 
+// Grouped-query attention: q [S,H,D], k/v [S,KvH,D], KvHeads attr.
+GradientCase attention_gqa_case(dif::ir::DType dtype, bool causal,
+                                std::uint64_t heads,
+                                std::uint64_t kv_heads) {
+  using namespace dif::ir;
+  GradientCase grad_case;
+  grad_case.name = std::string("attention_gqa") + std::to_string(heads) +
+                   "x" + std::to_string(kv_heads) +
+                   (causal ? "_causal_" : "_full_") +
+                   std::string(dtype_name(dtype));
+  const std::uint64_t sequence = 5U;
+  const std::uint64_t dim = 4U;
+  grad_case.forward.tensors = {
+      {1U, dtype, TensorRole::Input, {sequence, heads, dim}},
+      {2U, dtype, TensorRole::Input, {sequence, kv_heads, dim}},
+      {3U, dtype, TensorRole::Input, {sequence, kv_heads, dim}},
+      {4U, dtype, TensorRole::Internal, {sequence, heads, dim}},
+  };
+  grad_case.forward.operations = {
+      {1U, Opcode::Attention, {1U, 2U, 3U}, {4U},
+       {Attribute::boolean(AttrKey::Causal, causal),
+        Attribute::u64(AttrKey::KvHeads, kv_heads),
+        Attribute::u64(AttrKey::BlockSize, 32U)}},
+  };
+  grad_case.targets = {1U, 2U, 3U};
+  grad_case.bindings.emplace(
+      1U, random_tensor(dtype, {sequence, heads, dim}, 111U));
+  grad_case.bindings.emplace(
+      2U, random_tensor(dtype, {sequence, kv_heads, dim}, 112U));
+  grad_case.bindings.emplace(
+      3U, random_tensor(dtype, {sequence, kv_heads, dim}, 113U));
+  append_loss(grad_case, 4U, 114U);
+  return grad_case;
+}
+
 GradientCase qk_norm_rope_case(dif::ir::DType dtype, bool full_table) {
   using namespace dif::ir;
   GradientCase grad_case;
@@ -549,6 +584,12 @@ void test_group1_finite_differences() {
   finite_difference_check(attention_case(dif::ir::DType::F32, false));
   finite_difference_check(attention_case(dif::ir::DType::F32, true));
   finite_difference_check(linear_rank3_case(dif::ir::DType::F32));
+  finite_difference_check(
+      attention_gqa_case(dif::ir::DType::F32, false, 4U, 2U));
+  finite_difference_check(
+      attention_gqa_case(dif::ir::DType::F32, true, 4U, 2U));
+  finite_difference_check(
+      attention_gqa_case(dif::ir::DType::F32, false, 4U, 1U));
   finite_difference_check(composed_group1_case());
 }
 
@@ -570,6 +611,16 @@ void test_group1_backend_parity() {
   backend_cross_check(attention_case(dif::ir::DType::F32, false), f32_bar);
   backend_cross_check(attention_case(dif::ir::DType::F32, true), f32_bar);
   backend_cross_check(linear_rank3_case(dif::ir::DType::F32), f32_bar);
+  backend_cross_check(attention_gqa_case(dif::ir::DType::F32, false, 4U, 2U),
+                      f32_bar);
+  backend_cross_check(attention_gqa_case(dif::ir::DType::F32, true, 4U, 2U),
+                      f32_bar);
+  backend_cross_check(attention_gqa_case(dif::ir::DType::F32, false, 4U, 1U),
+                      f32_bar);
+  backend_cross_check(attention_gqa_case(dif::ir::DType::BF16, false, 4U, 2U),
+                      bf16_bar);
+  backend_cross_check(attention_gqa_case(dif::ir::DType::BF16, true, 4U, 1U),
+                      bf16_bar);
   backend_cross_check(composed_group1_case(), f32_bar);
   backend_cross_check(rms_norm_case(dif::ir::DType::BF16), bf16_bar);
   backend_cross_check(rms_norm_modulate_case(dif::ir::DType::BF16, true),
@@ -607,6 +658,88 @@ void test_group1_frozen_weight_economy() {
       expect(operation.outputs.size() == 2U,
              "weight-target RmsNorm differentiation emits the weight "
              "gradient");
+}
+
+// cuDNN GQA forward (implementation 2): grouped K/V descriptors on the
+// native cudnn_frontend SDPA, checked against the CPU reference math.  The
+// program carries BOTH a dense and a grouped attention op over the same
+// query geometry, so a plan cache that ignored KvHeads would reuse the
+// dense plan for the grouped op and fail the comparison (behavioral
+// plan-key-separation proof).
+void test_cudnn_gqa_attention() {
+#if DIF_HAS_CUDNN
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  const std::uint64_t sequence = 32U;
+  const std::uint64_t heads = 8U;
+  const std::uint64_t kv_heads = 2U;
+  const std::uint64_t dim = 128U;
+  Program program;
+  program.tensors = {
+      {1U, DType::BF16, TensorRole::Input, {sequence, heads, dim}},
+      {2U, DType::BF16, TensorRole::Input, {sequence, kv_heads, dim}},
+      {3U, DType::BF16, TensorRole::Input, {sequence, kv_heads, dim}},
+      {4U, DType::BF16, TensorRole::Input, {sequence, heads, dim}},
+      {5U, DType::BF16, TensorRole::Input, {sequence, heads, dim}},
+      {6U, DType::BF16, TensorRole::Output, {sequence, heads, dim}},
+      {7U, DType::BF16, TensorRole::Output, {sequence, heads, dim}},
+  };
+  program.operations = {
+      {1U, Opcode::Attention, {1U, 2U, 3U}, {6U},
+       {Attribute::u64(AttrKey::Implementation, 2U),
+        Attribute::u64(AttrKey::KvHeads, kv_heads),
+        Attribute::boolean(AttrKey::Causal, true)}},
+      {2U, Opcode::Attention, {1U, 4U, 5U}, {7U},
+       {Attribute::u64(AttrKey::Implementation, 2U),
+        Attribute::boolean(AttrKey::Causal, true)}},
+  };
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1U, random_tensor(DType::BF16,
+                                     {sequence, heads, dim}, 121U));
+  bindings.emplace(2U, random_tensor(DType::BF16,
+                                     {sequence, kv_heads, dim}, 122U));
+  bindings.emplace(3U, random_tensor(DType::BF16,
+                                     {sequence, kv_heads, dim}, 123U));
+  bindings.emplace(4U, random_tensor(DType::BF16,
+                                     {sequence, heads, dim}, 124U));
+  bindings.emplace(5U, random_tensor(DType::BF16,
+                                     {sequence, heads, dim}, 125U));
+  const auto reference = dif::runtime::make_cpu_executor()->run(
+      program, bindings, single_run_options());
+  const auto candidate = dif::runtime::make_cuda_executor()->run(
+      program, bindings, single_run_options());
+  float maximum_absolute_error = 0.0F;
+  for (const auto tensor_id : {6U, 7U}) {
+    const auto expected = float_values(reference.outputs.at(tensor_id));
+    const auto actual = float_values(candidate.outputs.at(tensor_id));
+    expect(expected.size() == actual.size(),
+           "cuDNN GQA output size parity");
+    for (std::size_t index = 0U; index < expected.size(); ++index)
+      maximum_absolute_error =
+          std::max(maximum_absolute_error,
+                   std::abs(expected[index] - actual[index]));
+  }
+  // Bar set AFTER measurement: BF16 cuDNN SDPA vs the CPU F32-math
+  // reference; measured worst max_abs 3.91e-3 (one BF16 ulp at unit
+  // magnitude, 2026-08-31, cuda-nvrtc-cudnn), admitted 3.2e-2.
+  expect(maximum_absolute_error <= 3.2e-2F,
+         "cuDNN GQA attention matches the CPU reference (max_abs=" +
+             std::to_string(maximum_absolute_error) + ")");
+  std::cout << "GATE cudnn_gqa_attention backend=" << candidate.backend_name
+            << " max_abs=" << maximum_absolute_error << "\n";
+#endif
+}
+
+void test_kv_heads_fingerprint_stability() {
+  dif::frontend::DitBlockTrainingConfig config;
+  config.blocks = 2U;
+  const auto build = dif::frontend::make_dit_block_training(config);
+  expect(dif::hex_digest(dif::ir::fingerprint(build.program)) ==
+             "364d809dd3f8098b5fd8a1074e4fd0f6be96ea6e49108cdf1b311d442a3"
+             "99c91",
+         "KvHeads-absent programs keep the recorded pre-GQA fingerprint "
+         "(2026-08-31 composed-gate constant)");
 }
 
 void test_dit_block_builder() {
@@ -847,6 +980,46 @@ void test_group1_verifier_negatives() {
                     "matching neither R nor R/2");
   }
   {
+    // GQA negatives: non-divisible KvHeads; k shape not matching the
+    // (defaulted) KvHeads contract.
+    Program gqa;
+    gqa.tensors = {
+        {1U, DType::F32, TensorRole::Input, {4U, 4U, 4U}},
+        {2U, DType::F32, TensorRole::Input, {4U, 3U, 4U}},
+        {3U, DType::F32, TensorRole::Input, {4U, 3U, 4U}},
+        {4U, DType::F32, TensorRole::Output, {4U, 4U, 4U}},
+    };
+    gqa.operations = {
+        {1U, Opcode::Attention, {1U, 2U, 3U}, {4U},
+         {Attribute::u64(AttrKey::KvHeads, 3U)}},
+    };
+    expect_rejected(gqa, "attention rejects a non-divisible KvHeads");
+    Program defaulted = gqa;
+    defaulted.operations[0].attributes.clear();
+    expect_rejected(defaulted,
+                    "attention rejects grouped k/v without the KvHeads "
+                    "attribute");
+    Program mismatched_gradients;
+    mismatched_gradients.tensors = {
+        {1U, DType::F32, TensorRole::Input, {4U, 4U, 4U}},
+        {2U, DType::F32, TensorRole::Input, {4U, 4U, 4U}},
+        {3U, DType::F32, TensorRole::Input, {4U, 2U, 4U}},
+        {4U, DType::F32, TensorRole::Input, {4U, 2U, 4U}},
+        {5U, DType::F32, TensorRole::Input, {4U, 4U, 4U}},
+        {6U, DType::F32, TensorRole::Input, {4U, 4U}},
+        {7U, DType::F32, TensorRole::Output, {4U, 4U, 4U}},
+        {8U, DType::F32, TensorRole::Output, {4U, 4U, 4U}},
+        {9U, DType::F32, TensorRole::Output, {4U, 4U, 4U}},
+    };
+    mismatched_gradients.operations = {
+        {1U, Opcode::AttentionBackward, {1U, 2U, 3U, 4U, 5U, 6U},
+         {7U, 8U, 9U}, {Attribute::u64(AttrKey::KvHeads, 2U)}},
+    };
+    expect_rejected(mismatched_gradients,
+                    "attention_backward rejects query-shaped k/v gradients "
+                    "under GQA");
+  }
+  {
     // AttentionBackward pins the saved logsumexp to F32 [S,H].
     Program mismatch;
     mismatch.tensors = {
@@ -893,6 +1066,8 @@ int main() {
     test_group1_backend_parity();
     test_group1_frozen_weight_economy();
     test_dit_block_builder();
+    test_kv_heads_fingerprint_stability();
+    test_cudnn_gqa_attention();
     test_group1_verifier_negatives();
   } catch (const std::exception &error) {
     std::cerr << "UNCAUGHT: " << error.what() << "\n";

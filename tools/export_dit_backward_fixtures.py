@@ -91,7 +91,14 @@ def qk_norm_rope_ref(x, weight, cos, sin, rotary: int, eps: float):
 
 
 def attention_ref(q, k, v, causal: bool):
+    # GQA-general: k/v [S,KvH,D] are repeated to the query head count (the
+    # torch reference for the KvHeads contract: query head h reads kv head
+    # h/(H/KvH), exactly repeat_interleave's expansion).
     S, H, D = q.shape
+    kv_heads = k.shape[1]
+    if kv_heads != H:
+        k = k.repeat_interleave(H // kv_heads, dim=1)
+        v = v.repeat_interleave(H // kv_heads, dim=1)
     scale = 1.0 / math.sqrt(D)
     scores = torch.einsum("qhd,khd->hqk", q, k) * scale
     if causal:
@@ -212,6 +219,32 @@ def build_cases(generator: torch.Generator):
             "wrt": ["q", "k", "v"],
             "attrs": {"causal": causal},
         }
+    # GQA cases (KvHeads attr): several groupings including the Qwen3-VL
+    # conditioner's 64/8 at small S.  These also record the FORWARD output.
+    for name, (S, H, KV, D, causal) in {
+        "attention_gqa4x2": (7, 4, 2, 6, False),
+        "attention_gqa4x2_causal": (7, 4, 2, 6, True),
+        "attention_gqa4x1": (7, 4, 1, 6, False),
+        # The Qwen3-VL conditioner geometry (64 query heads / 8 kv heads,
+        # D=128) at a small sequence, causal and full.  Keep the causal
+        # entry in this position: the input draws are sequential, so moving
+        # it would change its fixture values.
+        "attention_gqa64x8_causal": (8, 64, 8, 128, True),
+        "attention_gqa64x8": (8, 64, 8, 128, False),
+    }.items():
+        cases[name] = {
+            "inputs": {
+                "q": rand(S, H, D),
+                "k": rand(S, KV, D),
+                "v": rand(S, KV, D),
+            },
+            "grad_shape": (S, H, D),
+            "forward": lambda t, causal=causal: attention_ref(
+                t["q"], t["k"], t["v"], causal),
+            "wrt": ["q", "k", "v"],
+            "attrs": {"causal": causal, "kv_heads": KV},
+            "save_output": True,
+        }
     return cases
 
 
@@ -264,9 +297,26 @@ def main() -> None:
                 records[f"expected-grad-{key}"] = write_diftensor(
                     directory / f"expected-grad-{key}.diftensor",
                     gradient.to(store))
+            if case.get("save_output"):
+                records["expected-output"] = write_diftensor(
+                    directory / "expected-output.diftensor",
+                    prediction.detach().to(store))
+            # Per-fixture attribute declaration.  difditops reads this
+            # instead of sniffing the case name for semantic flags like
+            # `causal`, which is NOT derivable from the tensor shapes: a
+            # name-sniffed flag silently built a non-causal program for the
+            # causal 64/8 fixture (2026-08-31).  The gate now fails closed
+            # when a case's attrs are missing.
+            attrs = case.get("attrs", {})
+            (directory / "attrs.json").write_text(
+                json.dumps({key: (bool(value) if isinstance(value, bool)
+                                  else int(value))
+                            for key, value in attrs.items()}, indent=2))
+            records["attrs"] = {"path": str(directory / "attrs.json"),
+                                "values": attrs}
             manifest["cases"].setdefault(name, {})[dtype_name] = {
                 "wrt": case["wrt"],
-                "attrs": case.get("attrs", {}),
+                "attrs": attrs,
                 "tensors": records,
             }
     (arguments.output / "manifest.json").write_text(
