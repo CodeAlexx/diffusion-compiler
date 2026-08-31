@@ -15,6 +15,7 @@
 !/docs/RUNTIME_MODULES.md
 !/docs/BIGVGAN_DECODE_PLAN.md
 !/docs/FLAME_PORT_EXPERIMENT_LEDGER.md
+!/docs/FLAME_PORT_HANDOFF_2026-08-31.md
 *.log
 *.safetensors
 *.ckpt
