@@ -201,6 +201,13 @@ if(TARGET CUDA::cuda_driver)
   target_link_libraries(difh3noise PRIVATE CUDA::cuda_driver CUDA::nvrtc)
 endif()
 
+add_executable(difkrea2block tools/difkrea2block.cpp)
+target_link_libraries(difkrea2block PRIVATE difcore)
+add_executable(difkrea2text tools/difkrea2text.cpp)
+target_link_libraries(difkrea2text PRIVATE difcore)
+add_executable(difkrea2denoise tools/difkrea2denoise.cpp)
+target_link_libraries(difkrea2denoise PRIVATE difcore)
+
 if(DIF_ENABLE_OPENCL)
   find_path(DIF_OPENCL_INCLUDE_DIR CL/cl.h
             HINTS ${CUDAToolkit_INCLUDE_DIRS}

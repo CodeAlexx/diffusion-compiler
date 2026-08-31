@@ -22,6 +22,7 @@ constexpr std::int64_t kKeyUid = 2;
 constexpr std::int64_t kValueUid = 3;
 constexpr std::int64_t kOutputUid = 4;
 constexpr std::int64_t kScaleUid = 5;
+constexpr std::int64_t kBiasUid = 6;
 
 void check(cudnnStatus_t status, const char *action) {
   if (status == CUDNN_STATUS_SUCCESS)
@@ -43,6 +44,7 @@ struct CudnnAttentionPlan::Impl {
   std::shared_ptr<fe::graph::Graph> graph;
   std::size_t workspace{};
   float scale{};
+  bool additive_bias{};
 
   ~Impl() {
     graph.reset();
@@ -53,14 +55,17 @@ struct CudnnAttentionPlan::Impl {
 
 CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
                                        std::uint64_t kv_heads, double scale,
-                                       bool causal)
+                                       bool causal, bool additive_bias)
     : impl_(std::make_unique<Impl>()) {
   if ((query.dtype != ir::DType::BF16 && query.dtype != ir::DType::F16) ||
-      query.dims.size() != 3U)
-    fail("cuDNN attention requires BF16 or F16 [S,H,D]");
-  const auto sequence = dimension(query.dims[0], "sequence");
-  const auto heads = dimension(query.dims[1], "heads");
-  const auto head_dim = dimension(query.dims[2], "head dimension");
+      (query.dims.size() != 3U && query.dims.size() != 4U))
+    fail("cuDNN attention requires BF16 or F16 [S,H,D] or [B,S,H,D]");
+  const bool batched = query.dims.size() == 4U;
+  const auto batch = dimension(batched ? query.dims[0] : 1U, "batch");
+  const auto sequence = dimension(query.dims[batched ? 1U : 0U], "sequence");
+  const auto heads = dimension(query.dims[batched ? 2U : 1U], "heads");
+  const auto head_dim =
+      dimension(query.dims[batched ? 3U : 2U], "head dimension");
   // GQA: cudnn_frontend SDPA supports grouped K/V natively via differing
   // head counts on the K/V tensor descriptors (H % KvH == 0).
   const auto key_value_heads = dimension(kv_heads, "kv heads");
@@ -79,13 +84,15 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
       .set_compute_data_type(fe::DataType_t::FLOAT);
 
   impl_->scale = static_cast<float>(scale);
-  const std::vector<std::int64_t> dims{1, heads, sequence, head_dim};
-  // DiffIR stores [S,H,D].  Expose those bytes as the same non-contiguous
+  impl_->additive_bias = additive_bias;
+  const std::vector<std::int64_t> dims{batch, heads, sequence, head_dim};
+  // DiffIR stores [B,S,H,D] (or the legacy [S,H,D]). Expose those bytes as
+  // the same non-contiguous
   // [B,H,S,D] view that PyTorch creates by permuting a contiguous [B,S,H,D]
   // tensor before SDPA.  K/V use their own (possibly smaller) head count.
   const std::vector<std::int64_t> strides{
       heads * sequence * head_dim, head_dim, heads * head_dim, 1};
-  const std::vector<std::int64_t> key_value_dims{1, key_value_heads,
+  const std::vector<std::int64_t> key_value_dims{batch, key_value_heads,
                                                  sequence, head_dim};
   const std::vector<std::int64_t> key_value_strides{
       key_value_heads * sequence * head_dim, head_dim,
@@ -116,6 +123,14 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
                         .set_attn_scale(attention_scale);
   if (causal)
     attributes.set_causal_mask(true);
+  if (additive_bias) {
+    const std::vector<std::int64_t> bias_dims{batch, 1, sequence, sequence};
+    const std::vector<std::int64_t> bias_strides{sequence * sequence,
+                                                 sequence * sequence,
+                                                 sequence, 1};
+    auto bias = tensor("Bias", kBiasUid, bias_dims, bias_strides);
+    attributes.set_bias(bias);
+  }
   auto [output, stats] = impl_->graph->sdpa(q, k, v, attributes);
   (void)stats;
   output->set_output(true)
@@ -147,13 +162,16 @@ std::size_t CudnnAttentionPlan::workspace_bytes() const {
 }
 
 void CudnnAttentionPlan::execute(std::uintptr_t query, std::uintptr_t key,
-                                 std::uintptr_t value, std::uintptr_t output,
-                                 std::uintptr_t workspace,
+                                 std::uintptr_t value,
+                                 std::uintptr_t additive_bias,
+                                 std::uintptr_t output, std::uintptr_t workspace,
                                  std::uintptr_t stream) {
   if (!query || !key || !value || !output)
     fail("cuDNN attention received a null tensor pointer");
   if (impl_->workspace != 0U && !workspace)
     fail("cuDNN attention received a null workspace");
+  if (impl_->additive_bias && !additive_bias)
+    fail("cuDNN attention received a null additive bias");
   check(cudnnSetStream(impl_->handle, reinterpret_cast<cudaStream_t>(stream)),
         "cudnnSetStream");
   std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> bindings{
@@ -163,6 +181,8 @@ void CudnnAttentionPlan::execute(std::uintptr_t query, std::uintptr_t key,
       {kOutputUid, reinterpret_cast<void *>(output)},
       {kScaleUid, &impl_->scale},
   };
+  if (impl_->additive_bias)
+    bindings.emplace(kBiasUid, reinterpret_cast<void *>(additive_bias));
   auto status = impl_->graph->execute(
       impl_->handle, bindings, reinterpret_cast<void *>(workspace));
   if (!status.is_good())

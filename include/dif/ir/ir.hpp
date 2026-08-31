@@ -19,6 +19,7 @@ enum class DType : std::uint32_t {
   F16 = 3,
   I8 = 4,
   I32 = 5,
+  Bool = 6,
 };
 
 enum TensorRole : std::uint32_t {
@@ -81,6 +82,21 @@ enum class Opcode : std::uint32_t {
   Conv1d = 47,
   SnakeBeta = 48,
   Gelu = 49,
+  Sigmoid = 50,
+  Reshape = 51,
+  BroadcastTo = 52,
+  Slice = 53,
+  RotaryFrequency = 54,
+  RotaryApply = 55,
+  BooleanMaskToBias = 56,
+  // Generic velocity-form Euler update with eager storage-dtype boundaries:
+  // output = sample + round_dtype((next_t - current_t) * velocity).
+  // This is deliberately distinct from H3's data-ward FlowEulerStep.
+  EulerVelocityStep = 57,
+  Permute = 58,
+  // Concatenate equal-rank tensors along an explicit axis. The operation is
+  // physical (not a view): output storage follows row-major tensor order.
+  Concat = 59,
 };
 
 enum class AttrKey : std::uint32_t {
@@ -124,11 +140,31 @@ enum class AttrKey : std::uint32_t {
   TrimRight = 38,
   KvHeads = 39,
   Approximation = 40,
+  Axis = 41,
+  Start = 42,
+  Theta = 43,
+  Ntk = 44,
+  WeightOffset = 45,
+  RotaryLayout = 46,
+  Permutation0 = 47,
+  Permutation1 = 48,
+  Permutation2 = 49,
+  Permutation3 = 50,
+  Permutation4 = 51,
+  Permutation5 = 52,
+  Permutation6 = 53,
+  Permutation7 = 54,
 };
 
 // Gelu carries an explicit approximation because exact-erf and tanh GELU are
 // observably different source semantics.  Krea 2 uses the tanh form.
 enum class GeluApproximation : std::uint64_t { Tanh = 1 };
+
+// RotaryApply names the channel pairing explicitly.  Interleaved rotates
+// adjacent pairs (2d,2d+1), which is the layout used by Krea 2 and several
+// other DiT families.  HalfSplit remains a distinct semantic and must never
+// be inferred from tensor shape.
+enum class RotaryLayout : std::uint64_t { Interleaved = 1, HalfSplit = 2 };
 
 enum class AttrKind : std::uint32_t { U64 = 1, I64 = 2, F64 = 3, Bool = 4 };
 

@@ -432,12 +432,14 @@ private:
 #if DIF_HAS_CUDNN
 struct CudnnAttentionKey {
   ir::DType dtype{};
+  std::uint64_t batch{};
   std::uint64_t sequence{};
   std::uint64_t heads{};
   std::uint64_t kv_heads{};
   std::uint64_t head_dim{};
   std::uint64_t scale_bits{};
   bool causal{};
+  bool additive_bias{};
 
   bool operator==(const CudnnAttentionKey &) const = default;
 };
@@ -450,12 +452,14 @@ struct CudnnAttentionKeyHash {
       result *= 0x100000001b3ULL;
     };
     mix(static_cast<std::uint64_t>(key.dtype));
+    mix(key.batch);
     mix(key.sequence);
     mix(key.heads);
     mix(key.kv_heads);
     mix(key.head_dim);
     mix(key.scale_bits);
     mix(key.causal ? 1U : 0U);
+    mix(key.additive_bias ? 1U : 0U);
     return result;
   }
 };
@@ -3830,9 +3834,13 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     shared = block * sizeof(float);
   } else if (op.opcode == ir::Opcode::Attention) {
     const auto &dims = program.tensor(op.inputs[0])->dims;
+    const auto batched = dims.size() == 4U;
+    const auto batch = batched ? dims[0] : 1U;
+    const auto sequence = dims[batched ? 1U : 0U];
+    const auto heads = dims[batched ? 2U : 1U];
     block = std::min<unsigned>(block, 256U);
-    grid = static_cast<unsigned>(dims[0] * dims[1]);
-    shared = static_cast<unsigned>((block + dims[0]) * sizeof(float));
+    grid = static_cast<unsigned>(batch * sequence * heads);
+    shared = static_cast<unsigned>((block + sequence) * sizeof(float));
   } else {
     const auto count = program.tensor(op.outputs[0])->element_count();
     grid = static_cast<unsigned>((count + block - 1U) / block);
@@ -4065,22 +4073,29 @@ public:
       const auto *query = program_.tensor(op.inputs.at(0));
       if (!query)
         fail("cuDNN attention references a missing query tensor");
+      const bool batched = query->dims.size() == 4U;
+      const auto batch = batched ? query->dims.at(0) : 1U;
+      const auto sequence = query->dims.at(batched ? 1U : 0U);
+      const auto heads = query->dims.at(batched ? 2U : 1U);
+      const auto head_dim = query->dims.at(batched ? 3U : 2U);
       const CudnnAttentionKey key{
           query->dtype,
-          query->dims.at(0),
-          query->dims.at(1),
-          op.u64(ir::AttrKey::KvHeads, query->dims.at(1)),
-          query->dims.at(2),
+          batch,
+          sequence,
+          heads,
+          op.u64(ir::AttrKey::KvHeads, heads),
+          head_dim,
           std::bit_cast<std::uint64_t>(op.f64(
               ir::AttrKey::AttentionScale,
-              1.0 / std::sqrt(static_cast<double>(query->dims.at(2))))),
+              1.0 / std::sqrt(static_cast<double>(head_dim)))),
           op.boolean(ir::AttrKey::Causal, false),
+          op.inputs.size() == 4U,
       };
       auto found = cudnn_plan_cache.find(key);
       if (found == cudnn_plan_cache.end()) {
         auto plan = std::make_shared<CudnnAttentionPlan>(
             *query, key.kv_heads, std::bit_cast<double>(key.scale_bits),
-            key.causal);
+            key.causal, key.additive_bias);
         found = cudnn_plan_cache.emplace(key, std::move(plan)).first;
       }
       cudnn_attention_plans_.emplace(op.id, found->second);
@@ -4859,6 +4874,9 @@ public:
             static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
             static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
             static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2))),
+            op.inputs.size() == 4U
+                ? static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(3)))
+                : 0U,
             static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
             reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
             reinterpret_cast<std::uintptr_t>(context_.stream()));

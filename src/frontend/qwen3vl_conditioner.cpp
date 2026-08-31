@@ -2,6 +2,7 @@
 
 #include "dif/support/error.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -98,6 +99,25 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
   if (config.attention_implementation != 1U &&
       config.attention_implementation != 2U)
     fail("qwen3-vl attention implementation must be 1 (generated) or 2 (cuDNN)");
+  if (config.use_attention_mask && config.attention_implementation != 2U)
+    fail("masked qwen3-vl attention requires the exact cuDNN implementation");
+  if (config.dynamic_position_ids != config.use_attention_mask)
+    fail("qwen3-vl dynamic position ids and attention masking must be enabled together");
+  for (const auto hidden_state : config.selected_hidden_states)
+    if (hidden_state == 0U || hidden_state > config.executed_layers)
+      fail("selected qwen3-vl hidden state is outside the executed layer range");
+  if (!config.selected_hidden_states.empty()) {
+    if (config.output_sequence_length == 0U ||
+        config.output_slice_start > sequence_length ||
+        config.output_sequence_length >
+            sequence_length - config.output_slice_start)
+      fail("qwen3-vl selected hidden-state slice is outside the input sequence");
+    for (std::size_t index = 1; index < config.selected_hidden_states.size();
+         ++index)
+      if (config.selected_hidden_states[index - 1U] >=
+          config.selected_hidden_states[index])
+        fail("selected qwen3-vl hidden states must be strictly increasing");
+  }
 
   const auto sequence = sequence_length;
   const auto hidden = config.hidden_size;
@@ -115,6 +135,15 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
   // ---- inputs -------------------------------------------------------------
   build.token_ids_input_id = builder.add_tensor(
       DType::I32, static_cast<std::uint32_t>(TensorRole::Input), {sequence});
+  std::uint32_t attention_bias_id = 0U;
+  if (config.use_attention_mask) {
+    build.attention_mask_input_id = builder.add_tensor(
+        DType::Bool, static_cast<std::uint32_t>(TensorRole::Input),
+        {1U, sequence});
+    attention_bias_id = builder.internal({1U, 1U, sequence, sequence});
+    builder.operation(Opcode::BooleanMaskToBias,
+                      {build.attention_mask_input_id}, {attention_bias_id});
+  }
 
   // ---- rotary tables ------------------------------------------------------
   // Text-only prompts collapse Qwen3-VL's 3-axis MRoPE to ordinary 1-D RoPE:
@@ -130,8 +159,15 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
         1.0 / std::pow(config.rope_theta,
                        static_cast<double>(2U * index) /
                            static_cast<double>(head_dim)));
-  const auto positions_id =
-      builder.generated(f32_tensor({sequence, 1U}, positions));
+  const auto positions_id = config.dynamic_position_ids
+                                ? (build.position_ids_input_id =
+                                       builder.add_tensor(
+                                           DType::F32,
+                                           static_cast<std::uint32_t>(
+                                               TensorRole::Input),
+                                           {sequence, 1U}))
+                                : builder.generated(
+                                      f32_tensor({sequence, 1U}, positions));
   const auto inverse_frequency_id =
       builder.generated(f32_tensor({half_dim}, inverse_frequency));
   const auto cosine_id = builder.internal({sequence, head_dim});
@@ -206,14 +242,38 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     // Causal grouped-query attention: K/V keep their 8 heads and the KvHeads
     // attribute maps query head h to kv head h/(H/KvHeads) — no materialized
     // repeat of K/V.
-    const auto attention_id = builder.internal({sequence, heads, head_dim});
-    builder.operation(Opcode::Attention,
-                      {rotated_query_id, rotated_key_id, value_id},
-                      {attention_id},
-                      {Attribute::boolean(AttrKey::Causal, true),
-                       Attribute::u64(AttrKey::KvHeads, kv_heads),
-                       Attribute::u64(AttrKey::Implementation,
-                                      config.attention_implementation)});
+    std::uint32_t attention_id = 0U;
+    if (config.use_attention_mask) {
+      const auto batched_query = builder.internal({1U, sequence, heads, head_dim});
+      const auto batched_key =
+          builder.internal({1U, sequence, kv_heads, head_dim});
+      const auto batched_value =
+          builder.internal({1U, sequence, kv_heads, head_dim});
+      builder.operation(Opcode::Reshape, {rotated_query_id}, {batched_query});
+      builder.operation(Opcode::Reshape, {rotated_key_id}, {batched_key});
+      builder.operation(Opcode::Reshape, {value_id}, {batched_value});
+      const auto batched_attention =
+          builder.internal({1U, sequence, heads, head_dim});
+      builder.operation(
+          Opcode::Attention,
+          {batched_query, batched_key, batched_value, attention_bias_id},
+          {batched_attention},
+          {Attribute::boolean(AttrKey::Causal, true),
+           Attribute::u64(AttrKey::KvHeads, kv_heads),
+           Attribute::u64(AttrKey::Implementation,
+                          config.attention_implementation)});
+      attention_id = builder.internal({sequence, heads, head_dim});
+      builder.operation(Opcode::Reshape, {batched_attention}, {attention_id});
+    } else {
+      attention_id = builder.internal({sequence, heads, head_dim});
+      builder.operation(Opcode::Attention,
+                        {rotated_query_id, rotated_key_id, value_id},
+                        {attention_id},
+                        {Attribute::boolean(AttrKey::Causal, true),
+                         Attribute::u64(AttrKey::KvHeads, kv_heads),
+                         Attribute::u64(AttrKey::Implementation,
+                                        config.attention_implementation)});
+    }
     build.attention_operations += 1U;
 
     const auto output_weight_id =
@@ -258,14 +318,33 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     const auto layer_output_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::Add, {residual_id, down_id}, {layer_output_id});
     residual_id = layer_output_id;
+
+    const auto hidden_state_index = layer + 1U;
+    if (std::find(config.selected_hidden_states.begin(),
+                  config.selected_hidden_states.end(), hidden_state_index) !=
+        config.selected_hidden_states.end()) {
+      const auto selected = builder.add_tensor(
+          DType::BF16, static_cast<std::uint32_t>(TensorRole::Output),
+          {config.output_sequence_length, hidden});
+      builder.operation(
+          Opcode::Slice, {residual_id}, {selected},
+          {Attribute::u64(AttrKey::Axis, 0U),
+           Attribute::u64(AttrKey::Start, config.output_slice_start)});
+      build.conditioning_output_ids.push_back(selected);
+    }
   }
 
   // The conditioning contract is the RAW residual stream: model.norm is
   // deliberately NOT applied (extraction rule, plan §1).
-  for (auto &tensor : build.program.tensors)
-    if (tensor.id == residual_id)
-      tensor.roles = static_cast<std::uint32_t>(TensorRole::Output);
-  build.conditioning_output_id = residual_id;
+  if (build.conditioning_output_ids.empty()) {
+    for (auto &tensor : build.program.tensors)
+      if (tensor.id == residual_id)
+        tensor.roles = static_cast<std::uint32_t>(TensorRole::Output);
+    build.conditioning_output_id = residual_id;
+    build.conditioning_output_ids.push_back(residual_id);
+  } else {
+    build.conditioning_output_id = build.conditioning_output_ids.back();
+  }
 
   return build;
 }

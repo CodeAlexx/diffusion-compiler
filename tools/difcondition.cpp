@@ -17,6 +17,7 @@
 // against the oracle's raw hidden_states[k].
 
 #include "dif/frontend/qwen3vl_conditioner.hpp"
+#include "dif/frontend/krea2.hpp"
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/runtime/executor.hpp"
@@ -31,6 +32,7 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -44,6 +46,7 @@ struct Options {
   fs::path program;
   fs::path bundle;
   fs::path ids;
+  fs::path inputs;
   fs::path output;
   fs::path cache_directory;
   std::string backend{"cuda"};
@@ -51,17 +54,21 @@ struct Options {
   std::uint64_t layers{50};
   std::uint64_t attention{2};
   std::uint64_t minimum_free_mib{4096};
+  bool krea2{};
 };
 
 void usage() {
   std::cerr
       << "usage: difcondition program --checkpoint DIR --sequence N --output "
-         "FILE.difir [--layers N] [--attention 1|2]\n"
+         "FILE.difir [--layers N] [--attention 1|2] [--krea2]\n"
          "       difcondition bundle --checkpoint DIR --program FILE.difir "
          "--output FILE.difbind\n"
          "       difcondition run --program FILE.difir --bundle FILE.difbind "
          "--ids FILE.diftensor --output FILE.diftensor [--backend cuda|cpu] "
-         "[--cache-dir DIR] [--min-free-mib N]\n";
+         "[--cache-dir DIR] [--min-free-mib N]\n"
+         "       difcondition run --krea2 --program FILE.difir --bundle "
+         "FILE.difbind --inputs creator.safetensors --output "
+         "native.safetensors [--cache-dir DIR] [--min-free-mib N]\n";
 }
 
 std::uint64_t number(const std::string &text, const char *label) {
@@ -95,6 +102,8 @@ Options parse(int argc, char **argv) {
       options.bundle = value("--bundle");
     else if (option == "--ids")
       options.ids = value("--ids");
+    else if (option == "--inputs")
+      options.inputs = value("--inputs");
     else if (option == "--output")
       options.output = value("--output");
     else if (option == "--backend")
@@ -109,6 +118,8 @@ Options parse(int argc, char **argv) {
       options.attention = number(value("--attention"), "attention");
     else if (option == "--min-free-mib")
       options.minimum_free_mib = number(value("--min-free-mib"), "min free MiB");
+    else if (option == "--krea2")
+      options.krea2 = true;
     else {
       usage();
       dif::fail("unknown option: " + option);
@@ -118,6 +129,8 @@ Options parse(int argc, char **argv) {
 }
 
 dif::frontend::Qwen3VlConditionerConfig config_for(const Options &options) {
+  if (options.krea2)
+    return dif::frontend::make_krea2_conditioner_config();
   dif::frontend::Qwen3VlConditionerConfig config;
   config.executed_layers = options.layers;
   config.attention_implementation = options.attention;
@@ -141,7 +154,9 @@ void command_program(const Options &options) {
             << " attentions=" << build.attention_operations
             << " streamed_weights=" << build.bindings.size()
             << " input_id=" << build.token_ids_input_id
-            << " output_id=" << build.conditioning_output_id << "\n";
+            << " output_id=" << build.conditioning_output_id
+            << " outputs=" << build.conditioning_output_ids.size()
+            << " family=" << (options.krea2 ? "krea2" : "h3") << "\n";
 }
 
 // Bind every streamed weight straight to the shard that already holds it:
@@ -174,8 +189,10 @@ void command_bundle(const Options &options) {
   if (dif::ir::fingerprint(build.program) != dif::ir::fingerprint(program))
     dif::fail("conditioner program does not reconstruct from its own geometry");
 
-  const auto index_path =
-      options.checkpoint / "text_encoder" / "model.safetensors.index.json";
+  const auto index_path = options.krea2
+                              ? options.checkpoint / "model.safetensors.index.json"
+                              : options.checkpoint / "text_encoder" /
+                                    "model.safetensors.index.json";
   const auto index = dif::weights::read_safetensors_index(index_path);
 
   dif::weights::WeightBundle bundle;
@@ -218,8 +235,10 @@ void command_bundle(const Options &options) {
 
 void command_run(const Options &options) {
   if (options.program.empty() || options.bundle.empty() ||
-      options.ids.empty() || options.output.empty())
-    dif::fail("difcondition run requires --program, --bundle, --ids, --output");
+      (options.krea2 ? options.inputs.empty() : options.ids.empty()) ||
+      options.output.empty())
+    dif::fail("difcondition run requires --program, --bundle, --output and "
+              "either --ids or Krea 2 --inputs");
   if (fs::exists(options.output))
     dif::fail("refusing to overwrite " + options.output.string());
   const auto program = dif::ir::read_file(options.program);
@@ -231,41 +250,49 @@ void command_run(const Options &options) {
   // Rotary positions and inverse frequencies are compiler-derived constants,
   // not checkpoint tensors: rebuild the frontend description (fingerprint-
   // checked) and supply them alongside the bundle's weights.
-  {
-    std::uint64_t sequence = 0U;
-    for (const auto &tensor : program.tensors)
-      if ((tensor.roles &
-           static_cast<std::uint32_t>(dif::ir::TensorRole::Input)) != 0U)
-        sequence = tensor.dims.at(0);
-    std::uint64_t layers = 0U;
-    for (const auto &operation : program.operations)
-      if (operation.opcode == dif::ir::Opcode::Attention)
-        ++layers;
-    auto config = config_for(options);
-    config.executed_layers = layers;
-    auto build =
-        dif::frontend::build_qwen3vl_conditioner_program(sequence, config);
-    if (dif::ir::fingerprint(build.program) != dif::ir::fingerprint(program))
-      dif::fail("conditioner program does not reconstruct from its own geometry");
-    for (auto &generated : build.generated_constants)
-      inputs.insert_or_assign(generated.first, std::move(generated.second));
-  }
-  const auto ids = dif::runtime::read_tensor(options.ids);
-  if (ids.dtype != dif::ir::DType::I32 || ids.dims.size() != 1U)
-    dif::fail("token ids must be an I32 [S] tensor");
-  std::uint32_t input_id = 0U;
-  std::uint32_t output_id = 0U;
-  for (const auto &tensor : program.tensors) {
+  std::uint64_t sequence = 0U;
+  for (const auto &tensor : program.tensors)
     if ((tensor.roles & static_cast<std::uint32_t>(dif::ir::TensorRole::Input)) !=
-        0U)
-      input_id = tensor.id;
-    if ((tensor.roles &
-         static_cast<std::uint32_t>(dif::ir::TensorRole::Output)) != 0U)
-      output_id = tensor.id;
+            0U &&
+        tensor.dtype == dif::ir::DType::I32 && tensor.dims.size() == 1U)
+      sequence = tensor.dims[0];
+  std::uint64_t layers = 0U;
+  for (const auto &operation : program.operations)
+    if (operation.opcode == dif::ir::Opcode::Attention)
+      ++layers;
+  auto config = config_for(options);
+  config.executed_layers = layers;
+  auto build =
+      dif::frontend::build_qwen3vl_conditioner_program(sequence, config);
+  if (dif::ir::fingerprint(build.program) != dif::ir::fingerprint(program))
+    dif::fail("conditioner program does not reconstruct from its own geometry");
+  for (auto &generated : build.generated_constants)
+    inputs.insert_or_assign(generated.first, std::move(generated.second));
+
+  std::uint64_t token_count = sequence;
+  if (options.krea2) {
+    const auto fixture = dif::weights::read_safetensors(options.inputs);
+    auto ids = dif::weights::map_safetensor(fixture, "input_ids");
+    if (ids.dtype != dif::ir::DType::I32 ||
+        ids.element_count() != sequence)
+      dif::fail("Krea 2 input_ids must be I32 with the program sequence count");
+    ids.dims = {sequence};
+    ids.validate();
+    inputs.insert_or_assign(build.token_ids_input_id, std::move(ids));
+    inputs.insert_or_assign(
+        build.attention_mask_input_id,
+        dif::weights::map_safetensor(fixture, "attention_mask"));
+    inputs.insert_or_assign(build.position_ids_input_id,
+                            dif::weights::map_safetensor(fixture,
+                                                        "position_ids"));
+  } else {
+    const auto ids = dif::runtime::read_tensor(options.ids);
+    if (ids.dtype != dif::ir::DType::I32 || ids.dims.size() != 1U ||
+        ids.dims[0] != sequence)
+      dif::fail("token ids must be an I32 [S] tensor matching the program");
+    inputs.insert_or_assign(build.token_ids_input_id, ids);
+    token_count = ids.dims[0];
   }
-  if (input_id == 0U || output_id == 0U)
-    dif::fail("conditioner program is missing its input or output tensor");
-  inputs.insert_or_assign(input_id, ids);
 
   dif::runtime::RunOptions run_options;
   run_options.warmups = 0U;
@@ -280,11 +307,33 @@ void command_run(const Options &options) {
   const auto wall = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start)
                         .count();
-  const auto &conditioning = result.outputs.at(output_id);
-  dif::runtime::write_tensor(conditioning, options.output);
+  const auto &conditioning = result.outputs.at(build.conditioning_output_id);
+  if (options.krea2) {
+    std::vector<dif::weights::SafeTensorWriteSpec> specs;
+    for (std::size_t index = 0; index < build.conditioning_output_ids.size();
+         ++index) {
+      const auto &tensor = result.outputs.at(build.conditioning_output_ids[index]);
+      specs.push_back({"tap_" + (index < 10U ? std::string("0") : std::string()) +
+                           std::to_string(index),
+                       tensor.dtype, tensor.dims});
+    }
+    dif::weights::SafeTensorWriter writer(options.output, std::move(specs));
+    for (std::size_t index = 0; index < build.conditioning_output_ids.size();
+         ++index) {
+      const auto &tensor = result.outputs.at(build.conditioning_output_ids[index]);
+      const auto name = "tap_" +
+                        (index < 10U ? std::string("0") : std::string()) +
+                        std::to_string(index);
+      writer.append(name, std::span<const std::uint8_t>(tensor.data(),
+                                                        tensor.byte_size()));
+    }
+    (void)writer.finish();
+  } else {
+    dif::runtime::write_tensor(conditioning, options.output);
+  }
 
   std::cout << "CONDITIONING PASS backend=" << result.backend_name
-            << " tokens=" << ids.dims[0] << " shape=[" << conditioning.dims[0]
+            << " tokens=" << token_count << " shape=[" << conditioning.dims[0]
             << "," << conditioning.dims[1] << "]"
             << " payload_sha256="
             << dif::hex_digest(dif::sha256(

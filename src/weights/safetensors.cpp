@@ -58,6 +58,8 @@ std::optional<ir::DType> dtype(std::string_view name) {
     return ir::DType::I8;
   if (name == "I32")
     return ir::DType::I32;
+  if (name == "BOOL")
+    return ir::DType::Bool;
   return std::nullopt;
 }
 
@@ -90,6 +92,8 @@ std::string safetensors_dtype_name(ir::DType value) {
     return "I8";
   case ir::DType::I32:
     return "I32";
+  case ir::DType::Bool:
+    return "BOOL";
   }
   fail("cannot write unknown SafeTensors dtype");
 }

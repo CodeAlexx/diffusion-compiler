@@ -14,7 +14,7 @@ namespace {
 
 bool valid_dtype(DType dtype) {
   return dtype == DType::F32 || dtype == DType::BF16 || dtype == DType::F16 ||
-         dtype == DType::I8 || dtype == DType::I32;
+         dtype == DType::I8 || dtype == DType::I32 || dtype == DType::Bool;
 }
 
 bool supported_float(DType dtype) {
@@ -22,11 +22,11 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::Gelu;
+  return opcode >= Opcode::Add && opcode <= Opcode::Concat;
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::Approximation;
+  return key >= AttrKey::Epsilon && key <= AttrKey::Permutation7;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -114,6 +114,125 @@ void verify_operation(const Program &program, const Operation &op) {
         approximation->bits !=
             static_cast<std::uint64_t>(GeluApproximation::Tanh))
       fail("gelu currently requires Approximation=1 (tanh)");
+    return;
+  }
+
+  if (op.opcode == Opcode::Sigmoid) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype))
+      fail("sigmoid semantics admit f32, bf16, or f16");
+    return;
+  }
+
+  if (op.opcode == Opcode::Reshape) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || out.dtype != input.dtype ||
+        input.element_count() != out.element_count())
+      fail("reshape requires equal-count float input/output tensors");
+    return;
+  }
+
+  if (op.opcode == Opcode::BroadcastTo) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || out.dtype != input.dtype ||
+        input.dims.size() > out.dims.size())
+      fail("broadcast_to requires same-dtype float tensors and output rank >= input rank");
+    const auto pad = out.dims.size() - input.dims.size();
+    for (std::size_t axis = 0; axis < input.dims.size(); ++axis) {
+      const auto source = input.dims[axis];
+      const auto destination = out.dims[pad + axis];
+      if (source != 1U && source != destination)
+        fail("broadcast_to input dimensions must be one or match output");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::Slice) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const auto *axis_attribute = op.find(AttrKey::Axis);
+    const auto *start_attribute = op.find(AttrKey::Start);
+    if (!supported_float(input.dtype) || out.dtype != input.dtype ||
+        input.dims.size() != out.dims.size() || !axis_attribute ||
+        !start_attribute || axis_attribute->kind != AttrKind::U64 ||
+        start_attribute->kind != AttrKind::U64)
+      fail("slice requires equal-rank float tensors and u64 Axis/Start");
+    const auto axis = axis_attribute->as_u64();
+    const auto start = start_attribute->as_u64();
+    if (axis >= input.dims.size() || start > input.dims[axis] ||
+        out.dims[axis] > input.dims[axis] - start)
+      fail("slice axis or interval is outside the input");
+    for (std::size_t index = 0; index < input.dims.size(); ++index)
+      if (index != axis && input.dims[index] != out.dims[index])
+        fail("slice may change only its selected axis");
+    return;
+  }
+
+  if (op.opcode == Opcode::RotaryFrequency) {
+    expect_counts(op, 4, 2);
+    const auto &positions = tensor_or_fail(program, op.inputs[0], op);
+    const auto &pair_axes = tensor_or_fail(program, op.inputs[1], op);
+    const auto &pair_indices = tensor_or_fail(program, op.inputs[2], op);
+    const auto &axis_dims = tensor_or_fail(program, op.inputs[3], op);
+    const auto &cosine = tensor_or_fail(program, op.outputs[0], op);
+    const auto &sine = tensor_or_fail(program, op.outputs[1], op);
+    if (positions.dtype != DType::F32 || positions.dims.size() != 3U ||
+        pair_axes.dtype != DType::I32 || pair_axes.dims.size() != 1U ||
+        pair_indices.dtype != DType::I32 || pair_indices.dims != pair_axes.dims ||
+        axis_dims.dtype != DType::I32 || axis_dims.dims.size() != 1U ||
+        cosine.dtype != DType::F32 || sine.dtype != DType::F32 ||
+        cosine.dims != sine.dims || cosine.dims.size() != 3U ||
+        cosine.dims[0] != positions.dims[0] ||
+        cosine.dims[1] != positions.dims[1] ||
+        cosine.dims[2] != pair_axes.dims[0] ||
+        positions.dims[2] != axis_dims.dims[0])
+      fail("rotary_frequency requires positions [B,L,A], pair maps [P], axis dims [A], and f32 outputs [B,L,P]");
+    if (!(op.f64(AttrKey::Theta, 10000.0) > 0.0) ||
+        !(op.f64(AttrKey::Ntk, 1.0) > 0.0))
+      fail("rotary_frequency theta and ntk must be positive");
+    return;
+  }
+
+  if (op.opcode == Opcode::RotaryApply) {
+    expect_counts(op, 3, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &cosine = tensor_or_fail(program, op.inputs[1], op);
+    const auto &sine = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.size() != 4U ||
+        cosine.dtype != DType::F32 || sine.dtype != DType::F32 ||
+        cosine.dims != sine.dims || cosine.dims.size() != 3U ||
+        cosine.dims[0] != input.dims[0] ||
+        cosine.dims[1] != input.dims[1] ||
+        cosine.dims[2] * 2U > input.dims[3] ||
+        op.u64(AttrKey::RotaryLayout, 0U) !=
+            static_cast<std::uint64_t>(RotaryLayout::Interleaved))
+      fail("rotary_apply currently requires [B,L,H,D], f32 cos/sin [B,L,P], and explicit interleaved layout");
+    return;
+  }
+
+  if (op.opcode == Opcode::BooleanMaskToBias) {
+    expect_counts(op, 1, 1);
+    const auto &mask = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const bool vector_mask = mask.dims.size() == 2U;
+    const bool matrix_mask = mask.dims.size() == 3U;
+    if (mask.dtype != DType::Bool || (!vector_mask && !matrix_mask) ||
+        !supported_float(out.dtype) || out.dims.size() != 4U ||
+        out.dims[0] != mask.dims[0] || out.dims[1] != 1U ||
+        out.dims[2] != (vector_mask ? mask.dims[1] : mask.dims[1]) ||
+        out.dims[3] != (vector_mask ? mask.dims[1] : mask.dims[2]) ||
+        (matrix_mask && mask.dims[1] != mask.dims[2]))
+      fail("boolean_mask_to_bias requires bool [B,L] or [B,L,L] and float [B,1,L,L]");
     return;
   }
 
@@ -368,6 +487,8 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
     if (!(epsilon > 0.0))
       fail("rms_norm epsilon must be positive");
+    if (!std::isfinite(op.f64(AttrKey::WeightOffset, 0.0)))
+      fail("rms_norm weight offset must be finite");
     const auto block = op.u64(AttrKey::BlockSize, 256U);
     if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
       fail("rms_norm block size must be a power of two in [32,1024]");
@@ -514,6 +635,79 @@ void verify_operation(const Program &program, const Operation &op) {
         step_attribute->as_u64() >= timesteps.dims[0])
       fail("flow_euler_step requires equal float sample/velocity/output, "
            "f32 timesteps [K], f32 sigmas [K+1], and StepIndex<K");
+    return;
+  }
+
+  if (op.opcode == Opcode::EulerVelocityStep) {
+    expect_counts(op, 4, 1);
+    const auto &sample = tensor_or_fail(program, op.inputs[0], op);
+    const auto &velocity = tensor_or_fail(program, op.inputs[1], op);
+    const auto &current = tensor_or_fail(program, op.inputs[2], op);
+    const auto &next = tensor_or_fail(program, op.inputs[3], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(sample, velocity, op);
+    same_shape_dtype(sample, out, op);
+    if (!supported_float(sample.dtype) || current.dtype != DType::F32 ||
+        current.dims != std::vector<std::uint64_t>{1U} ||
+        next.dtype != DType::F32 || next.dims != current.dims)
+      fail("euler_velocity_step requires equal float sample/velocity/output "
+           "and f32 [1] current/next timesteps");
+    return;
+  }
+
+  if (op.opcode == Opcode::Permute) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || out.dtype != input.dtype ||
+        input.dims.size() != out.dims.size() || input.dims.empty())
+      fail("permute requires equal-rank non-scalar float input/output");
+    const auto rank = input.dims.size();
+    std::vector<bool> seen(rank, false);
+    for (std::size_t axis = 0; axis < rank; ++axis) {
+      const auto key = static_cast<AttrKey>(
+          static_cast<std::uint32_t>(AttrKey::Permutation0) + axis);
+      const auto *attribute = op.find(key);
+      if (!attribute || attribute->kind != AttrKind::U64 ||
+          attribute->as_u64() >= rank || seen[attribute->as_u64()] ||
+          out.dims[axis] != input.dims[attribute->as_u64()])
+        fail("permute requires a complete unique axis permutation matching output shape");
+      seen[attribute->as_u64()] = true;
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::Concat) {
+    if (op.inputs.size() < 2U || op.outputs.size() != 1U)
+      fail("concat requires at least two inputs and one output");
+    const auto &first = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const auto *axis_attribute = op.find(AttrKey::Axis);
+    if (!axis_attribute || axis_attribute->kind != AttrKind::U64 ||
+        first.dims.empty() || axis_attribute->as_u64() >= first.dims.size() ||
+        !supported_float(first.dtype) || out.dtype != first.dtype ||
+        out.dims.size() != first.dims.size())
+      fail("concat requires an in-range axis and equal-rank float tensors");
+    const auto axis = static_cast<std::size_t>(axis_attribute->as_u64());
+    std::uint64_t joined = 0U;
+    for (const auto input_id : op.inputs) {
+      const auto &input = tensor_or_fail(program, input_id, op);
+      if (input.dtype != first.dtype || input.dims.size() != first.dims.size())
+        fail("concat inputs must have equal dtype and rank");
+      for (std::size_t dimension = 0U; dimension < first.dims.size();
+           ++dimension)
+        if (dimension != axis && input.dims[dimension] != first.dims[dimension])
+          fail("concat non-axis dimensions must match");
+      if (joined > std::numeric_limits<std::uint64_t>::max() -
+                       input.dims[axis])
+        fail("concat axis size overflows");
+      joined += input.dims[axis];
+    }
+    for (std::size_t dimension = 0U; dimension < first.dims.size();
+         ++dimension)
+      if (out.dims[dimension] !=
+          (dimension == axis ? joined : first.dims[dimension]))
+        fail("concat output shape does not match joined inputs");
     return;
   }
 
@@ -672,34 +866,51 @@ void verify_operation(const Program &program, const Operation &op) {
   }
 
   if (op.opcode == Opcode::Attention) {
-    expect_counts(op, 3, 1);
+    if ((op.inputs.size() != 3U && op.inputs.size() != 4U) ||
+        op.outputs.size() != 1U)
+      fail("attention expects q, k, v, optional additive bias, and one output");
     const auto &q = tensor_or_fail(program, op.inputs[0], op);
     const auto &k = tensor_or_fail(program, op.inputs[1], op);
     const auto &v = tensor_or_fail(program, op.inputs[2], op);
     const auto &out = tensor_or_fail(program, op.outputs[0], op);
     same_shape_dtype(k, v, op);
     same_shape_dtype(q, out, op);
-    if (!supported_float(q.dtype) || q.dims.size() != 3)
-      fail("attention semantics require f32, bf16, or f16 [S,H,D]");
+    if (!supported_float(q.dtype) ||
+        (q.dims.size() != 3U && q.dims.size() != 4U))
+      fail("attention semantics require float [S,H,D] or [B,S,H,D]");
     // Grouped-query attention: k/v carry KvHeads heads (AttrKey 39); query
     // head h reads kv head h/(H/KvHeads).  An absent attribute means
     // KvHeads == H — bit-for-bit the historical contract, so every existing
     // program verifies and fingerprints unchanged.
-    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[1]);
-    if (kv_heads == 0U || q.dims[1] % kv_heads != 0U)
+    const auto head_axis = q.dims.size() - 2U;
+    const auto sequence_axis = q.dims.size() - 3U;
+    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[head_axis]);
+    if (kv_heads == 0U || q.dims[head_axis] % kv_heads != 0U)
       fail("attention KvHeads must be nonzero and divide the query head "
            "count");
-    if (k.dtype != q.dtype || k.dims.size() != 3U ||
-        k.dims[0] != q.dims[0] || k.dims[1] != kv_heads ||
-        k.dims[2] != q.dims[2])
-      fail("attention k/v must be [S,KvHeads,D] with the query dtype");
+    auto expected_kv = q.dims;
+    expected_kv[head_axis] = kv_heads;
+    if (k.dtype != q.dtype || k.dims != expected_kv)
+      fail("attention k/v must match query batch/sequence/head-dim with KvHeads heads");
+    if (op.inputs.size() == 4U) {
+      const auto &bias = tensor_or_fail(program, op.inputs[3], op);
+      const auto batch = q.dims.size() == 4U ? q.dims[0] : 1U;
+      const auto sequence = q.dims[sequence_axis];
+      if (q.dims.size() != 4U || bias.dtype != q.dtype ||
+          bias.dims != std::vector<std::uint64_t>{batch, 1U, sequence,
+                                                  sequence})
+        fail("attention additive bias must be [B,1,S,S] in the query dtype");
+    }
     const auto implementation = op.u64(AttrKey::Implementation, 1U);
     if (implementation != 1U && implementation != 2U)
       fail("attention implementation must be 1 (generated) or 2 (cuDNN)");
     if (implementation == 2U && q.dtype != DType::BF16 &&
         q.dtype != DType::F16)
       fail("cuDNN attention implementation requires bf16 or f16");
-    if (implementation == 1U && q.dims[0] > 4096U)
+    if (implementation == 1U &&
+        (q.dims.size() != 3U || op.inputs.size() != 3U))
+      fail("generated attention currently admits unbatched attention without additive bias; use cuDNN for batched/masked semantics");
+    if (implementation == 1U && q.dims[sequence_axis] > 4096U)
       fail("naive exact attention is admitted only for S<=4096; use a backend implementation");
     const auto block = op.u64(AttrKey::BlockSize, 64U);
     if (block < 32U || block > 256U || (block & (block - 1U)) != 0U)

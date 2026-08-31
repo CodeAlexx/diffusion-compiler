@@ -1,5 +1,6 @@
 #include "dif/runtime/tensor.hpp"
 
+#include "dif/runtime/scalar.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
 
@@ -311,6 +312,21 @@ Tensor zeros(const ir::TensorDesc &desc) {
   Tensor tensor{desc.dtype, desc.dims, {}};
   tensor.bytes.resize(static_cast<std::size_t>(desc.byte_count()), 0U);
   return tensor;
+}
+
+Tensor convert_float_tensor(const Tensor &source, ir::DType destination) {
+  source.validate();
+  if (!is_float_dtype(source.dtype) || !is_float_dtype(destination))
+    fail("convert_float_tensor requires floating source and destination");
+  if (source.dtype == destination)
+    fail("convert_float_tensor requires distinct source and destination dtypes");
+  Tensor output{destination, source.dims, {}};
+  output.bytes.resize(static_cast<std::size_t>(
+      source.element_count() * ir::dtype_size(destination)));
+  for (std::uint64_t index = 0U; index < source.element_count(); ++index)
+    store_float(output, index, load_float(source, index));
+  output.validate();
+  return output;
 }
 
 } // namespace dif::runtime

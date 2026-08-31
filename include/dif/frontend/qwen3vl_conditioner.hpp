@@ -30,6 +30,16 @@ struct Qwen3VlConditionerConfig {
   // 2 = cuDNN SDPA (BF16, the accepted denoiser's exact-attention class);
   // 1 = the generated exact kernel (admitted for S <= 4096).
   std::uint64_t attention_implementation{2};
+
+  // Optional generic extraction/masking contract used by diffusion
+  // conditioners such as Krea 2. Hidden-state index k means the raw residual
+  // after k decoder layers, matching transformers output_hidden_states.
+  // Empty selection preserves the historical single final-residual output.
+  std::vector<std::uint64_t> selected_hidden_states;
+  std::uint64_t output_slice_start{0};
+  std::uint64_t output_sequence_length{0};
+  bool use_attention_mask{false};
+  bool dynamic_position_ids{false};
 };
 
 // One checkpoint tensor the program consumes. `name` is the literal
@@ -49,7 +59,10 @@ struct Qwen3VlConditionerBuild {
   // derived from the config, so the program stays self-contained.
   runtime::TensorMap generated_constants;
   std::uint32_t token_ids_input_id{};
+  std::uint32_t attention_mask_input_id{};
+  std::uint32_t position_ids_input_id{};
   std::uint32_t conditioning_output_id{};
+  std::vector<std::uint32_t> conditioning_output_ids;
   std::uint64_t linear_operations{};
   std::uint64_t attention_operations{};
 };

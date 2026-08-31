@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dif/frontend/qwen3vl_conditioner.hpp"
 #include "dif/ir/ir.hpp"
 
 #include <cstdint>
@@ -70,5 +71,96 @@ struct Krea2TimeConditioningBuild {
 
 Krea2TimeConditioningBuild
 make_krea2_time_conditioning(const Krea2Config &config = {});
+
+// One released SingleStreamBlock expressed only with shared DiffIR semantics.
+// The input is the already-combined text/image sequence and the timestep
+// projection is accepted as an input so block parity can be localized before
+// admitting the conditioner and outer model. Checkpoint parameters are bound
+// in BF16 exactly as creator `model.to(torch.bfloat16)` materializes them;
+// source F32 tensors therefore require the runtime's explicit conversion.
+struct Krea2BlockBuild {
+  ir::Program program;
+  Krea2Config config;
+  std::uint64_t block_index{};
+  std::uint32_t sequence_input{};
+  std::uint32_t modulation_input{};
+  std::uint32_t positions_input{};
+  std::uint32_t validity_mask_input{};
+  std::uint32_t modulated_parameters{};
+  std::uint32_t input_normalized{};
+  std::uint32_t attention_input{};
+  std::uint32_t query{};
+  std::uint32_t key{};
+  std::uint32_t value{};
+  std::uint32_t rotary_query{};
+  std::uint32_t rotary_key{};
+  std::uint32_t attention_output{};
+  std::uint32_t attention_gate{};
+  std::uint32_t output_projection{};
+  std::uint32_t attention_residual{};
+  std::uint32_t mlp_input{};
+  std::uint32_t mlp_activation{};
+  std::uint32_t mlp_output{};
+  std::uint32_t final_output{};
+  std::uint32_t rotary_pair_axes{};
+  std::uint32_t rotary_pair_indices{};
+  std::uint32_t rotary_axis_dims{};
+  std::vector<std::uint32_t> checkpoint_tensors;
+  std::vector<std::string> checkpoint_names;
+};
+
+Krea2BlockBuild make_krea2_block(const Krea2Config &config = {},
+                                 std::uint64_t block_index = 0U,
+                                 bool capture_boundaries = true);
+
+// Exact official Krea 2 Qwen3-VL-4B text-tower contract. The encoder consumes
+// 541 prefix/prompt/padding tokens plus the fixed five-token assistant suffix,
+// executes all 36 layers with a padding-aware causal mask, then returns the
+// 12 raw residual taps sliced after the 34-token system/user prefix.
+Qwen3VlConditionerConfig make_krea2_conditioner_config();
+
+// The shared Krea text-fusion path consumes the 12 selected Qwen residual
+// taps, refines across the tap axis, projects 12 -> 1, refines across text
+// tokens with the exact padding mask, and maps 2560 -> the DiT width 6144.
+struct Krea2TextFusionBuild {
+  ir::Program program;
+  std::uint32_t context_input{};
+  std::uint32_t validity_mask_input{};
+  std::vector<std::uint32_t> block_outputs;
+  std::uint32_t projected_output{};
+  std::uint32_t conditioning_output{};
+  std::vector<std::uint32_t> checkpoint_tensors;
+  std::vector<std::string> checkpoint_names;
+};
+
+Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries = true);
+
+// Complete source-faithful Raw MMDiT evaluation after text fusion. The graph
+// owns the patch projection, timestep tower, all 28 shared-runtime blocks,
+// and the final 6144 -> 64 velocity head. It intentionally accepts packed
+// 2x2 image tokens: deterministic noise creation and patch packing are sampler
+// frontend responsibilities, while every learned operation remains in DiffIR.
+struct Krea2DenoiserBuild {
+  ir::Program program;
+  Krea2Config config;
+  std::uint32_t image_tokens_input{};
+  std::uint32_t context_input{};
+  std::uint32_t timestep_input{};
+  std::uint32_t positions_input{};
+  std::uint32_t validity_mask_input{};
+  std::uint32_t rotary_pair_axes{};
+  std::uint32_t rotary_pair_indices{};
+  std::uint32_t rotary_axis_dims{};
+  std::uint32_t projected_image{};
+  std::uint32_t timestep_output{};
+  std::uint32_t modulation_output{};
+  std::vector<std::uint32_t> block_outputs;
+  std::uint32_t velocity_output{};
+  std::vector<std::uint32_t> checkpoint_tensors;
+  std::vector<std::string> checkpoint_names;
+};
+
+Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config = {},
+                                       bool capture_block_outputs = false);
 
 } // namespace dif::frontend

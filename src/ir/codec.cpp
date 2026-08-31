@@ -131,6 +131,8 @@ std::size_t dtype_size(DType dtype) {
   case DType::F32:
   case DType::I32:
     return 4;
+  case DType::Bool:
+    return 1;
   case DType::BF16:
   case DType::F16:
     return 2;
@@ -152,6 +154,8 @@ std::string_view dtype_name(DType dtype) {
     return "i8";
   case DType::I32:
     return "i32";
+  case DType::Bool:
+    return "bool";
   }
   return "invalid";
 }
@@ -256,6 +260,26 @@ std::string_view opcode_name(Opcode opcode) {
     return "snake_beta";
   case Opcode::Gelu:
     return "gelu";
+  case Opcode::Sigmoid:
+    return "sigmoid";
+  case Opcode::Reshape:
+    return "reshape";
+  case Opcode::BroadcastTo:
+    return "broadcast_to";
+  case Opcode::Slice:
+    return "slice";
+  case Opcode::RotaryFrequency:
+    return "rotary_frequency";
+  case Opcode::RotaryApply:
+    return "rotary_apply";
+  case Opcode::BooleanMaskToBias:
+    return "boolean_mask_to_bias";
+  case Opcode::EulerVelocityStep:
+    return "euler_velocity_step";
+  case Opcode::Permute:
+    return "permute";
+  case Opcode::Concat:
+    return "concat";
   }
   return "invalid";
 }
