@@ -1,3 +1,5 @@
+#include "dif/compiler/residency_plan.hpp"
+#include "dif/compiler/layout_plan.hpp"
 #include "dif/frontend/krea2.hpp"
 #include "dif/ir/codec.hpp"
 #include "dif/runtime/executor.hpp"
@@ -16,10 +18,12 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -36,6 +40,21 @@ struct Arguments {
   std::filesystem::path report;
   std::filesystem::path diffir;
   std::filesystem::path cache_directory;
+  std::vector<std::uint32_t> tune_linear_operations;
+  std::vector<dif::runtime::LinearAlgorithmChoice> linear_algorithm_choices;
+  std::uint64_t resident_plan_mib{};
+  dif::compiler::StreamedResidencyOrder resident_order{
+      dif::compiler::StreamedResidencyOrder::FirstConsumer};
+  bool alias_reshapes{};
+  bool expand_linear_algorithms{};
+  bool pipelined_resident_upload{};
+  bool lazy_resident_upload{};
+  std::uint32_t streamed_stage_threads{1U};
+  std::uint32_t streamed_prefetch_depth{1U};
+  std::uint32_t streamed_staging_buffers{2U};
+  std::uint32_t linear_tuning_warmups{3U};
+  std::uint32_t linear_tuning_iterations{10U};
+  std::uint32_t linear_tuning_sessions{3U};
   std::uint32_t steps{52U};
   std::uint32_t stop_after{};
   float guidance{3.5F};
@@ -67,6 +86,60 @@ Arguments parse(int argc, char **argv) {
     else if (option == "--report") result.report = value();
     else if (option == "--diffir") result.diffir = value();
     else if (option == "--cache-dir") result.cache_directory = value();
+    else if (option == "--tune-linear")
+      result.tune_linear_operations.push_back(
+          static_cast<std::uint32_t>(std::stoul(value())));
+    else if (option == "--select-linear-algorithm") {
+      const auto selection = value();
+      const auto split = selection.find(':');
+      if (split == std::string::npos || split == 0U ||
+          split + 1U >= selection.size())
+        dif::fail("Linear algorithm choice must be OP_ID:HEURISTIC_RANK");
+      result.linear_algorithm_choices.push_back(
+          {static_cast<std::uint32_t>(
+               std::stoul(selection.substr(0U, split))),
+           static_cast<std::uint32_t>(
+               std::stoul(selection.substr(split + 1U)))});
+    }
+    else if (option == "--expand-linear-algorithms")
+      result.expand_linear_algorithms = true;
+    else if (option == "--pipelined-resident-upload")
+      result.pipelined_resident_upload = true;
+    else if (option == "--lazy-resident-upload")
+      result.lazy_resident_upload = true;
+    else if (option == "--linear-tune-warmups")
+      result.linear_tuning_warmups =
+          static_cast<std::uint32_t>(std::stoul(value()));
+    else if (option == "--linear-tune-iterations")
+      result.linear_tuning_iterations =
+          static_cast<std::uint32_t>(std::stoul(value()));
+    else if (option == "--linear-tune-sessions")
+      result.linear_tuning_sessions =
+          static_cast<std::uint32_t>(std::stoul(value()));
+    else if (option == "--streamed-stage-threads")
+      result.streamed_stage_threads =
+          static_cast<std::uint32_t>(std::stoul(value()));
+    else if (option == "--streamed-prefetch-depth")
+      result.streamed_prefetch_depth =
+          static_cast<std::uint32_t>(std::stoul(value()));
+    else if (option == "--streamed-staging-buffers")
+      result.streamed_staging_buffers =
+          static_cast<std::uint32_t>(std::stoul(value()));
+    else if (option == "--resident-plan-mib")
+      result.resident_plan_mib = std::stoull(value());
+    else if (option == "--resident-order") {
+      const auto order = value();
+      if (order == "first")
+        result.resident_order =
+            dif::compiler::StreamedResidencyOrder::FirstConsumer;
+      else if (order == "largest")
+        result.resident_order =
+            dif::compiler::StreamedResidencyOrder::LargestFirst;
+      else
+        dif::fail("resident order accepts first or largest");
+    }
+    else if (option == "--alias-reshapes")
+      result.alias_reshapes = true;
     else if (option == "--steps")
       result.steps = static_cast<std::uint32_t>(std::stoul(value()));
     else if (option == "--stop-after")
@@ -85,6 +158,12 @@ Arguments parse(int argc, char **argv) {
       result.report.empty() || result.diffir.empty() || result.steps == 0U ||
       result.guidance < 0.0F || !std::isfinite(result.guidance) ||
       (result.fixed_mu.has_value() && !std::isfinite(*result.fixed_mu)) ||
+      result.linear_tuning_iterations == 0U ||
+      result.linear_tuning_sessions < 2U ||
+      result.streamed_stage_threads == 0U ||
+      result.streamed_prefetch_depth == 0U ||
+      result.streamed_staging_buffers <= result.streamed_prefetch_depth ||
+      (result.pipelined_resident_upload && result.lazy_resident_upload) ||
       (result.stop_after != 0U && result.stop_after > result.steps))
     dif::fail("difkrea2sample requires checkpoint, positive conditioning and "
               "tokenizer, initial fixture, reference, output, report, diffir, "
@@ -106,6 +185,37 @@ dif::runtime::Tensor float_tensor(dif::ir::DType dtype,
 
 dif::runtime::Tensor scalar(dif::ir::DType dtype, float value) {
   return float_tensor(dtype, {1U}, std::span<const float>(&value, 1U));
+}
+
+std::string residency_plan_hash(
+    const dif::compiler::StreamedResidencyPlan &plan,
+    const dif::compiler::ReshapeAliasPlan *aliases,
+    std::uint32_t stage_threads, std::uint32_t prefetch_depth,
+    std::uint32_t staging_buffers,
+    dif::compiler::StreamedResidencyOrder order,
+    bool pipelined_resident_upload, bool lazy_resident_upload) {
+  std::string identity =
+      "streamed-residency-v2|max=" +
+      std::to_string(plan.maximum_total_bytes) + "|fixed=" +
+      std::to_string(plan.fixed_runtime_bytes) + "|stage_threads=" +
+      std::to_string(stage_threads) + "|prefetch_depth=" +
+      std::to_string(prefetch_depth) + "|staging_buffers=" +
+      std::to_string(staging_buffers) + "|order=" +
+      std::to_string(static_cast<std::uint32_t>(order)) +
+      "|pipelined_resident_upload=" +
+      std::to_string(pipelined_resident_upload ? 1U : 0U) +
+      "|lazy_resident_upload=" +
+      std::to_string(lazy_resident_upload ? 1U : 0U) + "|ids=";
+  for (const auto id : plan.resident_tensor_ids)
+    identity += std::to_string(id) + ",";
+  identity += "|reshape_ops=";
+  if (aliases) {
+    for (const auto id : aliases->operation_ids)
+      identity += std::to_string(id) + ",";
+  }
+  return dif::hex_digest(dif::sha256(std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t *>(identity.data()),
+      identity.size())));
 }
 
 dif::runtime::Tensor i32_tensor(std::vector<std::int32_t> values) {
@@ -321,6 +431,75 @@ int main(int argc, char **argv) {
     denoiser_options.minimum_free_bytes = 512ULL * 1024ULL * 1024ULL;
     denoiser_options.cache_directory = arguments.cache_directory;
     denoiser_options.streamed_release_mapped_pages_per_copy = false;
+    denoiser_options.tune_linear_operations =
+        arguments.tune_linear_operations;
+    denoiser_options.linear_algorithm_choices =
+        arguments.linear_algorithm_choices;
+    denoiser_options.expand_linear_algorithms =
+        arguments.expand_linear_algorithms;
+    denoiser_options.linear_tuning_warmups =
+        arguments.linear_tuning_warmups;
+    denoiser_options.linear_tuning_iterations =
+        arguments.linear_tuning_iterations;
+    denoiser_options.linear_tuning_sessions =
+        arguments.linear_tuning_sessions;
+    denoiser_options.streamed_stage_threads =
+        arguments.streamed_stage_threads;
+    denoiser_options.streamed_prefetch_depth =
+        arguments.streamed_prefetch_depth;
+    denoiser_options.streamed_staging_buffers =
+        arguments.streamed_staging_buffers;
+    denoiser_options.pipelined_resident_upload =
+        arguments.pipelined_resident_upload;
+    denoiser_options.lazy_resident_upload =
+        arguments.lazy_resident_upload;
+    std::optional<dif::compiler::ReshapeAliasPlan> reshape_alias_plan;
+    if (arguments.alias_reshapes) {
+      reshape_alias_plan.emplace(
+          dif::compiler::plan_reshape_aliases(denoiser.program));
+      denoiser_options.alias_reshape_operations =
+          reshape_alias_plan->operation_ids;
+    }
+    std::optional<dif::compiler::StreamedResidencyPlan> residency_plan;
+    std::string residency_hash;
+    if (arguments.resident_plan_mib != 0U) {
+      if (arguments.resident_plan_mib >
+          std::numeric_limits<std::uint64_t>::max() / (1024ULL * 1024ULL))
+        dif::fail("Krea resident-plan MiB value overflows bytes");
+      constexpr std::uint64_t linear_workspace_bytes =
+          64ULL * 1024ULL * 1024ULL;
+      residency_plan.emplace(dif::compiler::plan_streamed_residency(
+          denoiser.program,
+          arguments.resident_plan_mib * 1024ULL * 1024ULL,
+          linear_workspace_bytes,
+          denoiser_options.streamed_prefetch_depth,
+          reshape_alias_plan
+              ? reshape_alias_plan->output_to_root_input
+              : std::unordered_map<std::uint32_t, std::uint32_t>{},
+          arguments.resident_order));
+      denoiser_options.resident_streamed_constants =
+          residency_plan->resident_tensor_ids;
+      residency_hash = residency_plan_hash(
+          *residency_plan,
+          reshape_alias_plan ? &*reshape_alias_plan : nullptr,
+          denoiser_options.streamed_stage_threads,
+          denoiser_options.streamed_prefetch_depth,
+          denoiser_options.streamed_staging_buffers,
+          arguments.resident_order,
+          arguments.pipelined_resident_upload,
+          arguments.lazy_resident_upload);
+      std::cout << "KREA2_RESIDENCY_PLAN hash=" << residency_hash
+                << " resident_tensors="
+                << residency_plan->resident_tensor_ids.size()
+                << " resident_bytes="
+                << residency_plan->resident_constant_bytes
+                << " streamed_bytes="
+                << residency_plan->streamed_constant_bytes
+                << " required_bytes=" << residency_plan->required_bytes
+                << " maximum_bytes="
+                << residency_plan->maximum_total_bytes << "\n"
+                << std::flush;
+    }
     auto backend = dif::runtime::make_cuda_executor();
     auto prepared =
         backend->prepare(denoiser.program, denoiser_bindings, denoiser_options);
@@ -365,6 +544,9 @@ int main(int argc, char **argv) {
     std::vector<double> conditional_ms;
     std::vector<double> unconditional_ms;
     std::vector<double> scheduler_ms;
+    std::vector<dif::runtime::LinearTuningResult> linear_tuning_results;
+    std::vector<dif::runtime::LinearAlgorithmChoice>
+        selected_linear_algorithms;
     conditional_ms.reserve(executed_steps);
     unconditional_ms.reserve(executed_steps);
     scheduler_ms.reserve(executed_steps);
@@ -382,6 +564,10 @@ int main(int argc, char **argv) {
       auto start = std::chrono::steady_clock::now();
       auto conditional = prepared->run(denoiser_bindings, denoiser_options);
       conditional_ms.push_back(milliseconds_since(start));
+      if (step == 0U) {
+        linear_tuning_results = conditional.linear_tuning_results;
+        selected_linear_algorithms = conditional.selected_linear_algorithms;
+      }
 
       const auto &conditional_velocity =
           conditional.outputs.at(denoiser.velocity_output);
@@ -452,7 +638,8 @@ int main(int argc, char **argv) {
                 << scheduler_ms.back() << "\n"
                 << std::flush;
     }
-    captures.emplace_back("final_image_tokens", image);
+    if (executed_steps == arguments.steps)
+      captures.emplace_back("final_image_tokens", image);
     const auto wall_ms = milliseconds_since(wall_start);
 
     std::vector<dif::weights::SafeTensorWriteSpec> specs;
@@ -485,7 +672,144 @@ int main(int argc, char **argv) {
            << ",\n  \"denoiser_preparation_ms\": "
            << prepared->preparation_milliseconds()
            << ",\n  \"denoiser_resident_bytes\": " << prepared->resident_bytes()
-           << ",\n  \"wall_ms\": " << wall_ms << ",\n  \"steps_detail\": [\n";
+           << ",\n  \"reshape_alias_plan\": ";
+    if (reshape_alias_plan) {
+      report << "{\"operations\":"
+             << reshape_alias_plan->operation_ids.size()
+             << ",\"eliminated_materialization_bytes\":"
+             << reshape_alias_plan->eliminated_materialization_bytes
+             << ",\"operation_ids\":[";
+      for (std::size_t index = 0U;
+           index < reshape_alias_plan->operation_ids.size(); ++index) {
+        if (index != 0U)
+          report << ',';
+        report << reshape_alias_plan->operation_ids[index];
+      }
+      report << "]}";
+    } else {
+      report << "null";
+    }
+    report
+           << ",\n  \"resident_plan\": ";
+    if (residency_plan) {
+      report << "{\"identity_sha256\":" << std::quoted(residency_hash)
+             << ",\"selection_order\":"
+             << std::quoted(
+                    arguments.resident_order ==
+                            dif::compiler::StreamedResidencyOrder::LargestFirst
+                        ? "largest_first"
+                        : "first_consumer")
+             << ",\"maximum_total_bytes\":"
+             << residency_plan->maximum_total_bytes
+             << ",\"fixed_runtime_bytes\":"
+             << residency_plan->fixed_runtime_bytes
+             << ",\"memory_plan_bytes\":"
+             << residency_plan->memory_plan_bytes
+             << ",\"resident_constant_bytes\":"
+             << residency_plan->resident_constant_bytes
+             << ",\"streamed_constant_bytes\":"
+             << residency_plan->streamed_constant_bytes
+             << ",\"required_bytes\":" << residency_plan->required_bytes
+             << ",\"resident_tensor_ids\":[";
+      for (std::size_t index = 0U;
+           index < residency_plan->resident_tensor_ids.size(); ++index) {
+        if (index != 0U)
+          report << ',';
+        report << residency_plan->resident_tensor_ids[index];
+      }
+      report << "]}";
+    } else {
+      report << "null";
+    }
+    report
+           << ",\n  \"streamed_transport\": {\"stage_threads\":"
+           << denoiser_options.streamed_stage_threads
+           << ",\"prefetch_depth\":"
+           << denoiser_options.streamed_prefetch_depth
+           << ",\"staging_buffers\":"
+           << denoiser_options.streamed_staging_buffers
+           << ",\"pipelined_resident_upload\":"
+           << (denoiser_options.pipelined_resident_upload ? "true" : "false")
+           << ",\"lazy_resident_upload\":"
+           << (denoiser_options.lazy_resident_upload ? "true" : "false")
+           << "},\n  \"linear_plan\": {\"expanded_algorithms\":"
+           << (arguments.expand_linear_algorithms ? "true" : "false")
+           << ",\"requested_tuning_operations\":[";
+    for (std::size_t index = 0U;
+         index < arguments.tune_linear_operations.size(); ++index) {
+      if (index != 0U)
+        report << ',';
+      report << arguments.tune_linear_operations[index];
+    }
+    report << "],\"requested_algorithm_choices\":[";
+    for (std::size_t index = 0U;
+         index < arguments.linear_algorithm_choices.size(); ++index) {
+      if (index != 0U)
+        report << ',';
+      report << "{\"operation_id\":"
+             << arguments.linear_algorithm_choices[index].operation_id
+             << ",\"heuristic_rank\":"
+             << arguments.linear_algorithm_choices[index].heuristic_rank
+             << '}';
+    }
+    report << "],\"selected_algorithm_choices\":[";
+    for (std::size_t index = 0U;
+         index < selected_linear_algorithms.size(); ++index) {
+      if (index != 0U)
+        report << ',';
+      report << "{\"operation_id\":"
+             << selected_linear_algorithms[index].operation_id
+             << ",\"heuristic_rank\":"
+             << selected_linear_algorithms[index].heuristic_rank << '}';
+    }
+    report << "],\"tuning_results\":[";
+    for (std::size_t index = 0U; index < linear_tuning_results.size();
+         ++index) {
+      if (index != 0U)
+        report << ',';
+      const auto &tuning = linear_tuning_results[index];
+      report << "{\"operation_id\":" << tuning.operation_id
+             << ",\"selected_heuristic_rank\":"
+             << tuning.selected_heuristic_index
+             << ",\"selected_algorithm_id\":"
+             << tuning.selected_algorithm_id
+             << ",\"default_mean_ms\":"
+             << tuning.default_mean_milliseconds
+             << ",\"selected_mean_ms\":"
+             << tuning.selected_mean_milliseconds
+             << ",\"observed_noise_ms\":"
+             << tuning.observed_noise_milliseconds
+             << ",\"tuning_ms\":" << tuning.tuning_milliseconds
+             << ",\"changed_from_default\":"
+             << (tuning.changed_from_default ? "true" : "false")
+             << ",\"decision\":" << std::quoted(tuning.decision)
+             << ",\"candidates\":[";
+      for (std::size_t candidate_index = 0U;
+           candidate_index < tuning.candidates.size(); ++candidate_index) {
+        if (candidate_index != 0U)
+          report << ',';
+        const auto &candidate = tuning.candidates[candidate_index];
+        report << "{\"heuristic_rank\":" << candidate.heuristic_index
+               << ",\"algorithm_id\":" << candidate.algorithm_id
+               << ",\"tile_id\":" << candidate.tile_id
+               << ",\"stages_id\":" << candidate.stages_id
+               << ",\"split_k\":" << candidate.split_k
+               << ",\"reduction_scheme\":"
+               << candidate.reduction_scheme
+               << ",\"cta_swizzle\":" << candidate.cta_swizzle
+               << ",\"custom_option\":" << candidate.custom_option
+               << ",\"waves_count\":" << candidate.waves_count
+               << ",\"workspace_bytes\":" << candidate.workspace_bytes
+               << ",\"mean_ms\":" << candidate.mean_milliseconds
+               << ",\"session_min_ms\":"
+               << candidate.minimum_session_milliseconds
+               << ",\"session_max_ms\":"
+               << candidate.maximum_session_milliseconds << '}';
+      }
+      report << "]}";
+    }
+    report << "]},\n  \"wall_ms\": " << wall_ms
+           << ",\n  \"steps_detail\": [\n";
     for (std::size_t index = 0U; index < conditional_ms.size(); ++index) {
       report << "    {\"step\":" << index + 1U
              << ",\"conditional_ms\":" << conditional_ms[index]

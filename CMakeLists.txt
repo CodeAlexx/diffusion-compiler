@@ -17,7 +17,9 @@ add_library(difcore
     src/backend/plugin.cpp
     src/compiler/compiler.cpp
     src/compiler/int4.cpp
+    src/compiler/layout_plan.cpp
     src/compiler/memory_plan.cpp
+    src/compiler/residency_plan.cpp
     src/compiler/slice.cpp
   src/frontend/h3.cpp
   src/frontend/h3_conditioning.cpp

@@ -40,7 +40,9 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
                        const std::unordered_set<std::uint32_t>
                            &excluded_internal_tensors,
                        const std::unordered_set<std::uint32_t>
-                           &replaced_constant_tensors) {
+                           &replaced_constant_tensors,
+                       const std::unordered_map<std::uint32_t, std::uint32_t>
+                           &tensor_aliases) {
   ir::verify(program);
   (void)align_up(0U, alignment);
   const auto end = static_cast<std::uint64_t>(program.operations.size());
@@ -57,6 +59,31 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
     }
   }
 
+  std::unordered_map<std::uint32_t, std::uint32_t> alias_roots;
+  std::unordered_map<std::uint32_t, std::uint64_t> alias_last_consumer;
+  for (const auto &[output_id, input_id] : tensor_aliases) {
+    const auto *output = program.tensor(output_id);
+    const auto *input = program.tensor(input_id);
+    if (!output || !input || output->roles != ir::TensorRole::Internal ||
+        output->dtype != input->dtype ||
+        output->byte_count() != input->byte_count())
+      fail("memory-plan tensor alias is not an equal-storage internal view");
+    auto root = input_id;
+    std::unordered_set<std::uint32_t> seen{output_id};
+    while (tensor_aliases.contains(root)) {
+      if (!seen.insert(root).second)
+        fail("memory-plan tensor aliases contain a cycle");
+      root = tensor_aliases.at(root);
+    }
+    if (!program.tensor(root))
+      fail("memory-plan tensor alias resolves to a missing root");
+    alias_roots.emplace(output_id, root);
+    const auto consumed = last_consumer.find(output_id);
+    if (consumed != last_consumer.end())
+      alias_last_consumer[root] =
+          std::max(alias_last_consumer[root], consumed->second);
+  }
+
   std::vector<Interval> intervals;
   intervals.reserve(program.tensors.size());
   MemoryPlan plan;
@@ -68,6 +95,8 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
         fail("memory plan may exclude only internal lowering intermediates");
       continue;
     }
+    if (alias_roots.contains(tensor.id))
+      continue;
     if (replaced_constant_tensors.contains(tensor.id)) {
       if (!tensor.has_role(ir::TensorRole::Constant) ||
           tensor.has_role(ir::TensorRole::Input) ||
@@ -92,9 +121,13 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
     const auto first = streamed
                            ? streamed_first
                            : produced == producer.end() ? 0U : produced->second;
-    const auto last = tensor.has_role(ir::TensorRole::Output)
-                          ? end
-                          : consumed == last_consumer.end() ? first : consumed->second;
+    auto last = tensor.has_role(ir::TensorRole::Output)
+                    ? end
+                    : consumed == last_consumer.end() ? first
+                                                      : consumed->second;
+    if (const auto alias_last = alias_last_consumer.find(tensor.id);
+        alias_last != alias_last_consumer.end())
+      last = std::max(last, alias_last->second);
     intervals.push_back({&tensor, first, last, protected_role});
     const auto bytes = align_up(tensor.byte_count(), alignment);
     if (plan.naive_bytes > std::numeric_limits<std::uint64_t>::max() - bytes)

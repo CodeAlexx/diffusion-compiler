@@ -4,6 +4,8 @@
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/compiler/memory_plan.hpp"
+#include "dif/compiler/layout_plan.hpp"
+#include "dif/compiler/residency_plan.hpp"
 #include "dif/opt/gate.hpp"
 #include "dif/frontend/h3.hpp"
 #include "dif/frontend/h3_conditioning.hpp"
@@ -912,7 +914,7 @@ void test_krea2_real_dimension_frontend_scaffold() {
   const auto *velocity = denoiser.program.tensor(denoiser.velocity_output);
   expect(denoiser.checkpoint_tensors.size() == 376U &&
              denoiser.block_outputs.size() == 28U &&
-             denoiser.program.operations.size() == 1725U && velocity &&
+             denoiser.program.operations.size() == 1585U && velocity &&
              velocity->dtype == DType::BF16 &&
              velocity->dims == std::vector<std::uint64_t>({1U,4096U,64U}),
          "Krea 2 full denoiser is one real-dimension shared DiffIR program");
@@ -922,6 +924,13 @@ void test_krea2_real_dimension_frontend_scaffold() {
                          return operation.opcode == Opcode::Concat;
                        }) == 1,
          "Krea 2 full denoiser uses the generic text/image concat operation");
+  expect(std::count_if(denoiser.program.operations.begin(),
+                       denoiser.program.operations.end(),
+                       [](const auto &operation) {
+                         return operation.opcode == Opcode::AffineLastDim;
+                       }) == 56,
+         "Krea 2 full denoiser represents per-feature modulation with the "
+         "shared affine operation");
   for (const auto &operation : denoiser.program.operations)
     expect(operation.opcode != Opcode::H3AdaLNSelect &&
                operation.opcode != Opcode::H3DeinterleaveQkv &&
@@ -2724,6 +2733,120 @@ void test_memory_plan_omits_backend_replaced_constants() {
          "memory plan rejects replacement of a dynamic semantic input");
 }
 
+void test_compiler_streamed_residency_plan() {
+  using namespace dif::ir;
+  Program program;
+  constexpr auto streamed = TensorRole::Constant | TensorRole::Streamed;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 1024}},
+      {2, DType::F32, streamed, {1, 1024}},
+      {3, DType::F32, streamed, {1, 1024}},
+      {4, DType::F32, TensorRole::Internal, {1, 1024}},
+      {5, DType::F32, TensorRole::Output, {1, 1024}},
+  };
+  program.operations = {
+      {1, Opcode::Add, {1, 2}, {4}, {}},
+      {2, Opcode::Add, {4, 3}, {5}, {}},
+  };
+  const auto ordinary = dif::compiler::plan_memory(program, 256U, 0U);
+  const auto baseline = dif::compiler::plan_streamed_residency(
+      program, ordinary.total_bytes, 0U, 0U);
+  expect(baseline.resident_tensor_ids.empty() &&
+             baseline.streamed_constant_bytes == 2U * 4096U &&
+             baseline.required_bytes == ordinary.total_bytes,
+         "compiler residency plan preserves streaming under a tight budget");
+  const auto resident = dif::compiler::plan_streamed_residency(
+      program, ordinary.total_bytes + 4096U, 0U, 0U);
+  expect(resident.resident_tensor_ids ==
+                 std::vector<std::uint32_t>{2U, 3U} &&
+             resident.resident_constant_bytes == 2U * 4096U &&
+             resident.streamed_constant_bytes == 0U &&
+             resident.required_bytes == ordinary.total_bytes + 4096U,
+         "compiler residency plan admits an explicit reusable weight set");
+}
+
+void test_cuda_lazy_resident_upload() {
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  constexpr auto streamed = TensorRole::Constant | TensorRole::Streamed;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 4}},
+      {2, DType::F32, streamed, {1, 4}},
+      {3, DType::F32, TensorRole::Output, {1, 4}},
+  };
+  program.operations = {{1, Opcode::Add, {1, 2}, {3}, {}}};
+  dif::runtime::TensorMap bindings = {
+      {1, f32_tensor({1, 4}, {1.0F, 2.0F, 3.0F, 4.0F})},
+      {2, f32_tensor({1, 4}, {0.5F, 1.0F, 1.5F, 2.0F})},
+  };
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  options.resident_streamed_constants = {2U};
+  options.lazy_resident_upload = true;
+  options.streamed_release_mapped_pages_per_copy = false;
+  auto prepared =
+      dif::runtime::make_cuda_executor()->prepare(program, bindings, options);
+  const auto first = prepared->run(bindings, options);
+  const auto second = prepared->run(bindings, options);
+  expect(first.outputs.at(3U).bytes == second.outputs.at(3U).bytes &&
+             first.run_telemetry.h2d_copies == 2U &&
+             first.run_telemetry.h2d_bytes == 32U &&
+             second.run_telemetry.h2d_copies == 1U &&
+             second.run_telemetry.h2d_bytes == 16U,
+         "lazy resident constant uploads once and remains bit-exact");
+}
+
+void test_compiler_and_cuda_reshape_alias_plan() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 1024}},
+      {2, DType::F32, TensorRole::Internal, {1024, 1}},
+      {3, DType::F32, TensorRole::Constant, {1024, 1}},
+      {4, DType::F32, TensorRole::Output, {1024, 1}},
+  };
+  program.operations = {
+      {1, Opcode::Reshape, {1}, {2}, {}},
+      {2, Opcode::Add, {2, 3}, {4}, {}},
+  };
+  const auto aliases = dif::compiler::plan_reshape_aliases(program);
+  const auto ordinary = dif::compiler::plan_memory(program);
+  const auto aliased = dif::compiler::plan_memory(
+      program, 256U, 0U, {}, {}, aliases.output_to_root_input);
+  expect(aliases.operation_ids == std::vector<std::uint32_t>{1U} &&
+             aliases.output_to_root_input.at(2U) == 1U &&
+             aliased.total_bytes < ordinary.total_bytes,
+         "compiler reshape alias plan removes an internal materialization");
+
+  dif::runtime::TensorMap bindings;
+  std::vector<float> input_values(1024U);
+  std::vector<float> constant_values(1024U);
+  for (std::size_t index = 0U; index < input_values.size(); ++index) {
+    input_values[index] = static_cast<float>(index) * 0.25F;
+    constant_values[index] = static_cast<float>(index % 7U) - 3.0F;
+  }
+  bindings.emplace(1U, f32_tensor({1U, 1024U}, input_values));
+  bindings.emplace(3U, f32_tensor({1024U, 1U}, constant_values));
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  if (!dif::runtime::cuda_available())
+    return;
+  options.alias_reshape_operations = aliases.operation_ids;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cuda.outputs.at(4U).bytes == cpu.outputs.at(4U).bytes &&
+             cuda.run_telemetry.kernel_launches == 1U,
+         "CUDA reshape alias executes zero-copy and remains bit-exact");
+}
+
 void test_weight_bundle_roundtrip() {
   using namespace dif::ir;
   const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -3552,6 +3675,9 @@ int main() {
   test_memory_plan_pages_streamed_constants();
   test_memory_plan_reserves_prefetch_storage();
   test_memory_plan_omits_backend_replaced_constants();
+  test_compiler_streamed_residency_plan();
+  test_cuda_lazy_resident_upload();
+  test_compiler_and_cuda_reshape_alias_plan();
   test_weight_bundle_roundtrip();
   test_safetensors_streaming_writer();
   test_safetensors_tensor_metadata_is_skipped();

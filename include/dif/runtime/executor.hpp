@@ -47,6 +47,13 @@ struct RunOptions {
   std::vector<std::uint32_t> absorb_linear_bias_operations;
   std::vector<CutlassLinearChoice> cutlass_linear_operations;
   std::vector<LinearAlgorithmChoice> linear_algorithm_choices;
+  // Explicit compiler-selected streamed constants to promote into persistent
+  // device storage for the lifetime of this prepared execution. The runtime
+  // validates and executes this list but never chooses it heuristically.
+  std::vector<std::uint32_t> resident_streamed_constants;
+  // Explicit compiler-selected semantic Reshape operations whose internal
+  // outputs alias their immutable inputs in the prepared execution plan.
+  std::vector<std::uint32_t> alias_reshape_operations;
   // Accepted MiniMax-H3 W8A8 precision route. The cache is the Serenity
   // resident row-scale SafeTensors store; the backend recognizes and replaces
   // only an exclusive Linear->SwiGlu->Linear->ResidualGate MLP chain.
@@ -114,6 +121,16 @@ struct RunOptions {
   // Worker threads for the mmap->pinned staging copy (1 = the historical
   // single-threaded memcpy on the submitting thread).
   std::uint32_t streamed_stage_threads{1};
+  // Upload compiler-promoted reusable constants through a bounded two-slot
+  // pinned staging pipeline during preparation. This overlaps mmap-to-pinned
+  // host copies with the previous H2D transfer; policy remains explicit and
+  // the pinned footprint is checked against streamed_pinned_budget_bytes.
+  bool pipelined_resident_upload{false};
+  // Allocate selected persistent constants at prepare, but populate their
+  // dedicated device storage at first semantic use. The first execution can
+  // overlap this one-time upload with model compute; later executions reuse
+  // the populated storage without another transfer.
+  bool lazy_resident_upload{false};
   // Upper bound on pinned host memory the streamed staging ring may
   // allocate. The historical two-buffer footprint is always admitted; a
   // larger ring that would exceed the budget fails closed. This host has

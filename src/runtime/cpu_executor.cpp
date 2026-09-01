@@ -15,6 +15,8 @@
 namespace dif::runtime {
 namespace {
 
+float round_to_storage_dtype(float value, ir::DType dtype);
+
 void validate_bound_inputs(const ir::Program &program, const TensorMap &inputs) {
   for (const auto &desc : program.tensors) {
     if (!desc.has_role(ir::TensorRole::Input) &&
@@ -58,7 +60,8 @@ void affine_last_dim(const ir::Operation &op, TensorMap &tensors) {
   const auto width = input.dims.back();
   for (std::uint64_t index = 0; index < out.element_count(); ++index) {
     const auto column = index % width;
-    const auto scaled = load_float(input, index) * load_float(scale, column);
+    const auto scaled = round_to_storage_dtype(
+        load_float(input, index) * load_float(scale, column), out.dtype);
     store_float(out, index,
                 bias ? scaled + load_float(*bias, column) : scaled);
   }

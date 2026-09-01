@@ -49,7 +49,7 @@ conditioning policy, and scheduler rules stay in their frontends. Generic
 operations stay in DiffIR and the shared runtime; there is no Krea-specific
 executor or second tensor framework.
 
-## Krea 2 Turbo BF16 baseline
+## Krea 2 Turbo BF16 benchmark
 
 The frozen baseline uses the official Krea 2 Turbo checkpoint and creator
 recipe on one RTX 3090 Ti:
@@ -61,26 +61,35 @@ recipe on one RTX 3090 Ti:
 - identical checkpoint, prompt, seed, initial latent, schedule, and conditioning
   boundary for the compared denoisers
 
-The native path and the strict ComfyUI/PyTorch development comparator measured:
+The frozen pre-optimization native path, the first admitted whole-system plan,
+and the strict ComfyUI/PyTorch development comparator measured:
 
-| Measurement | Native C++ | ComfyUI/PyTorch BF16 |
-|---|---:|---:|
-| One-time denoiser preparation | 1.227 s | included in cold first step |
-| Cold first denoise step | 4.332 s | 28.287 s |
-| Hot denoise step median | 4.309 s | 2.000 s |
-| Complete 8-step denoise | 34.477 s | 42.316 s |
-| Peak NVML GPU use / host RSS | not captured with the same method | 25.487 GB / 27.028 GB |
+| Measurement | Native frozen | Native admitted plan | ComfyUI/PyTorch BF16 |
+|---|---:|---:|---:|
+| One-time denoiser preparation | 1.227 s | 1.224–1.230 s | included in cold first step |
+| Cold first denoise step | 4.332 s | 3.565–3.599 s | 28.287 s |
+| Hot denoise step median | 4.309 s | 2.249–2.258 s | 2.000 s |
+| Complete 8-step denoise | 34.477 s | 19.364–19.379 s | 42.316 s |
+| Preparation + 8-step denoise | 35.703 s | 20.594–20.602 s | 42.316 s |
+| Peak NVML GPU use / host RSS | not captured together | 23,364 MiB / 26,771,764 KiB | 25.487 GB / 27.028 GB |
 
-The instrumented native 8-step denoise loop is **1.227x faster**. Including
-native's separately measured preparation gives 35.703 s, still **1.185x
-faster** than the strict Comfy denoise loop, though the two runtimes expose
-setup at different boundaries. The warmed ComfyUI loop is **2.155x faster per
-repeated step**, while its cold first step is **6.53x slower**. This split is
-the measured optimization target: preserve the native cold-start advantage
-while improving prepared-plan residency, prefetch, launch count, layout
-persistence, workspace reuse, GEMM planning, and attention execution across
-all 28 blocks and 8 steps. No complete UI-to-image end-to-end speed ratio is
-claimed by this denoiser benchmark.
+Across two accepted repetitions, the admitted native plan is **2.054x faster**
+including its explicit preparation, and its denoise loop is **2.184x faster**.
+The warmed ComfyUI iteration remains about **1.12x faster** than the admitted
+native hot iteration; the native end-to-end advantage comes from retaining its
+small setup boundary and populating compiler-selected resident weights once
+during the first semantic evaluation instead of paying the framework's large
+cold step.
+
+The admitted plan keeps 22.072 GB of reusable weights resident, streams 2.775
+GB, selects residency largest-first under an explicit 22,000 MiB plan budget,
+aliases immutable reshapes, and uses four bounded host staging participants.
+Krea modulation now uses the shared `AffineLastDim` semantic instead of
+materializing redundant full-sequence broadcasts. All eight recorded states
+and the final latent remain bit-identical to the frozen creator trajectory; no
+quality or numerical threshold changed. This is the first 2x checkpoint, not
+the final optimization target. No complete UI-to-image speed ratio is claimed
+by this denoiser benchmark.
 
 The strict comparator uses the creator's padding mask and the same
 post-TextFusion conditioning boundary. Its final latent versus the exact
@@ -94,9 +103,9 @@ Qwen-Image VAE decode through the native runtime measured 0.977 s after a
 separate 4.519 s one-time plan build. Against the creator decode, the native
 PNG measured 56.81 dB PSNR and 0.999073 SSIM and passed visual inspection.
 
-These are source-faithful baseline numbers, not an optimized-plan claim. The
-next performance phase begins from this frozen baseline; it does not change
-the prompt, seed, BF16 quality class, scheduler, or output gate.
+The original numbers remain the frozen pre-optimization baseline. Successor
+plans continue to use the same prompt, seed, BF16 quality class, scheduler,
+and output gate.
 
 ## Build and test
 

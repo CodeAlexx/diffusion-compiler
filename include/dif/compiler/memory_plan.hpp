@@ -3,6 +3,7 @@
 #include "dif/ir/ir.hpp"
 
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -37,6 +38,8 @@ MemoryPlan plan_memory(const ir::Program &program,
                        const std::unordered_set<std::uint32_t>
                            &excluded_internal_tensors = {},
                        const std::unordered_set<std::uint32_t>
-                           &replaced_constant_tensors = {});
+                           &replaced_constant_tensors = {},
+                       const std::unordered_map<std::uint32_t, std::uint32_t>
+                           &tensor_aliases = {});
 
 } // namespace dif::compiler

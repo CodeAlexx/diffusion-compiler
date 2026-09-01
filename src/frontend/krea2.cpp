@@ -425,14 +425,10 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
       add_checkpoint("mod.lin", {6U * features});
   const auto modulation_delta_2d = add_bf16({1U, 6U * features});
   add_operation(Opcode::Reshape, {modulation_delta}, {modulation_delta_2d});
-  const auto modulation_delta_batch =
-      add_bf16({batch, 6U * features});
-  add_operation(Opcode::BroadcastTo, {modulation_delta_2d},
-                {modulation_delta_batch});
   build.modulated_parameters =
       add_bf16({batch, 6U * features}, true);
   add_operation(Opcode::Add,
-                {build.modulation_input, modulation_delta_batch},
+                {build.modulation_input, modulation_delta_2d},
                 {build.modulated_parameters});
 
   const auto modulation_chunk = [&](std::uint64_t chunk) {
@@ -440,20 +436,28 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
     add_operation(Opcode::Slice, {build.modulated_parameters}, {sliced},
                   {Attribute::u64(AttrKey::Axis, 1U),
                    Attribute::u64(AttrKey::Start, chunk * features)});
+    const auto vector = add_bf16({features});
+    add_operation(Opcode::Reshape, {sliced}, {vector});
+    return vector;
+  };
+  const auto prescale = modulation_chunk(0U);
+  const auto preshift = modulation_chunk(1U);
+  const auto pregate_vector = modulation_chunk(2U);
+  const auto postscale = modulation_chunk(3U);
+  const auto postshift = modulation_chunk(4U);
+  const auto postgate_vector = modulation_chunk(5U);
+
+  const auto broadcast_modulation = [&](std::uint32_t vector) {
     const auto expanded = add_bf16({batch, 1U, features});
-    add_operation(Opcode::Reshape, {sliced}, {expanded});
+    add_operation(Opcode::Reshape, {vector}, {expanded});
     const auto broadcast = add_bf16(sequence_shape);
     add_operation(Opcode::BroadcastTo, {expanded}, {broadcast});
     return broadcast;
   };
-  const auto prescale = modulation_chunk(0U);
-  const auto preshift = modulation_chunk(1U);
-  const auto pregate = modulation_chunk(2U);
-  const auto postscale = modulation_chunk(3U);
-  const auto postshift = modulation_chunk(4U);
-  const auto postgate = modulation_chunk(5U);
+  const auto pregate = broadcast_modulation(pregate_vector);
+  const auto postgate = broadcast_modulation(postgate_vector);
 
-  const auto ones = add_bf16(sequence_shape);
+  const auto ones = add_bf16({features});
   add_operation(Opcode::Fill, {}, {ones},
                 {Attribute::f64(AttrKey::Value, 1.0)});
   const auto prenorm_weight = add_checkpoint("prenorm.scale", {features});
@@ -466,14 +470,11 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
                  Attribute::u64(AttrKey::BlockSize, 512U),
                  Attribute::u64(AttrKey::ReductionTileSize,
                                 config.prenorm_reduction_tile)});
-  const auto prescale_plus_one = add_bf16(sequence_shape);
+  const auto prescale_plus_one = add_bf16({features});
   add_operation(Opcode::Add, {ones, prescale}, {prescale_plus_one});
-  const auto prenorm_scaled = add_bf16(sequence_shape);
-  add_operation(Opcode::Multiply,
-                {prescale_plus_one, build.input_normalized},
-                {prenorm_scaled});
   build.attention_input = add_bf16(sequence_shape, true);
-  add_operation(Opcode::Add, {prenorm_scaled, preshift},
+  add_operation(Opcode::AffineLastDim,
+                {build.input_normalized, prescale_plus_one, preshift},
                 {build.attention_input});
   const auto attention_input_flat = add_bf16({rows, features});
   add_operation(Opcode::Reshape, {build.attention_input},
@@ -593,13 +594,12 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
                  Attribute::u64(AttrKey::BlockSize, 512U),
                  Attribute::u64(AttrKey::ReductionTileSize,
                                 config.postnorm_reduction_tile)});
-  const auto postscale_plus_one = add_bf16(sequence_shape);
+  const auto postscale_plus_one = add_bf16({features});
   add_operation(Opcode::Add, {ones, postscale}, {postscale_plus_one});
-  const auto postnorm_scaled = add_bf16(sequence_shape);
-  add_operation(Opcode::Multiply, {postscale_plus_one, post_normalized},
-                {postnorm_scaled});
   build.mlp_input = add_bf16(sequence_shape, true);
-  add_operation(Opcode::Add, {postnorm_scaled, postshift}, {build.mlp_input});
+  add_operation(Opcode::AffineLastDim,
+                {post_normalized, postscale_plus_one, postshift},
+                {build.mlp_input});
   const auto mlp_input_flat = add_bf16({rows, features});
   add_operation(Opcode::Reshape, {build.mlp_input}, {mlp_input_flat});
   const auto mlp_gate_weight =

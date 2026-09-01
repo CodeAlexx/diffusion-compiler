@@ -3600,17 +3600,19 @@ public:
                      Context &context, std::uint32_t staging_buffers,
                      std::uint32_t stage_threads,
                      std::uint64_t pinned_budget_bytes,
-                     std::unordered_set<std::uint32_t> resident_overrides)
+                     std::unordered_set<std::uint32_t> resident_overrides,
+                     std::unordered_set<std::uint32_t> lazy_resident_overrides)
       : program_(program), constants_(constants), plan_(plan), buffers_(buffers),
         context_(context), staging_pool_(stage_threads),
-        resident_overrides_(std::move(resident_overrides)) {
+        resident_overrides_(std::move(resident_overrides)),
+        lazy_resident_overrides_(std::move(lazy_resident_overrides)) {
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
       for (const auto id : op.inputs) {
         const auto *desc = program_.tensor(id);
         if (!desc || !desc->has_role(ir::TensorRole::Streamed) ||
-            !buffers_.contains(id) || resident_overrides_.contains(id))
+            !buffers_.contains(id) || !active(id))
           continue;
         if (bytes > std::numeric_limits<std::uint64_t>::max() -
                         desc->byte_count())
@@ -3651,12 +3653,17 @@ public:
       for (const auto id : program_.operations[index].inputs) {
         const auto *desc = program_.tensor(id);
         if (desc && desc->has_role(ir::TensorRole::Streamed) &&
-            buffers_.contains(id) && !resident_overrides_.contains(id))
+            buffers_.contains(id) && active(id))
           first_consumer_.try_emplace(id, index);
       }
     }
     completion_recorded_.resize(program_.operations.size(), false);
     for (const auto &[id, first] : first_consumer_) {
+      if (lazy_resident_overrides_.contains(id)) {
+        overwrite_wait_operation_.emplace(
+            id, std::numeric_limits<std::size_t>::max());
+        continue;
+      }
       const auto *target = plan_.assignment(id);
       if (!target)
         fail("streamed tensor lacks a memory-plan assignment");
@@ -3681,8 +3688,15 @@ public:
     host_wait_milliseconds_ = 0.0;
     next_copy_timing_ = 0U;
     copy_timings_.clear();
-    const auto count = first_consumer_.size() *
-                       static_cast<std::size_t>(iterations);
+    std::size_t count = 0U;
+    for (const auto &[id, first] : first_consumer_) {
+      (void)first;
+      if (!active(id))
+        continue;
+      count += lazy_resident_overrides_.contains(id)
+                   ? 1U
+                   : static_cast<std::size_t>(iterations);
+    }
     copy_timings_.reserve(count);
     for (std::size_t index = 0U; index < count; ++index)
       copy_timings_.push_back({std::make_unique<Event>(),
@@ -3718,7 +3732,7 @@ public:
       has_streamed = has_streamed ||
                      (desc && desc->has_role(ir::TensorRole::Streamed) &&
                       buffers_.contains(id) &&
-                      !resident_overrides_.contains(id) &&
+                      active(id) &&
                       (force || first_consumer_.at(id) == operation_index));
     }
     if (!has_streamed)
@@ -3736,7 +3750,7 @@ public:
     for (const auto id : op.inputs) {
       const auto *desc = program_.tensor(id);
       if (!desc || !desc->has_role(ir::TensorRole::Streamed) ||
-          !buffers_.contains(id) || resident_overrides_.contains(id))
+          !buffers_.contains(id) || !active(id))
         continue;
       if (!force && first_consumer_.at(id) != operation_index)
         continue;
@@ -3752,7 +3766,7 @@ public:
     for (const auto id : op.inputs) {
       const auto *desc = program_.tensor(id);
       if (!desc || !desc->has_role(ir::TensorRole::Streamed) ||
-          !buffers_.contains(id) || resident_overrides_.contains(id))
+          !buffers_.contains(id) || !active(id))
         continue;
       if (!force && first_consumer_.at(id) != operation_index)
         continue;
@@ -3826,7 +3840,19 @@ public:
     completion_recorded_.at(operation_index) = true;
   }
 
+  void complete_iteration() {
+    loaded_lazy_residents_.insert(lazy_resident_overrides_.begin(),
+                                  lazy_resident_overrides_.end());
+  }
+
 private:
+  bool active(std::uint32_t id) const {
+    if (!resident_overrides_.contains(id))
+      return true;
+    return lazy_resident_overrides_.contains(id) &&
+           !loaded_lazy_residents_.contains(id);
+  }
+
   struct CopyTiming {
     std::unique_ptr<Event> start;
     std::unique_ptr<Event> stop;
@@ -3839,6 +3865,8 @@ private:
   Context &context_;
   StagingPool staging_pool_;
   std::unordered_set<std::uint32_t> resident_overrides_;
+  std::unordered_set<std::uint32_t> lazy_resident_overrides_;
+  std::unordered_set<std::uint32_t> loaded_lazy_residents_;
   std::vector<std::unique_ptr<PinnedHostWorkspace>> staging_;
   std::vector<std::unique_ptr<Event>> copy_done_;
   std::vector<bool> copy_recorded_;
@@ -3964,6 +3992,9 @@ public:
       : program_(std::move(program)), context_(device_ordinal) {
     const auto preparation_start = std::chrono::steady_clock::now();
     TelemetryScope telemetry_scope(preparation_telemetry_);
+    if (options.lazy_resident_upload && options.pipelined_resident_upload)
+      fail("lazy and pipelined resident upload are mutually exclusive");
+    lazy_resident_upload_ = options.lazy_resident_upload;
     ir::verify(program_);
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Constant))
@@ -4061,7 +4092,50 @@ public:
       ck_attention_scratch_bytes_ =
           h3_ck_attention_plan_->scratch_bytes();
     }
+    {
+      std::unordered_map<std::uint32_t, std::uint32_t> direct_aliases;
+      for (const auto operation_id : options.alias_reshape_operations) {
+        if (!reshape_alias_operations_.insert(operation_id).second)
+          fail("duplicate reshape-alias operation id: " +
+               std::to_string(operation_id));
+        const auto operation = std::find_if(
+            program_.operations.begin(), program_.operations.end(),
+            [&](const ir::Operation &value) {
+              return value.id == operation_id;
+            });
+        if (operation == program_.operations.end() ||
+            operation->opcode != ir::Opcode::Reshape ||
+            operation->inputs.size() != 1U ||
+            operation->outputs.size() != 1U)
+          fail("reshape-alias id is not a unary Reshape: " +
+               std::to_string(operation_id));
+        const auto *input = program_.tensor(operation->inputs.front());
+        const auto *output = program_.tensor(operation->outputs.front());
+        if (!input || !output || output->roles != ir::TensorRole::Internal ||
+            input->dtype != output->dtype ||
+            input->byte_count() != output->byte_count())
+          fail("reshape-alias operation is not an equal-storage internal view: " +
+               std::to_string(operation_id));
+        if (!direct_aliases
+                 .emplace(output->id, input->id)
+                 .second)
+          fail("multiple reshape aliases target tensor " +
+               std::to_string(output->id));
+      }
+      for (const auto &[output, input] : direct_aliases) {
+        auto root = input;
+        std::unordered_set<std::uint32_t> seen{output};
+        while (direct_aliases.contains(root)) {
+          if (!seen.insert(root).second)
+            fail("reshape aliases contain a cycle");
+          root = direct_aliases.at(root);
+        }
+        reshape_aliases_.emplace(output, root);
+      }
+    }
     auto generated = compiler::emit_cuda(program_);
+    generated.skipped_operations.insert(reshape_alias_operations_.begin(),
+                                        reshape_alias_operations_.end());
     generated.source +=
         fused_linear_swiglu_source(fused_linear_swiglu_plans_);
     generated.source += h3_w8a8_source(
@@ -4125,12 +4199,22 @@ public:
     // resident storage uploaded (and fenced) at preparation. Programs
     // without such constants (all production H3 graphs: gates/residuals
     // are activations) are byte-for-byte unaffected.
-    auto promote_streamed_constant = [&](std::uint32_t id) {
+    auto promote_streamed_constant = [&](std::uint32_t id, bool required) {
       const auto *description = program_.tensor(id);
       if (!description ||
           !description->has_role(ir::TensorRole::Constant) ||
-          !description->has_role(ir::TensorRole::Streamed))
+          !description->has_role(ir::TensorRole::Streamed)) {
+        if (required)
+          fail("resident streamed-constant id is not a streamed constant: " +
+               std::to_string(id));
         return;
+      }
+      if (!constants_.contains(id)) {
+        if (!required)
+          return;
+        fail("resident streamed-constant id has no bound tensor: " +
+             std::to_string(id));
+      }
       if (std::find(promoted_streamed_constants_.begin(),
                     promoted_streamed_constants_.end(),
                     id) != promoted_streamed_constants_.end())
@@ -4142,16 +4226,18 @@ public:
         fail("promoted streamed-constant storage overflow");
       promoted_constant_bytes_ += bytes;
     };
+    for (const auto id : options.resident_streamed_constants)
+      promote_streamed_constant(id, true);
     for (const auto &plan : h3_w8a8_mlp_plans_) {
-      promote_streamed_constant(plan.residual_tensor);
-      promote_streamed_constant(plan.gate_tensor);
+      promote_streamed_constant(plan.residual_tensor, false);
+      promote_streamed_constant(plan.gate_tensor, false);
     }
     for (const auto &plan : h3_w8a8_attention_plans_) {
       if (plan.has_qkv_projection)
-        promote_streamed_constant(plan.attention_input_tensor);
+        promote_streamed_constant(plan.attention_input_tensor, false);
       if (plan.has_output_projection) {
-        promote_streamed_constant(plan.residual_tensor);
-        promote_streamed_constant(plan.gate_tensor);
+        promote_streamed_constant(plan.residual_tensor, false);
+        promote_streamed_constant(plan.gate_tensor, false);
       }
     }
     for (const auto id : promoted_streamed_constants_)
@@ -4346,7 +4432,7 @@ public:
     memory_plan_ = compiler::plan_memory(
         program_, 256U,
         options.overlap_streaming ? streamed_prefetch_depth_ : 0U,
-        excluded_tensors, replaced_constant_tensors);
+        excluded_tensors, replaced_constant_tensors, reshape_aliases_);
     const auto tensor_bytes = memory_plan_.total_bytes;
     if (tensor_bytes > std::numeric_limits<std::uint64_t>::max() - workspace_bytes_ ||
         tensor_bytes + workspace_bytes_ >
@@ -4591,6 +4677,12 @@ public:
             plan, h3_w8a8_tail_weight_storage_->pointer());
       assign_h3_w8a8_scratch(plan, h3_w8a8_scratch_storage_->pointer());
     }
+    for (const auto &[output, root] : reshape_aliases_) {
+      if (!buffers_.contains(root))
+        fail("reshape alias root has no prepared device storage: " +
+             std::to_string(root));
+      buffers_.bind_external(output, buffers_.at(root));
+    }
     for (auto &plan : h3_groupwise_plans_) {
       allocate_h3_groupwise_weights(plan, arena_.get());
       assign_h3_groupwise_scratch(
@@ -4602,7 +4694,12 @@ public:
         options.streamed_pinned_budget_bytes,
         std::unordered_set<std::uint32_t>(
             promoted_streamed_constants_.begin(),
-            promoted_streamed_constants_.end()));
+            promoted_streamed_constants_.end()),
+        options.lazy_resident_upload
+            ? std::unordered_set<std::uint32_t>(
+                  promoted_streamed_constants_.begin(),
+                  promoted_streamed_constants_.end())
+            : std::unordered_set<std::uint32_t>{});
     if (options.pinned_io_staging) {
       auto input_bytes = std::uint64_t{0U};
       auto output_bytes = std::uint64_t{0U};
@@ -4776,11 +4873,54 @@ public:
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
-    for (const auto id : promoted_streamed_constants_) {
-      const auto &tensor = constants_.at(id);
-      check(counted_memcpy_htod(buffers_.at(id), tensor.data(),
-                                tensor.byte_size(), context_.stream()),
-            "cuMemcpyHtoDAsync promoted streamed constant");
+    if (options.lazy_resident_upload) {
+      // Dedicated storage is populated at first semantic use by the prepared
+      // prefetcher, then remains valid for the lifetime of this execution.
+    } else if (!options.pipelined_resident_upload) {
+      for (const auto id : promoted_streamed_constants_) {
+        const auto &tensor = constants_.at(id);
+        check(counted_memcpy_htod(buffers_.at(id), tensor.data(),
+                                  tensor.byte_size(), context_.stream()),
+              "cuMemcpyHtoDAsync promoted streamed constant");
+      }
+    } else if (!promoted_streamed_constants_.empty()) {
+      constexpr std::size_t staging_slots = 2U;
+      std::size_t maximum_bytes = 0U;
+      for (const auto id : promoted_streamed_constants_)
+        maximum_bytes =
+            std::max(maximum_bytes, constants_.at(id).byte_size());
+      if (maximum_bytes > options.streamed_pinned_budget_bytes / staging_slots)
+        fail("pipelined resident upload exceeds the pinned budget: slots=" +
+             std::to_string(staging_slots) + " buffer_bytes=" +
+             std::to_string(maximum_bytes) + " budget_bytes=" +
+             std::to_string(options.streamed_pinned_budget_bytes));
+      std::array<std::unique_ptr<PinnedHostWorkspace>, staging_slots> staging;
+      std::array<std::unique_ptr<Event>, staging_slots> copy_done;
+      std::array<bool, staging_slots> recorded{};
+      for (std::size_t slot = 0U; slot < staging_slots; ++slot) {
+        staging[slot] = std::make_unique<PinnedHostWorkspace>(maximum_bytes);
+        copy_done[slot] =
+            std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+      }
+      StagingPool staging_pool(options.streamed_stage_threads);
+      for (std::size_t index = 0U;
+           index < promoted_streamed_constants_.size(); ++index) {
+        const auto slot = index % staging_slots;
+        if (recorded[slot])
+          check(counted_event_synchronize(copy_done[slot]->get()),
+                "cuEventSynchronize resident staging reuse");
+        const auto id = promoted_streamed_constants_[index];
+        const auto &tensor = constants_.at(id);
+        staging_pool.copy(
+            static_cast<std::uint8_t *>(staging[slot]->data()), tensor.data(),
+            tensor.byte_size());
+        check(counted_memcpy_htod(buffers_.at(id), staging[slot]->data(),
+                                  tensor.byte_size(), context_.stream()),
+              "cuMemcpyHtoDAsync pipelined promoted constant");
+        check(counted_event_record(copy_done[slot]->get(), context_.stream()),
+              "cuEventRecord resident staging copy");
+        recorded[slot] = true;
+      }
     }
     check(counted_stream_synchronize(context_.stream()),
           "resident constant upload synchronization");
@@ -4838,8 +4978,9 @@ public:
           !description.has_role(ir::TensorRole::Streamed))
         constants_.at(description.id).discard_mapped_pages();
     }
-    for (const auto id : promoted_streamed_constants_)
-      constants_.at(id).discard_mapped_pages();
+    if (!options.lazy_resident_upload)
+      for (const auto id : promoted_streamed_constants_)
+        constants_.at(id).discard_mapped_pages();
     for (auto &plan : h3_w8a8_mlp_plans_) {
       plan.fc1_weight.discard_mapped_pages();
       plan.fc1_scale.discard_mapped_pages();
@@ -4874,6 +5015,8 @@ public:
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
     if (options.iterations == 0)
       fail("run iterations must be nonzero");
+    if (options.lazy_resident_upload != lazy_resident_upload_)
+      fail("lazy resident upload is fixed when the plan is prepared");
     LaunchTelemetry run_telemetry;
     TelemetryScope telemetry_scope(run_telemetry);
     streamed_prefetcher_->set_release_mapped_pages_per_copy(
@@ -5209,6 +5352,7 @@ public:
 
     for (std::uint32_t warmup = 0; warmup < options.warmups; ++warmup) {
       execute(0U, false);
+      streamed_prefetcher_->complete_iteration();
       check(counted_stream_synchronize(context_.stream()), "warmup synchronization");
     }
     if (options.profile_pipeline)
@@ -5319,6 +5463,7 @@ public:
         Event stop;
         check(counted_event_record(start.get(), context_.stream()), "cuEventRecord start");
         execute(iteration, options.profile_pipeline);
+        streamed_prefetcher_->complete_iteration();
         check(counted_event_record(stop.get(), context_.stream()), "cuEventRecord stop");
         check(counted_event_synchronize(stop.get()), "cuEventSynchronize");
         float milliseconds = 0.0F;
@@ -5609,6 +5754,9 @@ private:
   std::uint64_t free_bytes_before_{};
   std::uint32_t streamed_prefetch_depth_{1};
   std::vector<std::uint32_t> promoted_streamed_constants_;
+  std::unordered_set<std::uint32_t> reshape_alias_operations_;
+  std::unordered_map<std::uint32_t, std::uint32_t> reshape_aliases_;
+  bool lazy_resident_upload_{};
   std::unique_ptr<Workspace> promoted_constant_storage_;
   std::uint64_t promoted_constant_bytes_{};
   LaunchTelemetry preparation_telemetry_;
