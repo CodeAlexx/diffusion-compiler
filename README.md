@@ -62,7 +62,7 @@ recipe on one RTX 3090 Ti:
   boundary for the compared denoisers
 
 The frozen pre-optimization native path, the first admitted whole-system plan,
-and the strict ComfyUI/PyTorch development comparator measured:
+and the strict ComfyUI/PyTorch eager-mode development comparator measured:
 
 | Measurement | Native frozen | Native admitted plan | ComfyUI/PyTorch BF16 |
 |---|---:|---:|---:|
@@ -88,8 +88,33 @@ Krea modulation now uses the shared `AffineLastDim` semantic instead of
 materializing redundant full-sequence broadcasts. All eight recorded states
 and the final latent remain bit-identical to the frozen creator trajectory; no
 quality or numerical threshold changed. This is the first 2x checkpoint, not
-the final optimization target. No complete UI-to-image speed ratio is claimed
-by this denoiser benchmark.
+the final optimization target. No complete prompt-to-image speed ratio is
+claimed by this denoiser-only table.
+
+A separate literal-prompt-to-PNG validation measured every external stage with
+fresh processes and a warm operating-system page cache:
+
+| External stage | Native C++ | Creator / ComfyUI / PyTorch BF16 |
+|---|---:|---:|
+| Tokenizer + Qwen3-VL | 2.28 s | 9.05 s |
+| TextFusion | 1.29 s | 7.52 s |
+| Prepared 8-step denoise | 19.54 s | 34.26 s |
+| Qwen-Image VAE + PNG | 3.43 s | 8.31 s |
+| **Literal prompt to PNG** | **26.58 s** | **59.14 s** |
+
+That is a measured **2.225x complete-chain speedup** on the RTX 3090 Ti. The
+native run recorded zero filesystem input, so this is explicitly a warm-page-
+cache result, not a cold-disk claim. A cold-filesystem native diagnostic took
+55.58 s, dominated by 27.42 s of Qwen weight page-in; it is preserved as a
+separate I/O result rather than folded into the admitted number. The validated
+native denoiser remained bit-identical to the creator trajectory, the VAE gate
+passed at cosine `0.99999339` and relative L2 `0.00363512` after clamping, and
+the inspected PNG retained SHA-256
+`eea79ee7d84a703235481b0e1859ca087fa20d40304aa0243d9929da8333fbfd`.
+
+The framework comparator is ordinary ComfyUI/PyTorch eager execution. It does
+not use `torch.compile` or Inductor kernel fusion; that would be a separate
+matched benchmark.
 
 The strict comparator uses the creator's padding mask and the same
 post-TextFusion conditioning boundary. Its final latent versus the exact

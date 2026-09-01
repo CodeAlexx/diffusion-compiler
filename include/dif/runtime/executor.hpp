@@ -35,6 +35,11 @@ struct RunOptions {
   // unchanged; these ids identify exact Linear operations to benchmark or
   // exact Linear->SwiGlu chains to lower as a fused CUDA primitive.
   std::vector<std::uint32_t> tune_linear_operations;
+  // Explicit compiler-selected groups of independent unbiased Linear
+  // operations that share one activation. The CUDA backend may dispatch each
+  // group across separate compute streams with separately accounted
+  // workspaces; operation math and DiffIR values are unchanged.
+  std::vector<std::vector<std::uint32_t>> parallel_linear_groups;
   std::vector<std::uint32_t> fuse_linear_swiglu_operations;
   // Absorb an unbiased Linear's exclusive, immediately-adjacent BiasAdd into
   // the cuBLASLt bias epilogue: one library launch, no materialized

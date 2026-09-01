@@ -29,6 +29,8 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <span>
@@ -47,6 +49,7 @@ struct Options {
   fs::path ids;
   fs::path inputs;
   fs::path output;
+  fs::path report;
   fs::path cache_directory;
   std::string backend{"cuda"};
   std::uint64_t sequence{};
@@ -54,6 +57,8 @@ struct Options {
   std::uint64_t attention{2};
   std::uint64_t minimum_free_mib{4096};
   bool krea2{};
+  bool profile_pipeline{};
+  bool resident_streamed{};
 };
 
 void usage() {
@@ -105,6 +110,8 @@ Options parse(int argc, char **argv) {
       options.inputs = value("--inputs");
     else if (option == "--output")
       options.output = value("--output");
+    else if (option == "--report")
+      options.report = value("--report");
     else if (option == "--backend")
       options.backend = value("--backend");
     else if (option == "--cache-dir")
@@ -119,6 +126,10 @@ Options parse(int argc, char **argv) {
       options.minimum_free_mib = number(value("--min-free-mib"), "min free MiB");
     else if (option == "--krea2")
       options.krea2 = true;
+    else if (option == "--profile-pipeline")
+      options.profile_pipeline = true;
+    else if (option == "--resident-streamed")
+      options.resident_streamed = true;
     else {
       usage();
       dif::fail("unknown option: " + option);
@@ -141,6 +152,8 @@ void command_program(const Options &options) {
     dif::fail("difcondition program requires --sequence and --output");
   if (fs::exists(options.output))
     dif::fail("refusing to overwrite " + options.output.string());
+  if (!options.report.empty() && fs::exists(options.report))
+    dif::fail("refusing to overwrite " + options.report.string());
   const auto build = dif::frontend::build_qwen3vl_conditioner_program(
       options.sequence, config_for(options));
   dif::ir::verify(build.program);
@@ -166,6 +179,8 @@ void command_bundle(const Options &options) {
     dif::fail("difcondition bundle requires --checkpoint, --program, --output");
   if (fs::exists(options.output))
     dif::fail("refusing to overwrite " + options.output.string());
+  if (!options.report.empty() && fs::exists(options.report))
+    dif::fail("refusing to overwrite " + options.report.string());
   const auto program = dif::ir::read_file(options.program);
   dif::ir::verify(program);
 
@@ -298,6 +313,13 @@ void command_run(const Options &options) {
   run_options.iterations = 1U;
   run_options.cache_directory = options.cache_directory;
   run_options.minimum_free_bytes = options.minimum_free_mib * 1024ULL * 1024ULL;
+  run_options.profile_pipeline = options.profile_pipeline;
+  if (options.resident_streamed) {
+    for (const auto &tensor : program.tensors)
+      if (tensor.has_role(dif::ir::TensorRole::Constant) &&
+          tensor.has_role(dif::ir::TensorRole::Streamed))
+        run_options.resident_streamed_constants.push_back(tensor.id);
+  }
 
   auto backend = options.backend == "cpu" ? dif::runtime::make_cpu_executor()
                                           : dif::runtime::make_cuda_executor();
@@ -331,13 +353,81 @@ void command_run(const Options &options) {
     dif::runtime::write_tensor(conditioning, options.output);
   }
 
+  const auto payload_hash = dif::hex_digest(dif::sha256(
+      {conditioning.data(),
+       static_cast<std::size_t>(conditioning.byte_size())}));
+  if (!options.report.empty()) {
+    const auto &profile = result.pipeline_profile;
+    const auto &telemetry = result.run_telemetry;
+    std::ofstream report(options.report, std::ios::trunc);
+    report << std::setprecision(17)
+           << "{\n  \"backend\": " << std::quoted(result.backend_name)
+           << ",\n  \"device\": " << std::quoted(result.device_name)
+           << ",\n  \"diffir_fingerprint\": \""
+           << dif::hex_digest(dif::ir::fingerprint(program))
+           << "\",\n  \"payload_sha256\": \"" << payload_hash
+           << "\",\n  \"tokens\": " << token_count
+           << ",\n  \"preparation_ms\": " << result.preparation_milliseconds
+           << ",\n  \"execution_ms\": " << result.mean_milliseconds
+           << ",\n  \"wall_seconds\": " << wall
+           << ",\n  \"resident_bytes\": " << result.resident_bytes
+           << ",\n  \"resident_streamed_constants\": "
+           << run_options.resident_streamed_constants.size()
+           << ",\n  \"pipeline_profile\": {"
+           << "\"enabled\":" << (options.profile_pipeline ? "true" : "false")
+           << ",\"resident_weight_bytes\":" << profile.resident_weight_bytes
+           << ",\"resident_host_prefault_ms\":"
+           << profile.resident_host_prefault_milliseconds
+           << ",\"resident_h2d_ms\":" << profile.resident_h2d_milliseconds
+           << ",\"streamed_weight_bytes\":" << profile.streamed_weight_bytes
+           << ",\"streamed_host_stage_ms\":"
+           << profile.streamed_host_stage_milliseconds
+           << ",\"streamed_host_wait_ms\":"
+           << profile.streamed_host_wait_milliseconds
+           << ",\"streamed_h2d_ms\":" << profile.streamed_h2d_milliseconds
+           << ",\"operation_kernel_ms\":"
+           << profile.operation_kernel_milliseconds
+           << ",\"attention_kernel_ms\":"
+           << profile.attention_kernel_milliseconds
+           << ",\"non_kernel_device_timeline_ms\":"
+           << profile.non_kernel_device_timeline_milliseconds << "},\n"
+           << "  \"telemetry\": {\"kernel_launches\":"
+           << telemetry.kernel_launches
+           << ",\"cublaslt_matmuls\":" << telemetry.cublaslt_matmuls
+           << ",\"cudnn_attention_dispatches\":"
+           << telemetry.cudnn_attention_dispatches
+           << ",\"h2d_copies\":" << telemetry.h2d_copies
+           << ",\"h2d_bytes\":" << telemetry.h2d_bytes
+           << ",\"d2h_copies\":" << telemetry.d2h_copies
+           << ",\"d2h_bytes\":" << telemetry.d2h_bytes
+           << ",\"event_records\":" << telemetry.event_records
+           << ",\"stream_wait_events\":" << telemetry.stream_wait_events
+           << ",\"host_event_synchronizes\":"
+           << telemetry.host_event_synchronizes
+           << ",\"host_stream_synchronizes\":"
+           << telemetry.host_stream_synchronizes << "},\n"
+           << "  \"operations\": [";
+    for (std::size_t index = 0U; index < result.operation_timings.size();
+         ++index) {
+      if (index != 0U)
+        report << ',';
+      const auto &timing = result.operation_timings[index];
+      report << "{\"operation_id\":" << timing.operation_id
+             << ",\"opcode\":" << std::quoted(dif::ir::opcode_name(timing.opcode))
+             << ",\"mean_ms\":" << timing.mean_milliseconds
+             << ",\"min_ms\":" << timing.minimum_milliseconds
+             << ",\"max_ms\":" << timing.maximum_milliseconds << '}';
+    }
+    report << "]\n}\n";
+    if (!report)
+      dif::fail("failed to write conditioner report " +
+                options.report.string());
+  }
+
   std::cout << "CONDITIONING PASS backend=" << result.backend_name
             << " tokens=" << token_count << " shape=[" << conditioning.dims[0]
             << "," << conditioning.dims[1] << "]"
-            << " payload_sha256="
-            << dif::hex_digest(dif::sha256(
-                   {conditioning.data(),
-                    static_cast<std::size_t>(conditioning.byte_size())}))
+            << " payload_sha256=" << payload_hash
             << " prepare_ms=" << result.preparation_milliseconds
             << " run_ms=" << result.mean_milliseconds << " wall_s=" << wall
             << " resident_bytes=" << result.resident_bytes << "\n";

@@ -108,6 +108,16 @@ void set_attribute(ir::Operation &operation, ir::AttrKey key,
   operation.attributes.push_back(value);
 }
 
+bool equal_attributes(const std::vector<ir::Attribute> &left,
+                      const std::vector<ir::Attribute> &right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](const ir::Attribute &a, const ir::Attribute &b) {
+                      return a.key == b.key && a.kind == b.kind &&
+                             a.bits == b.bits;
+                    });
+}
+
 void erase_operations(ir::Program &program,
                       const std::unordered_set<std::uint32_t> &ids) {
   std::erase_if(program.operations, [&](const ir::Operation &operation) {
@@ -458,6 +468,116 @@ OperationIds linear_bias_sites(const ir::Program &program) {
     sites.push_back(operation.id);
   }
   return sites;
+}
+
+struct ParallelLinearSwiGluSite {
+  std::uint32_t multiply{};
+  std::uint32_t silu{};
+  std::uint32_t gate_linear{};
+  std::uint32_t value_linear{};
+  std::uint32_t activation{};
+  std::uint32_t gate_weight{};
+  std::uint32_t value_weight{};
+  std::uint32_t output{};
+};
+
+bool parallel_linear_swiglu_site(const ir::Program &program,
+                                 const ir::Operation &multiply,
+                                 ParallelLinearSwiGluSite &site) {
+  if (multiply.opcode != ir::Opcode::Multiply ||
+      multiply.inputs.size() != 2U || multiply.outputs.size() != 1U ||
+      pinned_numeric_semantics(multiply))
+    return false;
+  const auto producers = producer_map(program);
+  const auto consumers = consumer_map(program);
+  const ir::Operation *silu = nullptr;
+  const ir::Operation *value_linear = nullptr;
+  for (std::size_t input = 0U; input < 2U; ++input) {
+    const auto produced = producers.find(multiply.inputs[input]);
+    if (produced == producers.end())
+      return false;
+    const auto *operation = find_operation(program, produced->second);
+    if (!operation)
+      return false;
+    if (operation->opcode == ir::Opcode::SiLU)
+      silu = operation;
+    else if (operation->opcode == ir::Opcode::Linear)
+      value_linear = operation;
+    else
+      return false;
+  }
+  if (!silu || !value_linear || silu->inputs.size() != 1U ||
+      silu->outputs.size() != 1U || value_linear->inputs.size() != 2U ||
+      value_linear->outputs.size() != 1U ||
+      pinned_numeric_semantics(*silu) ||
+      pinned_numeric_semantics(*value_linear))
+    return false;
+  const auto gate_produced = producers.find(silu->inputs[0]);
+  if (gate_produced == producers.end())
+    return false;
+  const auto *gate_linear = find_operation(program, gate_produced->second);
+  if (!gate_linear || gate_linear->opcode != ir::Opcode::Linear ||
+      gate_linear->inputs.size() != 2U ||
+      gate_linear->outputs.size() != 1U ||
+      pinned_numeric_semantics(*gate_linear) ||
+      gate_linear->inputs[0] != value_linear->inputs[0] ||
+      gate_linear->attributes.size() != value_linear->attributes.size())
+    return false;
+  for (std::size_t index = 0U; index < gate_linear->attributes.size();
+       ++index)
+    if (gate_linear->attributes[index].key !=
+            value_linear->attributes[index].key ||
+        gate_linear->attributes[index].kind !=
+            value_linear->attributes[index].kind ||
+        gate_linear->attributes[index].bits !=
+            value_linear->attributes[index].bits)
+      return false;
+  const auto exclusive = [&](std::uint32_t tensor, std::uint32_t consumer) {
+    const auto found = consumers.find(tensor);
+    return found != consumers.end() && found->second.size() == 1U &&
+           found->second.front() == consumer;
+  };
+  if (!exclusive(gate_linear->outputs[0], silu->id) ||
+      !exclusive(silu->outputs[0], multiply.id) ||
+      !exclusive(value_linear->outputs[0], multiply.id))
+    return false;
+  const auto *activation = program.tensor(gate_linear->inputs[0]);
+  const auto *gate_weight = program.tensor(gate_linear->inputs[1]);
+  const auto *value_weight = program.tensor(value_linear->inputs[1]);
+  const auto *gate = program.tensor(gate_linear->outputs[0]);
+  const auto *value = program.tensor(value_linear->outputs[0]);
+  const auto *output = program.tensor(multiply.outputs[0]);
+  if (!activation || !gate_weight || !value_weight || !gate || !value ||
+      !output || activation->dtype != ir::DType::BF16 ||
+      gate_weight->dtype != ir::DType::BF16 ||
+      value_weight->dtype != ir::DType::BF16 ||
+      gate->dtype != ir::DType::BF16 || value->dtype != ir::DType::BF16 ||
+      output->dtype != ir::DType::BF16 || gate_weight->dims.size() != 2U ||
+      gate_weight->dims != value_weight->dims || gate->dims != value->dims ||
+      gate->dims != output->dims || !internal_only(*gate) ||
+      !internal_only(*value) || !internal_only(*program.tensor(silu->outputs[0])) ||
+      gate_weight->roles != value_weight->roles ||
+      !gate_weight->has_role(ir::TensorRole::Constant))
+    return false;
+  site = {multiply.id,
+          silu->id,
+          gate_linear->id,
+          value_linear->id,
+          gate_linear->inputs[0],
+          gate_linear->inputs[1],
+          value_linear->inputs[1],
+          multiply.outputs[0]};
+  return true;
+}
+
+OperationIds parallel_linear_swiglu_sites(const ir::Program &program) {
+  OperationIds result;
+  for (const auto &operation : program.operations) {
+    ParallelLinearSwiGluSite site;
+    if (parallel_linear_swiglu_site(program, operation, site))
+      result.push_back(operation.id);
+  }
+  return result;
 }
 
 struct QkvFusionSite {
@@ -845,6 +965,173 @@ void apply_fuse_linear_bias(const Transform &transform,
     erase_operations(context.program, {id});
     prune_unreferenced(context);
   }
+}
+
+void apply_fuse_parallel_linear_swiglu(const Transform &transform,
+                                       RewriteContext &context) {
+  expect_parameters(transform, 0U);
+  const auto scope =
+      resolve_scope(transform, parallel_linear_swiglu_sites(context.program));
+  for (const auto id : scope) {
+    const auto *multiply = find_operation(context.program, id);
+    ParallelLinearSwiGluSite site;
+    if (!multiply ||
+        !parallel_linear_swiglu_site(context.program, *multiply, site))
+      fail("fuse_parallel_linear_swiglu is not legal at operation " +
+           std::to_string(id));
+    const auto gate_linear = *find_operation(context.program, site.gate_linear);
+    const auto *gate_weight_desc = context.program.tensor(site.gate_weight);
+    const auto *value_weight_desc = context.program.tensor(site.value_weight);
+    const auto gate_binding = context.bindings.find(site.gate_weight);
+    const auto value_binding = context.bindings.find(site.value_weight);
+    if (gate_binding == context.bindings.end() ||
+        value_binding == context.bindings.end())
+      fail("fuse_parallel_linear_swiglu requires both bound weights");
+
+    const auto packed_weight_id = fresh_tensor_id(context.program);
+    auto packed_weight_dims = gate_weight_desc->dims;
+    packed_weight_dims[0] += value_weight_desc->dims[0];
+    context.program.tensors.push_back(
+        {packed_weight_id, gate_weight_desc->dtype, gate_weight_desc->roles,
+         packed_weight_dims});
+    runtime::Tensor packed_weight{gate_weight_desc->dtype,
+                                  packed_weight_dims, {}};
+    packed_weight.bytes.resize(static_cast<std::size_t>(
+        gate_binding->second.byte_size() + value_binding->second.byte_size()));
+    std::memcpy(packed_weight.mutable_data(), gate_binding->second.data(),
+                gate_binding->second.byte_size());
+    std::memcpy(packed_weight.mutable_data() + gate_binding->second.byte_size(),
+                value_binding->second.data(),
+                value_binding->second.byte_size());
+    packed_weight.validate();
+    context.bindings.emplace(packed_weight_id, std::move(packed_weight));
+
+    const auto *output_desc = context.program.tensor(site.output);
+    auto packed_output_dims = output_desc->dims;
+    packed_output_dims.back() *= 2U;
+    const auto packed_output_id = fresh_tensor_id(context.program);
+    context.program.tensors.push_back(
+        {packed_output_id, output_desc->dtype, ir::TensorRole::Internal,
+         packed_output_dims});
+    const auto packed_linear_id = fresh_operation_id(context.program);
+    ir::Operation packed_linear{
+        packed_linear_id, ir::Opcode::Linear,
+        {site.activation, packed_weight_id}, {packed_output_id},
+        gate_linear.attributes};
+    ir::Operation swiglu{
+        site.multiply, ir::Opcode::SwiGlu, {packed_output_id}, {site.output},
+        {ir::Attribute::boolean(ir::AttrKey::GateFirst, true)}};
+    splice_operations(context.program,
+                      {site.gate_linear, site.value_linear, site.silu,
+                       site.multiply},
+                      {packed_linear, swiglu});
+    prune_unreferenced(context);
+  }
+}
+
+void apply_fuse_parallel_linears(const Transform &transform,
+                                 RewriteContext &context) {
+  expect_parameters(transform, 0U);
+  if (!transform.tensors.empty() || transform.operations.size() < 2U)
+    fail("fuse_parallel_linears requires at least two operation ids and no "
+         "tensor ids");
+
+  std::vector<ir::Operation> linears;
+  linears.reserve(transform.operations.size());
+  const ir::TensorDesc *activation = nullptr;
+  const ir::TensorDesc *first_weight = nullptr;
+  const ir::TensorDesc *first_output = nullptr;
+  std::uint64_t packed_width = 0U;
+  std::size_t packed_weight_bytes = 0U;
+  for (const auto operation_id : transform.operations) {
+    const auto *operation = find_operation(context.program, operation_id);
+    if (!operation || operation->opcode != ir::Opcode::Linear ||
+        operation->inputs.size() != 2U || operation->outputs.size() != 1U)
+      fail("fuse_parallel_linears requires unbiased Linear operations");
+    const auto *current_activation =
+        context.program.tensor(operation->inputs[0]);
+    const auto *weight = context.program.tensor(operation->inputs[1]);
+    const auto *output = context.program.tensor(operation->outputs[0]);
+    const auto binding = context.bindings.find(operation->inputs[1]);
+    if (!current_activation || !weight || !output ||
+        weight->dims.size() != 2U || output->dims.empty() ||
+        binding == context.bindings.end())
+      fail("fuse_parallel_linears requires bound rank-2 weights");
+    if (!activation) {
+      activation = current_activation;
+      first_weight = weight;
+      first_output = output;
+    } else if (operation->inputs[0] != linears.front().inputs[0] ||
+               current_activation->dtype != activation->dtype ||
+               current_activation->dims != activation->dims ||
+               weight->dtype != first_weight->dtype ||
+               weight->dims[1] != first_weight->dims[1] ||
+               output->dtype != first_output->dtype ||
+               output->dims.size() != first_output->dims.size() ||
+               !std::equal(output->dims.begin(), output->dims.end() - 1,
+                           first_output->dims.begin()) ||
+               !equal_attributes(operation->attributes,
+                                 linears.front().attributes))
+      fail("fuse_parallel_linears operations do not share one compatible "
+           "projection contract");
+    if (packed_width > std::numeric_limits<std::uint64_t>::max() -
+                           weight->dims[0] ||
+        packed_weight_bytes > std::numeric_limits<std::size_t>::max() -
+                                  binding->second.byte_size())
+      fail("fuse_parallel_linears packed tensor size overflow");
+    packed_width += weight->dims[0];
+    packed_weight_bytes += binding->second.byte_size();
+    linears.push_back(*operation);
+  }
+
+  const auto packed_weight_dtype = first_weight->dtype;
+  const auto packed_weight_roles = first_weight->roles;
+  const auto packed_weight_inner = first_weight->dims[1];
+  const auto packed_output_dtype = first_output->dtype;
+  auto packed_output_dims = first_output->dims;
+  packed_output_dims.back() = packed_width;
+  const auto packed_weight_id = fresh_tensor_id(context.program);
+  context.program.tensors.push_back(
+      {packed_weight_id, packed_weight_dtype, packed_weight_roles,
+       {packed_width, packed_weight_inner}});
+  runtime::Tensor packed_weight{packed_weight_dtype,
+                                {packed_width, packed_weight_inner}, {}};
+  packed_weight.bytes.resize(packed_weight_bytes);
+  auto weight_offset = std::size_t{0U};
+  for (const auto &operation : linears) {
+    const auto &weight = context.bindings.at(operation.inputs[1]);
+    std::memcpy(packed_weight.mutable_data() + weight_offset, weight.data(),
+                weight.byte_size());
+    weight_offset += weight.byte_size();
+  }
+  packed_weight.validate();
+  context.bindings.emplace(packed_weight_id, std::move(packed_weight));
+
+  const auto packed_output_id = fresh_tensor_id(context.program);
+  context.program.tensors.push_back(
+      {packed_output_id, packed_output_dtype, ir::TensorRole::Internal,
+       packed_output_dims});
+  std::vector<ir::Operation> replacement;
+  replacement.reserve(linears.size() + 1U);
+  replacement.push_back(
+      {fresh_operation_id(context.program), ir::Opcode::Linear,
+       {linears.front().inputs[0], packed_weight_id}, {packed_output_id},
+       linears.front().attributes});
+  std::uint64_t start = 0U;
+  for (const auto &operation : linears) {
+    replacement.push_back(
+        {operation.id, ir::Opcode::Slice, {packed_output_id}, operation.outputs,
+         {ir::Attribute::u64(ir::AttrKey::Axis,
+                             packed_output_dims.size() - 1U),
+          ir::Attribute::u64(ir::AttrKey::Start, start)}});
+    start += context.program.tensor(operation.outputs[0])->dims.back();
+  }
+  splice_operations(
+      context.program,
+      std::unordered_set<std::uint32_t>(transform.operations.begin(),
+                                        transform.operations.end()),
+      replacement);
+  prune_unreferenced(context);
 }
 
 void apply_fuse_qkv_projection(const Transform &transform,
@@ -1275,6 +1562,12 @@ void apply(const Transform &transform, RewriteContext &context) {
     return;
   case TransformKind::SetPrefetchDistance:
     apply_set_prefetch_distance(transform, context);
+    return;
+  case TransformKind::FuseParallelLinearSwiGlu:
+    apply_fuse_parallel_linear_swiglu(transform, context);
+    return;
+  case TransformKind::FuseParallelLinears:
+    apply_fuse_parallel_linears(transform, context);
     return;
   }
   fail("unknown transform kind");

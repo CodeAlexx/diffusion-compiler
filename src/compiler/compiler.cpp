@@ -18,6 +18,38 @@ std::string function_name(const ir::Operation &op) {
   return "dif_op_" + std::to_string(op.id);
 }
 
+// Generated kernels are functions of opcode, tensor geometry/dtypes, and
+// attributes -- never tensor or operation identity. Repeated model blocks and
+// unrolled schedules therefore share one compiled entrypoint. The executor
+// still keeps an operation-id -> entrypoint map, so semantic provenance and
+// launch arguments remain per operation while NVRTC sees only unique code.
+std::string kernel_identity(const ir::Program &program,
+                            const ir::Operation &operation) {
+  std::ostringstream key;
+  key << static_cast<std::uint32_t>(operation.opcode) << '|';
+  const auto tensor = [&](std::uint32_t id) {
+    const auto *description = program.tensor(id);
+    if (!description)
+      fail("CUDA kernel identity references a missing tensor");
+    key << static_cast<std::uint32_t>(description->dtype) << ':';
+    for (const auto extent : description->dims)
+      key << extent << ',';
+    key << ';';
+  };
+  key << 'i' << operation.inputs.size() << ':';
+  for (const auto id : operation.inputs)
+    tensor(id);
+  key << 'o' << operation.outputs.size() << ':';
+  for (const auto id : operation.outputs)
+    tensor(id);
+  key << 'a' << operation.attributes.size() << ':';
+  for (const auto &attribute : operation.attributes)
+    key << static_cast<std::uint32_t>(attribute.key) << ','
+        << static_cast<std::uint32_t>(attribute.kind) << ','
+        << attribute.bits << ';';
+  return std::move(key).str();
+}
+
 struct LowbitLinearFusion {
   const ir::Operation *dequant{};
   const ir::Operation *linear{};
@@ -2759,6 +2791,7 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
            "and packed i8/bool constants");
   }
   emit_header(source);
+  std::unordered_map<std::string, std::string> pooled_entrypoints;
   auto fusions = find_lowbit_linear_fusions(program, generated.skipped_operations);
   const auto elementwise_regions =
       find_elementwise_regions(program, generated.skipped_operations);
@@ -2797,7 +2830,15 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       generated.launch_inputs.emplace(op.id, std::move(arguments));
       continue;
     }
-    generated.entrypoints.emplace(op.id, function_name(op));
+    const auto identity = kernel_identity(program, op);
+    if (const auto found = pooled_entrypoints.find(identity);
+        found != pooled_entrypoints.end()) {
+      generated.entrypoints.emplace(op.id, found->second);
+      continue;
+    }
+    const auto entrypoint = function_name(op);
+    pooled_entrypoints.emplace(identity, entrypoint);
+    generated.entrypoints.emplace(op.id, entrypoint);
     if (op.opcode == ir::Opcode::Cast) {
       emit_cast(source, program, op);
       continue;

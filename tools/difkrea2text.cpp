@@ -4,6 +4,7 @@
 #include "dif/runtime/scalar.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
+#include "dif/weights/bundle.hpp"
 #include "dif/weights/safetensors.hpp"
 
 #include <algorithm>
@@ -24,9 +25,10 @@
 namespace {
 
 struct Arguments {
-  std::filesystem::path checkpoint, fixture, taps, mask_inputs, output, report,
-      diffir;
+  std::filesystem::path checkpoint, bundle, fixture, taps, mask_inputs, output,
+      report, diffir;
   bool no_compare{};
+  bool capture_first_block{};
 };
 
 Arguments parse(int argc, char **argv) {
@@ -39,6 +41,7 @@ Arguments parse(int argc, char **argv) {
       return argv[index];
     };
     if (option == "--checkpoint") result.checkpoint = value();
+    else if (option == "--bundle") result.bundle = value();
     else if (option == "--fixture") result.fixture = value();
     else if (option == "--taps") result.taps = value();
     else if (option == "--mask-inputs") result.mask_inputs = value();
@@ -46,15 +49,19 @@ Arguments parse(int argc, char **argv) {
     else if (option == "--report") result.report = value();
     else if (option == "--diffir") result.diffir = value();
     else if (option == "--no-compare") result.no_compare = true;
+    else if (option == "--capture-first-block")
+      result.capture_first_block = true;
     else dif::fail("invalid difkrea2text argument: " + option);
   }
-  if (result.checkpoint.empty() || result.output.empty() ||
+  if ((result.checkpoint.empty() == result.bundle.empty()) ||
+      result.output.empty() ||
       result.report.empty() || result.diffir.empty() ||
       (result.fixture.empty() &&
        (result.taps.empty() || result.mask_inputs.empty())) ||
       (result.no_compare &&
        (result.taps.empty() || result.mask_inputs.empty())))
-    dif::fail("difkrea2text requires checkpoint, output, report, diffir, and "
+    dif::fail("difkrea2text requires exactly one of checkpoint or bundle, "
+              "output, report, diffir, and "
               "either a fixture or taps+mask-inputs");
   return result;
 }
@@ -119,6 +126,8 @@ Metrics measure(const dif::runtime::Tensor &reference,
     else if (reference.dims.size() > 1U &&
              reference.dims[1] == validity->size())
       token_width = reference.element_count() / reference.dims[1];
+    else if (reference.dims[0] % validity->size() == 0U)
+      token_width = reference.element_count() / validity->size();
   }
   long double dot = 0, reference_squared = 0, actual_squared = 0,
               error_squared = 0;
@@ -171,8 +180,15 @@ void emit(std::ostream &out, const Metrics &value) {
 int main(int argc, char **argv) {
   try {
     const auto arguments = parse(argc, argv);
-    const auto build = dif::frontend::make_krea2_text_fusion(true);
-    const auto checkpoint = dif::weights::read_safetensors(arguments.checkpoint);
+    const auto build = dif::frontend::make_krea2_text_fusion(
+        true, arguments.capture_first_block);
+    std::optional<dif::weights::SafeTensorFile> checkpoint;
+    std::optional<dif::weights::WeightBundle> weight_bundle;
+    if (!arguments.checkpoint.empty())
+      checkpoint.emplace(
+          dif::weights::read_safetensors(arguments.checkpoint));
+    else
+      weight_bundle.emplace(dif::weights::read_weight_bundle(arguments.bundle));
     std::optional<dif::weights::SafeTensorFile> fixture;
     if (!arguments.fixture.empty())
       fixture.emplace(dif::weights::read_safetensors(arguments.fixture));
@@ -196,18 +212,34 @@ int main(int argc, char **argv) {
           dif::weights::map_safetensor(*fixture, "validity_mask"));
     }
     std::uint64_t converted = 0U;
-    for (std::size_t index = 0; index < build.checkpoint_tensors.size(); ++index) {
-      auto tensor = dif::weights::map_safetensor(
-          checkpoint, build.checkpoint_names[index]);
-      if (tensor.dtype == dif::ir::DType::F32) {
-        tensor = dif::runtime::convert_float_tensor(tensor, dif::ir::DType::BF16);
-        ++converted;
+    if (weight_bundle) {
+      auto prepared_weights = dif::weights::load_weight_bundle(
+          *weight_bundle, build.program, false);
+      for (const auto tensor_id : build.checkpoint_tensors) {
+        auto found = prepared_weights.find(tensor_id);
+        if (found == prepared_weights.end())
+          dif::fail("Krea text prepared bundle is missing tensor " +
+                    std::to_string(tensor_id));
+        bindings.emplace(tensor_id, std::move(found->second));
       }
-      const auto *description = build.program.tensor(build.checkpoint_tensors[index]);
-      if (!description || description->dtype != tensor.dtype ||
-          description->dims != tensor.dims)
-        dif::fail("Krea text checkpoint mismatch: " + build.checkpoint_names[index]);
-      bindings.emplace(build.checkpoint_tensors[index], std::move(tensor));
+    } else {
+      for (std::size_t index = 0; index < build.checkpoint_tensors.size();
+           ++index) {
+        auto tensor = dif::weights::map_safetensor(
+            *checkpoint, build.checkpoint_names[index]);
+        if (tensor.dtype == dif::ir::DType::F32) {
+          tensor = dif::runtime::convert_float_tensor(
+              tensor, dif::ir::DType::BF16);
+          ++converted;
+        }
+        const auto *description =
+            build.program.tensor(build.checkpoint_tensors[index]);
+        if (!description || description->dtype != tensor.dtype ||
+            description->dims != tensor.dims)
+          dif::fail("Krea text checkpoint mismatch: " +
+                    build.checkpoint_names[index]);
+        bindings.emplace(build.checkpoint_tensors[index], std::move(tensor));
+      }
     }
     dif::ir::write_file(build.program, arguments.diffir);
     dif::runtime::RunOptions options;
@@ -218,7 +250,9 @@ int main(int argc, char **argv) {
     const auto result =
         dif::runtime::make_cuda_executor()->run(build.program, bindings, options);
 
-    const std::vector<std::pair<std::string, std::uint32_t>> boundaries{
+    std::vector<std::pair<std::string, std::uint32_t>> boundaries =
+        build.first_block_boundaries;
+    const std::vector<std::pair<std::string, std::uint32_t>> stage_boundaries{
         {"layerwise_0", build.block_outputs[0]},
         {"layerwise_1", build.block_outputs[1]},
         {"projected", build.projected_output},
@@ -226,6 +260,8 @@ int main(int argc, char **argv) {
         {"refiner_1", build.block_outputs[3]},
         {"conditioning_output", build.conditioning_output},
     };
+    boundaries.insert(boundaries.end(), stage_boundaries.begin(),
+                      stage_boundaries.end());
     std::vector<dif::weights::SafeTensorWriteSpec> specs;
     for (const auto &[name, id] : boundaries) {
       const auto &tensor = result.outputs.at(id);

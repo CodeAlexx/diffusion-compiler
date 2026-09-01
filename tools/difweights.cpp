@@ -1,6 +1,8 @@
 #include "dif/ir/codec.hpp"
 #include "dif/ir/ir.hpp"
 #include "dif/frontend/h3_vae.hpp"
+#include "dif/frontend/krea2.hpp"
+#include "dif/frontend/krea2_vae.hpp"
 #include "dif/runtime/scalar.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
@@ -23,6 +25,185 @@ namespace {
 using ShardIndexMap = std::map<std::string, std::uint32_t>;
 using ShardMetadataMap =
     std::unordered_map<std::string, dif::weights::SafeTensorFile>;
+
+dif::weights::WeightBundle materialize_mixed_bf16_bundle(
+    const std::filesystem::path &source_path,
+    const dif::ir::Program &program,
+    const std::vector<std::uint32_t> &tensor_ids,
+    const std::vector<std::string> &tensor_names,
+    const std::filesystem::path &derived_path) {
+  if (std::filesystem::exists(derived_path))
+    dif::fail("refusing to overwrite derived BF16 shard");
+  if (tensor_ids.size() != tensor_names.size() || tensor_ids.empty())
+    dif::fail("prepared BF16 bundle requires matched tensor ids and names");
+  const auto source = dif::weights::read_safetensors(source_path);
+  std::vector<dif::weights::SafeTensorWriteSpec> specs;
+  for (std::size_t index = 0U; index < tensor_ids.size(); ++index) {
+    const auto *description = program.tensor(tensor_ids[index]);
+    const auto *entry = source.find(tensor_names[index]);
+    if (!description || !entry)
+      dif::fail("checkpoint binding is missing " + tensor_names[index]);
+    if (entry->dims != description->dims)
+      dif::fail("checkpoint shape disagrees with DiffIR: " +
+                tensor_names[index]);
+    if (entry->dtype == description->dtype)
+      continue;
+    if (entry->dtype != dif::ir::DType::F32 ||
+        description->dtype != dif::ir::DType::BF16)
+      dif::fail("prepared bundle only supports F32 to BF16: " +
+                tensor_names[index]);
+    specs.push_back(
+        {tensor_names[index], description->dtype, description->dims});
+  }
+  if (specs.empty())
+    dif::fail("Krea 2 checkpoint has no F32 tensors to materialize");
+
+  dif::weights::SafeTensorWriter writer(derived_path, std::move(specs));
+  std::uint64_t converted_tensors = 0U;
+  std::uint64_t converted_bytes = 0U;
+  for (std::size_t index = 0U; index < tensor_ids.size(); ++index) {
+    const auto *description = program.tensor(tensor_ids[index]);
+    const auto *entry = source.find(tensor_names[index]);
+    if (entry->dtype == description->dtype)
+      continue;
+    auto mapped =
+        dif::weights::map_safetensor(source, tensor_names[index]);
+    auto converted =
+        dif::runtime::convert_float_tensor(mapped, dif::ir::DType::BF16);
+    writer.append(tensor_names[index],
+                  {converted.data(), converted.byte_size()});
+    converted_bytes += converted.byte_size();
+    ++converted_tensors;
+    mapped.discard_mapped_pages();
+  }
+  const auto derived = writer.finish();
+
+  dif::weights::WeightBundle bundle;
+  bundle.program_fingerprint = dif::ir::fingerprint(program);
+  const auto source_digest = dif::sha256_file(source_path);
+  bundle.index_fingerprint = source_digest;
+  bundle.shards.push_back(
+      {std::filesystem::absolute(source_path).lexically_normal(),
+       source.file_size, source_digest});
+  bundle.shards.push_back(
+      {std::filesystem::absolute(derived_path).lexically_normal(),
+       derived.file_size, dif::sha256_file(derived_path)});
+  for (std::size_t index = 0U; index < tensor_ids.size(); ++index) {
+    const auto *description = program.tensor(tensor_ids[index]);
+    const auto *source_entry = source.find(tensor_names[index]);
+    const auto derived_binding = source_entry->dtype != description->dtype;
+    const auto *entry = derived_binding
+                            ? derived.find(tensor_names[index])
+                            : source_entry;
+    if (!entry || entry->dtype != description->dtype ||
+        entry->dims != description->dims)
+      dif::fail("prepared bundle lost " + tensor_names[index]);
+    bundle.bindings.push_back(
+        {tensor_ids[index], derived_binding ? 1U : 0U,
+         tensor_names[index], entry->dtype, entry->dims,
+         entry->file_offset, entry->byte_count});
+  }
+  dif::weights::verify_weight_bundle(bundle, program, false);
+  std::cout << "BF16_MATERIALIZED tensors=" << converted_tensors
+            << " bytes=" << converted_bytes << "\n";
+  return bundle;
+}
+
+dif::runtime::Tensor krea2_vae_weight(
+    const dif::weights::SafeTensorFile &source,
+    const dif::frontend::Krea2VaeWeightBinding &binding,
+    const dif::ir::TensorDesc &destination) {
+  auto tensor = dif::weights::map_safetensor(source, binding.source_name);
+  if (tensor.dtype == dif::ir::DType::F32 &&
+      destination.dtype == dif::ir::DType::BF16)
+    tensor = dif::runtime::convert_float_tensor(tensor, destination.dtype);
+  switch (binding.transform) {
+  case dif::frontend::Krea2VaeWeightTransform::Direct:
+    break;
+  case dif::frontend::Krea2VaeWeightTransform::FlattenSingletonDimensions:
+    if (tensor.element_count() != destination.element_count())
+      dif::fail("Qwen Image VAE flattened weight size mismatch: " +
+                binding.source_name);
+    tensor.dims = destination.dims;
+    break;
+  case dif::frontend::Krea2VaeWeightTransform::Conv3dLastTemporalSlice: {
+    if (tensor.dtype != destination.dtype || tensor.dims.size() != 5U ||
+        destination.dims.size() != 4U ||
+        tensor.dims[0] != destination.dims[0] ||
+        tensor.dims[1] != destination.dims[1] ||
+        tensor.dims[3] != destination.dims[2] ||
+        tensor.dims[4] != destination.dims[3])
+      dif::fail("Qwen Image VAE Conv3d slice mismatch: " +
+                binding.source_name);
+    dif::runtime::Tensor sliced{destination.dtype, destination.dims, {}};
+    sliced.bytes.resize(static_cast<std::size_t>(destination.byte_count()));
+    const auto outer = tensor.dims[0] * tensor.dims[1];
+    const auto temporal = tensor.dims[2];
+    const auto plane = tensor.dims[3] * tensor.dims[4];
+    const auto plane_bytes = static_cast<std::size_t>(
+        plane * dif::ir::dtype_size(tensor.dtype));
+    for (std::uint64_t index = 0U; index < outer; ++index) {
+      const auto source_offset =
+          (index * temporal + temporal - 1U) * plane_bytes;
+      std::memcpy(sliced.mutable_data() + index * plane_bytes,
+                  tensor.data() + source_offset, plane_bytes);
+    }
+    sliced.validate();
+    tensor = std::move(sliced);
+    break;
+  }
+  }
+  if (tensor.dtype != destination.dtype || tensor.dims != destination.dims)
+    dif::fail("Qwen Image VAE prepared weight mismatch: " +
+              binding.source_name);
+  tensor.validate();
+  return tensor;
+}
+
+dif::weights::WeightBundle materialize_krea2_vae_bundle(
+    const std::filesystem::path &source_path,
+    const dif::frontend::Krea2VaeBuild &build,
+    const std::filesystem::path &derived_path) {
+  if (std::filesystem::exists(derived_path))
+    dif::fail("refusing to overwrite Qwen Image VAE prepared shard");
+  const auto source = dif::weights::read_safetensors(source_path);
+  std::vector<dif::weights::SafeTensorWriteSpec> specs;
+  specs.reserve(build.weights.size());
+  for (const auto &binding : build.weights) {
+    const auto *description = build.program.tensor(binding.tensor);
+    if (!description)
+      dif::fail("Qwen Image VAE binding lost its DiffIR tensor");
+    specs.push_back(
+        {binding.source_name, description->dtype, description->dims});
+  }
+  dif::weights::SafeTensorWriter writer(derived_path, std::move(specs));
+  for (const auto &binding : build.weights) {
+    const auto *description = build.program.tensor(binding.tensor);
+    auto tensor = krea2_vae_weight(source, binding, *description);
+    writer.append(binding.source_name, {tensor.data(), tensor.byte_size()});
+  }
+  const auto derived = writer.finish();
+  dif::weights::WeightBundle bundle;
+  bundle.program_fingerprint = dif::ir::fingerprint(build.program);
+  bundle.index_fingerprint = dif::sha256_file(source_path);
+  const auto absolute =
+      std::filesystem::absolute(derived_path).lexically_normal();
+  bundle.shards.push_back(
+      {absolute, derived.file_size, dif::sha256_file(absolute)});
+  for (const auto &binding : build.weights) {
+    const auto *description = build.program.tensor(binding.tensor);
+    const auto *entry = derived.find(binding.source_name);
+    if (!description || !entry || entry->dtype != description->dtype ||
+        entry->dims != description->dims)
+      dif::fail("Qwen Image VAE prepared shard lost " +
+                binding.source_name);
+    bundle.bindings.push_back(
+        {binding.tensor, 0U, binding.source_name, entry->dtype, entry->dims,
+         entry->file_offset, entry->byte_count});
+  }
+  dif::weights::verify_weight_bundle(bundle, build.program, false);
+  return bundle;
+}
 
 void append_checkpoint_binding(
     const dif::weights::SafeTensorIndex &index,
@@ -664,6 +845,9 @@ void usage() {
                "       difweights check-h3-denoiser-bindings INDEX PROGRAM.difir\n"
                "       difweights make-h3-denoiser-bundle INDEX PROGRAM.difir OUT.difbind\n"
                "       difweights rebind-h3-denoiser-bundle SEALED.difbind INDEX PROGRAM.difir OUT.difbind\n"
+               "       difweights make-krea2-bf16-bundle SOURCE.safetensors PROGRAM.difir DERIVED.safetensors OUT.difbind\n"
+               "       difweights make-krea2-text-bf16-bundle SOURCE.safetensors PROGRAM.difir DERIVED.safetensors OUT.difbind\n"
+               "       difweights make-krea2-vae-bf16-bundle SOURCE.safetensors PROGRAM.difir DERIVED.safetensors OUT.difbind\n"
                "       difweights make-h3-video-vae-bundle SOURCE.safetensors PROGRAM.difir OUT.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights seal-h3-video-vae-bundle DERIVED.safetensors SOURCE.safetensors PROGRAM.difir OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights reuse-h3-video-vae-bundle SEALED.difbind PROGRAM.difir GEOMETRY.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
@@ -786,6 +970,72 @@ int main(int argc, char **argv) {
                 << " program="
                 << dif::hex_digest(bundle.program_fingerprint)
                 << " shards=" << bundle.shards.size()
+                << " bindings=" << bundle.bindings.size() << "\n";
+      return 0;
+    }
+    if (command == "make-krea2-bf16-bundle" && argc == 6) {
+      if (std::filesystem::exists(argv[5]))
+        dif::fail("refusing to overwrite Krea 2 BF16 weight bundle");
+      dif::frontend::Krea2Config config;
+      config.streamed_constants = true;
+      const auto build = dif::frontend::make_krea2_denoiser(config, false);
+      const auto program = dif::ir::read_file(argv[3]);
+      if (dif::ir::fingerprint(program) !=
+          dif::ir::fingerprint(build.program))
+        dif::fail("Krea 2 program does not match the production denoiser");
+      const auto bundle = materialize_mixed_bf16_bundle(
+          argv[2], build.program, build.checkpoint_tensors,
+          build.checkpoint_names, argv[4]);
+      dif::weights::write_weight_bundle(bundle, argv[5]);
+      std::cout << "KREA2_BF16_BUNDLE path=" << argv[5]
+                << " shard=" << argv[4]
+                << " program="
+                << dif::hex_digest(bundle.program_fingerprint)
+                << " checkpoint="
+                << dif::hex_digest(bundle.index_fingerprint)
+                << " bindings=" << bundle.bindings.size() << "\n";
+      return 0;
+    }
+    if (command == "make-krea2-text-bf16-bundle" && argc == 6) {
+      if (std::filesystem::exists(argv[5]))
+        dif::fail("refusing to overwrite Krea 2 text BF16 weight bundle");
+      const auto build = dif::frontend::make_krea2_text_fusion(true);
+      const auto program = dif::ir::read_file(argv[3]);
+      if (dif::ir::fingerprint(program) !=
+          dif::ir::fingerprint(build.program))
+        dif::fail("Krea 2 text program does not match production TextFusion");
+      const auto bundle = materialize_mixed_bf16_bundle(
+          argv[2], build.program, build.checkpoint_tensors,
+          build.checkpoint_names, argv[4]);
+      dif::weights::write_weight_bundle(bundle, argv[5]);
+      std::cout << "KREA2_TEXT_BF16_BUNDLE path=" << argv[5]
+                << " shard=" << argv[4]
+                << " program="
+                << dif::hex_digest(bundle.program_fingerprint)
+                << " checkpoint="
+                << dif::hex_digest(bundle.index_fingerprint)
+                << " bindings=" << bundle.bindings.size() << "\n";
+      return 0;
+    }
+    if (command == "make-krea2-vae-bf16-bundle" && argc == 6) {
+      if (std::filesystem::exists(argv[5]))
+        dif::fail("refusing to overwrite Qwen Image VAE BF16 bundle");
+      dif::frontend::Krea2VaeConfig config;
+      config.capture_boundaries = false;
+      const auto build = dif::frontend::make_krea2_qwen_image_vae(config);
+      const auto program = dif::ir::read_file(argv[3]);
+      if (dif::ir::fingerprint(program) !=
+          dif::ir::fingerprint(build.program))
+        dif::fail("Qwen Image VAE program is not the 32x32 production tile");
+      const auto bundle = materialize_krea2_vae_bundle(
+          argv[2], build, argv[4]);
+      dif::weights::write_weight_bundle(bundle, argv[5]);
+      std::cout << "KREA2_VAE_BF16_BUNDLE path=" << argv[5]
+                << " shard=" << argv[4]
+                << " program="
+                << dif::hex_digest(bundle.program_fingerprint)
+                << " checkpoint="
+                << dif::hex_digest(bundle.index_fingerprint)
                 << " bindings=" << bundle.bindings.size() << "\n";
       return 0;
     }

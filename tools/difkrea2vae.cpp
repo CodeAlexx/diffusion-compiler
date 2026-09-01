@@ -6,6 +6,7 @@
 #include "dif/support/json.hpp"
 #include "dif/support/png.hpp"
 #include "dif/support/sha256.hpp"
+#include "dif/weights/bundle.hpp"
 #include "dif/weights/safetensors.hpp"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -28,8 +30,8 @@
 namespace {
 
 struct Arguments {
-  std::filesystem::path checkpoint, fixture, sampler, reference, config, png,
-      output, report, diffir;
+  std::filesystem::path checkpoint, bundle, fixture, sampler, reference,
+      config, png, output, report, diffir;
 };
 
 Arguments parse(int argc, char **argv) {
@@ -43,6 +45,8 @@ Arguments parse(int argc, char **argv) {
     };
     if (option == "--checkpoint")
       result.checkpoint = value();
+    else if (option == "--bundle")
+      result.bundle = value();
     else if (option == "--fixture")
       result.fixture = value();
     else if (option == "--sampler")
@@ -63,12 +67,15 @@ Arguments parse(int argc, char **argv) {
       dif::fail("invalid difkrea2vae argument: " + option);
   }
   const auto full = !result.sampler.empty();
-  if (result.checkpoint.empty() || result.output.empty() ||
+  if ((result.checkpoint.empty() == result.bundle.empty()) ||
+      result.output.empty() ||
       result.report.empty() || result.diffir.empty() ||
-      (!full && result.fixture.empty()) ||
+      (!full && (result.fixture.empty() || result.checkpoint.empty())) ||
       (full && (result.reference.empty() || result.config.empty() ||
                 result.png.empty())))
-    dif::fail("difkrea2vae tile mode requires checkpoint/fixture/output/report/diffir; full mode replaces fixture with sampler/reference/config/png");
+    dif::fail("difkrea2vae requires exactly one of checkpoint or bundle; "
+              "tile mode requires checkpoint/fixture/output/report/diffir; "
+              "full mode replaces fixture with sampler/reference/config/png");
   if (std::filesystem::exists(result.output) ||
       std::filesystem::exists(result.report) ||
       std::filesystem::exists(result.diffir) ||
@@ -341,7 +348,8 @@ struct PreparedTile {
 
 std::unique_ptr<PreparedTile> prepare_tile(
     dif::runtime::Executor &backend,
-    const dif::weights::SafeTensorFile &checkpoint,
+    const dif::weights::SafeTensorFile *checkpoint,
+    const dif::runtime::TensorMap *prepared_weights,
     const dif::runtime::Tensor &latent_std,
     const dif::runtime::Tensor &latent_mean, std::uint64_t height,
     std::uint64_t width, const dif::runtime::RunOptions &options,
@@ -359,9 +367,19 @@ std::unique_ptr<PreparedTile> prepare_tile(
   result->bindings.emplace(result->build.latent_mean, latent_mean);
   for (const auto &binding : result->build.weights) {
     const auto *destination = result->build.program.tensor(binding.tensor);
-    result->bindings.emplace(
-        binding.tensor,
-        bind_weight(checkpoint, binding, *destination, converted));
+    if (prepared_weights) {
+      const auto found = prepared_weights->find(binding.tensor);
+      if (found == prepared_weights->end() ||
+          found->second.dtype != destination->dtype ||
+          found->second.dims != destination->dims)
+        dif::fail("Qwen Image VAE prepared bundle mismatch: " +
+                  binding.source_name);
+      result->bindings.emplace(binding.tensor, found->second);
+    } else {
+      result->bindings.emplace(
+          binding.tensor,
+          bind_weight(*checkpoint, binding, *destination, converted));
+    }
   }
   result->fingerprint =
       dif::hex_digest(dif::ir::fingerprint(result->build.program));
@@ -371,8 +389,20 @@ std::unique_ptr<PreparedTile> prepare_tile(
 }
 
 int run_full(const Arguments &arguments) {
-  const auto checkpoint =
-      dif::weights::read_safetensors(arguments.checkpoint);
+  std::optional<dif::weights::SafeTensorFile> checkpoint;
+  std::optional<dif::weights::WeightBundle> bundle;
+  dif::runtime::TensorMap prepared_weights;
+  if (!arguments.checkpoint.empty()) {
+    checkpoint.emplace(dif::weights::read_safetensors(arguments.checkpoint));
+  } else {
+    bundle.emplace(dif::weights::read_weight_bundle(arguments.bundle));
+    dif::frontend::Krea2VaeConfig canonical_config;
+    canonical_config.capture_boundaries = false;
+    const auto canonical =
+        dif::frontend::make_krea2_qwen_image_vae(canonical_config);
+    prepared_weights =
+        dif::weights::load_weight_bundle(*bundle, canonical.program, false);
+  }
   const auto sampler = dif::weights::read_safetensors(arguments.sampler);
   const auto reference = dif::weights::read_safetensors(arguments.reference);
   const auto tokens =
@@ -397,8 +427,9 @@ int run_full(const Arguments &arguments) {
   std::uint64_t resident_bytes = 0U;
   for (std::size_t index = 0U; index < shapes.size(); ++index) {
     prepared[index] = prepare_tile(
-        *backend, checkpoint, latent_std, latent_mean, shapes[index].first,
-        shapes[index].second, options, converted);
+        *backend, checkpoint ? &*checkpoint : nullptr,
+        bundle ? &prepared_weights : nullptr, latent_std, latent_mean,
+        shapes[index].first, shapes[index].second, options, converted);
     preparation_milliseconds +=
         prepared[index]->execution->preparation_milliseconds();
     resident_bytes += prepared[index]->execution->resident_bytes();
@@ -524,6 +555,8 @@ int run_full(const Arguments &arguments) {
   report << std::setprecision(17)
          << "{\n  \"source_commit\": \"db3984fbc6e13b34c0064990fc2d95ac64d00058\",\n"
          << "  \"checkpoint\": " << std::quoted(arguments.checkpoint.string())
+         << ",\n  \"weight_bundle\": "
+         << std::quoted(arguments.bundle.string())
          << ",\n  \"sampler\": " << std::quoted(arguments.sampler.string())
          << ",\n  \"reference\": " << std::quoted(arguments.reference.string())
          << ",\n  \"config\": " << std::quoted(arguments.config.string())

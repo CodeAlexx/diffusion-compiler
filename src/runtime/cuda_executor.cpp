@@ -251,6 +251,24 @@ private:
   cublasLtHandle_t cublas_lt_{};
 };
 
+class Stream {
+public:
+  Stream() {
+    check(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING),
+          "cuStreamCreate auxiliary compute");
+  }
+  ~Stream() {
+    if (stream_)
+      (void)cuStreamDestroy(stream_);
+  }
+  Stream(const Stream &) = delete;
+  Stream &operator=(const Stream &) = delete;
+  CUstream get() const { return stream_; }
+
+private:
+  CUstream stream_{};
+};
+
 class Module {
 public:
   explicit Module(const std::string &ptx) {
@@ -3825,17 +3843,18 @@ public:
     }
   }
 
-  void wait(std::size_t operation_index, bool ready) {
+  void wait(std::size_t operation_index, bool ready,
+            CUstream stream = nullptr) {
     if (!ready)
       return;
-    check(counted_stream_wait_event(context_.stream(),
+    check(counted_stream_wait_event(stream ? stream : context_.stream(),
                             ready_events_.at(operation_index)->get(), 0U),
           "cuStreamWaitEvent prefetched constant");
   }
 
-  void complete(std::size_t operation_index) {
+  void complete(std::size_t operation_index, CUstream stream = nullptr) {
     check(counted_event_record(completion_events_.at(operation_index)->get(),
-                        context_.stream()),
+                        stream ? stream : context_.stream()),
           "cuEventRecord operation completion");
     completion_recorded_.at(operation_index) = true;
   }
@@ -3988,8 +4007,10 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
 class CudaPreparedExecution final : public PreparedExecution {
 public:
   CudaPreparedExecution(ir::Program program, const TensorMap &bindings,
-                        const RunOptions &options, int device_ordinal)
-      : program_(std::move(program)), context_(device_ordinal) {
+                        const RunOptions &options,
+                        std::shared_ptr<Context> context)
+      : program_(std::move(program)), context_owner_(std::move(context)),
+        context_(*context_owner_) {
     const auto preparation_start = std::chrono::steady_clock::now();
     TelemetryScope telemetry_scope(preparation_telemetry_);
     if (options.lazy_resident_upload && options.pipelined_resident_upload)
@@ -4251,6 +4272,61 @@ public:
                  !fused_linear_operations.contains(op.id);
         });
     workspace_bytes_ = contains_linear ? linear_workspace_bytes : 0U;
+    {
+      std::unordered_set<std::uint32_t> scheduled;
+      const std::unordered_set<std::uint32_t> resident_streamed(
+          options.resident_streamed_constants.begin(),
+          options.resident_streamed_constants.end());
+      std::size_t maximum_width = 1U;
+      for (const auto &group : options.parallel_linear_groups) {
+        if (group.size() < 2U)
+          fail("parallel Linear group requires at least two operations");
+        std::vector<std::size_t> indices;
+        indices.reserve(group.size());
+        std::optional<std::uint32_t> activation;
+        for (const auto operation_id : group) {
+          if (!scheduled.insert(operation_id).second)
+            fail("parallel Linear operation appears in multiple groups");
+          const auto found = std::find_if(
+              program_.operations.begin(), program_.operations.end(),
+              [&](const ir::Operation &operation) {
+                return operation.id == operation_id;
+              });
+          if (found == program_.operations.end() ||
+              found->opcode != ir::Opcode::Linear ||
+              found->inputs.size() != 2U || found->outputs.size() != 1U ||
+              generated.launch_inputs.contains(operation_id) ||
+              fused_linear_operations.contains(operation_id))
+            fail("parallel Linear group requires unfused unbiased Linears");
+          if (!activation)
+            activation = found->inputs[0];
+          else if (*activation != found->inputs[0])
+            fail("parallel Linear group operations must share one input");
+          const auto *weight = program_.tensor(found->inputs[1]);
+          if (!weight || !weight->has_role(ir::TensorRole::Constant) ||
+              (weight->has_role(ir::TensorRole::Streamed) &&
+               !resident_streamed.contains(weight->id)))
+            fail("parallel Linear group weights must be resident");
+          indices.push_back(static_cast<std::size_t>(
+              std::distance(program_.operations.begin(), found)));
+        }
+        std::sort(indices.begin(), indices.end());
+        for (std::size_t index = 1U; index < indices.size(); ++index)
+          if (indices[index] != indices.front() + index)
+            fail("parallel Linear group operations must be contiguous");
+        parallel_linear_followups_.insert(indices.begin() + 1U,
+                                          indices.end());
+        parallel_linear_groups_.emplace(indices.front(), std::move(indices));
+        maximum_width = std::max(maximum_width, group.size());
+      }
+      if (maximum_width > 1U) {
+        if (workspace_bytes_ > std::numeric_limits<std::uint64_t>::max() /
+                                   (maximum_width - 1U))
+          fail("parallel Linear workspace size overflow");
+        parallel_workspace_bytes_ =
+            workspace_bytes_ * (maximum_width - 1U);
+      }
+    }
     cudnn_workspace_bytes_ = 0U;
 #if DIF_HAS_CUDNN
     std::unordered_map<CudnnAttentionKey,
@@ -4436,6 +4512,9 @@ public:
     const auto tensor_bytes = memory_plan_.total_bytes;
     if (tensor_bytes > std::numeric_limits<std::uint64_t>::max() - workspace_bytes_ ||
         tensor_bytes + workspace_bytes_ >
+            std::numeric_limits<std::uint64_t>::max() -
+                parallel_workspace_bytes_ ||
+        tensor_bytes + workspace_bytes_ + parallel_workspace_bytes_ >
             std::numeric_limits<std::uint64_t>::max() - cudnn_workspace_bytes_)
       fail("DiffIR allocation plus backend workspace overflow");
     auto h3_w8a8_weight_bytes = std::uint64_t{0U};
@@ -4505,8 +4584,9 @@ public:
         fail("H3 modulation prepared storage overflow");
       h3_modulation_bytes += plan.storage_bytes;
     }
-    const auto base_required =
-        tensor_bytes + workspace_bytes_ + cudnn_workspace_bytes_;
+    const auto base_required = tensor_bytes + workspace_bytes_ +
+                               parallel_workspace_bytes_ +
+                               cudnn_workspace_bytes_;
     if (base_required > std::numeric_limits<std::uint64_t>::max() -
                             ck_attention_scratch_bytes_)
       fail("DiffIR allocation plus H3 CK scratch overflow");
@@ -4531,6 +4611,8 @@ public:
     if (options.profile_pipeline) {
       std::cerr << "CUDA_MEMORY_PLAN tensor_bytes=" << tensor_bytes
                 << " linear_workspace_bytes=" << workspace_bytes_
+                << " parallel_linear_workspace_bytes="
+                << parallel_workspace_bytes_
                 << " attention_workspace_bytes=" << cudnn_workspace_bytes_
                 << " ck_attention_scratch_bytes="
                 << ck_attention_scratch_bytes_
@@ -4621,6 +4703,22 @@ public:
                             replaced_constant_tensors.end());
     buffers_.allocate(program_, memory_plan_, excluded_tensors, arena_.get());
     workspace_ = std::make_unique<Workspace>(workspace_bytes_, arena_.get());
+    if (parallel_workspace_bytes_ != 0U) {
+      const auto auxiliary_count =
+          parallel_workspace_bytes_ / workspace_bytes_;
+      parallel_streams_.reserve(auxiliary_count);
+      parallel_workspaces_.reserve(auxiliary_count);
+      parallel_done_events_.reserve(auxiliary_count);
+      for (std::size_t index = 0U; index < auxiliary_count; ++index) {
+        parallel_streams_.push_back(std::make_unique<Stream>());
+        parallel_workspaces_.push_back(
+            std::make_unique<Workspace>(workspace_bytes_, arena_.get()));
+        parallel_done_events_.push_back(
+            std::make_unique<Event>(CU_EVENT_DISABLE_TIMING));
+      }
+      parallel_start_event_ =
+          std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+    }
     cudnn_workspace_ =
         std::make_unique<Workspace>(cudnn_workspace_bytes_, arena_.get());
     h3_w8a8_scratch_storage_ = std::make_unique<Workspace>(
@@ -4732,6 +4830,9 @@ public:
       std::unordered_set<std::uint32_t> ranked_ids;
       for (const auto &choice : options.linear_algorithm_choices)
         ranked_ids.insert(choice.operation_id);
+      std::unordered_map<std::string, std::shared_ptr<LinearPlan>> shared_plans;
+      std::uint64_t linear_operation_count = 0U;
+      std::uint64_t isolated_plan_count = 0U;
       for (const auto &op : program_.operations) {
         if (op.opcode != ir::Opcode::Linear ||
             fused_launch_inputs_.contains(op.id) ||
@@ -4755,15 +4856,63 @@ public:
         const auto allow_restore = !options.expand_linear_algorithms &&
                                    !tuned_ids.contains(op.id) &&
                                    !ranked_ids.contains(op.id);
-        linear_plans_.emplace(
-            op.id,
-            std::make_unique<LinearPlan>(
-                program_, plan_operation, buffers_, context_.cublas_lt(),
-                workspace_bytes_, options.expand_linear_algorithms, major,
-                minor, options.cache_directory,
-                options.persist_linear_heuristics, allow_restore,
-                &linear_heuristic_cache_stats_));
+        ++linear_operation_count;
+        const auto *input = program_.tensor(plan_operation.inputs.at(0));
+        const auto *weight = program_.tensor(plan_operation.inputs.at(1));
+        const auto *output = program_.tensor(plan_operation.outputs.at(0));
+        const auto shareable = allow_restore && input && weight && output &&
+                               input->dtype == ir::DType::BF16;
+        std::string key;
+        if (shareable) {
+          const auto rows = input->dims.at(0);
+          const auto inner = input->element_count() / rows;
+          const auto width = weight->dims.at(0);
+          key = "bf16|m=" + std::to_string(rows) +
+                "|n=" + std::to_string(width) +
+                "|k=" + std::to_string(inner) +
+                "|bias=" +
+                std::to_string(plan_operation.inputs.size() == 3U ? 1U : 0U) +
+                "|bias_mode=" +
+                std::to_string(plan_operation.u64(
+                    ir::AttrKey::LinearBiasMode,
+                    static_cast<std::uint64_t>(ir::LinearBiasMode::Epilogue))) +
+                "|implementation=" +
+                std::to_string(plan_operation.u64(
+                    ir::AttrKey::Implementation, 1U)) +
+                "|workspace=" +
+                std::to_string(plan_operation.u64(
+                    ir::AttrKey::WorkspaceLimitBytes, workspace_bytes_)) +
+                "|persist=" +
+                std::to_string(options.persist_linear_heuristics ? 1U : 0U);
+        }
+        auto shared = shareable ? shared_plans.find(key) : shared_plans.end();
+        if (shared != shared_plans.end()) {
+          linear_plans_.emplace(op.id, shared->second);
+          continue;
+        }
+        auto plan = std::make_shared<LinearPlan>(
+            program_, plan_operation, buffers_, context_.cublas_lt(),
+            workspace_bytes_, options.expand_linear_algorithms, major,
+            minor, options.cache_directory,
+            options.persist_linear_heuristics, allow_restore,
+            &linear_heuristic_cache_stats_);
+        linear_plans_.emplace(op.id, plan);
+        if (shareable) {
+          std::cout << "CUDA_LINEAR_PLAN_CLASS operation=" << op.id
+                    << " key=" << key << "\n";
+          shared_plans.emplace(std::move(key), std::move(plan));
+        } else
+          ++isolated_plan_count;
       }
+      const auto unique_plan_count =
+          static_cast<std::uint64_t>(shared_plans.size()) +
+          isolated_plan_count;
+      std::cout << "CUDA_LINEAR_PLAN_POOL operations="
+                << linear_operation_count
+                << " unique=" << unique_plan_count
+                << " reused=" << linear_operation_count - unique_plan_count
+                << " isolated=" << isolated_plan_count
+                << "\n";
     }
 #if DIF_HAS_CUTLASS
     std::unordered_set<std::uint32_t> cutlass_operations;
@@ -5290,14 +5439,77 @@ public:
         profile_operation_events.push_back(
             {std::make_unique<Event>(), std::make_unique<Event>()});
     }
+    auto execute_parallel_group = [&](std::size_t first,
+                                      std::uint32_t iteration,
+                                      bool profile,
+                                      const std::vector<bool> *prefetched) {
+      const auto found = parallel_linear_groups_.find(first);
+      if (found == parallel_linear_groups_.end())
+        return false;
+      const auto &indices = found->second;
+      std::vector<bool> ready(indices.size(), false);
+      for (std::size_t lane = 1U; lane < indices.size(); ++lane) {
+        const auto operation_index = indices[lane];
+        ready[lane] = prefetched ? prefetched->at(operation_index) : false;
+        if (!ready[lane])
+          ready[lane] = streamed_prefetcher_->prefetch(operation_index);
+      }
+      check(counted_event_record(parallel_start_event_->get(),
+                                 context_.stream()),
+            "cuEventRecord parallel Linear start");
+      for (std::size_t lane = 0U; lane < indices.size(); ++lane) {
+        const auto operation_index = indices[lane];
+        const auto &operation = program_.operations[operation_index];
+        const auto stream = lane == 0U
+                                ? context_.stream()
+                                : parallel_streams_.at(lane - 1U)->get();
+        const auto &workspace =
+            lane == 0U ? *workspace_ : *parallel_workspaces_.at(lane - 1U);
+        if (lane != 0U)
+          streamed_prefetcher_->wait(operation_index, ready[lane], stream);
+        if (lane != 0U)
+          check(counted_stream_wait_event(stream, parallel_start_event_->get(),
+                                          0U),
+                "cuStreamWaitEvent parallel Linear input");
+        OperationEventPair *timing = nullptr;
+        if (profile) {
+          timing = &profile_operation_events.at(
+              static_cast<std::size_t>(iteration) *
+                      program_.operations.size() +
+              operation_index);
+          check(counted_event_record(timing->start->get(), stream),
+                "cuEventRecord profiled parallel Linear start");
+        }
+        linear_plans_.at(operation.id)->launch(
+            operation, buffers_, context_.cublas_lt(), workspace, stream);
+        if (timing)
+          check(counted_event_record(timing->stop->get(), stream),
+                "cuEventRecord profiled parallel Linear stop");
+        streamed_prefetcher_->complete(operation_index, stream);
+        if (lane != 0U)
+          check(counted_event_record(parallel_done_events_.at(lane - 1U)->get(),
+                                     stream),
+                "cuEventRecord parallel Linear completion");
+      }
+      for (std::size_t lane = 1U; lane < indices.size(); ++lane)
+        check(counted_stream_wait_event(
+                  context_.stream(), parallel_done_events_.at(lane - 1U)->get(),
+                  0U),
+              "cuStreamWaitEvent parallel Linear completion");
+      return true;
+    };
     auto execute = [&](std::uint32_t iteration, bool profile) {
       if (program_.operations.empty())
         return;
       if (!options.overlap_streaming) {
         for (std::size_t index = 0; index < program_.operations.size(); ++index) {
+          if (parallel_linear_followups_.contains(index))
+            continue;
           const auto &op = program_.operations[index];
           const auto ready = streamed_prefetcher_->prefetch(index);
           streamed_prefetcher_->wait(index, ready);
+          if (execute_parallel_group(index, iteration, profile, nullptr))
+            continue;
           OperationEventPair *timing = nullptr;
           if (profile && !skipped_operations_.contains(op.id)) {
             timing = &profile_operation_events.at(
@@ -5322,8 +5534,17 @@ public:
            ++ahead)
         prefetched[ahead] = streamed_prefetcher_->prefetch(ahead);
       for (std::size_t index = 0; index < operation_count; ++index) {
+        if (parallel_linear_followups_.contains(index)) {
+          if (index + depth < operation_count)
+            prefetched[index + depth] =
+                streamed_prefetcher_->prefetch(index + depth);
+          continue;
+        }
         const auto &op = program_.operations[index];
         streamed_prefetcher_->wait(index, prefetched[index]);
+        if (execute_parallel_group(index, iteration, profile, &prefetched)) {
+          continue;
+        }
         OperationEventPair *timing = nullptr;
         if (profile && !skipped_operations_.contains(op.id)) {
           timing = &profile_operation_events.at(
@@ -5687,12 +5908,20 @@ public:
 private:
   ir::Program program_;
   TensorMap constants_;
-  Context context_;
+  // All prepared executables made by one Executor share its CUDA session.
+  // Shape-specialized plans and storage remain independently owned, while
+  // streams and vendor handles are created once and reused serially.
+  std::shared_ptr<Context> context_owner_;
+  Context &context_;
   std::unique_ptr<Module> module_;
   compiler::MemoryPlan memory_plan_;
   std::unique_ptr<DeviceArena> arena_;
   DeviceBuffers buffers_;
   std::unique_ptr<Workspace> workspace_;
+  std::vector<std::unique_ptr<Stream>> parallel_streams_;
+  std::vector<std::unique_ptr<Workspace>> parallel_workspaces_;
+  std::unique_ptr<Event> parallel_start_event_;
+  std::vector<std::unique_ptr<Event>> parallel_done_events_;
   std::unique_ptr<Workspace> cudnn_workspace_;
   std::unique_ptr<Workspace> h3_w8a8_scratch_storage_;
   std::unique_ptr<Workspace> h3_w8a8_tail_weight_storage_;
@@ -5709,7 +5938,10 @@ private:
   std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
       fused_launch_inputs_;
   std::unordered_set<std::uint32_t> skipped_operations_;
-  std::unordered_map<std::uint32_t, std::unique_ptr<LinearPlan>> linear_plans_;
+  std::unordered_map<std::uint32_t, std::shared_ptr<LinearPlan>> linear_plans_;
+  std::unordered_map<std::size_t, std::vector<std::size_t>>
+      parallel_linear_groups_;
+  std::unordered_set<std::size_t> parallel_linear_followups_;
 #if DIF_HAS_CUTLASS
   std::unordered_map<std::uint32_t, std::unique_ptr<CutlassLinearPlan>>
       cutlass_linear_plans_;
@@ -5742,6 +5974,7 @@ private:
   std::string device_name_;
   std::string source_hash_;
   std::size_t workspace_bytes_{};
+  std::uint64_t parallel_workspace_bytes_{};
   std::size_t cudnn_workspace_bytes_{};
   std::uint64_t ck_attention_scratch_bytes_{};
   std::uint64_t h3_w8a8_tail_attention_bytes_{};
@@ -5772,19 +6005,20 @@ private:
 
 class CudaExecutor final : public Executor {
 public:
-  explicit CudaExecutor(int device) : device_ordinal_(device) {}
+  explicit CudaExecutor(int device)
+      : context_(std::make_shared<Context>(device)) {}
 
   std::unique_ptr<PreparedExecution>
   prepare(const ir::Program &program, const TensorMap &bindings,
           const RunOptions &options) override {
     return std::make_unique<CudaPreparedExecution>(program, bindings, options,
-                                                   device_ordinal_);
+                                                   context_);
   }
 
   std::string name() const override { return "cuda-nvrtc-cublaslt"; }
 
 private:
-  int device_ordinal_{};
+  std::shared_ptr<Context> context_;
 };
 
 } // namespace

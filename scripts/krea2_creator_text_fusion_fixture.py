@@ -32,12 +32,13 @@ def main() -> None:
     parser.add_argument("--conditioner", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--capture-first-block", action="store_true")
     args = parser.parse_args()
     if args.output.exists() or args.report.exists():
         raise SystemExit("refusing to overwrite an existing text-fusion artifact")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(args.creator))
-    from mmdit import RMSNorm, TextFusionTransformer
+    from mmdit import RMSNorm, TextFusionTransformer, attention
 
     text_fusion = TextFusionTransformer(
         num_txt_layers=12,
@@ -70,9 +71,52 @@ def main() -> None:
     start = time.perf_counter()
     with torch.no_grad():
         x = context.reshape(512, 12, 2560)
-        for index, block in enumerate(text_fusion.layerwise_blocks):
-            x = block(x.contiguous(), mask=None)
-            outputs[f"layerwise_{index}"] = x.reshape(1, 512, 12, 2560).cpu()
+        block = text_fusion.layerwise_blocks[0]
+        prenorm = block.prenorm(x.contiguous())
+        q = block.attn.wq(prenorm)
+        k = block.attn.wk(prenorm)
+        v = block.attn.wv(prenorm)
+        q_heads = rearrange(q, "B L (H D) -> B H L D", H=block.attn.heads)
+        k_heads = rearrange(k, "B L (H D) -> B H L D", H=block.attn.kvheads)
+        v_heads = rearrange(v, "B L (H D) -> B H L D", H=block.attn.kvheads)
+        qnorm, knorm, _ = block.attn.qknorm(q_heads, k_heads, v_heads)
+        attended = attention(qnorm, knorm, v_heads, mask=None, gqa=False)
+        gate_logits = block.attn.gate(prenorm)
+        gate = torch.sigmoid(gate_logits)
+        gated = attended * gate
+        projected_attention = block.attn.wo(gated)
+        attention_residual = x + projected_attention
+        postnorm = block.postnorm(attention_residual)
+        mlp_gate = block.mlp.gate(postnorm)
+        mlp_up = block.mlp.up(postnorm)
+        mlp_gate_activated = torch.nn.functional.silu(mlp_gate)
+        mlp_activation = mlp_gate_activated * mlp_up
+        mlp_output = block.mlp.down(mlp_activation)
+        x = attention_residual + mlp_output
+        if args.capture_first_block:
+            outputs.update({
+            "first_prenorm": prenorm.cpu(),
+            "first_q": q.reshape(512 * 12, 2560).cpu(),
+            "first_k": k.reshape(512 * 12, 2560).cpu(),
+            "first_v": v.reshape(512 * 12, 2560).cpu(),
+            "first_qnorm": qnorm.permute(0, 2, 1, 3).contiguous().cpu(),
+            "first_knorm": knorm.permute(0, 2, 1, 3).contiguous().cpu(),
+            "first_attention": attended.reshape(512, 12, 20, 128).cpu(),
+            "first_gate_logits": gate_logits.reshape(512 * 12, 2560).cpu(),
+            "first_gate": gate.reshape(512 * 12, 2560).cpu(),
+            "first_gated_attention": gated.reshape(512 * 12, 2560).cpu(),
+            "first_attention_projection": projected_attention.reshape(512 * 12, 2560).cpu(),
+            "first_attention_residual": attention_residual.cpu(),
+            "first_postnorm": postnorm.cpu(),
+            "first_mlp_gate": mlp_gate.reshape(512 * 12, -1).cpu(),
+            "first_mlp_up": mlp_up.reshape(512 * 12, -1).cpu(),
+            "first_mlp_gate_activated": mlp_gate_activated.reshape(512 * 12, -1).cpu(),
+            "first_mlp_activation": mlp_activation.reshape(512 * 12, -1).cpu(),
+            "first_mlp_output": mlp_output.reshape(512 * 12, 2560).cpu(),
+            })
+        outputs["layerwise_0"] = x.reshape(1, 512, 12, 2560).cpu()
+        x = text_fusion.layerwise_blocks[1](x.contiguous(), mask=None)
+        outputs["layerwise_1"] = x.reshape(1, 512, 12, 2560).cpu()
         x = rearrange(x, "(b l) n d -> b l d n", b=1, l=512)
         x = text_fusion.projector(x).squeeze(-1)
         outputs["projected"] = x.cpu()

@@ -39,6 +39,15 @@ enum class TransformKind : std::uint32_t {
   // Memory policy. These change residency and streaming, not arithmetic.
   SetConstantResidency = 15,
   SetPrefetchDistance = 16,
+  // Packs two unbiased Linears sharing one activation, followed by
+  // SiLU(gate) * value, into one wider Linear and a SwiGlu. Packing changes
+  // the vendor GEMM problem shape and is therefore numerical, even though the
+  // real-number equation is unchanged.
+  FuseParallelLinearSwiGlu = 17,
+  // Packs two or more unbiased Linears with a common activation into one
+  // wider Linear followed by last-dimension slices. The wider vendor GEMM may
+  // select a different accumulation schedule, so admission is numerical.
+  FuseParallelLinears = 18,
 };
 
 // Broad classification used by search policy and by reporting. It is derived

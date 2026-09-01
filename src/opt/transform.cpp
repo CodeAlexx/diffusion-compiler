@@ -16,7 +16,7 @@ struct KindName {
   TransformClass classification;
 };
 
-constexpr std::array<KindName, 16> kKindNames = {{
+constexpr std::array<KindName, 18> kKindNames = {{
     {TransformKind::FoldConstantSubgraph, "fold_constant_subgraph",
      TransformClass::Structural},
     {TransformKind::EliminateDeadOperations, "eliminate_dead_operations",
@@ -50,6 +50,10 @@ constexpr std::array<KindName, 16> kKindNames = {{
      TransformClass::Memory},
     {TransformKind::SetPrefetchDistance, "set_prefetch_distance",
      TransformClass::Memory},
+    {TransformKind::FuseParallelLinearSwiGlu,
+     "fuse_parallel_linear_swiglu", TransformClass::Numeric},
+    {TransformKind::FuseParallelLinears,
+     "fuse_parallel_linears", TransformClass::Numeric},
 }};
 
 const KindName *lookup(TransformKind kind) {

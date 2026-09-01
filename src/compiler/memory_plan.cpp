@@ -42,8 +42,10 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
                        const std::unordered_set<std::uint32_t>
                            &replaced_constant_tensors,
                        const std::unordered_map<std::uint32_t, std::uint32_t>
-                           &tensor_aliases) {
-  ir::verify(program);
+                           &tensor_aliases,
+                       bool verify_program) {
+  if (verify_program)
+    ir::verify(program);
   (void)align_up(0U, alignment);
   const auto end = static_cast<std::uint64_t>(program.operations.size());
   std::unordered_map<std::uint32_t, std::uint64_t> producer;

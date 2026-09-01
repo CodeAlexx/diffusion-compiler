@@ -71,7 +71,7 @@ StreamedResidencyPlan plan_streamed_residency(
   std::unordered_set<std::uint32_t> selected;
   std::uint64_t resident_bytes = 0U;
   auto memory = plan_memory(program, 256U, stream_prefetch_distance, {}, {},
-                            tensor_aliases);
+                            tensor_aliases, false);
   auto required = checked_add(memory.total_bytes, fixed_runtime_bytes,
                               "streamed residency baseline bytes overflow");
   if (required > maximum_total_bytes)
@@ -88,7 +88,8 @@ StreamedResidencyPlan plan_streamed_residency(
         resident_bytes, align_256(tensor->byte_count()),
         "streamed residency selected constant bytes overflow");
     const auto trial_memory = plan_memory(
-        program, 256U, stream_prefetch_distance, {}, trial, tensor_aliases);
+        program, 256U, stream_prefetch_distance, {}, trial, tensor_aliases,
+        false);
     auto trial_required = checked_add(
         trial_memory.total_bytes, fixed_runtime_bytes,
         "streamed residency execution bytes overflow");

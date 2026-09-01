@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace dif::frontend {
@@ -658,7 +659,8 @@ Qwen3VlConditionerConfig make_krea2_conditioner_config() {
   return config;
 }
 
-Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries) {
+Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries,
+                                            bool capture_first_block) {
   using namespace ir;
   constexpr std::uint64_t batch = 1U;
   constexpr std::uint64_t tokens = 512U;
@@ -715,25 +717,34 @@ Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries) {
   const auto text_block = [&](std::uint32_t input, const std::string &prefix,
                               std::uint64_t block_batch,
                               std::uint64_t block_tokens,
-                              std::uint32_t attention_bias) {
+                              std::uint32_t attention_bias,
+                              bool capture_first_block) {
+    const auto capture = [&](std::string name, std::uint32_t id) {
+      if (capture_first_block)
+        build.first_block_boundaries.emplace_back(std::move(name), id);
+    };
     const std::vector<std::uint64_t> shape{block_batch, block_tokens, hidden};
     const auto prenorm_weight =
         checkpoint(prefix + "prenorm.scale", {hidden});
-    const auto prenorm = bf16(shape);
+    const auto prenorm = bf16(shape, capture_first_block);
     operation(Opcode::RmsNorm, {input, prenorm_weight}, {prenorm},
               norm_attributes);
+    capture("first_prenorm", prenorm);
     const auto rows = block_batch * block_tokens;
     const auto prenorm_flat = bf16({rows, hidden});
     operation(Opcode::Reshape, {prenorm}, {prenorm_flat});
     const auto wq = checkpoint(prefix + "attn.wq.weight", {hidden, hidden});
     const auto wk = checkpoint(prefix + "attn.wk.weight", {hidden, hidden});
     const auto wv = checkpoint(prefix + "attn.wv.weight", {hidden, hidden});
-    const auto q_flat = bf16({rows, hidden});
-    const auto k_flat = bf16({rows, hidden});
-    const auto v_flat = bf16({rows, hidden});
+    const auto q_flat = bf16({rows, hidden}, capture_first_block);
+    const auto k_flat = bf16({rows, hidden}, capture_first_block);
+    const auto v_flat = bf16({rows, hidden}, capture_first_block);
     operation(Opcode::Linear, {prenorm_flat, wq}, {q_flat});
     operation(Opcode::Linear, {prenorm_flat, wk}, {k_flat});
     operation(Opcode::Linear, {prenorm_flat, wv}, {v_flat});
+    capture("first_q", q_flat);
+    capture("first_k", k_flat);
+    capture("first_v", v_flat);
     const auto q = bf16({block_batch, block_tokens, heads, head_dim});
     const auto k = bf16({block_batch, block_tokens, heads, head_dim});
     const auto v = bf16({block_batch, block_tokens, heads, head_dim});
@@ -744,40 +755,52 @@ Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries) {
         checkpoint(prefix + "attn.qknorm.qnorm.scale", {head_dim});
     const auto knorm_weight =
         checkpoint(prefix + "attn.qknorm.knorm.scale", {head_dim});
-    const auto qnorm = bf16({block_batch, block_tokens, heads, head_dim});
-    const auto knorm = bf16({block_batch, block_tokens, heads, head_dim});
+    const auto qnorm = bf16({block_batch, block_tokens, heads, head_dim},
+                            capture_first_block);
+    const auto knorm = bf16({block_batch, block_tokens, heads, head_dim},
+                            capture_first_block);
     operation(Opcode::RmsNorm, {q, qnorm_weight}, {qnorm}, norm_attributes);
     operation(Opcode::RmsNorm, {k, knorm_weight}, {knorm}, norm_attributes);
-    const auto attended = bf16({block_batch, block_tokens, heads, head_dim});
+    capture("first_qnorm", qnorm);
+    capture("first_knorm", knorm);
+    const auto attended = bf16({block_batch, block_tokens, heads, head_dim},
+                               capture_first_block);
     auto attention_inputs = std::vector<std::uint32_t>{qnorm, knorm, v};
     if (attention_bias != 0U)
       attention_inputs.push_back(attention_bias);
     operation(Opcode::Attention, std::move(attention_inputs), {attended},
               {Attribute::u64(AttrKey::KvHeads, heads),
                Attribute::u64(AttrKey::Implementation, 2U)});
+    capture("first_attention", attended);
     const auto attended_flat = bf16({rows, hidden});
     operation(Opcode::Reshape, {attended}, {attended_flat});
     const auto gate_weight =
         checkpoint(prefix + "attn.gate.weight", {hidden, hidden});
-    const auto gate_logits = bf16({rows, hidden});
+    const auto gate_logits = bf16({rows, hidden}, capture_first_block);
     operation(Opcode::Linear, {prenorm_flat, gate_weight}, {gate_logits});
-    const auto gate = bf16({rows, hidden});
+    capture("first_gate_logits", gate_logits);
+    const auto gate = bf16({rows, hidden}, capture_first_block);
     operation(Opcode::Sigmoid, {gate_logits}, {gate});
-    const auto gated = bf16({rows, hidden});
+    capture("first_gate", gate);
+    const auto gated = bf16({rows, hidden}, capture_first_block);
     operation(Opcode::Multiply, {attended_flat, gate}, {gated});
+    capture("first_gated_attention", gated);
     const auto wo = checkpoint(prefix + "attn.wo.weight", {hidden, hidden});
-    const auto projected_flat = bf16({rows, hidden});
+    const auto projected_flat = bf16({rows, hidden}, capture_first_block);
     operation(Opcode::Linear, {gated, wo}, {projected_flat});
+    capture("first_attention_projection", projected_flat);
     const auto projected = bf16(shape);
     operation(Opcode::Reshape, {projected_flat}, {projected});
-    const auto attention_residual = bf16(shape);
+    const auto attention_residual = bf16(shape, capture_first_block);
     operation(Opcode::Add, {input, projected}, {attention_residual});
+    capture("first_attention_residual", attention_residual);
 
     const auto postnorm_weight =
         checkpoint(prefix + "postnorm.scale", {hidden});
-    const auto postnorm = bf16(shape);
+    const auto postnorm = bf16(shape, capture_first_block);
     operation(Opcode::RmsNorm, {attention_residual, postnorm_weight},
               {postnorm}, norm_attributes);
+    capture("first_postnorm", postnorm);
     const auto postnorm_flat = bf16({rows, hidden});
     operation(Opcode::Reshape, {postnorm}, {postnorm_flat});
     const auto gate_mlp_weight =
@@ -786,16 +809,21 @@ Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries) {
         checkpoint(prefix + "mlp.up.weight", {mlp, hidden});
     const auto down_mlp_weight =
         checkpoint(prefix + "mlp.down.weight", {hidden, mlp});
-    const auto gate_mlp = bf16({rows, mlp});
-    const auto up_mlp = bf16({rows, mlp});
+    const auto gate_mlp = bf16({rows, mlp}, capture_first_block);
+    const auto up_mlp = bf16({rows, mlp}, capture_first_block);
     operation(Opcode::Linear, {postnorm_flat, gate_mlp_weight}, {gate_mlp});
     operation(Opcode::Linear, {postnorm_flat, up_mlp_weight}, {up_mlp});
-    const auto activated = bf16({rows, mlp});
+    capture("first_mlp_gate", gate_mlp);
+    capture("first_mlp_up", up_mlp);
+    const auto activated = bf16({rows, mlp}, capture_first_block);
     operation(Opcode::SiLU, {gate_mlp}, {activated});
-    const auto multiplied = bf16({rows, mlp});
+    capture("first_mlp_gate_activated", activated);
+    const auto multiplied = bf16({rows, mlp}, capture_first_block);
     operation(Opcode::Multiply, {activated, up_mlp}, {multiplied});
-    const auto down_flat = bf16({rows, hidden});
+    capture("first_mlp_activation", multiplied);
+    const auto down_flat = bf16({rows, hidden}, capture_first_block);
     operation(Opcode::Linear, {multiplied, down_mlp_weight}, {down_flat});
+    capture("first_mlp_output", down_flat);
     const auto down = bf16(shape);
     operation(Opcode::Reshape, {down_flat}, {down});
     const auto output = bf16(shape, true);
@@ -809,7 +837,8 @@ Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries) {
   for (std::uint64_t index = 0; index < 2U; ++index)
     context = text_block(
         context, "txtfusion.layerwise_blocks." + std::to_string(index) + ".",
-        tokens, taps, 0U);
+        tokens, taps, 0U,
+        capture_boundaries && capture_first_block && index == 0U);
 
   const auto context_4d = bf16({batch, tokens, taps, hidden});
   operation(Opcode::Reshape, {context}, {context_4d});
@@ -837,7 +866,7 @@ Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries) {
   for (std::uint64_t index = 0; index < 2U; ++index)
     context = text_block(
         context, "txtfusion.refiner_blocks." + std::to_string(index) + ".",
-        batch, tokens, text_bias);
+        batch, tokens, text_bias, false);
 
   const auto txt_norm_weight = checkpoint("txtmlp.0.scale", {hidden});
   const auto txt_norm = bf16({batch, tokens, hidden});
@@ -1127,6 +1156,135 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
              Attribute::u64(AttrKey::Start, config.text_tokens)});
 
   verify(program);
+  return build;
+}
+
+Krea2TurboExecutionBuild
+make_krea2_turbo_execution(const Krea2Config &config, std::uint32_t steps,
+                           bool capture_trajectory,
+                           const std::vector<std::uint32_t>
+                               &reusable_resident_constants) {
+  using namespace ir;
+  if (steps == 0U)
+    fail("Krea 2 Turbo execution requires at least one evaluation");
+
+  const auto denoiser = make_krea2_denoiser(config, false);
+  Krea2TurboExecutionBuild build;
+  build.config = config;
+  build.initial_image_input = denoiser.image_tokens_input;
+  build.context_input = denoiser.context_input;
+  build.positions_input = denoiser.positions_input;
+  build.validity_mask_input = denoiser.validity_mask_input;
+  build.rotary_pair_axes = denoiser.rotary_pair_axes;
+  build.rotary_pair_indices = denoiser.rotary_pair_indices;
+  build.rotary_axis_dims = denoiser.rotary_axis_dims;
+  build.checkpoint_tensors = denoiser.checkpoint_tensors;
+  build.checkpoint_names = denoiser.checkpoint_names;
+  const std::unordered_set<std::uint32_t> reusable(
+      reusable_resident_constants.begin(),
+      reusable_resident_constants.end());
+
+  const auto shared = [&](std::uint32_t id) {
+    return id == denoiser.image_tokens_input ||
+           id == denoiser.context_input || id == denoiser.positions_input ||
+           id == denoiser.validity_mask_input;
+  };
+  for (const auto &tensor : denoiser.program.tensors) {
+    if (tensor.has_role(TensorRole::Constant)) {
+      if (tensor.has_role(TensorRole::Streamed) &&
+          !reusable.contains(tensor.id))
+        continue;
+      build.program.tensors.push_back(tensor);
+    } else if (shared(tensor.id)) {
+      build.program.tensors.push_back(tensor);
+    }
+  }
+
+  auto next_tensor = std::uint32_t{1U};
+  for (const auto &tensor : denoiser.program.tensors)
+    next_tensor = std::max(next_tensor, tensor.id + 1U);
+  auto next_operation = std::uint32_t{1U};
+  for (const auto &operation : denoiser.program.operations)
+    next_operation = std::max(next_operation, operation.id + 1U);
+  const auto add_tensor = [&](DType dtype, std::uint32_t roles,
+                              const std::vector<std::uint64_t> &dims) {
+    const auto id = next_tensor++;
+    build.program.tensors.push_back({id, dtype, roles, dims});
+    return id;
+  };
+
+  auto sample = denoiser.image_tokens_input;
+  for (std::uint32_t step = 0U; step < steps; ++step) {
+    std::unordered_map<std::uint32_t, std::uint32_t> remap;
+    for (const auto &tensor : denoiser.program.tensors) {
+      if (tensor.has_role(TensorRole::Constant)) {
+        if (!tensor.has_role(TensorRole::Streamed) ||
+            reusable.contains(tensor.id)) {
+          remap.emplace(tensor.id, tensor.id);
+        } else {
+          const auto id = add_tensor(tensor.dtype, tensor.roles, tensor.dims);
+          build.constant_sources.emplace_back(id, tensor.id);
+          remap.emplace(tensor.id, id);
+        }
+        continue;
+      }
+      if (tensor.id == denoiser.context_input ||
+          tensor.id == denoiser.positions_input ||
+          tensor.id == denoiser.validity_mask_input) {
+        remap.emplace(tensor.id, tensor.id);
+        continue;
+      }
+      if (tensor.id == denoiser.image_tokens_input) {
+        remap.emplace(tensor.id, sample);
+        continue;
+      }
+      if (tensor.id == denoiser.timestep_input) {
+        const auto id = add_tensor(tensor.dtype, TensorRole::Input,
+                                   tensor.dims);
+        build.model_timestep_inputs.push_back(id);
+        remap.emplace(tensor.id, id);
+        continue;
+      }
+      auto roles = static_cast<std::uint32_t>(TensorRole::Internal);
+      if (capture_trajectory && tensor.id == denoiser.velocity_output)
+        roles = TensorRole::Output;
+      const auto id = add_tensor(tensor.dtype, roles, tensor.dims);
+      remap.emplace(tensor.id, id);
+    }
+
+    for (const auto &source : denoiser.program.operations) {
+      auto inputs = source.inputs;
+      auto outputs = source.outputs;
+      for (auto &id : inputs)
+        id = remap.at(id);
+      for (auto &id : outputs)
+        id = remap.at(id);
+      build.program.operations.push_back(
+          {next_operation++, source.opcode, std::move(inputs),
+           std::move(outputs), source.attributes});
+    }
+
+    const auto current = add_tensor(DType::F32, TensorRole::Input, {1U});
+    const auto next = add_tensor(DType::F32, TensorRole::Input, {1U});
+    build.current_timestep_inputs.push_back(current);
+    build.next_timestep_inputs.push_back(next);
+    const auto output_roles =
+        capture_trajectory || step + 1U == steps
+            ? static_cast<std::uint32_t>(TensorRole::Output)
+            : static_cast<std::uint32_t>(TensorRole::Internal);
+    const auto image = add_tensor(
+        DType::BF16, output_roles,
+        denoiser.program.tensor(denoiser.image_tokens_input)->dims);
+    const auto velocity = remap.at(denoiser.velocity_output);
+    build.program.operations.push_back(
+        {next_operation++, Opcode::EulerVelocityStep,
+         {sample, velocity, current, next}, {image}, {}});
+    build.velocity_outputs.push_back(velocity);
+    build.image_outputs.push_back(image);
+    sample = image;
+  }
+  build.final_image_output = sample;
+  verify(build.program);
   return build;
 }
 

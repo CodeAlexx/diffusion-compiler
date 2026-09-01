@@ -38,10 +38,17 @@ def sha256(path: Path) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--prompt", required=True)
+    prompt_group = parser.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt")
+    prompt_group.add_argument("--prompt-file", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
+    prompt = (
+        args.prompt
+        if args.prompt is not None
+        else args.prompt_file.read_text(encoding="utf-8").strip()
+    )
     if args.output.exists() or args.report.exists():
         raise SystemExit("refusing to overwrite an existing conditioner artifact")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -53,7 +60,7 @@ def main() -> None:
         args.model, max_length=OUTPUT_TOKENS, local_files_only=True
     )
     prefix_inputs = tokenizer(
-        [PREFIX + args.prompt],
+        [PREFIX + prompt],
         truncation=True,
         return_length=False,
         return_overflowing_tokens=False,
@@ -125,8 +132,8 @@ def main() -> None:
         "creator_source_commit": "db3984fbc6e13b34c0064990fc2d95ac64d00058",
         "fixture_generator_commit": creator_commit,
         "model": str(args.model.resolve()),
-        "prompt": args.prompt,
-        "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(),
+        "prompt": prompt,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "selected_hidden_states": list(SELECTED),
         "input_shape": list(input_ids.shape),
         "output_shape": [1, 512, 12, 2560],

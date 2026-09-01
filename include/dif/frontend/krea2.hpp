@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dif::frontend {
@@ -198,13 +199,15 @@ struct Krea2TextFusionBuild {
   std::uint32_t context_input{};
   std::uint32_t validity_mask_input{};
   std::vector<std::uint32_t> block_outputs;
+  std::vector<std::pair<std::string, std::uint32_t>> first_block_boundaries;
   std::uint32_t projected_output{};
   std::uint32_t conditioning_output{};
   std::vector<std::uint32_t> checkpoint_tensors;
   std::vector<std::string> checkpoint_names;
 };
 
-Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries = true);
+Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries = true,
+                                            bool capture_first_block = false);
 
 // Complete source-faithful Raw MMDiT evaluation after text fusion. The graph
 // owns the patch projection, timestep tower, all 28 shared-runtime blocks,
@@ -238,5 +241,40 @@ struct Krea2DenoiserBuild {
 
 Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config = {},
                                        bool capture_block_outputs = false);
+
+// One complete Turbo denoise execution plan. The 28-block denoiser is
+// repeated inside a single verified DiffIR program and the source-ordered
+// Euler update connects one evaluation to the next. Checkpoint constants and
+// prompt inputs keep one tensor identity across every evaluation; only
+// timestep inputs and transient activations are cloned. This is deliberately
+// an execution-plan frontend, not a Krea-specific runtime path.
+struct Krea2TurboExecutionBuild {
+  ir::Program program;
+  Krea2Config config;
+  std::uint32_t initial_image_input{};
+  std::uint32_t context_input{};
+  std::uint32_t positions_input{};
+  std::uint32_t validity_mask_input{};
+  std::uint32_t rotary_pair_axes{};
+  std::uint32_t rotary_pair_indices{};
+  std::uint32_t rotary_axis_dims{};
+  std::vector<std::uint32_t> model_timestep_inputs;
+  std::vector<std::uint32_t> current_timestep_inputs;
+  std::vector<std::uint32_t> next_timestep_inputs;
+  std::vector<std::uint32_t> velocity_outputs;
+  std::vector<std::uint32_t> image_outputs;
+  std::uint32_t final_image_output{};
+  std::vector<std::uint32_t> checkpoint_tensors;
+  std::vector<std::string> checkpoint_names;
+  // Per-evaluation streamed aliases map new DiffIR tensor ids back to the
+  // canonical checkpoint tensor id whose mapped host storage they share.
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> constant_sources;
+};
+
+Krea2TurboExecutionBuild
+make_krea2_turbo_execution(const Krea2Config &config, std::uint32_t steps,
+                           bool capture_trajectory,
+                           const std::vector<std::uint32_t>
+                               &reusable_resident_constants);
 
 } // namespace dif::frontend
