@@ -4,10 +4,11 @@
 // modcache_steps_*.safetensors that only serenitymojo could generate
 // (serenitymojo/models/dit/minimax_h3_modcache.mojo + minimax_h3_runtime_cache
 // .mojo + pipeline/minimax_h3_t2va.mojo section 5). This tool reproduces that
-// generator natively, aiming for BYTE-IDENTICAL output:
+// generator natively while storing each prepared-executable slice in the
+// creator's local sorted-unique row-timestep order:
 //
-//   timesteps[2i]   = 1.0f - video_sigmas[i]          (i in [0, points-1))
-//   timesteps[2i+1] = 1.0f - audio_sigmas[i]
+//   local = sorted_unique(video_t, audio_t, optional condition timesteps)
+//   local is padded by repeating its last value to the graph's fixed width
 //   sinusoid  : freq = exp(-ln(10000)*(i/128)), cos block then sin block
 //   temb      : sinusoid -> linear(proj_in) -> silu -> linear(proj_out), F32
 //   activated : bf16_rne(silu(temb))
@@ -31,12 +32,14 @@
 //     compact JSON, insertion order, no padding, contiguous offsets, and the
 //     __meta__ tensors of models/dit/minimax_h3_runtime_cache.mojo
 //     (version, kind, src_path, src_size, src_mtime, steps,
-//     distinct_timesteps, nblocks) followed by block.0..N-1 and final.
+//     distinct_timesteps, nblocks), plus an explicit compiler row-layout tag,
+//     followed by block.0..N-1 and final.
 //
 // The --verify-against mode compares the generated file to a recorded cache
 // tensor-by-tensor and reports exact element mismatch counts.
 
 #include "dif/runtime/tensor.hpp"
+#include "dif/frontend/h3_conditioning.hpp"
 #include "dif/sampling/rectified_flow.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
@@ -51,6 +54,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -118,6 +122,8 @@ struct Arguments {
       "/home/alex/mojodiffusion/.pixi/envs/default/lib/libcublas.so.13";
   long long schedule_points = -1;
   long long steps = -1;
+  std::optional<float> condition_video_floor;
+  std::optional<float> condition_audio_timestep;
 };
 
 [[noreturn]] void usage_error(const std::string &message) {
@@ -125,6 +131,8 @@ struct Arguments {
             << "usage: difmodcache --checkpoint-index INDEX.json "
                "(--video-sigmas F.diftensor --audio-sigmas F.diftensor | "
                "--schedule-points N) [--steps N] --output FILE.safetensors "
+               "[--condition-video-floor F32] "
+               "[--condition-audio-timestep F32] "
                "[--engine cuda|cpu] [--cublas LIB.so] "
                "[--source-index-string STR] "
                "[--verify-against FILE.safetensors]\n";
@@ -496,6 +504,12 @@ int main(int argc, char **argv) {
             std::stoll(value("--schedule-points"));
       else if (option == "--steps")
         arguments.steps = std::stoll(value("--steps"));
+      else if (option == "--condition-video-floor")
+        arguments.condition_video_floor =
+            std::stof(value("--condition-video-floor"));
+      else if (option == "--condition-audio-timestep")
+        arguments.condition_audio_timestep =
+            std::stof(value("--condition-audio-timestep"));
       else if (option == "--output")
         arguments.output = value("--output");
       else if (option == "--engine")
@@ -513,6 +527,12 @@ int main(int argc, char **argv) {
       usage_error("--checkpoint-index and --output are required");
     if (arguments.engine != "cuda" && arguments.engine != "cpu")
       usage_error("--engine must be cuda or cpu");
+    for (const auto &timestep : {arguments.condition_video_floor,
+                                arguments.condition_audio_timestep}) {
+      if (timestep &&
+          (!std::isfinite(*timestep) || *timestep < 0.0F || *timestep > 1.0F))
+        usage_error("condition timesteps must be finite and within [0,1]");
+    }
 
     // ── schedule → interleaved model timesteps ──────────────────────────────
     std::vector<float> video_sigmas, audio_sigmas;
@@ -552,16 +572,18 @@ int main(int argc, char **argv) {
     const auto points = video_sigmas.size();
     if (video_sigmas.back() != 0.0F || audio_sigmas.back() != 0.0F)
       dif::fail("sigma schedules must end at zero");
-    const auto evaluations = points - 1U;
-    const auto distinct_timesteps = 2U * evaluations;
+    const auto schedule_table = dif::frontend::make_h3_schedule_timestep_table(
+        video_sigmas, audio_sigmas, arguments.condition_video_floor.has_value(),
+        arguments.condition_audio_timestep.has_value(),
+        arguments.condition_video_floor.value_or(0.999F),
+        arguments.condition_audio_timestep.value_or(1.0F));
+    const auto evaluations = schedule_table.evaluations;
+    const auto timestep_tables = schedule_table.tables;
+    const auto distinct_timesteps = schedule_table.timesteps.size();
     if (arguments.steps < 0)
       arguments.steps = static_cast<long long>(points);
 
-    std::vector<float> timesteps(distinct_timesteps);
-    for (std::size_t i = 0; i < evaluations; ++i) {
-      timesteps[2U * i] = 1.0F - video_sigmas[i];
-      timesteps[2U * i + 1U] = 1.0F - audio_sigmas[i];
-    }
+    const auto &timesteps = schedule_table.timesteps;
 
     // ── checkpoint tensors ──────────────────────────────────────────────────
     const auto index =
@@ -596,6 +618,7 @@ int main(int argc, char **argv) {
     std::memcpy(&neg_ln_mp_bits, &neg_ln_mp, 4);
     std::cout << "MODCACHE build: blocks=" << num_blocks
               << " distinct_timesteps=" << distinct_timesteps
+              << " timestep_tables=" << timestep_tables
               << " freq_dim=" << freq_dim << " hidden=" << embed_hidden
               << " time_embed_dim=" << time_embed_dim << " engine="
               << arguments.engine << " neg_ln_mp=" << std::hexfloat << neg_ln_mp
@@ -820,6 +843,8 @@ int main(int argc, char **argv) {
     std::vector<EmitTensor> tensors;
     tensors.push_back(meta_i64("__meta__.version", 1));
     tensors.push_back(meta_u8("__meta__.kind", "adaln-modulation"));
+    tensors.push_back(meta_u8("__meta__.row_layout",
+                              "per-evaluation-sorted-unique-padded-v1"));
     tensors.push_back(meta_u8("__meta__.src_path", source_string));
     tensors.push_back(meta_i64("__meta__.src_size", source_stat.st_size));
     tensors.push_back(meta_i64("__meta__.src_mtime", source_stat.st_mtime));
@@ -857,9 +882,54 @@ int main(int argc, char **argv) {
       const auto generated = dif::weights::read_safetensors(arguments.output);
       const auto recorded =
           dif::weights::read_safetensors(arguments.verify_against);
+      const auto recorded_row_layout = [&]() -> std::optional<std::string> {
+        const auto *entry = recorded.find_metadata("__meta__.row_layout");
+        if (!entry)
+          return std::nullopt;
+        if (entry->dtype != "U8" || entry->dims.size() != 1U)
+          dif::fail("verify: invalid recorded row-layout metadata");
+        const auto bytes =
+            dif::weights::read_safetensor_metadata(recorded,
+                                                   "__meta__.row_layout");
+        return std::string(reinterpret_cast<const char *>(bytes.data()),
+                           bytes.size());
+      }();
+      const auto semantic_legacy_global =
+          timestep_tables > 2U && !recorded_row_layout.has_value();
+      std::vector<std::size_t> recorded_slot_for_local;
+      if (semantic_legacy_global) {
+        recorded_slot_for_local.resize(distinct_timesteps);
+        for (std::size_t evaluation = 0U; evaluation < evaluations;
+             ++evaluation) {
+          const auto video_timestep = 1.0F - video_sigmas[evaluation];
+          std::vector<float> global = {
+              video_timestep, 1.0F - audio_sigmas[evaluation]};
+          if (arguments.condition_video_floor)
+            global.push_back(std::max(video_timestep,
+                                      *arguments.condition_video_floor));
+          if (arguments.condition_audio_timestep)
+            global.push_back(*arguments.condition_audio_timestep);
+          if (global.size() != timestep_tables)
+            dif::fail("verify: legacy global table width mismatch");
+          for (std::size_t local = 0U; local < timestep_tables; ++local) {
+            const auto value =
+                timesteps[evaluation * timestep_tables + local];
+            const auto found = std::find(global.begin(), global.end(), value);
+            if (found == global.end())
+              dif::fail("verify: local timestep is absent from legacy global table");
+            recorded_slot_for_local[evaluation * timestep_tables + local] =
+                evaluation * timestep_tables +
+                static_cast<std::size_t>(found - global.begin());
+          }
+        }
+        std::cout << "MODCACHE_VERIFY mode=semantic-local-vs-legacy-global\n";
+      } else {
+        std::cout << "MODCACHE_VERIFY mode=direct-layout\n";
+      }
       std::uint64_t total_elements = 0, total_mismatched = 0;
       std::size_t mismatched_tensors = 0;
-      const auto compare_tensor = [&](const std::string &name) {
+      const auto compare_tensor = [&](const std::string &name,
+                                      std::size_t rows_per_timestep) {
         const auto ours = dif::weights::map_safetensor(generated, name);
         const auto theirs = dif::weights::map_safetensor(recorded, name);
         if (ours.dims != theirs.dims)
@@ -868,8 +938,28 @@ int main(int argc, char **argv) {
         const auto *a = reinterpret_cast<const std::uint16_t *>(ours.data());
         const auto *b = reinterpret_cast<const std::uint16_t *>(theirs.data());
         std::uint64_t mismatched = 0;
-        for (std::uint64_t i = 0; i < count; ++i)
-          mismatched += a[i] != b[i];
+        if (!semantic_legacy_global) {
+          for (std::uint64_t i = 0; i < count; ++i)
+            mismatched += a[i] != b[i];
+        } else {
+          if (ours.dims.size() != 2U ||
+              ours.dims.at(0) != distinct_timesteps * rows_per_timestep)
+            dif::fail("verify: conditioned cache tensor layout mismatch on " +
+                      name);
+          const auto columns = static_cast<std::size_t>(ours.dims.at(1));
+          for (std::size_t local_slot = 0U;
+               local_slot < distinct_timesteps; ++local_slot) {
+            const auto recorded_slot = recorded_slot_for_local[local_slot];
+            for (std::size_t row = 0U; row < rows_per_timestep; ++row) {
+              const auto a_offset =
+                  (local_slot * rows_per_timestep + row) * columns;
+              const auto b_offset =
+                  (recorded_slot * rows_per_timestep + row) * columns;
+              for (std::size_t column = 0U; column < columns; ++column)
+                mismatched += a[a_offset + column] != b[b_offset + column];
+            }
+          }
+        }
         total_elements += count;
         total_mismatched += mismatched;
         if (mismatched) {
@@ -879,8 +969,8 @@ int main(int argc, char **argv) {
         }
       };
       for (std::size_t block = 0; block < num_blocks; ++block)
-        compare_tensor("block." + std::to_string(block));
-      compare_tensor("final");
+        compare_tensor("block." + std::to_string(block), 3U);
+      compare_tensor("final", 1U);
       const auto generated_sha =
           dif::hex_digest(dif::sha256_file(arguments.output));
       const auto recorded_sha =
@@ -896,7 +986,7 @@ int main(int argc, char **argv) {
       else if (total_mismatched == 0)
         std::cout << "MODCACHE_VERIFY payloads identical, file bytes differ "
                      "(header/meta)\n";
-      return total_mismatched == 0 && generated_sha == recorded_sha ? 0 : 3;
+      return total_mismatched == 0 ? 0 : 3;
     }
     return 0;
   } catch (const std::exception &error) {

@@ -321,6 +321,7 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
   }
   if (expected != output.file_size)
     fail("SafeTensors tensor data does not cover the file");
+  output.mapping = runtime::map_readonly_file(path);
   return output;
 }
 
@@ -343,7 +344,9 @@ runtime::Tensor map_safetensor(const SafeTensorFile &file,
   const auto *entry = file.find(name);
   if (!entry)
     fail("SafeTensors tensor is missing: " + std::string(name));
-  return runtime::map_tensor_slice(file.path, entry->dtype, entry->dims,
+  if (!file.mapping)
+    fail("SafeTensors file has no shared read-only mapping");
+  return runtime::map_tensor_slice(file.mapping, entry->dtype, entry->dims,
                                    entry->file_offset, entry->byte_count);
 }
 

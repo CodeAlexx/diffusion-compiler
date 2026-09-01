@@ -84,6 +84,10 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   if(DIF_CUTLASS_INCLUDE_DIR)
     enable_language(CUDA)
     target_sources(difcore PRIVATE src/runtime/cutlass_gemm.cu)
+    # CUTLASS 2.x epilogue visitors use CUTE constexpr tuple/move helpers from
+    # device callbacks and require relaxed constexpr under CUDA 12.x.
+    set_source_files_properties(src/runtime/cutlass_gemm.cu PROPERTIES
+                                COMPILE_OPTIONS "--expt-relaxed-constexpr")
     target_include_directories(difcore SYSTEM PRIVATE "${DIF_CUTLASS_INCLUDE_DIR}")
     target_link_libraries(difcore PRIVATE CUDA::cudart)
     target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=1)
@@ -206,6 +210,12 @@ if(TARGET CUDA::cuda_driver)
   target_link_libraries(difh3noise PRIVATE CUDA::cuda_driver CUDA::nvrtc)
 endif()
 
+add_executable(difh3convrot tools/difh3convrot.cpp)
+target_link_libraries(difh3convrot PRIVATE difcore)
+if(TARGET CUDA::cuda_driver)
+  target_link_libraries(difh3convrot PRIVATE CUDA::cuda_driver CUDA::nvrtc)
+endif()
+
 add_executable(difkrea2block tools/difkrea2block.cpp)
 target_link_libraries(difkrea2block PRIVATE difcore)
 add_executable(difkrea2text tools/difkrea2text.cpp)
@@ -242,7 +252,7 @@ else()
   message(STATUS "Diffusion compiler OpenCL backend: disabled")
 endif()
 
-install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer difh3media difslice
+install(TARGETS difc difrun difinspect diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer difh3media difh3convrot difslice
         RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)

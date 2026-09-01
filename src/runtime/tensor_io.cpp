@@ -16,24 +16,57 @@
 
 namespace dif::runtime {
 
-class MappedStorage {
-public:
-  MappedStorage(void *address, std::size_t size) : address_(address), size_(size) {}
-  ~MappedStorage() {
-    if (address_ && address_ != MAP_FAILED)
-      (void)munmap(address_, size_);
-  }
-  MappedStorage(const MappedStorage &) = delete;
-  MappedStorage &operator=(const MappedStorage &) = delete;
-  const std::uint8_t *data() const {
-    return static_cast<const std::uint8_t *>(address_);
-  }
-  std::size_t size() const { return size_; }
+MappedStorage::MappedStorage(void *address, std::size_t size, int descriptor)
+    : address_(address), size_(size), descriptor_(descriptor) {}
 
-private:
-  void *address_{};
-  std::size_t size_{};
-};
+MappedStorage::~MappedStorage() {
+  if (address_ && address_ != MAP_FAILED)
+    (void)munmap(address_, size_);
+  if (descriptor_ >= 0)
+    (void)close(descriptor_);
+}
+
+const std::uint8_t *MappedStorage::data() const {
+  return static_cast<const std::uint8_t *>(address_);
+}
+
+std::size_t MappedStorage::size() const { return size_; }
+
+void MappedStorage::discard(std::size_t offset, std::size_t bytes) const {
+  if (!address_ || address_ == MAP_FAILED || bytes == 0U || offset > size_ ||
+      bytes > size_ - offset)
+    return;
+  const auto page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return;
+  const auto page = static_cast<std::size_t>(page_size);
+  const auto begin = offset - (offset % page);
+  const auto end_unaligned = offset + bytes;
+  const auto end = std::min(
+      size_, end_unaligned + (page - end_unaligned % page) % page);
+  (void)madvise(static_cast<std::uint8_t *>(address_) + begin, end - begin,
+                MADV_DONTNEED);
+}
+
+void MappedStorage::evict(std::size_t offset, std::size_t bytes) const {
+  discard(offset, bytes);
+  if (bytes == 0U || offset > size_ || bytes > size_ - offset)
+    return;
+  const auto page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return;
+  const auto page = static_cast<std::size_t>(page_size);
+  const auto begin = offset - (offset % page);
+  const auto end_unaligned = offset + bytes;
+  const auto end = std::min(
+      size_, end_unaligned + (page - end_unaligned % page) % page);
+  // A GPU-resident tensor has finished its host lifetime.  fadvise lets the
+  // kernel reclaim its clean file-cache range.  Streamed tensors deliberately
+  // use discard(), not evict(), so repeated evaluations do not reread disk.
+  if (descriptor_ >= 0)
+    (void)posix_fadvise(descriptor_, static_cast<off_t>(begin),
+                       static_cast<off_t>(end - begin), POSIX_FADV_DONTNEED);
+}
 
 namespace {
 
@@ -168,16 +201,13 @@ std::size_t Tensor::byte_size() const {
 void Tensor::discard_mapped_pages() const {
   if (!mapping || mapping_bytes == 0U)
     return;
-  const auto page_size = sysconf(_SC_PAGESIZE);
-  if (page_size <= 0)
+  mapping->discard(mapping_offset, mapping_bytes);
+}
+
+void Tensor::evict_mapped_pages() const {
+  if (!mapping || mapping_bytes == 0U)
     return;
-  const auto page = static_cast<std::size_t>(page_size);
-  const auto begin = mapping_offset - (mapping_offset % page);
-  const auto end_unaligned = mapping_offset + mapping_bytes;
-  const auto end = std::min(mapping->size(),
-                            end_unaligned + (page - end_unaligned % page) % page);
-  (void)madvise(const_cast<std::uint8_t *>(mapping->data()) + begin,
-                end - begin, MADV_DONTNEED);
+  mapping->evict(mapping_offset, mapping_bytes);
 }
 
 std::span<float> Tensor::f32() {
@@ -206,6 +236,22 @@ Tensor read_tensor(const std::filesystem::path &path) {
 }
 
 Tensor map_tensor(const std::filesystem::path &path) {
+  auto storage = map_readonly_file(path);
+  const auto file = std::span<const std::uint8_t>(storage->data(), storage->size());
+  const auto header = parse_tensor_file(file);
+  Tensor tensor{header.dtype, header.dims, {}};
+  tensor.mapping = std::move(storage);
+  tensor.mapping_offset = header.data_offset;
+  tensor.mapping_bytes = header.byte_count;
+  tensor.validate();
+  // Checksum verification touched every page. Drop those clean file-backed
+  // pages so mapping a full checkpoint does not imply retaining it in RAM.
+  tensor.mapping->discard(0U, tensor.mapping->size());
+  return tensor;
+}
+
+std::shared_ptr<const MappedStorage>
+map_readonly_file(const std::filesystem::path &path) {
   const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (descriptor < 0)
     fail("cannot open mapped tensor file: " + path.string());
@@ -216,20 +262,28 @@ Tensor map_tensor(const std::filesystem::path &path) {
   }
   const auto size = static_cast<std::size_t>(status.st_size);
   void *address = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, descriptor, 0);
-  (void)close(descriptor);
-  if (address == MAP_FAILED)
+  if (address == MAP_FAILED) {
+    (void)close(descriptor);
     fail("cannot mmap tensor file: " + path.string());
-  auto storage = std::make_shared<MappedStorage>(address, size);
-  const auto file = std::span<const std::uint8_t>(storage->data(), storage->size());
-  const auto header = parse_tensor_file(file);
-  Tensor tensor{header.dtype, header.dims, {}};
+  }
+  return std::shared_ptr<const MappedStorage>(
+      new MappedStorage(address, size, descriptor));
+}
+
+Tensor map_tensor_slice(std::shared_ptr<const MappedStorage> storage,
+                        ir::DType dtype, std::vector<std::uint64_t> dims,
+                        std::uint64_t file_offset,
+                        std::uint64_t byte_count) {
+  if (!storage || file_offset > storage->size() ||
+      byte_count > storage->size() - file_offset ||
+      file_offset > std::numeric_limits<std::size_t>::max() ||
+      byte_count > std::numeric_limits<std::size_t>::max())
+    fail("mapped tensor slice is outside the file");
+  Tensor tensor{dtype, std::move(dims), {}};
   tensor.mapping = std::move(storage);
-  tensor.mapping_offset = header.data_offset;
-  tensor.mapping_bytes = header.byte_count;
+  tensor.mapping_offset = static_cast<std::size_t>(file_offset);
+  tensor.mapping_bytes = static_cast<std::size_t>(byte_count);
   tensor.validate();
-  // Checksum verification touched every page. Drop those clean file-backed
-  // pages so mapping a full checkpoint does not imply retaining it in RAM.
-  (void)madvise(address, size, MADV_DONTNEED);
   return tensor;
 }
 
@@ -237,9 +291,8 @@ Tensor map_tensor_slice(const std::filesystem::path &path, ir::DType dtype,
                         std::vector<std::uint64_t> dims,
                         std::uint64_t file_offset,
                         std::uint64_t byte_count) {
-  auto tensors = map_tensor_slices(
-      path, {{dtype, std::move(dims), file_offset, byte_count}});
-  return std::move(tensors.front());
+  return map_tensor_slice(map_readonly_file(path), dtype, std::move(dims),
+                          file_offset, byte_count);
 }
 
 std::vector<Tensor>
@@ -247,40 +300,20 @@ map_tensor_slices(const std::filesystem::path &path,
                   const std::vector<TensorSlice> &slices) {
   if (slices.empty())
     return {};
-  const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (descriptor < 0)
-    fail("cannot open tensor slice file: " + path.string());
-  struct stat status {};
-  if (fstat(descriptor, &status) != 0 || status.st_size <= 0) {
-    (void)close(descriptor);
-    fail("cannot stat tensor slice file: " + path.string());
-  }
-  const auto size = static_cast<std::uint64_t>(status.st_size);
+  auto storage = map_readonly_file(path);
+  const auto size = static_cast<std::uint64_t>(storage->size());
   for (const auto &slice : slices) {
     if (slice.file_offset > size ||
         slice.byte_count > size - slice.file_offset ||
         slice.file_offset > std::numeric_limits<std::size_t>::max() ||
-        slice.byte_count > std::numeric_limits<std::size_t>::max()) {
-      (void)close(descriptor);
+        slice.byte_count > std::numeric_limits<std::size_t>::max())
       fail("mapped tensor slice is outside the file");
-    }
   }
-  void *address = mmap(nullptr, static_cast<std::size_t>(size), PROT_READ,
-                       MAP_PRIVATE, descriptor, 0);
-  (void)close(descriptor);
-  if (address == MAP_FAILED)
-    fail("cannot mmap tensor slice file: " + path.string());
-  auto storage =
-      std::make_shared<MappedStorage>(address, static_cast<std::size_t>(size));
   std::vector<Tensor> tensors;
   tensors.reserve(slices.size());
   for (const auto &slice : slices) {
-    Tensor tensor{slice.dtype, slice.dims, {}};
-    tensor.mapping = storage;
-    tensor.mapping_offset = static_cast<std::size_t>(slice.file_offset);
-    tensor.mapping_bytes = static_cast<std::size_t>(slice.byte_count);
-    tensor.validate();
-    tensors.push_back(std::move(tensor));
+    tensors.push_back(map_tensor_slice(storage, slice.dtype, slice.dims,
+                                       slice.file_offset, slice.byte_count));
   }
   return tensors;
 }

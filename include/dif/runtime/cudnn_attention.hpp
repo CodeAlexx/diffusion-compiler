@@ -13,7 +13,8 @@ public:
   // kv_heads: number of K/V heads (GQA); must divide the query head count.
   // Pass query.dims[1] for dense attention.
   CudnnAttentionPlan(const ir::TensorDesc &query, std::uint64_t kv_heads,
-                     double scale, bool causal, bool additive_bias = false);
+                     double scale, bool causal, bool additive_bias = false,
+                     std::uint32_t heuristic = 0U);
   ~CudnnAttentionPlan();
 
   CudnnAttentionPlan(const CudnnAttentionPlan &) = delete;

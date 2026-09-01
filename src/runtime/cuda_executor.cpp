@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -37,6 +38,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -120,6 +122,15 @@ CUresult counted_memcpy_dtoh(void *destination, CUdeviceptr source,
     active_telemetry->d2h_bytes += bytes;
   }
   return cuMemcpyDtoHAsync(destination, source, bytes, stream);
+}
+
+CUresult counted_memcpy_dtod(CUdeviceptr destination, CUdeviceptr source,
+                             std::size_t bytes, CUstream stream) {
+  if (active_telemetry) {
+    ++active_telemetry->d2d_copies;
+    active_telemetry->d2d_bytes += bytes;
+  }
+  return cuMemcpyDtoDAsync(destination, source, bytes, stream);
 }
 
 CUresult counted_event_record(CUevent event, CUstream stream) {
@@ -464,6 +475,7 @@ struct CudnnAttentionKey {
   std::uint64_t scale_bits{};
   bool causal{};
   bool additive_bias{};
+  std::uint32_t heuristic{};
 
   bool operator==(const CudnnAttentionKey &) const = default;
 };
@@ -484,6 +496,7 @@ struct CudnnAttentionKeyHash {
     mix(key.scale_bits);
     mix(key.causal ? 1U : 0U);
     mix(key.additive_bias ? 1U : 0U);
+    mix(key.heuristic);
     return result;
   }
 };
@@ -1164,7 +1177,351 @@ private:
   std::filesystem::path passive_cache_file_;
 };
 
+struct H3Int8GemmKey {
+  std::uint32_t rows{};
+  std::uint32_t columns{};
+  std::uint32_t contraction{};
+  bool operator==(const H3Int8GemmKey &) const = default;
+};
+
+struct H3Int8GemmKeyHash {
+  std::size_t operator()(const H3Int8GemmKey &key) const noexcept {
+    auto result = static_cast<std::size_t>(key.rows);
+    result = result * 0x9e3779b185ebca87ULL + key.columns;
+    result = result * 0x9e3779b185ebca87ULL + key.contraction;
+    return result;
+  }
+};
+
+class H3Int8GemmPlan {
+public:
+  H3Int8GemmPlan(cublasLtHandle_t handle, H3Int8GemmKey key,
+                 std::size_t workspace_bytes, std::uint32_t heuristic_rank)
+      : key_(key), workspace_bytes_(workspace_bytes) {
+    if (key.rows == 0U || key.columns == 0U || key.contraction == 0U)
+      fail("H3 INT8 cuBLASLt plan requires positive dimensions");
+    check(cublasLtMatmulDescCreate(&operation_, CUBLAS_COMPUTE_32I,
+                                   CUDA_R_32I),
+          "cublasLtMatmulDescCreate H3 INT8");
+    constexpr cublasOperation_t trans_a = CUBLAS_OP_N;
+    constexpr cublasOperation_t trans_b = CUBLAS_OP_T;
+    check(cublasLtMatmulDescSetAttribute(operation_,
+                                         CUBLASLT_MATMUL_DESC_TRANSA,
+                                         &trans_a, sizeof(trans_a)),
+          "cublasLtMatmulDescSetAttribute H3 INT8 trans A");
+    check(cublasLtMatmulDescSetAttribute(operation_,
+                                         CUBLASLT_MATMUL_DESC_TRANSB,
+                                         &trans_b, sizeof(trans_b)),
+          "cublasLtMatmulDescSetAttribute H3 INT8 trans B");
+    check(cublasLtMatrixLayoutCreate(&activation_, CUDA_R_8I, key.rows,
+                                     key.contraction, key.contraction),
+          "cublasLtMatrixLayoutCreate H3 INT8 activation");
+    check(cublasLtMatrixLayoutCreate(&weight_, CUDA_R_8I, key.columns,
+                                     key.contraction, key.contraction),
+          "cublasLtMatrixLayoutCreate H3 INT8 weight");
+    check(cublasLtMatrixLayoutCreate(&output_, CUDA_R_32I, key.rows,
+                                     key.columns, key.columns),
+          "cublasLtMatrixLayoutCreate H3 INT8 output");
+    constexpr cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+    for (auto layout : {activation_, weight_, output_})
+      check(cublasLtMatrixLayoutSetAttribute(
+                layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+                sizeof(row_major)),
+            "cublasLtMatrixLayoutSetAttribute H3 INT8 row major");
+
+    cublasLtMatmulPreference_t preference{};
+    check(cublasLtMatmulPreferenceCreate(&preference),
+          "cublasLtMatmulPreferenceCreate H3 INT8");
+    try {
+      check(cublasLtMatmulPreferenceSetAttribute(
+                preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &workspace_bytes_, sizeof(workspace_bytes_)),
+            "cublasLtMatmulPreferenceSetAttribute H3 INT8 workspace");
+      constexpr int requested = 32;
+      std::array<cublasLtMatmulHeuristicResult_t, requested> candidates{};
+      int returned = 0;
+      check(cublasLtMatmulAlgoGetHeuristic(
+                handle, operation_, activation_, weight_, output_, output_,
+                preference, requested, candidates.data(), &returned),
+            "cublasLtMatmulAlgoGetHeuristic H3 INT8");
+      if (returned == 0)
+        fail("cuBLASLt found no H3 INT8 projection algorithm");
+      if (heuristic_rank >= static_cast<std::uint32_t>(returned))
+        fail("H3 INT8 cuBLASLt heuristic rank " +
+             std::to_string(heuristic_rank) + " is unavailable for shape " +
+             std::to_string(key.rows) + "x" +
+             std::to_string(key.columns) + "x" +
+             std::to_string(key.contraction));
+      heuristics_.assign(candidates.begin(), candidates.begin() + returned);
+      heuristic_ = heuristics_.at(heuristic_rank);
+    } catch (...) {
+      (void)cublasLtMatmulPreferenceDestroy(preference);
+      throw;
+    }
+    check(cublasLtMatmulPreferenceDestroy(preference),
+          "cublasLtMatmulPreferenceDestroy H3 INT8");
+  }
+
+  ~H3Int8GemmPlan() {
+    if (output_)
+      (void)cublasLtMatrixLayoutDestroy(output_);
+    if (weight_)
+      (void)cublasLtMatrixLayoutDestroy(weight_);
+    if (activation_)
+      (void)cublasLtMatrixLayoutDestroy(activation_);
+    if (operation_)
+      (void)cublasLtMatmulDescDestroy(operation_);
+  }
+  H3Int8GemmPlan(const H3Int8GemmPlan &) = delete;
+  H3Int8GemmPlan &operator=(const H3Int8GemmPlan &) = delete;
+
+  void launch(cublasLtHandle_t handle, CUdeviceptr activation,
+              CUdeviceptr weight, CUdeviceptr output,
+              const Workspace &workspace, CUstream stream) const {
+    constexpr std::int32_t alpha = 1;
+    constexpr std::int32_t beta = 0;
+    count_cublaslt_matmul();
+    check(cublasLtMatmul(
+              handle, operation_, &alpha,
+              reinterpret_cast<const void *>(activation), activation_,
+              reinterpret_cast<const void *>(weight), weight_, &beta,
+              reinterpret_cast<const void *>(output), output_,
+              reinterpret_cast<void *>(output), output_, &heuristic_.algo,
+              workspace.data(),
+              std::min(workspace.size(), workspace_bytes_),
+              reinterpret_cast<cudaStream_t>(stream)),
+          "cublasLtMatmul H3 INT8 projection");
+  }
+
+  std::pair<std::uint32_t, double>
+  tune(cublasLtHandle_t handle, CUdeviceptr activation, CUdeviceptr weight,
+       CUdeviceptr output, const Workspace &workspace, CUstream stream) {
+    auto best_rank = std::uint32_t{0U};
+    auto best_ms = std::numeric_limits<double>::infinity();
+    for (std::size_t index = 0U; index < heuristics_.size(); ++index) {
+      const auto launch_candidate = [&]() {
+        constexpr std::int32_t alpha = 1;
+        constexpr std::int32_t beta = 0;
+        count_cublaslt_matmul();
+        return cublasLtMatmul(
+            handle, operation_, &alpha,
+            reinterpret_cast<const void *>(activation), activation_,
+            reinterpret_cast<const void *>(weight), weight_, &beta,
+            reinterpret_cast<const void *>(output), output_,
+            reinterpret_cast<void *>(output), output_,
+            &heuristics_[index].algo, workspace.data(),
+            std::min(workspace.size(), workspace_bytes_),
+            reinterpret_cast<cudaStream_t>(stream));
+      };
+      if (launch_candidate() != CUBLAS_STATUS_SUCCESS)
+        continue;
+      Event start;
+      Event stop;
+      check(counted_event_record(start.get(), stream),
+            "cuEventRecord H3 INT8 tuning start");
+      constexpr std::uint32_t iterations = 2U;
+      auto admitted = true;
+      for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration)
+        if (launch_candidate() != CUBLAS_STATUS_SUCCESS) {
+          admitted = false;
+          break;
+        }
+      if (!admitted)
+        continue;
+      check(counted_event_record(stop.get(), stream),
+            "cuEventRecord H3 INT8 tuning stop");
+      check(counted_event_synchronize(stop.get()),
+            "cuEventSynchronize H3 INT8 tuning");
+      float elapsed = 0.0F;
+      check(cuEventElapsedTime(&elapsed, start.get(), stop.get()),
+            "cuEventElapsedTime H3 INT8 tuning");
+      const auto mean = static_cast<double>(elapsed) / iterations;
+      if (mean < best_ms) {
+        best_ms = mean;
+        best_rank = static_cast<std::uint32_t>(index);
+      }
+    }
+    if (!std::isfinite(best_ms))
+      fail("H3 INT8 cuBLASLt tuning found no runnable algorithm");
+    heuristic_ = heuristics_.at(best_rank);
+    return {best_rank, best_ms};
+  }
+
+private:
+  H3Int8GemmKey key_{};
+  std::size_t workspace_bytes_{};
+  cublasLtMatmulDesc_t operation_{};
+  cublasLtMatrixLayout_t activation_{};
+  cublasLtMatrixLayout_t weight_{};
+  cublasLtMatrixLayout_t output_{};
+  cublasLtMatmulHeuristicResult_t heuristic_{};
+  std::vector<cublasLtMatmulHeuristicResult_t> heuristics_;
+};
+
+class H3Int8GemmRegistry {
+public:
+  H3Int8GemmRegistry(cublasLtHandle_t handle, std::size_t workspace_bytes,
+                     std::uint32_t heuristic_rank)
+      : handle_(handle), workspace_bytes_(workspace_bytes),
+        heuristic_rank_(heuristic_rank) {}
+
+  void add(H3Int8GemmKey key) {
+    if (!plans_.contains(key))
+      plans_.emplace(key, std::make_unique<H3Int8GemmPlan>(
+                              handle_, key, workspace_bytes_,
+                              heuristic_rank_));
+  }
+
+  void launch(H3Int8GemmKey key, CUdeviceptr activation, CUdeviceptr weight,
+              CUdeviceptr output, const Workspace &workspace,
+              CUstream stream) const {
+    const auto found = plans_.find(key);
+    if (found == plans_.end())
+      fail("missing prepared H3 INT8 cuBLASLt shape");
+    found->second->launch(handle_, activation, weight, output, workspace,
+                          stream);
+  }
+
+  void tune(H3Int8GemmKey key, CUdeviceptr activation, CUdeviceptr weight,
+            CUdeviceptr output, const Workspace &workspace, CUstream stream) {
+    if (!tuned_.insert(key).second)
+      return;
+    const auto found = plans_.find(key);
+    if (found == plans_.end())
+      fail("missing prepared H3 INT8 cuBLASLt tuning shape");
+    const auto [rank, milliseconds] = found->second->tune(
+        handle_, activation, weight, output, workspace, stream);
+    std::cerr << "H3_INT8_CUBLASLT_TUNED rows=" << key.rows
+              << " columns=" << key.columns
+              << " contraction=" << key.contraction << " rank=" << rank
+              << " mean_ms=" << milliseconds << '\n';
+  }
+
+  std::size_t size() const { return plans_.size(); }
+
+private:
+  cublasLtHandle_t handle_{};
+  std::size_t workspace_bytes_{};
+  std::uint32_t heuristic_rank_{};
+  std::unordered_map<H3Int8GemmKey, std::unique_ptr<H3Int8GemmPlan>,
+                     H3Int8GemmKeyHash>
+      plans_;
+  std::unordered_set<H3Int8GemmKey, H3Int8GemmKeyHash> tuned_;
+};
+
 #if DIF_HAS_CUTLASS
+struct CutlassInt8ScaledGemmDeleter {
+  void operator()(CutlassInt8ScaledGemmHandle *handle) const {
+    destroy_cutlass_int8_scaled_gemm(handle);
+  }
+};
+
+class H3Int8ScaledGemmPlan {
+public:
+  H3Int8ScaledGemmPlan(H3Int8GemmKey key, CUdeviceptr activation,
+                      CUdeviceptr weight, CUdeviceptr row_scale,
+                      CUdeviceptr column_scale, CUdeviceptr output,
+                      CUstream stream)
+      : key_(key) {
+    std::array<char, 512> error{};
+    handle_.reset(create_cutlass_int8_scaled_gemm(
+        key.rows, key.columns, key.contraction,
+        static_cast<std::uintptr_t>(activation),
+        static_cast<std::uintptr_t>(weight),
+        static_cast<std::uintptr_t>(row_scale),
+        static_cast<std::uintptr_t>(column_scale),
+        static_cast<std::uintptr_t>(output),
+        reinterpret_cast<std::uintptr_t>(stream), error.data(), error.size()));
+    if (!handle_)
+      fail(std::string("CUTLASS H3 scaled INT8 plan creation failed: ") +
+           error.data());
+  }
+
+  void launch(CUdeviceptr activation, CUdeviceptr weight,
+              CUdeviceptr row_scale, CUdeviceptr column_scale,
+              CUdeviceptr output, CUstream stream) const {
+    std::array<char, 512> error{};
+    count_cutlass_launch();
+    if (!launch_cutlass_int8_scaled_gemm(
+            handle_.get(), static_cast<std::uintptr_t>(activation),
+            static_cast<std::uintptr_t>(weight),
+            static_cast<std::uintptr_t>(row_scale),
+            static_cast<std::uintptr_t>(column_scale),
+            static_cast<std::uintptr_t>(output),
+            reinterpret_cast<std::uintptr_t>(stream), error.data(),
+            error.size()))
+      fail(std::string("CUTLASS H3 scaled INT8 launch failed: ") +
+           error.data());
+  }
+
+private:
+  H3Int8GemmKey key_{};
+  std::unique_ptr<CutlassInt8ScaledGemmHandle,
+                  CutlassInt8ScaledGemmDeleter>
+      handle_;
+};
+
+struct H3Int8ScaledGemmKey {
+  H3Int8GemmKey gemm{};
+  CUdeviceptr activation{};
+  CUdeviceptr weight{};
+  CUdeviceptr row_scale{};
+  CUdeviceptr column_scale{};
+  CUdeviceptr output{};
+
+  bool operator==(const H3Int8ScaledGemmKey &) const = default;
+};
+
+struct H3Int8ScaledGemmKeyHash {
+  std::size_t operator()(const H3Int8ScaledGemmKey &key) const noexcept {
+    auto result = H3Int8GemmKeyHash{}(key.gemm);
+    const auto mix = [&result](CUdeviceptr pointer) {
+      result ^= std::hash<CUdeviceptr>{}(pointer) + 0x9e3779b97f4a7c15ULL +
+                (result << 6U) + (result >> 2U);
+    };
+    mix(key.activation);
+    mix(key.weight);
+    mix(key.row_scale);
+    mix(key.column_scale);
+    mix(key.output);
+    return result;
+  }
+};
+
+class H3Int8ScaledGemmRegistry {
+public:
+  void add(H3Int8GemmKey key, CUdeviceptr activation, CUdeviceptr weight,
+           CUdeviceptr row_scale, CUdeviceptr column_scale,
+           CUdeviceptr output, CUstream stream) {
+    const auto prepared = H3Int8ScaledGemmKey{
+        key, activation, weight, row_scale, column_scale, output};
+    if (!plans_.contains(prepared))
+      plans_.emplace(prepared, std::make_unique<H3Int8ScaledGemmPlan>(
+                                   key, activation, weight, row_scale,
+                                   column_scale, output, stream));
+  }
+
+  void launch(H3Int8GemmKey key, CUdeviceptr activation, CUdeviceptr weight,
+              CUdeviceptr row_scale, CUdeviceptr column_scale,
+              CUdeviceptr output, CUstream stream) const {
+    const auto prepared = H3Int8ScaledGemmKey{
+        key, activation, weight, row_scale, column_scale, output};
+    const auto found = plans_.find(prepared);
+    if (found == plans_.end())
+      fail("missing pointer-stable H3 CUTLASS scaled INT8 plan");
+    found->second->launch(activation, weight, row_scale, column_scale, output,
+                          stream);
+  }
+
+  std::size_t size() const { return plans_.size(); }
+
+private:
+  std::unordered_map<H3Int8ScaledGemmKey,
+                     std::unique_ptr<H3Int8ScaledGemmPlan>,
+                     H3Int8ScaledGemmKeyHash>
+      plans_;
+};
+
 class CutlassLinearPlan {
 public:
   CutlassLinearPlan(const ir::Program &program, const ir::Operation &op,
@@ -1528,8 +1885,28 @@ std::vector<AbsorbedLinearBiasPlan> find_absorbed_linear_bias_plans(
   return result;
 }
 
-constexpr std::uint32_t kH3W8A8MlpChunkRows = 1024U;
 constexpr std::uint32_t kH3W8A8ProjectionChunkRows = 4096U;
+
+struct H3CompactAdaLNBinding {
+  bool enabled{};
+  std::uint32_t norm_operation{};
+  std::uint32_t norm_input_tensor{};
+  std::uint32_t norm_weight_tensor{};
+  std::uint32_t modulation_tensor{};
+  std::uint32_t indices_tensor{};
+  std::uint32_t scale_lane{};
+  std::uint32_t shift_lane{};
+  std::uint32_t gate_lane{};
+  float epsilon{};
+};
+
+struct H3CompactAdaLNPlan {
+  std::uint32_t select_operation{};
+  std::array<std::uint32_t, 6> expanded_tensors{};
+  std::array<std::uint32_t, 2> norm_operations{};
+  std::array<std::uint32_t, 2> normalized_tensors{};
+  std::uint32_t layer{};
+};
 
 struct H3W8A8MlpPlan {
   std::uint32_t fc1_operation{};
@@ -1541,6 +1918,7 @@ struct H3W8A8MlpPlan {
   std::uint32_t gate_tensor{};
   std::uint32_t output_tensor{};
   std::uint32_t layer{};
+  std::uint32_t chunk_rows{};
   std::uint64_t rows{};
   std::uint64_t hidden{};
   std::uint64_t ffn{};
@@ -1569,6 +1947,11 @@ struct H3W8A8MlpPlan {
   std::uint64_t eliminated_intermediate_bytes{};
   std::filesystem::path cache_path;
   bool resident{};
+  bool uploaded{};
+  bool convrot{};
+  bool cutlass_scaled_fc1{};
+  bool cutlass_scaled_fc2{};
+  H3CompactAdaLNBinding compact_adaln;
 };
 
 struct H3W8A8AttentionPlan {
@@ -1591,6 +1974,7 @@ struct H3W8A8AttentionPlan {
   std::uint64_t hidden{};
   std::uint64_t inner{};
   std::uint64_t packed_inner{};
+  std::uint64_t head_dim{};
   Tensor qkv_weight;
   Tensor qkv_scale;
   Tensor output_weight;
@@ -1609,6 +1993,10 @@ struct H3W8A8AttentionPlan {
   std::uint64_t eliminated_intermediate_bytes{};
   std::filesystem::path cache_path;
   bool resident{};
+  bool uploaded{};
+  bool convrot{};
+  bool cutlass_scaled{};
+  H3CompactAdaLNBinding compact_adaln;
 };
 
 struct H3W8A8Functions {
@@ -1619,15 +2007,28 @@ struct H3W8A8Functions {
   CUfunction residual{};
 };
 
+struct H3ConvRotFunctions {
+  CUfunction encode{};
+  CUfunction compact_encode{};
+  CUfunction qkv{};
+  CUfunction qkv_bf16{};
+  CUfunction swiglu{};
+  CUfunction swiglu_encode{};
+  CUfunction swiglu_bf16_encode{};
+  CUfunction compact_residual{};
+  CUfunction compact_residual_bf16{};
+};
+
 std::uint64_t align_256(std::uint64_t value) {
   if (value > std::numeric_limits<std::uint64_t>::max() - 255U)
     fail("H3 W8A8 storage alignment overflow");
   return (value + 255U) & ~std::uint64_t{255U};
 }
 
-// Direct port of the accepted Serenity Comfy Kitchen C ABI bridge. The loaded
-// DSO contains only the pinned raw CUDA launchers plus ABI/target-SM metadata;
-// no Mojo or Python runtime participates in prepared execution.
+// Architecture-tagged development DSO adapter. The project-owned ABI and the
+// legacy Serenity oracle ABI are detected and reported separately. The loaded
+// DSO contains raw CUDA launchers plus ABI/target-SM metadata; no Mojo, Python,
+// or external model weights participate in prepared execution.
 class CkAttentionLibrary {
 public:
   using QuantQK = void (*)(
@@ -1645,6 +2046,15 @@ public:
       int, int, int, int, int, int, int, int, int, int, int, int, int,
       float, int, void *);
   using MetadataInt = int (*)();
+  using OwnedQuantKv = int (*)(
+      const void *, const void *, void *, void *, void *, void *, int, int,
+      int, int, std::int64_t, std::int64_t, std::int64_t, std::int64_t,
+      std::int64_t, std::int64_t, void *);
+  using OwnedAttend = int (*)(
+      const void *, const void *, const void *, const void *, const void *,
+      void *, int, int, int, int, float, std::int64_t, std::int64_t,
+      std::int64_t, std::int64_t, std::int64_t, std::int64_t, void *);
+  using OwnedError = const char *(*)(int);
 
   CkAttentionLibrary(const std::filesystem::path &path, int current_sm)
       : path_(path) {
@@ -1655,11 +2065,16 @@ public:
       fail("cannot load H3 CK attention DSO " + path_string + ": " +
            (reason ? reason : "unknown dlopen error"));
     }
-    auto symbol = [&](const char *name) {
+    auto optional_symbol = [&](const char *name) {
       dlerror();
       auto *address = dlsym(candidate, name);
       const char *reason = dlerror();
-      if (!address || reason) {
+      return reason ? nullptr : address;
+    };
+    auto symbol = [&](const char *name) {
+      auto *address = optional_symbol(name);
+      if (!address) {
+        const char *reason = dlerror();
         const auto message = std::string("H3 CK attention DSO is missing ") +
                              name + ": " +
                              (reason ? reason : "unknown dlsym error");
@@ -1668,6 +2083,34 @@ public:
       }
       return address;
     };
+    if (auto *owned_abi_address =
+            optional_symbol("codealexx_h3_dense_abi_version")) {
+      const auto abi = reinterpret_cast<MetadataInt>(owned_abi_address);
+      const auto target = reinterpret_cast<MetadataInt>(
+          symbol("codealexx_h3_dense_target_sm"));
+      const auto abi_version = abi();
+      target_sm_ = target();
+      if ((abi_version != 3 && abi_version != 4) ||
+          target_sm_ != current_sm) {
+        const auto message =
+            "owned H3 dense attention DSO admission failed: ABI=" +
+            std::to_string(abi_version) + " target_sm=" +
+            std::to_string(target_sm_) + " current_sm=" +
+            std::to_string(current_sm);
+        dlclose(candidate);
+        fail(message);
+      }
+      owned_quant_kv_ = reinterpret_cast<OwnedQuantKv>(
+          symbol("codealexx_h3_dense_quantize_kv_bf16"));
+      owned_attend_ = reinterpret_cast<OwnedAttend>(
+          symbol("codealexx_h3_dense_attention_bf16"));
+      owned_error_ = reinterpret_cast<OwnedError>(
+          symbol("codealexx_h3_dense_cuda_error"));
+      owned_abi_version_ = abi_version;
+      owned_dense_ = true;
+      handle_ = candidate;
+      return;
+    }
     const auto abi = reinterpret_cast<MetadataInt>(
         symbol("serenity_ck_attention_abi_version"));
     const auto target = reinterpret_cast<MetadataInt>(
@@ -1718,6 +2161,27 @@ public:
     auto pointer = [](CUdeviceptr value) {
       return reinterpret_cast<void *>(value);
     };
+    if (owned_dense_) {
+      const auto padded_sequence =
+          (sequence + cta_k - 1) / cta_k * cta_k;
+      auto status = owned_quant_kv_(
+          pointer(key), pointer(value), pointer(k_int8), pointer(k_scale),
+          pointer(v_int8), pointer(v_scale), batch, heads, sequence,
+          padded_sequence, in_sb, in_sh, in_sn, in_sb, in_sh, in_sn,
+          reinterpret_cast<void *>(stream));
+      if (status == 0)
+        status = owned_attend_(
+            pointer(query), pointer(k_int8), pointer(k_scale), pointer(v_int8),
+            pointer(v_scale), pointer(output), batch, heads, sequence,
+            padded_sequence, scale, in_sb, in_sh, in_sn, in_sb, in_sh, in_sn,
+            reinterpret_cast<void *>(stream));
+      if (status != 0) {
+        const char *reason = owned_error_ ? owned_error_(status) : nullptr;
+        fail("owned H3 dense attention launch failed: " +
+             std::string(reason ? reason : "unknown CUDA error"));
+      }
+      return;
+    }
     quant_qk_(pointer(query), pointer(q_int8), pointer(q_scale), pointer(key),
               pointer(k_int8), pointer(k_scale), batch, heads, sequence, heads,
               sequence, head_dim, cta_q, warp_q, cta_k, warp_k, in_sb, in_sh,
@@ -1744,6 +2208,18 @@ public:
   }
 
   int target_sm() const { return target_sm_; }
+  bool owned_dense() const { return owned_dense_; }
+  int owned_abi_version() const { return owned_abi_version_; }
+  std::string classification() const {
+    return owned_dense_ ? "approximate_owned_h3_dense_int8_gate"
+                        : "approximate_ck_int8_established_h3_gate";
+  }
+  std::string implementation() const {
+    return owned_dense_
+               ? "codealexx_h3_dense_int8_v" +
+                     std::to_string(owned_abi_version_)
+               : "serenity_comfy_kitchen_sage_bf16";
+  }
   const std::filesystem::path &path() const { return path_; }
 
 private:
@@ -1752,7 +2228,12 @@ private:
   QuantQK quant_qk_{};
   QuantV quant_v_{};
   Attend attend_{};
+  OwnedQuantKv owned_quant_kv_{};
+  OwnedAttend owned_attend_{};
+  OwnedError owned_error_{};
   int target_sm_{};
+  int owned_abi_version_{};
+  bool owned_dense_{};
 };
 
 class CkAttentionPlan {
@@ -1779,14 +2260,29 @@ public:
     const auto padded_sequence = (sequence + 127U) / 128U * 128U;
     const auto elements = sequence * heads * 128U;
     const auto q_scale_elements = heads * ((sequence + 127U) / 128U) * 32U;
-    const auto k_scale_elements = heads * ((sequence + 127U) / 128U) * 4U;
+    const auto k_scale_elements =
+        library_->owned_dense()
+            ? (library_->owned_abi_version() == 3
+                   ? heads * padded_sequence
+                   : heads * (padded_sequence / 128U))
+            : heads * ((sequence + 127U) / 128U) * 4U;
+    const auto v_scale_elements =
+        library_->owned_dense() && library_->owned_abi_version() == 3
+            ? heads * (padded_sequence / 128U) * 128U
+            : heads * 128U;
     const auto v_elements = heads * 128U * padded_sequence;
-    scratch_bytes_ = align_256(elements) + align_256(elements) +
-                     align_256(q_scale_elements * sizeof(float)) +
-                     align_256(k_scale_elements * sizeof(float)) +
-                     align_256(v_elements) +
-                     align_256(heads * 128U * sizeof(float)) +
-                     align_256(heads * sizeof(std::int32_t));
+    if (library_->owned_dense())
+      scratch_bytes_ = align_256(elements) +
+                       align_256(k_scale_elements * sizeof(float)) +
+                       align_256(v_elements) +
+                       align_256(v_scale_elements * sizeof(float));
+    else
+      scratch_bytes_ = align_256(elements) + align_256(elements) +
+                       align_256(q_scale_elements * sizeof(float)) +
+                       align_256(k_scale_elements * sizeof(float)) +
+                       align_256(v_elements) +
+                       align_256(heads * 128U * sizeof(float)) +
+                       align_256(heads * sizeof(std::int32_t));
   }
 
   void allocate(DeviceArena *arena) {
@@ -1797,7 +2293,16 @@ public:
     const auto padded_sequence = (sequence + 127U) / 128U * 128U;
     const auto elements = sequence * heads * 128U;
     const auto q_scale_elements = heads * ((sequence + 127U) / 128U) * 32U;
-    const auto k_scale_elements = heads * ((sequence + 127U) / 128U) * 4U;
+    const auto k_scale_elements =
+        library_->owned_dense()
+            ? (library_->owned_abi_version() == 3
+                   ? heads * padded_sequence
+                   : heads * (padded_sequence / 128U))
+            : heads * ((sequence + 127U) / 128U) * 4U;
+    const auto v_scale_elements =
+        library_->owned_dense() && library_->owned_abi_version() == 3
+            ? heads * (padded_sequence / 128U) * 128U
+            : heads * 128U;
     const auto v_elements = heads * 128U * padded_sequence;
     storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(scratch_bytes_), arena);
@@ -1806,13 +2311,20 @@ public:
       target = storage_->pointer() + offset;
       offset += align_256(bytes);
     };
-    assign(q_int8_, elements);
-    assign(k_int8_, elements);
-    assign(q_scale_, q_scale_elements * sizeof(float));
-    assign(k_scale_, k_scale_elements * sizeof(float));
-    assign(v_int8_, v_elements);
-    assign(v_scale_, heads * 128U * sizeof(float));
-    assign(anchor_indices_, heads * sizeof(std::int32_t));
+    if (library_->owned_dense()) {
+      assign(k_int8_, elements);
+      assign(k_scale_, k_scale_elements * sizeof(float));
+      assign(v_int8_, v_elements);
+      assign(v_scale_, v_scale_elements * sizeof(float));
+    } else {
+      assign(q_int8_, elements);
+      assign(k_int8_, elements);
+      assign(q_scale_, q_scale_elements * sizeof(float));
+      assign(k_scale_, k_scale_elements * sizeof(float));
+      assign(v_int8_, v_elements);
+      assign(v_scale_, heads * 128U * sizeof(float));
+      assign(anchor_indices_, heads * sizeof(std::int32_t));
+    }
     if (offset != scratch_bytes_)
       fail("H3 CK attention scratch layout mismatch");
   }
@@ -1842,6 +2354,11 @@ public:
   std::uint32_t operation_id() const { return operation_id_; }
   std::uint64_t scratch_bytes() const { return scratch_bytes_; }
   int target_sm() const { return library_->target_sm(); }
+  bool owned_dense() const { return library_->owned_dense(); }
+  const std::string classification() const { return library_->classification(); }
+  const std::string implementation() const {
+    return library_->implementation();
+  }
   const std::filesystem::path &path() const { return library_->path(); }
 
 private:
@@ -1868,6 +2385,7 @@ struct H3ModulationCachePlan {
   std::uint32_t input_tensor{};
   std::uint32_t layer{};
   std::uint32_t slices{1U};
+  std::uint32_t tables{};
   std::vector<std::uint32_t> replaced_constant_tensors;
   Tensor modulation;
   CUdeviceptr modulation_device{};
@@ -1903,19 +2421,46 @@ std::string h3_metadata_string(const weights::SafeTensorFile &file,
   return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
 }
 
+std::optional<std::string>
+h3_optional_metadata_string(const weights::SafeTensorFile &file,
+                            std::string_view name) {
+  const auto *entry = file.find_metadata(name);
+  if (!entry)
+    return std::nullopt;
+  if (entry->dtype != "U8" || entry->dims.size() != 1U)
+    fail("H3 runtime cache has invalid string metadata: " +
+         std::string(name));
+  const auto bytes = weights::read_safetensor_metadata(file, name);
+  return std::string(reinterpret_cast<const char *>(bytes.data()),
+                     bytes.size());
+}
+
 void validate_h3_modulation_cache_metadata(
     const weights::SafeTensorFile &cache, const RunOptions &options,
-    std::uint32_t slices, std::uint32_t blocks) {
+    std::uint32_t slices, std::uint32_t tables, std::uint32_t blocks) {
   if (options.h3_modulation_source_index.empty() ||
       options.h3_modulation_steps == 0U)
     fail("schedule modulation cache requires its source index and step count");
+  const auto row_layout =
+      h3_optional_metadata_string(cache, "__meta__.row_layout");
+  constexpr std::string_view local_layout =
+      "per-evaluation-sorted-unique-padded-v1";
+  // Legacy two-table T2VA caches happen to use the same value order as the
+  // creator's sorted local table. Conditioned global caches do not: their
+  // collapsed first evaluation repeats video/audio before condition rows.
+  // Reinterpreting those bytes as local slices silently selects the wrong
+  // modulation, so conditioned caches must declare the native layout.
+  if ((row_layout && *row_layout != local_layout) ||
+      (!row_layout && tables > 2U))
+    fail("conditioned H3 modulation cache lacks compatible local row-layout provenance");
   if (h3_metadata_u64(cache, "__meta__.version") != 1U ||
       h3_metadata_string(cache, "__meta__.kind") != "adaln-modulation" ||
       h3_metadata_string(cache, "__meta__.src_path") !=
           options.h3_modulation_source_index.string() ||
       h3_metadata_u64(cache, "__meta__.steps") !=
           options.h3_modulation_steps ||
-      h3_metadata_u64(cache, "__meta__.distinct_timesteps") != 2U * slices ||
+      h3_metadata_u64(cache, "__meta__.distinct_timesteps") !=
+          static_cast<std::uint64_t>(tables) * slices ||
       h3_metadata_u64(cache, "__meta__.nblocks") != blocks)
     fail("H3 schedule modulation cache metadata does not match this run");
   struct stat source_stat {};
@@ -2026,6 +2571,7 @@ std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
     plan.input_tensor = input->id;
     plan.layer = layer;
     plan.slices = slices;
+    plan.tables = static_cast<std::uint32_t>(tables);
     plan.replaced_constant_tensors = {weight->id, bias->id};
     plan.modulation = std::move(modulation);
     plan.storage_bytes = align_256(plan.modulation.byte_size());
@@ -2085,6 +2631,7 @@ std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
     plan.input_tensor = input->id;
     plan.layer = block_count;
     plan.slices = result.front().slices;
+    plan.tables = result.front().tables;
     plan.replaced_constant_tensors = {weight->id, bias->id};
     plan.modulation = std::move(modulation);
     plan.storage_bytes = align_256(plan.modulation.byte_size());
@@ -2107,14 +2654,15 @@ std::vector<H3ModulationCachePlan> find_h3_modulation_cache_plans(
     if (options.h3_modulation_total_layers == 0U) {
       if (result.size() != static_cast<std::size_t>(block_count) + 1U)
         fail("schedule modulation cache requires the final output-head tensor");
-      validate_h3_modulation_cache_metadata(cache, options, slices,
-                                            block_count);
+      validate_h3_modulation_cache_metadata(
+          cache, options, slices, result.front().tables, block_count);
     } else {
       if (options.h3_modulation_layer + block_count >
           options.h3_modulation_total_layers)
         fail("H3 diagnostic modulation slice exceeds total layer count");
       validate_h3_modulation_cache_metadata(
-          cache, options, slices, options.h3_modulation_total_layers);
+          cache, options, slices, result.front().tables,
+          options.h3_modulation_total_layers);
     }
   }
   return result;
@@ -2187,8 +2735,9 @@ std::vector<H3GroupwiseBlockPlan> find_h3_groupwise_plans(
       fail("H3 groupwise layer requires an H3 groupwise cache");
     return {};
   }
-  if (!options.h3_w8a8_cache.empty())
-    fail("H3 W8A8 and groupwise INT8 caches are mutually exclusive");
+  if (!options.h3_w8a8_cache.empty() ||
+      !options.h3_convrot_int8_checkpoint.empty())
+    fail("H3 direct INT8 and groupwise INT8 precision routes are mutually exclusive");
   const auto cache = weights::read_safetensors(options.h3_groupwise_cache);
   std::unordered_map<std::uint32_t, const ir::Operation *> producers;
   std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>> consumers;
@@ -2438,11 +2987,63 @@ void launch_h3_groupwise_dequant(const H3GroupwiseProjection &projection,
         "cuLaunchKernel H3 groupwise INT8 dequant");
 }
 
+struct H3DirectInt8Config {
+  std::filesystem::path path;
+  std::uint32_t layer{};
+  std::uint32_t resident_layers{};
+  bool convrot{};
+};
+
+H3DirectInt8Config h3_direct_int8_config(const RunOptions &options) {
+  if (!options.h3_w8a8_cache.empty() &&
+      !options.h3_convrot_int8_checkpoint.empty())
+    fail("H3 W8A8 and ConvRot INT8 precision routes are mutually exclusive");
+  if (!options.h3_convrot_int8_checkpoint.empty())
+    return {options.h3_convrot_int8_checkpoint,
+            options.h3_convrot_int8_layer,
+            options.h3_convrot_int8_resident_layers, true};
+  return {options.h3_w8a8_cache, options.h3_w8a8_layer,
+          options.h3_w8a8_resident_layers, false};
+}
+
+bool h3_channel_scale_shape(const Tensor &scale, std::uint64_t rows) {
+  return scale.dtype == ir::DType::F32 &&
+         (scale.dims == std::vector<std::uint64_t>{rows} ||
+          scale.dims == std::vector<std::uint64_t>{rows, 1U});
+}
+
+void validate_h3_convrot_metadata(const weights::SafeTensorFile &cache,
+                                  std::uint32_t required_layer) {
+  constexpr std::uint32_t magic = 0x44494643U; // "DIFC"
+  constexpr std::uint32_t version = 1U;
+  constexpr std::uint32_t group_size = 256U;
+  constexpr std::uint32_t qkv_layout_contiguous = 1U;
+  constexpr std::uint32_t projection_count = 4U;
+  const auto metadata =
+      weights::map_safetensor(cache, "__meta__.h3_convrot");
+  if (metadata.dtype != ir::DType::I32 ||
+      metadata.dims != std::vector<std::uint64_t>{14U} ||
+      metadata.byte_size() != 14U * sizeof(std::uint32_t))
+    fail("H3 ConvRot cache has an invalid identity record");
+  std::array<std::uint32_t, 14> identity{};
+  std::memcpy(identity.data(), metadata.data(), metadata.byte_size());
+  if (identity[0] != magic || identity[1] != version ||
+      identity[2] != group_size || identity[3] != qkv_layout_contiguous ||
+      identity[5] != projection_count)
+    fail("H3 ConvRot cache has unsupported native format metadata");
+  if (required_layer >= identity[4])
+    fail("H3 ConvRot cache does not cover requested block " +
+         std::to_string(required_layer));
+}
+
 std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
     const ir::Program &program, const RunOptions &options) {
-  if (options.h3_w8a8_cache.empty())
+  const auto config = h3_direct_int8_config(options);
+  if (config.path.empty())
     return {};
-  const auto cache = weights::read_safetensors(options.h3_w8a8_cache);
+  if (options.h3_int8_mlp_chunk_rows == 0U)
+    fail("H3 direct INT8 MLP chunk rows must be positive");
+  const auto cache = weights::read_safetensors(config.path);
   std::unordered_map<std::uint32_t, const ir::Operation *> producer;
   std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>> consumers;
   for (const auto &operation : program.operations) {
@@ -2463,10 +3064,7 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
         consumers[swiglu.inputs.at(0)].size() != 1U)
       continue;
     const auto &fc1 = *fc1_found->second;
-    // DiffIR binds the released [gate|value] FC1 tensor and therefore records
-    // GateFirst=true. The accepted Serenity cache stores its runtime-swapped
-    // [value|gate] compute copy; the W8A8 epilogue below consumes that copy in
-    // its native order while preserving the same semantic result.
+    // DiffIR and the official checkpoint both bind FC1 as [gate|value].
     if (fc1.inputs.size() != 2U || fc1.outputs.size() != 1U ||
         !swiglu.boolean(ir::AttrKey::GateFirst, false))
       continue;
@@ -2520,12 +3118,9 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
         fail("H3 W8A8 MLP requires unobservable exclusive intermediates");
     }
 
-    const auto layer = options.h3_w8a8_layer +
+    const auto layer = config.layer +
                        static_cast<std::uint32_t>(result.size());
     const auto prefix = "block." + std::to_string(layer);
-    auto mapped = [&](const std::string &suffix) {
-      return weights::map_safetensor(cache, prefix + suffix);
-    };
     H3W8A8MlpPlan plan;
     plan.fc1_operation = fc1.id;
     plan.swiglu_operation = swiglu.id;
@@ -2536,8 +3131,14 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
     plan.gate_tensor = residual.inputs.at(2);
     plan.output_tensor = residual.outputs.at(0);
     plan.layer = layer;
-    plan.resident = layer - options.h3_w8a8_layer <
-                    options.h3_w8a8_resident_layers;
+    plan.chunk_rows = options.h3_int8_mlp_chunk_rows;
+    plan.resident = layer - config.layer < config.resident_layers;
+    plan.convrot = config.convrot;
+    plan.cutlass_scaled_fc1 = config.convrot &&
+                              (options.h3_int8_cutlass_scaled_fc1 ||
+                               options.h3_int8_cutlass_scaled_all);
+    plan.cutlass_scaled_fc2 =
+        config.convrot && options.h3_int8_cutlass_scaled_all;
     plan.rows = input->dims.at(0);
     plan.hidden = hidden;
     plan.ffn = ffn;
@@ -2545,18 +3146,32 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
     plan.excluded_tensors = {fc1.outputs.at(0), swiglu.outputs.at(0),
                              fc2.outputs.at(0)};
     plan.replaced_constant_tensors = {fc1.inputs.at(1), fc2.inputs.at(1)};
-    plan.fc1_weight = mapped(".weight.2");
-    plan.fc1_scale = mapped(".scale.2");
-    plan.fc2_weight = mapped(".weight.3");
-    plan.fc2_scale = mapped(".scale.3");
+    if (config.convrot) {
+      validate_h3_convrot_metadata(cache, layer);
+      plan.fc1_weight =
+          weights::map_safetensor(cache, prefix + ".convrot_weight.2");
+      plan.fc1_scale =
+          weights::map_safetensor(cache, prefix + ".convrot_scale.2");
+      plan.fc2_weight =
+          weights::map_safetensor(cache, prefix + ".convrot_weight.3");
+      plan.fc2_scale =
+          weights::map_safetensor(cache, prefix + ".convrot_scale.3");
+    } else {
+      plan.fc1_weight =
+          weights::map_safetensor(cache, prefix + ".weight.2");
+      plan.fc1_scale =
+          weights::map_safetensor(cache, prefix + ".scale.2");
+      plan.fc2_weight =
+          weights::map_safetensor(cache, prefix + ".weight.3");
+      plan.fc2_scale =
+          weights::map_safetensor(cache, prefix + ".scale.3");
+    }
     if (plan.fc1_weight.dtype != ir::DType::I8 ||
         plan.fc1_weight.dims != fc1_weight->dims ||
-        plan.fc1_scale.dtype != ir::DType::F32 ||
-        plan.fc1_scale.dims != std::vector<std::uint64_t>{packed_ffn} ||
+        !h3_channel_scale_shape(plan.fc1_scale, packed_ffn) ||
         plan.fc2_weight.dtype != ir::DType::I8 ||
         plan.fc2_weight.dims != fc2_weight->dims ||
-        plan.fc2_scale.dtype != ir::DType::F32 ||
-        plan.fc2_scale.dims != std::vector<std::uint64_t>{hidden})
+        !h3_channel_scale_shape(plan.fc2_scale, hidden))
       fail("H3 W8A8 cache tensors do not match the semantic MLP shapes");
     plan.quantized_weight_bytes =
         plan.fc1_weight.byte_size() + plan.fc1_scale.byte_size() +
@@ -2569,17 +3184,21 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
     for (const auto tensor_id : plan.excluded_tensors)
       plan.eliminated_intermediate_bytes +=
           program.tensor(tensor_id)->byte_count();
-    const auto chunk_rows = std::min<std::uint64_t>(
-        plan.rows, kH3W8A8MlpChunkRows);
+    const auto chunk_rows =
+        std::min<std::uint64_t>(plan.rows, plan.chunk_rows);
     plan.scratch_bytes =
         align_256(chunk_rows * sizeof(float)) +
         align_256(chunk_rows * hidden) +
-        align_256(chunk_rows * packed_ffn * sizeof(std::int32_t)) +
+        align_256(chunk_rows * packed_ffn *
+                  (plan.cutlass_scaled_fc1 ? sizeof(std::uint16_t)
+                                           : sizeof(std::int32_t))) +
         align_256(chunk_rows * ffn * sizeof(std::uint16_t)) +
         align_256(chunk_rows * sizeof(float)) +
         align_256(chunk_rows * ffn) +
-        align_256(chunk_rows * hidden * sizeof(std::int32_t));
-    plan.cache_path = options.h3_w8a8_cache;
+        align_256(chunk_rows * hidden *
+                  (plan.cutlass_scaled_fc2 ? sizeof(std::uint16_t)
+                                           : sizeof(std::int32_t)));
+    plan.cache_path = config.path;
     result.push_back(std::move(plan));
   }
   return result;
@@ -2587,9 +3206,10 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
 
 std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
     const ir::Program &program, const RunOptions &options) {
-  if (options.h3_w8a8_cache.empty())
+  const auto config = h3_direct_int8_config(options);
+  if (config.path.empty())
     return {};
-  const auto cache = weights::read_safetensors(options.h3_w8a8_cache);
+  const auto cache = weights::read_safetensors(config.path);
   std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>> consumers;
   for (const auto &operation : program.operations) {
     for (const auto input : operation.inputs)
@@ -2751,12 +3371,9 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
         continue;
     }
 
-    const auto layer = options.h3_w8a8_layer +
+    const auto layer = config.layer +
                        static_cast<std::uint32_t>(result.size());
     const auto prefix = "block." + std::to_string(layer);
-    auto mapped = [&](const std::string &suffix) {
-      return weights::map_safetensor(cache, prefix + suffix);
-    };
     H3W8A8AttentionPlan plan;
     plan.has_qkv_projection = true;
     plan.has_output_projection = has_output_projection;
@@ -2781,31 +3398,51 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
       planned_output_linears.insert(output_linear->id);
     }
     plan.layer = layer;
-    plan.resident = layer - options.h3_w8a8_layer <
-                    options.h3_w8a8_resident_layers;
+    plan.resident = layer - config.layer < config.resident_layers;
+    plan.convrot = config.convrot;
+    plan.cutlass_scaled =
+        config.convrot && options.h3_int8_cutlass_scaled_all;
     plan.rows = rows;
     plan.hidden = hidden;
     plan.inner = inner;
     plan.packed_inner = packed_inner;
-    plan.qkv_weight = mapped(".weight.0");
-    plan.qkv_scale = mapped(".scale.0");
+    plan.head_dim = q_output->dims.at(2);
+    if (config.convrot) {
+      validate_h3_convrot_metadata(cache, layer);
+      plan.qkv_weight =
+          weights::map_safetensor(cache, prefix + ".convrot_weight.0");
+      plan.qkv_scale =
+          weights::map_safetensor(cache, prefix + ".convrot_scale.0");
+    } else {
+      plan.qkv_weight =
+          weights::map_safetensor(cache, prefix + ".weight.0");
+      plan.qkv_scale =
+          weights::map_safetensor(cache, prefix + ".scale.0");
+    }
     if (plan.qkv_weight.dtype != ir::DType::I8 ||
         plan.qkv_weight.dims != packed_weight->dims ||
-        plan.qkv_scale.dtype != ir::DType::F32 ||
-        plan.qkv_scale.dims != std::vector<std::uint64_t>{packed_inner})
+        !h3_channel_scale_shape(plan.qkv_scale, packed_inner))
       fail("H3 W8A8 cache tensors do not match the semantic QKV shapes");
     plan.quantized_weight_bytes =
         plan.qkv_weight.byte_size() + plan.qkv_scale.byte_size();
     plan.weight_storage_bytes = align_256(plan.qkv_weight.byte_size()) +
                                 align_256(plan.qkv_scale.byte_size());
     if (has_output_projection) {
-      plan.output_weight = mapped(".weight.1");
-      plan.output_scale = mapped(".scale.1");
+      if (config.convrot) {
+        plan.output_weight =
+            weights::map_safetensor(cache, prefix + ".convrot_weight.1");
+        plan.output_scale =
+            weights::map_safetensor(cache, prefix + ".convrot_scale.1");
+      } else {
+        plan.output_weight =
+            weights::map_safetensor(cache, prefix + ".weight.1");
+        plan.output_scale =
+            weights::map_safetensor(cache, prefix + ".scale.1");
+      }
       if (plan.output_weight.dtype != ir::DType::I8 ||
           plan.output_weight.dims !=
               std::vector<std::uint64_t>{hidden, inner} ||
-          plan.output_scale.dtype != ir::DType::F32 ||
-          plan.output_scale.dims != std::vector<std::uint64_t>{hidden})
+          !h3_channel_scale_shape(plan.output_scale, hidden))
         fail("H3 W8A8 cache tensors do not match output projection shapes");
       plan.quantized_weight_bytes +=
           plan.output_weight.byte_size() + plan.output_scale.byte_size();
@@ -2821,8 +3458,10 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
     plan.scratch_bytes = align_256(rows * sizeof(float)) +
                          align_256(rows * hidden) +
                          align_256(chunk_rows * packed_inner *
-                                   sizeof(std::int32_t));
-    plan.cache_path = options.h3_w8a8_cache;
+                                   (plan.cutlass_scaled
+                                        ? sizeof(std::uint16_t)
+                                        : sizeof(std::int32_t)));
+    plan.cache_path = config.path;
     result.push_back(std::move(plan));
   }
   for (const auto &output_linear : program.operations) {
@@ -2862,7 +3501,7 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
     if (projected->dims.at(0) != rows ||
         weight->dims != std::vector<std::uint64_t>{hidden, inner})
       continue;
-    const auto layer = options.h3_w8a8_layer +
+    const auto layer = config.layer +
                        static_cast<std::uint32_t>(result.size());
     const auto prefix = "block." + std::to_string(layer);
     H3W8A8AttentionPlan plan;
@@ -2876,20 +3515,29 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
     plan.excluded_tensors = {output_linear.outputs.at(0)};
     plan.replaced_constant_tensors = {output_linear.inputs.at(1)};
     plan.layer = layer;
-    plan.resident = layer - options.h3_w8a8_layer <
-                    options.h3_w8a8_resident_layers;
+    plan.resident = layer - config.layer < config.resident_layers;
+    plan.convrot = config.convrot;
+    plan.cutlass_scaled =
+        config.convrot && options.h3_int8_cutlass_scaled_all;
     plan.rows = rows;
     plan.hidden = hidden;
     plan.inner = inner;
     plan.packed_inner = 3U * inner;
-    plan.output_weight =
-        weights::map_safetensor(cache, prefix + ".weight.1");
-    plan.output_scale =
-        weights::map_safetensor(cache, prefix + ".scale.1");
+    if (config.convrot) {
+      validate_h3_convrot_metadata(cache, layer);
+      plan.output_weight =
+          weights::map_safetensor(cache, prefix + ".convrot_weight.1");
+      plan.output_scale =
+          weights::map_safetensor(cache, prefix + ".convrot_scale.1");
+    } else {
+      plan.output_weight =
+          weights::map_safetensor(cache, prefix + ".weight.1");
+      plan.output_scale =
+          weights::map_safetensor(cache, prefix + ".scale.1");
+    }
     if (plan.output_weight.dtype != ir::DType::I8 ||
         plan.output_weight.dims != weight->dims ||
-        plan.output_scale.dtype != ir::DType::F32 ||
-        plan.output_scale.dims != std::vector<std::uint64_t>{hidden})
+        !h3_channel_scale_shape(plan.output_scale, hidden))
       fail("H3 W8A8 cache tensors do not match output projection shapes");
     plan.quantized_weight_bytes =
         plan.output_weight.byte_size() + plan.output_scale.byte_size();
@@ -2901,10 +3549,150 @@ std::vector<H3W8A8AttentionPlan> find_h3_w8a8_attention_plans(
     plan.scratch_bytes = align_256(chunk_rows * sizeof(float)) +
                          align_256(chunk_rows * inner) +
                          align_256(chunk_rows * hidden *
-                                   sizeof(std::int32_t));
-    plan.cache_path = options.h3_w8a8_cache;
+                                   (plan.cutlass_scaled
+                                        ? sizeof(std::uint16_t)
+                                        : sizeof(std::int32_t)));
+    plan.cache_path = config.path;
     result.push_back(std::move(plan));
   }
+  return result;
+}
+
+std::vector<H3CompactAdaLNPlan> find_h3_compact_adaln_plans(
+    const ir::Program &program, const RunOptions &options,
+    std::vector<H3W8A8AttentionPlan> &attention_plans,
+    std::vector<H3W8A8MlpPlan> &mlp_plans) {
+  if (!options.h3_int8_compact_adaln)
+    return {};
+  if (options.h3_convrot_int8_checkpoint.empty() ||
+      options.h3_modulation_cache.empty())
+    fail("H3 compact AdaLN requires ConvRot INT8 and a prepared modulation cache");
+  if (attention_plans.empty() || mlp_plans.empty())
+    fail("H3 compact AdaLN requires complete direct INT8 attention and MLP plans");
+
+  std::unordered_map<std::uint32_t, const ir::Operation *> producer;
+  std::unordered_map<std::uint32_t, const ir::Operation *> operation_by_id;
+  std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>> consumers;
+  for (const auto &operation : program.operations) {
+    operation_by_id.emplace(operation.id, &operation);
+    for (const auto output : operation.outputs)
+      producer.emplace(output, &operation);
+    for (const auto input : operation.inputs)
+      consumers[input].push_back(&operation);
+  }
+  const auto single_consumer_is = [&](std::uint32_t tensor,
+                                      const ir::Operation *operation) {
+    const auto found = consumers.find(tensor);
+    return found != consumers.end() && found->second.size() == 1U &&
+           found->second.front() == operation;
+  };
+
+  std::vector<H3CompactAdaLNPlan> result;
+  for (const auto &select : program.operations) {
+    if (select.opcode != ir::Opcode::H3AdaLNSelect)
+      continue;
+    if (select.inputs.size() != 2U || select.outputs.size() != 6U)
+      fail("H3 compact AdaLN found a malformed select operation");
+    auto attention = std::find_if(
+        attention_plans.begin(), attention_plans.end(),
+        [&](const H3W8A8AttentionPlan &plan) {
+          return plan.has_qkv_projection && plan.has_output_projection &&
+                 plan.gate_tensor == select.outputs.at(2);
+        });
+    auto mlp = std::find_if(mlp_plans.begin(), mlp_plans.end(),
+                            [&](const H3W8A8MlpPlan &plan) {
+                              return plan.gate_tensor == select.outputs.at(5);
+                            });
+    if (attention == attention_plans.end() || mlp == mlp_plans.end())
+      continue;
+    if (!attention->convrot || !mlp->convrot || attention->layer != mlp->layer)
+      fail("H3 compact AdaLN matched inconsistent ConvRot block plans");
+
+    const auto attention_norm_found = producer.find(attention->attention_input_tensor);
+    const auto mlp_norm_found = producer.find(mlp->input_tensor);
+    if (attention_norm_found == producer.end() ||
+        mlp_norm_found == producer.end())
+      fail("H3 compact AdaLN normalized input has no producer");
+    const auto *attention_norm = attention_norm_found->second;
+    const auto *mlp_norm = mlp_norm_found->second;
+    const auto valid_norm = [&](const ir::Operation *norm,
+                                std::uint32_t scale,
+                                std::uint32_t shift) {
+      if (!norm || norm->opcode != ir::Opcode::RmsNormModulate ||
+          norm->inputs.size() != 4U || norm->outputs.size() != 1U ||
+          norm->inputs.at(2) != scale || norm->inputs.at(3) != shift ||
+          norm->u64(ir::AttrKey::ModulationLayout,
+                    static_cast<std::uint64_t>(
+                        ir::ModulationLayout::ExplicitScaleShift)) !=
+              static_cast<std::uint64_t>(
+                  ir::ModulationLayout::ExplicitScaleShift) ||
+          norm->u64(ir::AttrKey::BlockSize, 256U) != 256U ||
+          !(norm->f64(ir::AttrKey::Epsilon, 1.0e-5) > 0.0))
+        return false;
+      const auto *input = program.tensor(norm->inputs.at(0));
+      const auto *weight = program.tensor(norm->inputs.at(1));
+      const auto *output = program.tensor(norm->outputs.at(0));
+      return input && weight && output && input->dtype == ir::DType::BF16 &&
+             output->dtype == ir::DType::BF16 && input->dims == output->dims &&
+             input->dims == std::vector<std::uint64_t>{attention->rows,
+                                                        attention->hidden} &&
+             weight->dtype == ir::DType::BF16 &&
+             weight->dims == std::vector<std::uint64_t>{attention->hidden};
+    };
+    if (!valid_norm(attention_norm, select.outputs.at(1),
+                    select.outputs.at(0)) ||
+        !valid_norm(mlp_norm, select.outputs.at(4), select.outputs.at(3)))
+      fail("H3 compact AdaLN requires the creator BF16 RMSNorm/modulation chain");
+    if (attention_norm->outputs.at(0) != attention->attention_input_tensor ||
+        mlp_norm->outputs.at(0) != mlp->input_tensor ||
+        !operation_by_id.contains(attention->residual_operation) ||
+        !operation_by_id.contains(mlp->residual_operation) ||
+        !single_consumer_is(select.outputs.at(0), attention_norm) ||
+        !single_consumer_is(select.outputs.at(1), attention_norm) ||
+        !single_consumer_is(select.outputs.at(2),
+                            operation_by_id.at(attention->residual_operation)) ||
+        !single_consumer_is(select.outputs.at(3), mlp_norm) ||
+        !single_consumer_is(select.outputs.at(4), mlp_norm) ||
+        !single_consumer_is(select.outputs.at(5),
+                            operation_by_id.at(mlp->residual_operation)))
+      fail("H3 compact AdaLN select outputs have an unsupported extra consumer");
+
+    const auto bind = [&](H3CompactAdaLNBinding &binding,
+                          const ir::Operation &norm, std::uint32_t scale_lane,
+                          std::uint32_t shift_lane, std::uint32_t gate_lane) {
+      binding.enabled = true;
+      binding.norm_operation = norm.id;
+      binding.norm_input_tensor = norm.inputs.at(0);
+      binding.norm_weight_tensor = norm.inputs.at(1);
+      binding.modulation_tensor = select.inputs.at(0);
+      binding.indices_tensor = select.inputs.at(1);
+      binding.scale_lane = scale_lane;
+      binding.shift_lane = shift_lane;
+      binding.gate_lane = gate_lane;
+      binding.epsilon = static_cast<float>(
+          norm.f64(ir::AttrKey::Epsilon, 1.0e-5));
+    };
+    bind(attention->compact_adaln, *attention_norm, 1U, 0U, 2U);
+    bind(mlp->compact_adaln, *mlp_norm, 4U, 3U, 5U);
+
+    H3CompactAdaLNPlan compact;
+    compact.select_operation = select.id;
+    std::copy(select.outputs.begin(), select.outputs.end(),
+              compact.expanded_tensors.begin());
+    compact.norm_operations = {attention_norm->id, mlp_norm->id};
+    compact.normalized_tensors = {attention_norm->outputs.at(0),
+                                  mlp_norm->outputs.at(0)};
+    compact.layer = attention->layer;
+    result.push_back(compact);
+  }
+  const auto complete_attention_count = static_cast<std::size_t>(std::count_if(
+      attention_plans.begin(), attention_plans.end(),
+      [](const H3W8A8AttentionPlan &plan) {
+        return plan.has_qkv_projection && plan.has_output_projection;
+      }));
+  if (result.size() != mlp_plans.size() ||
+      result.size() != complete_attention_count)
+    fail("H3 compact AdaLN did not cover every direct INT8 transformer block");
   return result;
 }
 
@@ -2972,6 +3760,249 @@ extern "C" __global__ void dif_h3_w8a8_residual(
 )CUDA";
 }
 
+std::string h3_convrot_source(bool enabled) {
+  if (!enabled)
+    return {};
+  // Source-faithful H3 ConvRot activation contract: normalized
+  // H256 = H4 kron H4 kron H4 kron H4, online in 256-wide groups, followed
+  // by dynamic per-row INT8 quantization. The checkpoint already contains
+  // the matching offline-rotated per-output-channel INT8 weights.
+  return R"CUDA(
+template<int S> __device__ __forceinline__ void dif_convrot_stage64(
+    const float* src,float* dst,int lane){
+  int base=(lane%S)+(lane/S)*(4*S);float x0=src[base],x1=src[base+S];
+  float x2=src[base+2*S],x3=src[base+3*S];
+  dst[base]=0.5f*(x0+x1+x2-x3);dst[base+S]=0.5f*(x0+x1-x2+x3);
+  dst[base+2*S]=0.5f*(x0-x1+x2+x3);dst[base+3*S]=0.5f*(-x0+x1+x2+x3);}
+template<int S> __device__ __forceinline__ float dif_convrot_stage64_store(
+    const float* src,float* output,int lane){
+  int base=(lane%S)+(lane/S)*(4*S);float x0=src[base],x1=src[base+S];
+  float x2=src[base+2*S],x3=src[base+3*S];
+  float y0=0.5f*(x0+x1+x2-x3),y1=0.5f*(x0+x1-x2+x3);
+  float y2=0.5f*(x0-x1+x2+x3),y3=0.5f*(-x0+x1+x2+x3);
+  output[base]=y0;output[base+S]=y1;output[base+2*S]=y2;output[base+3*S]=y3;
+  return fmaxf(fmaxf(fabsf(y0),fabsf(y1)),fmaxf(fabsf(y2),fabsf(y3)));}
+extern "C" __global__ void dif_convrot_int8_encode(
+    const dif_bf16* x,signed char* q,float* scales,int row_start,int rows,int K){
+  constexpr int group=256,group_threads=64,groups_in_flight=16;
+  extern __shared__ float smem[];float* row_buf=smem;float* tmp=smem+K;
+  __shared__ float warp_max[32];__shared__ float block_max;
+  int row=(int)blockIdx.x,tid=(int)threadIdx.x,sub=tid/group_threads;
+  int lane=tid%group_threads,n_groups=K/group;float local_max=0.0f;
+  unsigned long long input_base=(unsigned long long)(row_start+row)*K;
+  for(int it=0;it<(n_groups+groups_in_flight-1)/groups_in_flight;++it){
+    int g=it*groups_in_flight+sub;bool active=g<n_groups;int b=lane*4;
+    int gc=g*group,col=gc+b;float* b0=tmp+sub*(2*group);float* b1=b0+group;
+    float x0=active?dif_load_bf16(x,input_base+col):0.0f;
+    float x1=active?dif_load_bf16(x,input_base+col+1):0.0f;
+    float x2=active?dif_load_bf16(x,input_base+col+2):0.0f;
+    float x3=active?dif_load_bf16(x,input_base+col+3):0.0f;
+    b1[b]=0.5f*(x0+x1+x2-x3);b1[b+1]=0.5f*(x0+x1-x2+x3);
+    b1[b+2]=0.5f*(x0-x1+x2+x3);b1[b+3]=0.5f*(-x0+x1+x2+x3);
+    __syncthreads();dif_convrot_stage64<4>(b1,b0,lane);__syncthreads();
+    dif_convrot_stage64<16>(b0,b1,lane);__syncthreads();
+    if(active)local_max=fmaxf(local_max,
+      dif_convrot_stage64_store<64>(b1,row_buf+gc,lane));__syncthreads();}
+  for(int offset=16;offset>0;offset>>=1)local_max=fmaxf(
+      local_max,__shfl_down_sync(0xffffffff,local_max,offset));
+  int warp=tid>>5,lane32=tid&31;if(lane32==0)warp_max[warp]=local_max;
+  __syncthreads();if(warp==0){float v=lane32<32?warp_max[lane32]:0.0f;
+    for(int offset=16;offset>0;offset>>=1)v=fmaxf(v,__shfl_down_sync(0xffffffff,v,offset));
+    if(lane32==0){block_max=v;float s=v*(1.0f/127.0f);scales[row]=s<1.0e-30f?1.0e-30f:s;}}
+  __syncthreads();float scale_bf16=dif_round_bf16(scales[row]);
+  unsigned long long output_base=(unsigned long long)row*K;
+  for(int col=tid;col<K;col+=1024){float value=dif_round_bf16(row_buf[col]);
+    float scaled=dif_round_bf16(value/scale_bf16);int v=(int)nearbyintf(scaled);
+    v=v>127?127:(v<-128?-128:v);q[output_base+col]=(signed char)v;}}
+extern "C" __global__ void dif_h3_convrot_compact_adaln_encode(
+    const dif_bf16* x,const dif_bf16* weight,const dif_bf16* modulation,
+    const int* indices,signed char* q,float* scales,int row_start,int rows,
+    int K,int scale_lane,int shift_lane,float epsilon){
+  constexpr int group=256,group_threads=64,groups_in_flight=16;
+  extern __shared__ float smem[];float* reduction=smem;float* row_buf=smem;
+  float* tmp=smem+K;__shared__ float warp_max[32];__shared__ float block_max;
+  int row=(int)blockIdx.x,tid=(int)threadIdx.x,sub=tid/group_threads;
+  int lane=tid%group_threads,n_groups=K/group;int global_row=row_start+row;
+  float local=0.0f;if(tid<256){for(int col=tid;col<K;col+=256){
+    float value=dif_load_bf16(x,(unsigned long long)global_row*K+col);
+    local=__fadd_rn(local,__fmul_rn(value,value));}reduction[tid]=local;}
+  __syncthreads();for(unsigned active=128U;active>0U;active>>=1U){
+    if(tid<(int)active)reduction[tid]=__fadd_rn(reduction[tid],reduction[tid+active]);
+    __syncthreads();}
+  float inv=rsqrtf(__fadd_rn(__fdiv_rn(reduction[0],(float)K),epsilon));
+  unsigned long long table=(unsigned long long)indices[global_row];
+  unsigned long long scale_base=(table*6ULL+(unsigned long long)scale_lane)*K;
+  unsigned long long shift_base=(table*6ULL+(unsigned long long)shift_lane)*K;
+  float local_max=0.0f;
+  for(int it=0;it<(n_groups+groups_in_flight-1)/groups_in_flight;++it){
+    int g=it*groups_in_flight+sub;bool active=g<n_groups;int b=lane*4;
+    int gc=g*group,col=gc+b;float* b0=tmp+sub*(2*group);float* b1=b0+group;
+    float values[4];
+    #pragma unroll
+    for(int j=0;j<4;++j){float value=0.0f;if(active){int c=col+j;
+      unsigned long long i=(unsigned long long)global_row*K+c;
+      float normed=dif_round_bf16(dif_load_bf16(x,i)*inv*dif_load_bf16(weight,c));
+      float result=(1.0f+dif_load_bf16(modulation,scale_base+c))*normed+
+                   dif_load_bf16(modulation,shift_base+c);
+      value=dif_round_bf16(result);}values[j]=value;}
+    b1[b]=0.5f*(values[0]+values[1]+values[2]-values[3]);
+    b1[b+1]=0.5f*(values[0]+values[1]-values[2]+values[3]);
+    b1[b+2]=0.5f*(values[0]-values[1]+values[2]+values[3]);
+    b1[b+3]=0.5f*(-values[0]+values[1]+values[2]+values[3]);
+    __syncthreads();dif_convrot_stage64<4>(b1,b0,lane);__syncthreads();
+    dif_convrot_stage64<16>(b0,b1,lane);__syncthreads();
+    if(active)local_max=fmaxf(local_max,
+      dif_convrot_stage64_store<64>(b1,row_buf+gc,lane));__syncthreads();}
+  for(int offset=16;offset>0;offset>>=1)local_max=fmaxf(
+      local_max,__shfl_down_sync(0xffffffff,local_max,offset));
+  int warp=tid>>5,lane32=tid&31;if(lane32==0)warp_max[warp]=local_max;
+  __syncthreads();if(warp==0){float v=lane32<32?warp_max[lane32]:0.0f;
+    for(int offset=16;offset>0;offset>>=1)v=fmaxf(v,__shfl_down_sync(0xffffffff,v,offset));
+    if(lane32==0){block_max=v;float s=v*(1.0f/127.0f);scales[row]=s<1.0e-30f?1.0e-30f:s;}}
+  __syncthreads();float scale_bf16=dif_round_bf16(scales[row]);
+  unsigned long long output_base=(unsigned long long)row*K;
+  for(int col=tid;col<K;col+=1024){float value=dif_round_bf16(row_buf[col]);
+    float scaled=dif_round_bf16(value/scale_bf16);int v=(int)nearbyintf(scaled);
+    v=v>127?127:(v<-128?-128:v);q[output_base+col]=(signed char)v;}}
+extern "C" __global__ void dif_h3_convrot_qkv(
+    const int* accumulator,const float* x_scale,const float* w_scale,
+    dif_bf16* q,dif_bf16* k,dif_bf16* v,int row_start,int rows,int inner){
+  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x,total=(unsigned long long)rows*inner;
+  int packed=3*inner;while(i<total){int row=(int)(i/(unsigned long long)inner),col=(int)(i%(unsigned long long)inner);
+    unsigned long long oi=(unsigned long long)(row_start+row)*inner+col;
+    float xs=x_scale[row_start+row];unsigned long long base=(unsigned long long)row*packed;
+    dif_store_bf16(q,oi,(float)accumulator[base+col]*xs*w_scale[col]);
+    dif_store_bf16(k,oi,(float)accumulator[base+inner+col]*xs*w_scale[inner+col]);
+    dif_store_bf16(v,oi,(float)accumulator[base+2*inner+col]*xs*w_scale[2*inner+col]);i+=stride;}}
+extern "C" __global__ void dif_h3_convrot_qkv_bf16(
+    const dif_bf16* projected,dif_bf16* q,dif_bf16* k,dif_bf16* v,
+    int row_start,int rows,int inner){
+  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x,total=(unsigned long long)rows*inner;
+  int packed=3*inner;while(i<total){int row=(int)(i/(unsigned long long)inner),col=(int)(i%(unsigned long long)inner);
+    unsigned long long oi=(unsigned long long)(row_start+row)*inner+col;
+    unsigned long long base=(unsigned long long)row*packed;
+    dif_store_bf16(q,oi,dif_load_bf16(projected,base+col));
+    dif_store_bf16(k,oi,dif_load_bf16(projected,base+inner+col));
+    dif_store_bf16(v,oi,dif_load_bf16(projected,base+2*inner+col));i+=stride;}}
+extern "C" __global__ void dif_h3_convrot_swiglu(
+    const int* accumulator,const float* x_scale,const float* w_scale,
+    dif_bf16* output,int rows,int ffn){
+  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x,total=(unsigned long long)rows*ffn;
+  int packed=2*ffn;while(i<total){int row=(int)(i/(unsigned long long)ffn),col=(int)(i%(unsigned long long)ffn);
+    float xs=x_scale[row];float gate=dif_round_bf16((float)accumulator[(unsigned long long)row*packed+col]*xs*w_scale[col]);
+    float value=dif_round_bf16((float)accumulator[(unsigned long long)row*packed+ffn+col]*xs*w_scale[ffn+col]);
+    float activated=dif_round_bf16(gate/(1.0f+expf(-gate)));
+    dif_store_bf16(output,i,activated*value);i+=stride;}}
+extern "C" __global__ void dif_h3_convrot_swiglu_int8_encode(
+    const int* accumulator,const float* x_scale,const float* w_scale,
+    signed char* q,float* scales,int rows,int K){
+  constexpr int group=256,group_threads=64,groups_in_flight=16;
+  extern __shared__ float smem[];float* row_buf=smem;float* tmp=smem+K;
+  __shared__ float warp_max[32];__shared__ float block_max;
+  int row=(int)blockIdx.x,tid=(int)threadIdx.x,sub=tid/group_threads;
+  int lane=tid%group_threads,n_groups=K/group;float local_max=0.0f;
+  int packed=2*K;unsigned long long input_base=(unsigned long long)row*packed;
+  float xs=x_scale[row];
+  for(int it=0;it<(n_groups+groups_in_flight-1)/groups_in_flight;++it){
+    int g=it*groups_in_flight+sub;bool active=g<n_groups;int b=lane*4;
+    int gc=g*group,col=gc+b;float* b0=tmp+sub*(2*group);float* b1=b0+group;
+    float values[4];
+    #pragma unroll
+    for(int j=0;j<4;++j){int c=col+j;float gate=0.0f,value=0.0f;
+      if(active){gate=dif_round_bf16((float)accumulator[input_base+c]*xs*w_scale[c]);
+        value=dif_round_bf16((float)accumulator[input_base+K+c]*xs*w_scale[K+c]);}
+      values[j]=(gate/(1.0f+expf(-gate)))*value;}
+    b1[b]=0.5f*(values[0]+values[1]+values[2]-values[3]);
+    b1[b+1]=0.5f*(values[0]+values[1]-values[2]+values[3]);
+    b1[b+2]=0.5f*(values[0]-values[1]+values[2]+values[3]);
+    b1[b+3]=0.5f*(-values[0]+values[1]+values[2]+values[3]);
+    __syncthreads();dif_convrot_stage64<4>(b1,b0,lane);__syncthreads();
+    dif_convrot_stage64<16>(b0,b1,lane);__syncthreads();
+    if(active)local_max=fmaxf(local_max,
+      dif_convrot_stage64_store<64>(b1,row_buf+gc,lane));__syncthreads();}
+  for(int offset=16;offset>0;offset>>=1)local_max=fmaxf(
+      local_max,__shfl_down_sync(0xffffffff,local_max,offset));
+  int warp=tid>>5,lane32=tid&31;if(lane32==0)warp_max[warp]=local_max;
+  __syncthreads();if(warp==0){float v=lane32<32?warp_max[lane32]:0.0f;
+    for(int offset=16;offset>0;offset>>=1)v=fmaxf(v,__shfl_down_sync(0xffffffff,v,offset));
+    if(lane32==0){block_max=v;float s=v*(1.0f/127.0f);scales[row]=s<1.0e-30f?1.0e-30f:s;}}
+  __syncthreads();float scale_bf16=dif_round_bf16(scales[row]);
+  unsigned long long output_base=(unsigned long long)row*K;
+  for(int col=tid;col<K;col+=1024){float value=dif_round_bf16(row_buf[col]);
+    float scaled=dif_round_bf16(value/scale_bf16);int v=(int)nearbyintf(scaled);
+    v=v>127?127:(v<-128?-128:v);q[output_base+col]=(signed char)v;}}
+extern "C" __global__ void dif_h3_convrot_swiglu_bf16_int8_encode(
+    const dif_bf16* projected,signed char* q,float* scales,int rows,int K){
+  constexpr int group=256,group_threads=64,groups_in_flight=16;
+  extern __shared__ float smem[];float* row_buf=smem;float* tmp=smem+K;
+  __shared__ float warp_max[32];__shared__ float block_max;
+  int row=(int)blockIdx.x,tid=(int)threadIdx.x,sub=tid/group_threads;
+  int lane=tid%group_threads,n_groups=K/group;float local_max=0.0f;
+  int packed=2*K;unsigned long long input_base=(unsigned long long)row*packed;
+  for(int it=0;it<(n_groups+groups_in_flight-1)/groups_in_flight;++it){
+    int g=it*groups_in_flight+sub;bool active=g<n_groups;int b=lane*4;
+    int gc=g*group,col=gc+b;float* b0=tmp+sub*(2*group);float* b1=b0+group;
+    float values[4];
+    #pragma unroll
+    for(int j=0;j<4;++j){int c=col+j;float gate=0.0f,value=0.0f;
+      if(active){gate=dif_load_bf16(projected,input_base+c);
+        value=dif_load_bf16(projected,input_base+K+c);}
+      values[j]=(gate/(1.0f+expf(-gate)))*value;}
+    b1[b]=0.5f*(values[0]+values[1]+values[2]-values[3]);
+    b1[b+1]=0.5f*(values[0]+values[1]-values[2]+values[3]);
+    b1[b+2]=0.5f*(values[0]-values[1]+values[2]+values[3]);
+    b1[b+3]=0.5f*(-values[0]+values[1]+values[2]+values[3]);
+    __syncthreads();dif_convrot_stage64<4>(b1,b0,lane);__syncthreads();
+    dif_convrot_stage64<16>(b0,b1,lane);__syncthreads();
+    if(active)local_max=fmaxf(local_max,
+      dif_convrot_stage64_store<64>(b1,row_buf+gc,lane));__syncthreads();}
+  for(int offset=16;offset>0;offset>>=1)local_max=fmaxf(
+      local_max,__shfl_down_sync(0xffffffff,local_max,offset));
+  int warp=tid>>5,lane32=tid&31;if(lane32==0)warp_max[warp]=local_max;
+  __syncthreads();if(warp==0){float v=lane32<32?warp_max[lane32]:0.0f;
+    for(int offset=16;offset>0;offset>>=1)v=fmaxf(v,__shfl_down_sync(0xffffffff,v,offset));
+    if(lane32==0){block_max=v;float s=v*(1.0f/127.0f);scales[row]=s<1.0e-30f?1.0e-30f:s;}}
+  __syncthreads();float scale_bf16=dif_round_bf16(scales[row]);
+  unsigned long long output_base=(unsigned long long)row*K;
+  for(int col=tid;col<K;col+=1024){float value=dif_round_bf16(row_buf[col]);
+    float scaled=dif_round_bf16(value/scale_bf16);int v=(int)nearbyintf(scaled);
+    v=v>127?127:(v<-128?-128:v);q[output_base+col]=(signed char)v;}}
+extern "C" __global__ void dif_h3_convrot_compact_adaln_residual(
+    const int* accumulator,const float* x_scale,const float* w_scale,
+    const dif_bf16* residual,const dif_bf16* modulation,const int* indices,
+    dif_bf16* output,int row_start,int rows,int hidden,int gate_lane){
+  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  unsigned long long total=(unsigned long long)rows*hidden;while(i<total){
+    int row=(int)(i/(unsigned long long)hidden),col=(int)(i%(unsigned long long)hidden);
+    unsigned long long output_row=(unsigned long long)(row_start+row);
+    unsigned long long oi=output_row*hidden+col;
+    unsigned long long table=(unsigned long long)indices[output_row];
+    unsigned long long gi=(table*6ULL+(unsigned long long)gate_lane)*hidden+col;
+    float projected=dif_round_bf16((float)accumulator[i]*x_scale[row]*w_scale[col]);
+    float result=dif_load_bf16(residual,oi)+dif_load_bf16(modulation,gi)*projected;
+    dif_store_bf16(output,oi,result);i+=stride;}}
+extern "C" __global__ void dif_h3_convrot_compact_adaln_residual_bf16(
+    const dif_bf16* projected,const dif_bf16* residual,
+    const dif_bf16* modulation,const int* indices,dif_bf16* output,
+    int row_start,int rows,int hidden,int gate_lane){
+  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  unsigned long long total=(unsigned long long)rows*hidden;while(i<total){
+    int row=(int)(i/(unsigned long long)hidden),col=(int)(i%(unsigned long long)hidden);
+    unsigned long long output_row=(unsigned long long)(row_start+row);
+    unsigned long long oi=output_row*hidden+col;
+    unsigned long long table=(unsigned long long)indices[output_row];
+    unsigned long long gi=(table*6ULL+(unsigned long long)gate_lane)*hidden+col;
+    float result=dif_load_bf16(residual,oi)+dif_load_bf16(modulation,gi)*
+                 dif_load_bf16(projected,i);
+    dif_store_bf16(output,oi,result);i+=stride;}}
+)CUDA";
+}
+
 void assign_h3_w8a8_weights(H3W8A8MlpPlan &plan, CUdeviceptr base) {
   auto weight_offset = std::uint64_t{0U};
   auto assign_weight = [&](CUdeviceptr &pointer, const Tensor &tensor) {
@@ -2994,7 +4025,7 @@ void allocate_h3_w8a8_weights(H3W8A8MlpPlan &plan, DeviceArena *arena) {
 
 void assign_h3_w8a8_scratch(H3W8A8MlpPlan &plan, CUdeviceptr scratch) {
   const auto chunk_rows = std::min<std::uint64_t>(
-      plan.rows, kH3W8A8MlpChunkRows);
+      plan.rows, plan.chunk_rows);
   auto scratch_offset = std::uint64_t{0U};
   auto assign_scratch = [&](CUdeviceptr &pointer, std::uint64_t bytes) {
     pointer = scratch + scratch_offset;
@@ -3003,13 +4034,17 @@ void assign_h3_w8a8_scratch(H3W8A8MlpPlan &plan, CUdeviceptr scratch) {
   assign_scratch(plan.input_scale_device, chunk_rows * sizeof(float));
   assign_scratch(plan.input_i8_device, chunk_rows * plan.hidden);
   assign_scratch(plan.fc1_accumulator_device,
-                 chunk_rows * plan.packed_ffn * sizeof(std::int32_t));
+                 chunk_rows * plan.packed_ffn *
+                     (plan.cutlass_scaled_fc1 ? sizeof(std::uint16_t)
+                                              : sizeof(std::int32_t)));
   assign_scratch(plan.activation_device,
                  chunk_rows * plan.ffn * sizeof(std::uint16_t));
   assign_scratch(plan.activation_scale_device, chunk_rows * sizeof(float));
   assign_scratch(plan.activation_i8_device, chunk_rows * plan.ffn);
   assign_scratch(plan.fc2_accumulator_device,
-                 chunk_rows * plan.hidden * sizeof(std::int32_t));
+                 chunk_rows * plan.hidden *
+                     (plan.cutlass_scaled_fc2 ? sizeof(std::uint16_t)
+                                              : sizeof(std::int32_t)));
   if (scratch_offset != plan.scratch_bytes)
     fail("H3 W8A8 scratch-storage layout mismatch");
 }
@@ -3026,16 +4061,27 @@ void upload_h3_w8a8_weights(const H3W8A8MlpPlan &plan, CUstream stream) {
   upload(plan.fc2_scale_device, plan.fc2_scale);
 }
 
+using H3HostCopy =
+    std::function<void(std::uint8_t *, const std::uint8_t *, std::size_t)>;
+
+void evict_h3_w8a8_weights(const H3W8A8MlpPlan &plan) {
+  plan.fc1_weight.evict_mapped_pages();
+  plan.fc1_scale.evict_mapped_pages();
+  plan.fc2_weight.evict_mapped_pages();
+  plan.fc2_scale.evict_mapped_pages();
+}
+
 std::uint64_t stage_h3_w8a8_weights(const H3W8A8MlpPlan &plan,
                                     void *staging,
                                     std::uint64_t staging_bytes,
-                                    CUstream stream) {
+                                    CUstream stream,
+                                    const H3HostCopy &host_copy) {
   auto *base = static_cast<std::uint8_t *>(staging);
   auto cursor = std::uint64_t{0U};
   const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
     if (tensor.byte_size() > staging_bytes - cursor)
       fail("H3 W8A8 MLP tail staging overflow");
-    std::memcpy(base + cursor, tensor.data(), tensor.byte_size());
+    host_copy(base + cursor, tensor.data(), tensor.byte_size());
     check(counted_memcpy_htod(destination, base + cursor, tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 MLP tail weight");
@@ -3086,12 +4132,16 @@ void assign_h3_w8a8_scratch(H3W8A8AttentionPlan &plan,
     assign(plan.activation_scale_device, plan.rows * sizeof(float));
     assign(plan.activation_i8_device, plan.rows * plan.hidden);
     assign(plan.accumulator_device,
-           chunk_rows * plan.packed_inner * sizeof(std::int32_t));
+           chunk_rows * plan.packed_inner *
+               (plan.cutlass_scaled ? sizeof(std::uint16_t)
+                                    : sizeof(std::int32_t)));
   } else {
     assign(plan.activation_scale_device, chunk_rows * sizeof(float));
     assign(plan.activation_i8_device, chunk_rows * plan.inner);
     assign(plan.accumulator_device,
-           chunk_rows * plan.hidden * sizeof(std::int32_t));
+           chunk_rows * plan.hidden *
+               (plan.cutlass_scaled ? sizeof(std::uint16_t)
+                                    : sizeof(std::int32_t)));
   }
   if (offset != plan.scratch_bytes)
     fail("H3 W8A8 attention scratch-storage layout mismatch");
@@ -3114,16 +4164,28 @@ void upload_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
   }
 }
 
+void evict_h3_w8a8_weights(const H3W8A8AttentionPlan &plan) {
+  if (plan.has_qkv_projection) {
+    plan.qkv_weight.evict_mapped_pages();
+    plan.qkv_scale.evict_mapped_pages();
+  }
+  if (plan.has_output_projection) {
+    plan.output_weight.evict_mapped_pages();
+    plan.output_scale.evict_mapped_pages();
+  }
+}
+
 std::uint64_t stage_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
                                     void *staging,
                                     std::uint64_t staging_bytes,
-                                    CUstream stream) {
+                                    CUstream stream,
+                                    const H3HostCopy &host_copy) {
   auto *base = static_cast<std::uint8_t *>(staging);
   auto cursor = std::uint64_t{0U};
   const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
     if (tensor.byte_size() > staging_bytes - cursor)
       fail("H3 W8A8 attention tail staging overflow");
-    std::memcpy(base + cursor, tensor.data(), tensor.byte_size());
+    host_copy(base + cursor, tensor.data(), tensor.byte_size());
     check(counted_memcpy_htod(destination, base + cursor, tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 attention tail weight");
@@ -3154,31 +4216,125 @@ void launch_h3_w8a8_kernel(CUfunction function, unsigned grid,
         label);
 }
 
+void launch_h3_convrot_encode(CUfunction function, CUdeviceptr input,
+                              CUdeviceptr encoded, CUdeviceptr scale,
+                              int row_start, int rows, int columns,
+                              CUstream stream, const char *label) {
+  constexpr int group_size = 256;
+  constexpr int block_threads = 1024;
+  constexpr std::uint64_t temporary_floats = 16U * 2U * group_size;
+  if (columns <= 0 || columns % group_size != 0 || rows <= 0)
+    fail("H3 ConvRot requires positive rows and K divisible by 256");
+  const auto shared_bytes =
+      (static_cast<std::uint64_t>(columns) + temporary_floats) *
+      sizeof(float);
+  std::array<void *, 6> arguments = {
+      &input, &encoded, &scale, &row_start, &rows, &columns};
+  check(counted_launch_kernel(
+            function, static_cast<unsigned>(rows), 1U, 1U, block_threads, 1U,
+            1U, static_cast<unsigned>(shared_bytes), stream, arguments.data(),
+            nullptr),
+        label);
+}
+
+void launch_h3_convrot_compact_adaln_encode(
+    CUfunction function, const H3CompactAdaLNBinding &binding,
+    const DeviceBuffers &buffers, CUdeviceptr encoded, CUdeviceptr scale,
+    int row_start, int rows, int columns, CUstream stream,
+    const char *label) {
+  constexpr int group_size = 256;
+  constexpr int block_threads = 1024;
+  constexpr std::uint64_t temporary_floats = 16U * 2U * group_size;
+  if (!binding.enabled || columns <= 0 || columns % group_size != 0 ||
+      rows <= 0)
+    fail("H3 compact AdaLN ConvRot requires an admitted binding and aligned geometry");
+  auto input = buffers.at(binding.norm_input_tensor);
+  auto weight = buffers.at(binding.norm_weight_tensor);
+  auto modulation = buffers.at(binding.modulation_tensor);
+  auto indices = buffers.at(binding.indices_tensor);
+  auto scale_lane = static_cast<int>(binding.scale_lane);
+  auto shift_lane = static_cast<int>(binding.shift_lane);
+  auto epsilon = binding.epsilon;
+  const auto shared_bytes =
+      (static_cast<std::uint64_t>(columns) + temporary_floats) *
+      sizeof(float);
+  std::array<void *, 12> arguments = {
+      &input,      &weight,     &modulation, &indices,    &encoded,
+      &scale,      &row_start,  &rows,       &columns,    &scale_lane,
+      &shift_lane, &epsilon};
+  check(counted_launch_kernel(
+            function, static_cast<unsigned>(rows), 1U, 1U, block_threads, 1U,
+            1U, static_cast<unsigned>(shared_bytes), stream, arguments.data(),
+            nullptr),
+        label);
+}
+
+void launch_h3_direct_int8_gemm(
+    cublasHandle_t cublas, const H3Int8GemmRegistry *registry,
+    const Workspace *workspace, CUdeviceptr activation, CUdeviceptr weight,
+    CUdeviceptr accumulator, int rows, int columns, int contraction,
+    CUstream stream, const char *label) {
+  if (registry) {
+    if (!workspace)
+      fail("H3 INT8 cuBLASLt projection requires prepared workspace");
+    registry->launch(
+        {static_cast<std::uint32_t>(rows),
+         static_cast<std::uint32_t>(columns),
+         static_cast<std::uint32_t>(contraction)},
+        activation, weight, accumulator, *workspace, stream);
+    return;
+  }
+  constexpr std::int32_t alpha = 1;
+  constexpr std::int32_t beta = 0;
+  check(counted_cublas_gemm_ex(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N, columns, rows, contraction,
+            &alpha, reinterpret_cast<const void *>(weight), CUDA_R_8I,
+            contraction, reinterpret_cast<const void *>(activation),
+            CUDA_R_8I, contraction, &beta,
+            reinterpret_cast<void *>(accumulator), CUDA_R_32I, columns,
+            CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+        label);
+}
+
 void launch_h3_w8a8_qkv(const H3W8A8AttentionPlan &plan,
                          const H3W8A8Functions &functions,
+                         const H3ConvRotFunctions &convrot_functions,
                          const DeviceBuffers &buffers, cublasHandle_t cublas,
-                         CUstream stream) {
-  auto input = buffers.at(plan.attention_input_tensor);
+                         const H3Int8GemmRegistry *registry,
+#if DIF_HAS_CUTLASS
+                         const H3Int8ScaledGemmRegistry *scaled_registry,
+#endif
+                         const Workspace *workspace, CUstream stream) {
   auto scale = plan.activation_scale_device;
   auto zero = 0;
   auto rows = static_cast<int>(plan.rows);
   auto hidden = static_cast<int>(plan.hidden);
-  std::array<void *, 5> rowscale_arguments = {
-      &input, &scale, &zero, &hidden, &rows};
-  launch_h3_w8a8_kernel(functions.rowscale, static_cast<unsigned>(rows),
-                         rowscale_arguments, stream,
-                         "cuLaunchKernel H3 W8A8 QKV rowscale");
-
   auto encoded = plan.activation_i8_device;
-  std::array<void *, 6> encode_arguments = {
-      &input, &scale, &encoded, &zero, &rows, &hidden};
-  check(counted_launch_kernel(functions.encode,
-                       h3_w8a8_grid(plan.rows * plan.hidden), 1U, 1U, 256U,
-                       1U, 1U, 0U, stream, encode_arguments.data(), nullptr),
-        "cuLaunchKernel H3 W8A8 QKV encode");
+  if (plan.compact_adaln.enabled)
+    launch_h3_convrot_compact_adaln_encode(
+        convrot_functions.compact_encode, plan.compact_adaln, buffers,
+        encoded, scale, zero, rows, hidden, stream,
+        "cuLaunchKernel H3 compact AdaLN ConvRot QKV encode");
+  else if (plan.convrot)
+    launch_h3_convrot_encode(convrot_functions.encode,
+                             buffers.at(plan.attention_input_tensor), encoded,
+                             scale, zero, rows, hidden, stream,
+                             "cuLaunchKernel H3 ConvRot QKV encode");
+  else {
+    auto input = buffers.at(plan.attention_input_tensor);
+    std::array<void *, 5> rowscale_arguments = {
+        &input, &scale, &zero, &hidden, &rows};
+    launch_h3_w8a8_kernel(functions.rowscale, static_cast<unsigned>(rows),
+                           rowscale_arguments, stream,
+                           "cuLaunchKernel H3 W8A8 QKV rowscale");
+    std::array<void *, 6> encode_arguments = {
+        &input, &scale, &encoded, &zero, &rows, &hidden};
+    check(counted_launch_kernel(functions.encode,
+                         h3_w8a8_grid(plan.rows * plan.hidden), 1U, 1U, 256U,
+                         1U, 1U, 0U, stream, encode_arguments.data(), nullptr),
+          "cuLaunchKernel H3 W8A8 QKV encode");
+  }
 
-  constexpr std::int32_t alpha = 1;
-  constexpr std::int32_t beta = 0;
   auto packed_inner = static_cast<int>(plan.packed_inner);
   auto inner = static_cast<int>(plan.inner);
   for (std::uint64_t row_start = 0U; row_start < plan.rows;
@@ -3186,15 +4342,22 @@ void launch_h3_w8a8_qkv(const H3W8A8AttentionPlan &plan,
     auto chunk_rows = static_cast<int>(std::min<std::uint64_t>(
         kH3W8A8ProjectionChunkRows, plan.rows - row_start));
     auto chunk_input = plan.activation_i8_device + row_start * plan.hidden;
-    check(counted_cublas_gemm_ex(
-              cublas, CUBLAS_OP_T, CUBLAS_OP_N, packed_inner, chunk_rows,
-              hidden, &alpha,
-              reinterpret_cast<const void *>(plan.qkv_weight_device),
-              CUDA_R_8I, hidden,
-              reinterpret_cast<const void *>(chunk_input), CUDA_R_8I, hidden,
-              &beta, reinterpret_cast<void *>(plan.accumulator_device),
-              CUDA_R_32I, packed_inner, CUBLAS_COMPUTE_32I,
-              CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+#if DIF_HAS_CUTLASS
+    if (plan.cutlass_scaled) {
+      if (!scaled_registry)
+        fail("H3 CUTLASS scaled QKV plan is missing its prepared registry");
+      scaled_registry->launch(
+          {static_cast<std::uint32_t>(chunk_rows),
+           static_cast<std::uint32_t>(packed_inner),
+           static_cast<std::uint32_t>(hidden)},
+          chunk_input, plan.qkv_weight_device,
+          plan.activation_scale_device + row_start * sizeof(float),
+          plan.qkv_scale_device, plan.accumulator_device, stream);
+    } else
+#endif
+      launch_h3_direct_int8_gemm(
+          cublas, registry, workspace, chunk_input, plan.qkv_weight_device,
+          plan.accumulator_device, chunk_rows, packed_inner, hidden, stream,
           "cublasGemmEx H3 W8A8 QKV");
     auto accumulator = plan.accumulator_device;
     auto weight_scale = plan.qkv_scale_device;
@@ -3202,185 +4365,324 @@ void launch_h3_w8a8_qkv(const H3W8A8AttentionPlan &plan,
     auto k = buffers.at(plan.qkv_output_tensors.at(1));
     auto v = buffers.at(plan.qkv_output_tensors.at(2));
     auto row_start_i32 = static_cast<int>(row_start);
-    std::array<void *, 9> arguments = {
-        &accumulator, &scale, &weight_scale, &q, &k, &v,
-        &row_start_i32, &chunk_rows, &inner};
-    check(counted_launch_kernel(functions.qkv,
-                         h3_w8a8_grid(static_cast<std::uint64_t>(chunk_rows) *
-                                     plan.inner),
-                         1U, 1U, 256U, 1U, 1U, 0U, stream, arguments.data(),
-                         nullptr),
-          "cuLaunchKernel H3 W8A8 QKV dequant");
+    const auto grid = h3_w8a8_grid(
+        static_cast<std::uint64_t>(chunk_rows) * plan.inner);
+    if (plan.cutlass_scaled) {
+      std::array<void *, 7> arguments = {
+          &accumulator, &q, &k, &v, &row_start_i32, &chunk_rows, &inner};
+      check(counted_launch_kernel(convrot_functions.qkv_bf16, grid, 1U, 1U,
+                                  256U, 1U, 1U, 0U, stream,
+                                  arguments.data(), nullptr),
+            "cuLaunchKernel H3 ConvRot BF16 QKV split");
+    } else if (plan.convrot) {
+      std::array<void *, 9> arguments = {
+          &accumulator, &scale, &weight_scale, &q, &k, &v,
+          &row_start_i32, &chunk_rows, &inner};
+      check(counted_launch_kernel(convrot_functions.qkv, grid, 1U, 1U, 256U,
+                                  1U, 1U, 0U, stream, arguments.data(),
+                                  nullptr),
+            "cuLaunchKernel H3 ConvRot QKV dequant");
+    } else {
+      std::array<void *, 9> arguments = {
+          &accumulator, &scale, &weight_scale, &q, &k, &v,
+          &row_start_i32, &chunk_rows, &inner};
+      check(counted_launch_kernel(functions.qkv, grid, 1U, 1U, 256U, 1U, 1U,
+                                  0U, stream, arguments.data(), nullptr),
+            "cuLaunchKernel H3 W8A8 QKV dequant");
+    }
   }
 }
 
 void launch_h3_w8a8_output(const H3W8A8AttentionPlan &plan,
                             const H3W8A8Functions &functions,
+                            const H3ConvRotFunctions &convrot_functions,
                             const DeviceBuffers &buffers,
-                            cublasHandle_t cublas, CUstream stream) {
+                            cublasHandle_t cublas,
+                            const H3Int8GemmRegistry *registry,
+#if DIF_HAS_CUTLASS
+                            const H3Int8ScaledGemmRegistry *scaled_registry,
+#endif
+                            const Workspace *workspace, CUstream stream) {
   auto input = buffers.at(plan.output_input_tensor);
   auto residual = buffers.at(plan.residual_tensor);
-  auto gate = buffers.at(plan.gate_tensor);
   auto output = buffers.at(plan.output_tensor);
   auto inner = static_cast<int>(plan.inner);
   auto hidden = static_cast<int>(plan.hidden);
-  constexpr std::int32_t alpha = 1;
-  constexpr std::int32_t beta = 0;
   for (std::uint64_t row_start = 0U; row_start < plan.rows;
        row_start += kH3W8A8ProjectionChunkRows) {
     auto rows = static_cast<int>(std::min<std::uint64_t>(
         kH3W8A8ProjectionChunkRows, plan.rows - row_start));
     auto row_start_i32 = static_cast<int>(row_start);
     auto scale = plan.activation_scale_device;
-    std::array<void *, 5> rowscale_arguments = {
-        &input, &scale, &row_start_i32, &inner, &rows};
-    launch_h3_w8a8_kernel(functions.rowscale, static_cast<unsigned>(rows),
-                           rowscale_arguments, stream,
-                           "cuLaunchKernel H3 W8A8 output rowscale");
     auto encoded = plan.activation_i8_device;
-    std::array<void *, 6> encode_arguments = {
-        &input, &scale, &encoded, &row_start_i32, &rows, &inner};
-    check(counted_launch_kernel(functions.encode,
-                         h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
-                                     plan.inner),
-                         1U, 1U, 256U, 1U, 1U, 0U, stream,
-                         encode_arguments.data(), nullptr),
-          "cuLaunchKernel H3 W8A8 output encode");
-    check(counted_cublas_gemm_ex(
-              cublas, CUBLAS_OP_T, CUBLAS_OP_N, hidden, rows, inner, &alpha,
-              reinterpret_cast<const void *>(plan.output_weight_device),
-              CUDA_R_8I, inner,
-              reinterpret_cast<const void *>(plan.activation_i8_device),
-              CUDA_R_8I, inner, &beta,
-              reinterpret_cast<void *>(plan.accumulator_device), CUDA_R_32I,
-              hidden, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-          "cublasGemmEx H3 W8A8 output projection");
+    if (plan.convrot)
+      launch_h3_convrot_encode(convrot_functions.encode, input, encoded, scale,
+                               row_start_i32, rows, inner, stream,
+                               "cuLaunchKernel H3 ConvRot output encode");
+    else {
+      std::array<void *, 5> rowscale_arguments = {
+          &input, &scale, &row_start_i32, &inner, &rows};
+      launch_h3_w8a8_kernel(functions.rowscale, static_cast<unsigned>(rows),
+                             rowscale_arguments, stream,
+                             "cuLaunchKernel H3 W8A8 output rowscale");
+      std::array<void *, 6> encode_arguments = {
+          &input, &scale, &encoded, &row_start_i32, &rows, &inner};
+      check(counted_launch_kernel(functions.encode,
+                           h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
+                                       plan.inner),
+                           1U, 1U, 256U, 1U, 1U, 0U, stream,
+                           encode_arguments.data(), nullptr),
+            "cuLaunchKernel H3 W8A8 output encode");
+    }
+#if DIF_HAS_CUTLASS
+    if (plan.cutlass_scaled) {
+      if (!scaled_registry)
+        fail("H3 CUTLASS scaled output plan is missing its prepared registry");
+      scaled_registry->launch(
+          {static_cast<std::uint32_t>(rows),
+           static_cast<std::uint32_t>(hidden),
+           static_cast<std::uint32_t>(inner)},
+          plan.activation_i8_device, plan.output_weight_device,
+          plan.activation_scale_device, plan.output_scale_device,
+          plan.accumulator_device, stream);
+    } else
+#endif
+      launch_h3_direct_int8_gemm(
+          cublas, registry, workspace, plan.activation_i8_device,
+          plan.output_weight_device, plan.accumulator_device, rows, hidden,
+          inner, stream, "cublasGemmEx H3 W8A8 output projection");
     auto accumulator = plan.accumulator_device;
     auto weight_scale = plan.output_scale_device;
-    std::array<void *, 9> residual_arguments = {
-        &accumulator, &scale, &weight_scale, &residual, &gate, &output,
-        &row_start_i32, &rows, &hidden};
-    check(counted_launch_kernel(functions.residual,
-                         h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
-                                     plan.hidden),
-                         1U, 1U, 256U, 1U, 1U, 0U, stream,
-                         residual_arguments.data(), nullptr),
-          "cuLaunchKernel H3 W8A8 output residual");
+    const auto grid = h3_w8a8_grid(
+        static_cast<std::uint64_t>(rows) * plan.hidden);
+    if (plan.compact_adaln.enabled) {
+      auto modulation = buffers.at(plan.compact_adaln.modulation_tensor);
+      auto indices = buffers.at(plan.compact_adaln.indices_tensor);
+      auto gate_lane = static_cast<int>(plan.compact_adaln.gate_lane);
+      if (plan.cutlass_scaled) {
+        std::array<void *, 9> residual_arguments = {
+            &accumulator, &residual, &modulation, &indices, &output,
+            &row_start_i32, &rows, &hidden, &gate_lane};
+        check(counted_launch_kernel(
+                  convrot_functions.compact_residual_bf16, grid, 1U, 1U,
+                  256U, 1U, 1U, 0U, stream, residual_arguments.data(),
+                  nullptr),
+              "cuLaunchKernel H3 compact AdaLN BF16 output residual");
+      } else {
+        std::array<void *, 11> residual_arguments = {
+            &accumulator, &scale, &weight_scale, &residual, &modulation,
+            &indices, &output, &row_start_i32, &rows, &hidden, &gate_lane};
+        check(counted_launch_kernel(
+                  convrot_functions.compact_residual, grid, 1U, 1U, 256U,
+                  1U, 1U, 0U, stream, residual_arguments.data(), nullptr),
+              "cuLaunchKernel H3 compact AdaLN output residual");
+      }
+    } else {
+      auto gate = buffers.at(plan.gate_tensor);
+      std::array<void *, 9> residual_arguments = {
+          &accumulator, &scale, &weight_scale, &residual, &gate, &output,
+          &row_start_i32, &rows, &hidden};
+      check(counted_launch_kernel(functions.residual, grid, 1U, 1U, 256U,
+                                  1U, 1U, 0U, stream,
+                                  residual_arguments.data(), nullptr),
+            "cuLaunchKernel H3 W8A8 output residual");
+    }
   }
 }
 
 void launch_h3_w8a8_mlp(const H3W8A8MlpPlan &plan,
                          const H3W8A8Functions &functions,
+                         const H3ConvRotFunctions &convrot_functions,
                          const DeviceBuffers &buffers, cublasHandle_t cublas,
-                         CUstream stream) {
-  const auto input = buffers.at(plan.input_tensor);
+                         const H3Int8GemmRegistry *registry,
+#if DIF_HAS_CUTLASS
+                         const H3Int8ScaledGemmRegistry *scaled_registry,
+#endif
+                         const Workspace *workspace, CUstream stream) {
   const auto residual = buffers.at(plan.residual_tensor);
-  const auto gate = buffers.at(plan.gate_tensor);
   const auto output = buffers.at(plan.output_tensor);
   auto hidden = static_cast<int>(plan.hidden);
   auto ffn = static_cast<int>(plan.ffn);
   auto packed_ffn = static_cast<int>(plan.packed_ffn);
-  constexpr std::int32_t alpha = 1;
-  constexpr std::int32_t beta = 0;
-
   auto gemm = [&](CUdeviceptr activation, CUdeviceptr weight,
                   CUdeviceptr accumulator, int rows, int columns,
                   int contraction) {
-    check(counted_cublas_gemm_ex(
-              cublas, CUBLAS_OP_T, CUBLAS_OP_N, columns, rows, contraction,
-              &alpha, reinterpret_cast<const void *>(weight), CUDA_R_8I,
-              contraction, reinterpret_cast<const void *>(activation),
-              CUDA_R_8I, contraction, &beta,
-              reinterpret_cast<void *>(accumulator), CUDA_R_32I, columns,
-              CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-          "cublasGemmEx H3 W8A8");
+    launch_h3_direct_int8_gemm(
+        cublas, registry, workspace, activation, weight, accumulator, rows,
+        columns, contraction, stream, "cublasGemmEx H3 W8A8");
   };
 
   for (std::uint64_t row_start = 0U; row_start < plan.rows;
-       row_start += kH3W8A8MlpChunkRows) {
+       row_start += plan.chunk_rows) {
     auto rows = static_cast<int>(std::min<std::uint64_t>(
-        kH3W8A8MlpChunkRows, plan.rows - row_start));
+        plan.chunk_rows, plan.rows - row_start));
     auto row_start_i32 = static_cast<int>(row_start);
 
-    auto rowscale_input = input;
-    auto rowscale_output = plan.input_scale_device;
-    std::array<void *, 5> rowscale_arguments = {
-        &rowscale_input, &rowscale_output, &row_start_i32, &hidden, &rows};
-    launch_h3_w8a8_kernel(functions.rowscale,
-                           static_cast<unsigned>(rows), rowscale_arguments,
-                           stream, "cuLaunchKernel H3 W8A8 input rowscale");
+    auto input_scale = plan.input_scale_device;
+    auto input_i8 = plan.input_i8_device;
+    if (plan.compact_adaln.enabled)
+      launch_h3_convrot_compact_adaln_encode(
+          convrot_functions.compact_encode, plan.compact_adaln, buffers,
+          input_i8, input_scale, row_start_i32, rows, hidden, stream,
+          "cuLaunchKernel H3 compact AdaLN ConvRot MLP input encode");
+    else if (plan.convrot)
+      launch_h3_convrot_encode(convrot_functions.encode,
+                               buffers.at(plan.input_tensor), input_i8,
+                               input_scale, row_start_i32, rows, hidden,
+                               stream,
+                               "cuLaunchKernel H3 ConvRot MLP input encode");
+    else {
+      auto input = buffers.at(plan.input_tensor);
+      std::array<void *, 5> rowscale_arguments = {
+          &input, &input_scale, &row_start_i32, &hidden, &rows};
+      launch_h3_w8a8_kernel(functions.rowscale,
+                             static_cast<unsigned>(rows), rowscale_arguments,
+                             stream, "cuLaunchKernel H3 W8A8 input rowscale");
+      std::array<void *, 6> full_encode_arguments = {
+          &input, &input_scale, &input_i8, &row_start_i32, &rows, &hidden};
+      check(counted_launch_kernel(functions.encode,
+                           h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
+                                       plan.hidden),
+                           1U, 1U, 256U, 1U, 1U, 0U, stream,
+                           full_encode_arguments.data(), nullptr),
+            "cuLaunchKernel H3 W8A8 input encode");
+    }
 
-    auto encode_input = input;
-    auto encode_scale = plan.input_scale_device;
-    auto encode_output = plan.input_i8_device;
-    std::array<void *, 6> full_encode_arguments = {
-        &encode_input, &encode_scale, &encode_output,
-        &row_start_i32, &rows, &hidden};
-    check(counted_launch_kernel(functions.encode,
-                         h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
-                                     plan.hidden),
-                         1U, 1U, 256U, 1U, 1U, 0U, stream,
-                         full_encode_arguments.data(), nullptr),
-          "cuLaunchKernel H3 W8A8 input encode");
-
-    gemm(plan.input_i8_device, plan.fc1_weight_device,
-         plan.fc1_accumulator_device, rows, packed_ffn, hidden);
-
-    auto swiglu_accumulator = plan.fc1_accumulator_device;
-    auto swiglu_input_scale = plan.input_scale_device;
-    auto swiglu_weight_scale = plan.fc1_scale_device;
-    auto swiglu_output = plan.activation_device;
-    std::array<void *, 6> swiglu_arguments = {
-        &swiglu_accumulator, &swiglu_input_scale, &swiglu_weight_scale,
-        &swiglu_output, &rows, &ffn};
-    check(counted_launch_kernel(functions.swiglu,
-                         h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
-                                     plan.ffn),
-                         1U, 1U, 256U, 1U, 1U, 0U, stream,
-                         swiglu_arguments.data(), nullptr),
-          "cuLaunchKernel H3 W8A8 SwiGLU");
+#if DIF_HAS_CUTLASS
+    if (plan.cutlass_scaled_fc1) {
+      if (!scaled_registry)
+        fail("H3 CUTLASS scaled FC1 plan is missing its prepared registry");
+      scaled_registry->launch(
+          {static_cast<std::uint32_t>(rows),
+           static_cast<std::uint32_t>(packed_ffn),
+           static_cast<std::uint32_t>(hidden)},
+          plan.input_i8_device, plan.fc1_weight_device,
+          plan.input_scale_device, plan.fc1_scale_device,
+          plan.fc1_accumulator_device, stream);
+    } else
+#endif
+      gemm(plan.input_i8_device, plan.fc1_weight_device,
+           plan.fc1_accumulator_device, rows, packed_ffn, hidden);
 
     auto rowscale_activation = plan.activation_device;
     auto rowscale_activation_output = plan.activation_scale_device;
     auto zero = 0;
-    std::array<void *, 5> activation_rowscale_arguments = {
-        &rowscale_activation, &rowscale_activation_output, &zero, &ffn, &rows};
-    launch_h3_w8a8_kernel(
-        functions.rowscale, static_cast<unsigned>(rows),
-        activation_rowscale_arguments, stream,
-        "cuLaunchKernel H3 W8A8 activation rowscale");
-
     auto activation_scale = plan.activation_scale_device;
     auto activation_i8 = plan.activation_i8_device;
-    std::array<void *, 6> activation_encode_arguments = {
-        &rowscale_activation, &activation_scale, &activation_i8,
-        &zero, &rows, &ffn};
-    check(counted_launch_kernel(functions.encode,
-                         h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
-                                     plan.ffn),
-                         1U, 1U, 256U, 1U, 1U, 0U, stream,
-                         activation_encode_arguments.data(), nullptr),
-          "cuLaunchKernel H3 W8A8 activation encode");
+    auto swiglu_accumulator = plan.fc1_accumulator_device;
+    auto swiglu_input_scale = plan.input_scale_device;
+    auto swiglu_weight_scale = plan.fc1_scale_device;
+    if (plan.convrot) {
+      constexpr std::uint64_t temporary_floats = 16U * 2U * 256U;
+      const auto shared_bytes =
+          (plan.ffn + temporary_floats) * sizeof(float);
+      if (plan.cutlass_scaled_fc1) {
+        std::array<void *, 5> arguments = {
+            &swiglu_accumulator, &activation_i8, &activation_scale, &rows,
+            &ffn};
+        check(counted_launch_kernel(
+                  convrot_functions.swiglu_bf16_encode,
+                  static_cast<unsigned>(rows), 1U, 1U, 1024U, 1U, 1U,
+                  static_cast<unsigned>(shared_bytes), stream,
+                  arguments.data(), nullptr),
+              "cuLaunchKernel H3 ConvRot BF16 SwiGLU encode");
+      } else {
+        std::array<void *, 7> arguments = {
+            &swiglu_accumulator, &swiglu_input_scale, &swiglu_weight_scale,
+            &activation_i8, &activation_scale, &rows, &ffn};
+        check(counted_launch_kernel(
+                  convrot_functions.swiglu_encode,
+                  static_cast<unsigned>(rows), 1U, 1U, 1024U, 1U, 1U,
+                  static_cast<unsigned>(shared_bytes), stream,
+                  arguments.data(), nullptr),
+              "cuLaunchKernel H3 ConvRot SwiGLU encode");
+      }
+    } else {
+      auto swiglu_output = plan.activation_device;
+      std::array<void *, 6> swiglu_arguments = {
+          &swiglu_accumulator, &swiglu_input_scale, &swiglu_weight_scale,
+          &swiglu_output, &rows, &ffn};
+      check(counted_launch_kernel(functions.swiglu,
+                           h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
+                                       plan.ffn),
+                           1U, 1U, 256U, 1U, 1U, 0U, stream,
+                           swiglu_arguments.data(), nullptr),
+            "cuLaunchKernel H3 W8A8 SwiGLU");
+      std::array<void *, 5> activation_rowscale_arguments = {
+          &rowscale_activation, &rowscale_activation_output, &zero, &ffn,
+          &rows};
+      launch_h3_w8a8_kernel(
+          functions.rowscale, static_cast<unsigned>(rows),
+          activation_rowscale_arguments, stream,
+          "cuLaunchKernel H3 W8A8 activation rowscale");
+      std::array<void *, 6> activation_encode_arguments = {
+          &rowscale_activation, &activation_scale, &activation_i8,
+          &zero, &rows, &ffn};
+      check(counted_launch_kernel(functions.encode,
+                           h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
+                                       plan.ffn),
+                           1U, 1U, 256U, 1U, 1U, 0U, stream,
+                           activation_encode_arguments.data(), nullptr),
+            "cuLaunchKernel H3 W8A8 activation encode");
+    }
 
-    gemm(plan.activation_i8_device, plan.fc2_weight_device,
-         plan.fc2_accumulator_device, rows, hidden, ffn);
+#if DIF_HAS_CUTLASS
+    if (plan.cutlass_scaled_fc2) {
+      if (!scaled_registry)
+        fail("H3 CUTLASS scaled FC2 plan is missing its prepared registry");
+      scaled_registry->launch(
+          {static_cast<std::uint32_t>(rows),
+           static_cast<std::uint32_t>(hidden),
+           static_cast<std::uint32_t>(ffn)},
+          plan.activation_i8_device, plan.fc2_weight_device,
+          plan.activation_scale_device, plan.fc2_scale_device,
+          plan.fc2_accumulator_device, stream);
+    } else
+#endif
+      gemm(plan.activation_i8_device, plan.fc2_weight_device,
+           plan.fc2_accumulator_device, rows, hidden, ffn);
 
     auto residual_accumulator = plan.fc2_accumulator_device;
     auto residual_scale = plan.activation_scale_device;
     auto residual_weight_scale = plan.fc2_scale_device;
     auto residual_input = residual;
-    auto residual_gate = gate;
     auto residual_output = output;
-    std::array<void *, 9> residual_arguments = {
-        &residual_accumulator, &residual_scale, &residual_weight_scale,
-        &residual_input, &residual_gate, &residual_output,
-        &row_start_i32, &rows, &hidden};
-    check(counted_launch_kernel(functions.residual,
-                         h3_w8a8_grid(static_cast<std::uint64_t>(rows) *
-                                     plan.hidden),
-                         1U, 1U, 256U, 1U, 1U, 0U, stream,
-                         residual_arguments.data(), nullptr),
-          "cuLaunchKernel H3 W8A8 residual");
+    const auto grid = h3_w8a8_grid(
+        static_cast<std::uint64_t>(rows) * plan.hidden);
+    if (plan.compact_adaln.enabled) {
+      auto modulation = buffers.at(plan.compact_adaln.modulation_tensor);
+      auto indices = buffers.at(plan.compact_adaln.indices_tensor);
+      auto gate_lane = static_cast<int>(plan.compact_adaln.gate_lane);
+      if (plan.cutlass_scaled_fc2) {
+        std::array<void *, 9> residual_arguments = {
+            &residual_accumulator, &residual_input, &modulation, &indices,
+            &residual_output, &row_start_i32, &rows, &hidden, &gate_lane};
+        check(counted_launch_kernel(
+                  convrot_functions.compact_residual_bf16, grid, 1U, 1U,
+                  256U, 1U, 1U, 0U, stream, residual_arguments.data(),
+                  nullptr),
+              "cuLaunchKernel H3 compact AdaLN BF16 MLP residual");
+      } else {
+        std::array<void *, 11> residual_arguments = {
+            &residual_accumulator, &residual_scale, &residual_weight_scale,
+            &residual_input, &modulation, &indices, &residual_output,
+            &row_start_i32, &rows, &hidden, &gate_lane};
+        check(counted_launch_kernel(
+                  convrot_functions.compact_residual, grid, 1U, 1U, 256U,
+                  1U, 1U, 0U, stream, residual_arguments.data(), nullptr),
+              "cuLaunchKernel H3 compact AdaLN MLP residual");
+      }
+    } else {
+      auto residual_gate = buffers.at(plan.gate_tensor);
+      std::array<void *, 9> residual_arguments = {
+          &residual_accumulator, &residual_scale, &residual_weight_scale,
+          &residual_input, &residual_gate, &residual_output,
+          &row_start_i32, &rows, &hidden};
+      check(counted_launch_kernel(functions.residual, grid, 1U, 1U, 256U,
+                                  1U, 1U, 0U, stream,
+                                  residual_arguments.data(), nullptr),
+            "cuLaunchKernel H3 W8A8 residual");
+    }
   }
 }
 
@@ -3619,7 +4921,8 @@ public:
                      std::uint32_t stage_threads,
                      std::uint64_t pinned_budget_bytes,
                      std::unordered_set<std::uint32_t> resident_overrides,
-                     std::unordered_set<std::uint32_t> lazy_resident_overrides)
+                     std::unordered_set<std::uint32_t> lazy_resident_overrides,
+                     bool describe_plan)
       : program_(program), constants_(constants), plan_(plan), buffers_(buffers),
         context_(context), staging_pool_(stage_threads),
         resident_overrides_(std::move(resident_overrides)),
@@ -3697,23 +5000,47 @@ public:
       }
       overwrite_wait_operation_.emplace(id, wait);
     }
+    if (describe_plan) {
+      auto total = std::uint64_t{0U};
+      for (const auto &[id, first] : first_consumer_) {
+        (void)first;
+        total += constants_.at(id).byte_size();
+      }
+      std::cerr << "STREAMED_PREFETCH_PLAN tensors=" << first_consumer_.size()
+                << " bytes_per_iteration=" << total << '\n';
+      for (const auto &[id, first] : first_consumer_) {
+        const auto bytes = constants_.at(id).byte_size();
+        if (bytes >= 64ULL * 1024ULL * 1024ULL)
+          std::cerr << "STREAMED_PREFETCH_TENSOR id=" << id
+                    << " bytes=" << bytes << " first_operation=" << first
+                    << '\n';
+      }
+    }
   }
 
-  void begin_profile(std::uint32_t iterations) {
+  void begin_profile(
+      std::uint32_t iterations,
+      const std::unordered_set<std::uint32_t> &repeated_invariant_operations,
+      std::uint32_t repeated_invariant_executions) {
     profiling_ = true;
     streamed_bytes_ = 0U;
     host_stage_milliseconds_ = 0.0;
     host_wait_milliseconds_ = 0.0;
+    profiled_copy_counts_.clear();
     next_copy_timing_ = 0U;
     copy_timings_.clear();
     std::size_t count = 0U;
     for (const auto &[id, first] : first_consumer_) {
-      (void)first;
       if (!active(id))
         continue;
-      count += lazy_resident_overrides_.contains(id)
-                   ? 1U
-                   : static_cast<std::size_t>(iterations);
+      if (lazy_resident_overrides_.contains(id)) {
+        count += 1U;
+        continue;
+      }
+      const auto invariant = repeated_invariant_operations.contains(
+          program_.operations.at(first).id);
+      count += invariant ? repeated_invariant_executions
+                         : static_cast<std::size_t>(iterations);
     }
     copy_timings_.reserve(count);
     for (std::size_t index = 0U; index < count; ++index)
@@ -3738,6 +5065,21 @@ public:
     profile.streamed_host_stage_milliseconds = host_stage_milliseconds_;
     profile.streamed_host_wait_milliseconds = host_wait_milliseconds_;
     profile.streamed_h2d_milliseconds = h2d_milliseconds;
+    std::vector<std::pair<std::uint32_t, std::size_t>> copied;
+    copied.reserve(profiled_copy_counts_.size());
+    for (const auto &[id, copies] : profiled_copy_counts_)
+      copied.emplace_back(id, copies);
+    std::sort(copied.begin(), copied.end());
+    auto copied_bytes = std::uint64_t{0U};
+    for (const auto &[id, copies] : copied) {
+      (void)copies;
+      copied_bytes += constants_.at(id).byte_size();
+    }
+    if (!copied.empty()) {
+      std::cerr << "STREAMED_COPY_PROFILE tensors=" << copied.size()
+                << " bytes=" << copied_bytes
+                << '\n';
+    }
     profiling_ = false;
   }
 
@@ -3801,6 +5143,7 @@ public:
                 std::chrono::steady_clock::now() - host_stage_start)
                 .count();
         streamed_bytes_ += tensor.byte_size();
+        ++profiled_copy_counts_[id];
         if (next_copy_timing_ >= copy_timings_.size())
           fail("streamed pipeline profile observed an unexpected weight copy");
         auto &timing = copy_timings_.at(next_copy_timing_++);
@@ -3901,6 +5244,7 @@ private:
   double host_wait_milliseconds_{};
   std::size_t next_copy_timing_{};
   std::vector<CopyTiming> copy_timings_;
+  std::unordered_map<std::uint32_t, std::size_t> profiled_copy_counts_;
 };
 
 void upload_resident_constants(const ir::Program &program,
@@ -4004,6 +5348,99 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
         "cuLaunchKernel");
 }
 
+struct RepeatedInvariantPlan {
+  std::unordered_set<std::uint32_t> operations;
+  std::unordered_set<std::uint32_t> persistent_tensors;
+  std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
+      outputs_by_producer;
+  std::vector<std::uint32_t> input_tensors;
+  std::uint64_t persistent_bytes{};
+};
+
+RepeatedInvariantPlan find_repeated_invariant_plan(
+    const ir::Program &program,
+    const std::vector<std::uint32_t> &requested_operations) {
+  RepeatedInvariantPlan result;
+  if (requested_operations.empty())
+    return result;
+
+  std::unordered_map<std::uint32_t, const ir::Operation *> operations;
+  std::unordered_map<std::uint32_t, const ir::Operation *> producers;
+  std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>>
+      consumers;
+  for (const auto &operation : program.operations) {
+    if (!operations.emplace(operation.id, &operation).second)
+      fail("repeated-invariant plan found a duplicate operation id");
+    for (const auto output : operation.outputs)
+      producers.emplace(output, &operation);
+    for (const auto input : operation.inputs)
+      consumers[input].push_back(&operation);
+  }
+  for (const auto operation_id : requested_operations) {
+    if (!operations.contains(operation_id))
+      fail("repeated-invariant plan references missing operation " +
+           std::to_string(operation_id));
+    if (!result.operations.insert(operation_id).second)
+      fail("repeated-invariant plan contains duplicate operation " +
+           std::to_string(operation_id));
+  }
+
+  std::unordered_set<std::uint32_t> external_inputs;
+  for (const auto operation_id : result.operations) {
+    const auto &operation = *operations.at(operation_id);
+    if (operation.opcode == ir::Opcode::Barrier)
+      fail("repeated-invariant plan may contain only pure tensor operations");
+    for (const auto input : operation.inputs) {
+      const auto produced = producers.find(input);
+      if (produced != producers.end()) {
+        if (!result.operations.contains(produced->second->id))
+          fail("repeated-invariant plan is not dependency-closed at tensor " +
+               std::to_string(input));
+        continue;
+      }
+      const auto *description = program.tensor(input);
+      if (!description ||
+          (!description->has_role(ir::TensorRole::Input) &&
+           !description->has_role(ir::TensorRole::Constant)))
+        fail("repeated-invariant plan depends on an unbound tensor " +
+             std::to_string(input));
+      if (description->has_role(ir::TensorRole::Input))
+        external_inputs.insert(input);
+      if (description->has_role(ir::TensorRole::Streamed)) {
+        for (const auto *consumer : consumers[input])
+          if (!result.operations.contains(consumer->id))
+            fail("repeated-invariant streamed tensor has a consumer outside "
+                 "the cached region: " +
+                 std::to_string(input));
+      }
+    }
+    for (const auto output : operation.outputs) {
+      const auto *description = program.tensor(output);
+      if (!description)
+        fail("repeated-invariant operation has a missing output tensor");
+      const auto crossing =
+          description->has_role(ir::TensorRole::Output) ||
+          std::any_of(consumers[output].begin(), consumers[output].end(),
+                      [&](const auto *consumer) {
+                        return !result.operations.contains(consumer->id);
+                      });
+      if (!crossing)
+        continue;
+      if (description->roles ==
+          static_cast<std::uint32_t>(ir::TensorRole::Internal)) {
+        result.persistent_tensors.insert(output);
+        result.outputs_by_producer[operation.id].push_back(output);
+        result.persistent_bytes += description->byte_count();
+      }
+    }
+  }
+  if (result.persistent_tensors.empty())
+    fail("repeated-invariant plan has no internal output crossing its boundary");
+  result.input_tensors.assign(external_inputs.begin(), external_inputs.end());
+  std::sort(result.input_tensors.begin(), result.input_tensors.end());
+  return result;
+}
+
 class CudaPreparedExecution final : public PreparedExecution {
 public:
   CudaPreparedExecution(ir::Program program, const TensorMap &bindings,
@@ -4015,8 +5452,57 @@ public:
     TelemetryScope telemetry_scope(preparation_telemetry_);
     if (options.lazy_resident_upload && options.pipelined_resident_upload)
       fail("lazy and pipelined resident upload are mutually exclusive");
+    if (options.cudnn_attention_heuristic > 3U)
+      fail("cuDNN attention heuristic must be 0 (A), 1 (B), 2 (FALLBACK), or 3 (autotune)");
+    cudnn_attention_heuristic_ = options.cudnn_attention_heuristic;
     lazy_resident_upload_ = options.lazy_resident_upload;
     ir::verify(program_);
+    auto repeated_invariant = find_repeated_invariant_plan(
+        program_, options.repeated_invariant_operations);
+    repeated_invariant_operations_ = std::move(repeated_invariant.operations);
+    repeated_invariant_persistent_tensors_ =
+        std::move(repeated_invariant.persistent_tensors);
+    repeated_invariant_outputs_by_producer_ =
+        std::move(repeated_invariant.outputs_by_producer);
+    repeated_invariant_input_tensors_ =
+        std::move(repeated_invariant.input_tensors);
+    repeated_invariant_persistent_bytes_ =
+        repeated_invariant.persistent_bytes;
+    capture_intermediate_tensors_ = options.capture_intermediate_tensors;
+    std::sort(capture_intermediate_tensors_.begin(),
+              capture_intermediate_tensors_.end());
+    if (std::adjacent_find(capture_intermediate_tensors_.begin(),
+                           capture_intermediate_tensors_.end()) !=
+        capture_intermediate_tensors_.end())
+      fail("intermediate capture plan contains a duplicate tensor id");
+    for (const auto tensor_id : capture_intermediate_tensors_) {
+      const auto *description = program_.tensor(tensor_id);
+      if (!description ||
+          description->has_role(ir::TensorRole::Input) ||
+          description->has_role(ir::TensorRole::Constant))
+        fail("intermediate capture requires a produced tensor " +
+             std::to_string(tensor_id));
+      const auto producer = std::find_if(
+          program_.operations.begin(), program_.operations.end(),
+          [&](const auto &operation) {
+            return std::find(operation.outputs.begin(), operation.outputs.end(),
+                             tensor_id) != operation.outputs.end();
+          });
+      if (producer == program_.operations.end())
+        fail("intermediate capture tensor has no producer " +
+             std::to_string(tensor_id));
+      captured_tensors_by_producer_[producer->id].push_back(tensor_id);
+    }
+    std::vector<std::uint32_t> repeated_persistent_ids(
+        repeated_invariant_persistent_tensors_.begin(),
+        repeated_invariant_persistent_tensors_.end());
+    std::sort(repeated_persistent_ids.begin(), repeated_persistent_ids.end());
+    for (const auto tensor_id : repeated_persistent_ids) {
+      repeated_invariant_cache_offsets_.emplace(
+          tensor_id, repeated_invariant_cache_bytes_);
+      repeated_invariant_cache_bytes_ +=
+          align_256(program_.tensor(tensor_id)->byte_count());
+    }
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Constant))
         continue;
@@ -4077,9 +5563,48 @@ public:
     h3_w8a8_mlp_plans_ = find_h3_w8a8_mlp_plans(program_, options);
     h3_w8a8_attention_plans_ =
         find_h3_w8a8_attention_plans(program_, options);
-    if (!options.h3_w8a8_cache.empty() && h3_w8a8_mlp_plans_.empty() &&
-        h3_w8a8_attention_plans_.empty())
-      fail("H3 W8A8 cache requested but no supported H3 chain was found");
+    h3_compact_adaln_plans_ = find_h3_compact_adaln_plans(
+        program_, options, h3_w8a8_attention_plans_, h3_w8a8_mlp_plans_);
+    if ((!options.h3_w8a8_cache.empty() ||
+         !options.h3_convrot_int8_checkpoint.empty()) &&
+        h3_w8a8_mlp_plans_.empty() && h3_w8a8_attention_plans_.empty())
+      fail("H3 direct INT8 checkpoint requested but no supported H3 chain was found");
+    if (options.h3_int8_cutlass_scaled_fc1) {
+#if DIF_HAS_CUTLASS
+      if (h3_w8a8_mlp_plans_.empty() ||
+          !std::all_of(h3_w8a8_mlp_plans_.begin(),
+                       h3_w8a8_mlp_plans_.end(), [](const auto &plan) {
+                         return plan.convrot && plan.cutlass_scaled_fc1;
+                       }))
+        fail("H3 CUTLASS scaled FC1 requires a ConvRot INT8 MLP plan");
+#else
+      fail("H3 CUTLASS scaled FC1 requested without CUTLASS support");
+#endif
+    }
+    if (options.h3_int8_cutlass_scaled_all) {
+#if DIF_HAS_CUTLASS
+      const auto complete_mlp =
+          !h3_w8a8_mlp_plans_.empty() &&
+          std::all_of(h3_w8a8_mlp_plans_.begin(),
+                      h3_w8a8_mlp_plans_.end(), [](const auto &plan) {
+                        return plan.convrot && plan.cutlass_scaled_fc1 &&
+                               plan.cutlass_scaled_fc2 &&
+                               plan.compact_adaln.enabled;
+                      });
+      const auto complete_attention =
+          !h3_w8a8_attention_plans_.empty() &&
+          std::all_of(h3_w8a8_attention_plans_.begin(),
+                      h3_w8a8_attention_plans_.end(), [](const auto &plan) {
+                        return plan.convrot && plan.cutlass_scaled &&
+                               plan.compact_adaln.enabled;
+                      });
+      if (!complete_mlp || !complete_attention)
+        fail("H3 CUTLASS scaled-all requires complete compact-AdaLN ConvRot "
+             "INT8 attention and MLP plans");
+#else
+      fail("H3 CUTLASS scaled-all requested without CUTLASS support");
+#endif
+    }
     if (!options.h3_ck_attention_dso.empty()) {
       auto library = std::make_shared<CkAttentionLibrary>(
           options.h3_ck_attention_dso, major * 10 + minor);
@@ -4093,11 +5618,18 @@ public:
           fail("H3 CK attention found an invalid query tensor");
         maximum_sequence = std::max(maximum_sequence, query->dims.front());
       }
+      auto transformer_attention_index = std::uint32_t{0U};
       for (const auto &operation : program_.operations) {
         if (operation.opcode != ir::Opcode::Attention)
           continue;
         const auto *query = program_.tensor(operation.inputs.front());
         if (!query || query->dims.front() != maximum_sequence)
+          continue;
+        const auto layer_index = transformer_attention_index++;
+        if (layer_index < options.h3_int8_attention_first_layer)
+          continue;
+        if (h3_ck_attention_plans_.size() >=
+            options.h3_int8_attention_layers)
           continue;
         if (operation.u64(ir::AttrKey::Implementation, 1U) != 2U)
           fail("H3 CK attention can replace only an exact backend Attention");
@@ -4109,7 +5641,8 @@ public:
         h3_ck_attention_plans_.emplace(operation.id, h3_ck_attention_plan_);
       }
       if (h3_ck_attention_plans_.empty())
-        fail("H3 CK attention DSO requested but no Attention operation exists");
+        fail("H3 INT8 attention DSO requested but no transformer Attention "
+             "operation was selected");
       ck_attention_scratch_bytes_ =
           h3_ck_attention_plan_->scratch_bytes();
     }
@@ -4162,6 +5695,13 @@ public:
     generated.source += h3_w8a8_source(
         !h3_w8a8_mlp_plans_.empty() ||
         !h3_w8a8_attention_plans_.empty());
+    const auto has_h3_convrot =
+        std::any_of(h3_w8a8_mlp_plans_.begin(), h3_w8a8_mlp_plans_.end(),
+                    [](const auto &plan) { return plan.convrot; }) ||
+        std::any_of(h3_w8a8_attention_plans_.begin(),
+                    h3_w8a8_attention_plans_.end(),
+                    [](const auto &plan) { return plan.convrot; });
+    generated.source += h3_convrot_source(has_h3_convrot);
     generated.source += h3_groupwise_source(!h3_groupwise_plans_.empty());
     std::unordered_set<std::uint32_t> fused_linear_operations;
     std::unordered_set<std::uint32_t> excluded_tensors;
@@ -4208,6 +5748,12 @@ public:
                               plan.excluded_tensors.end());
       replaced_constant_tensors.insert(plan.replaced_constant_tensors.begin(),
                                        plan.replaced_constant_tensors.end());
+    }
+    for (const auto &plan : h3_compact_adaln_plans_) {
+      excluded_tensors.insert(plan.expanded_tensors.begin(),
+                              plan.expanded_tensors.end());
+      excluded_tensors.insert(plan.normalized_tensors.begin(),
+                              plan.normalized_tensors.end());
     }
     // Root cause of the W8A8+streamed nondeterminism: a fused W8A8 plan
     // launches its kernels at an earlier operation than the semantic ops
@@ -4261,6 +5807,12 @@ public:
         promote_streamed_constant(plan.gate_tensor, false);
       }
     }
+    for (const auto &plan : h3_w8a8_attention_plans_)
+      if (plan.compact_adaln.enabled)
+        promote_streamed_constant(plan.compact_adaln.norm_weight_tensor, true);
+    for (const auto &plan : h3_w8a8_mlp_plans_)
+      if (plan.compact_adaln.enabled)
+        promote_streamed_constant(plan.compact_adaln.norm_weight_tensor, true);
     for (const auto id : promoted_streamed_constants_)
       replaced_constant_tensors.insert(id);
     constexpr std::size_t linear_workspace_bytes = 64U * 1024U * 1024U;
@@ -4272,6 +5824,44 @@ public:
                  !fused_linear_operations.contains(op.id);
         });
     workspace_bytes_ = contains_linear ? linear_workspace_bytes : 0U;
+    if (options.h3_int8_cublaslt) {
+      if (h3_w8a8_mlp_plans_.empty() &&
+          h3_w8a8_attention_plans_.empty())
+        fail("H3 INT8 cuBLASLt policy requested without a direct INT8 plan");
+      workspace_bytes_ = std::max(workspace_bytes_, linear_workspace_bytes);
+      h3_int8_gemm_registry_ = std::make_unique<H3Int8GemmRegistry>(
+          context_.cublas_lt(), workspace_bytes_,
+          options.h3_int8_cublaslt_heuristic_rank);
+      for (const auto &plan : h3_w8a8_mlp_plans_) {
+        for (std::uint64_t row_start = 0U; row_start < plan.rows;
+             row_start += plan.chunk_rows) {
+          const auto rows = static_cast<std::uint32_t>(
+              std::min<std::uint64_t>(plan.chunk_rows,
+                                      plan.rows - row_start));
+          h3_int8_gemm_registry_->add(
+              {rows, static_cast<std::uint32_t>(plan.packed_ffn),
+               static_cast<std::uint32_t>(plan.hidden)});
+          h3_int8_gemm_registry_->add(
+              {rows, static_cast<std::uint32_t>(plan.hidden),
+               static_cast<std::uint32_t>(plan.ffn)});
+        }
+      }
+      for (const auto &plan : h3_w8a8_attention_plans_) {
+        for (std::uint64_t row_start = 0U; row_start < plan.rows;
+             row_start += kH3W8A8ProjectionChunkRows) {
+          const auto rows = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+              kH3W8A8ProjectionChunkRows, plan.rows - row_start));
+          if (plan.has_qkv_projection)
+            h3_int8_gemm_registry_->add(
+                {rows, static_cast<std::uint32_t>(plan.packed_inner),
+                 static_cast<std::uint32_t>(plan.hidden)});
+          if (plan.has_output_projection)
+            h3_int8_gemm_registry_->add(
+                {rows, static_cast<std::uint32_t>(plan.hidden),
+                 static_cast<std::uint32_t>(plan.inner)});
+        }
+      }
+    }
     {
       std::unordered_set<std::uint32_t> scheduled;
       const std::unordered_set<std::uint32_t> resident_streamed(
@@ -4364,12 +5954,13 @@ public:
               1.0 / std::sqrt(static_cast<double>(head_dim)))),
           op.boolean(ir::AttrKey::Causal, false),
           op.inputs.size() == 4U,
+          options.cudnn_attention_heuristic,
       };
       auto found = cudnn_plan_cache.find(key);
       if (found == cudnn_plan_cache.end()) {
         auto plan = std::make_shared<CudnnAttentionPlan>(
             *query, key.kv_heads, std::bit_cast<double>(key.scale_bits),
-            key.causal, key.additive_bias);
+            key.causal, key.additive_bias, key.heuristic);
         found = cudnn_plan_cache.emplace(key, std::move(plan)).first;
       }
       cudnn_attention_plans_.emplace(op.id, found->second);
@@ -4508,7 +6099,8 @@ public:
     memory_plan_ = compiler::plan_memory(
         program_, 256U,
         options.overlap_streaming ? streamed_prefetch_depth_ : 0U,
-        excluded_tensors, replaced_constant_tensors, reshape_aliases_);
+        excluded_tensors, replaced_constant_tensors, reshape_aliases_, true,
+        repeated_invariant_persistent_tensors_);
     const auto tensor_bytes = memory_plan_.total_bytes;
     if (tensor_bytes > std::numeric_limits<std::uint64_t>::max() - workspace_bytes_ ||
         tensor_bytes + workspace_bytes_ >
@@ -4526,6 +6118,9 @@ public:
                 plan.weight_storage_bytes)
           fail("H3 W8A8 prepared storage overflow");
         h3_w8a8_weight_bytes += plan.weight_storage_bytes;
+        if (options.lazy_resident_upload)
+          h3_w8a8_tail_stage_half_bytes_ = std::max(
+              h3_w8a8_tail_stage_half_bytes_, plan.quantized_weight_bytes);
       } else {
         h3_w8a8_tail_mlp_bytes_ =
             std::max(h3_w8a8_tail_mlp_bytes_, plan.weight_storage_bytes);
@@ -4542,6 +6137,9 @@ public:
                 plan.weight_storage_bytes)
           fail("H3 W8A8 prepared storage overflow");
         h3_w8a8_weight_bytes += plan.weight_storage_bytes;
+        if (options.lazy_resident_upload)
+          h3_w8a8_tail_stage_half_bytes_ = std::max(
+              h3_w8a8_tail_stage_half_bytes_, plan.quantized_weight_bytes);
       } else {
         h3_w8a8_tail_attention_bytes_ = std::max(
             h3_w8a8_tail_attention_bytes_, plan.weight_storage_bytes);
@@ -4606,8 +6204,13 @@ public:
     if (base_with_weights + h3_modulation_bytes >
         std::numeric_limits<std::uint64_t>::max() - promoted_constant_bytes_)
       fail("DiffIR allocation plus promoted constant storage overflow");
-    const auto required =
+    const auto base_with_promoted =
         base_with_weights + h3_modulation_bytes + promoted_constant_bytes_;
+    if (base_with_promoted > std::numeric_limits<std::uint64_t>::max() -
+                                 repeated_invariant_cache_bytes_)
+      fail("DiffIR allocation plus repeated-invariant cache overflow");
+    const auto required =
+        base_with_promoted + repeated_invariant_cache_bytes_;
     if (options.profile_pipeline) {
       std::cerr << "CUDA_MEMORY_PLAN tensor_bytes=" << tensor_bytes
                 << " linear_workspace_bytes=" << workspace_bytes_
@@ -4626,10 +6229,17 @@ public:
                 << " h3_modulation_bytes=" << h3_modulation_bytes
                 << " promoted_streamed_constant_bytes="
                 << promoted_constant_bytes_
+                << " repeated_invariant_cache_bytes="
+                << repeated_invariant_cache_bytes_
                 << " required_bytes=" << required
                 << " free_before_bytes=" << free_before
                 << " minimum_free_bytes=" << options.minimum_free_bytes
                 << '\n';
+      for (const auto &slot : memory_plan_.slots) {
+        if (slot.bytes >= 64ULL * 1024ULL * 1024ULL)
+          std::cerr << "CUDA_MEMORY_SLOT id=" << slot.id
+                    << " bytes=" << slot.bytes << '\n';
+      }
     }
     if (required > free_before ||
         free_before - required < options.minimum_free_bytes)
@@ -4661,6 +6271,11 @@ public:
                                    plan.qkv_linear_operations.end());
       if (plan.has_output_projection)
         skipped_operations_.insert(plan.residual_operation);
+    }
+    for (const auto &plan : h3_compact_adaln_plans_) {
+      skipped_operations_.insert(plan.select_operation);
+      skipped_operations_.insert(plan.norm_operations.begin(),
+                                 plan.norm_operations.end());
     }
     for (const auto &plan : h3_modulation_cache_plans_)
       skipped_operations_.insert(plan.linear_operation);
@@ -4695,6 +6310,73 @@ public:
                                 "dif_h3_w8a8_residual"),
             "cuModuleGetFunction H3 W8A8 residual");
     }
+    if (has_h3_convrot) {
+      check(cuModuleGetFunction(&h3_convrot_functions_.encode, module_->get(),
+                                "dif_convrot_int8_encode"),
+            "cuModuleGetFunction ConvRot INT8 encode");
+      check(cuModuleGetFunction(&h3_convrot_functions_.compact_encode,
+                                module_->get(),
+                                "dif_h3_convrot_compact_adaln_encode"),
+            "cuModuleGetFunction H3 compact AdaLN ConvRot encode");
+      check(cuModuleGetFunction(&h3_convrot_functions_.qkv, module_->get(),
+                                "dif_h3_convrot_qkv"),
+            "cuModuleGetFunction H3 ConvRot QKV");
+      check(cuModuleGetFunction(&h3_convrot_functions_.qkv_bf16,
+                                module_->get(),
+                                "dif_h3_convrot_qkv_bf16"),
+            "cuModuleGetFunction H3 ConvRot BF16 QKV");
+      check(cuModuleGetFunction(&h3_convrot_functions_.swiglu, module_->get(),
+                                "dif_h3_convrot_swiglu"),
+            "cuModuleGetFunction H3 ConvRot SwiGLU");
+      check(cuModuleGetFunction(&h3_convrot_functions_.swiglu_encode,
+                                module_->get(),
+                                "dif_h3_convrot_swiglu_int8_encode"),
+            "cuModuleGetFunction H3 ConvRot SwiGLU encode");
+      check(cuModuleGetFunction(&h3_convrot_functions_.swiglu_bf16_encode,
+                                module_->get(),
+                                "dif_h3_convrot_swiglu_bf16_int8_encode"),
+            "cuModuleGetFunction H3 ConvRot BF16 SwiGLU encode");
+      check(cuModuleGetFunction(&h3_convrot_functions_.compact_residual,
+                                module_->get(),
+                                "dif_h3_convrot_compact_adaln_residual"),
+            "cuModuleGetFunction H3 compact AdaLN residual");
+      check(cuModuleGetFunction(
+                &h3_convrot_functions_.compact_residual_bf16, module_->get(),
+                "dif_h3_convrot_compact_adaln_residual_bf16"),
+            "cuModuleGetFunction H3 compact AdaLN BF16 residual");
+      std::uint64_t maximum_k = 0U;
+      for (const auto &plan : h3_w8a8_mlp_plans_)
+        if (plan.convrot)
+          maximum_k = std::max({maximum_k, plan.hidden, plan.ffn});
+      for (const auto &plan : h3_w8a8_attention_plans_)
+        if (plan.convrot)
+          maximum_k = std::max({maximum_k, plan.hidden, plan.inner});
+      constexpr std::uint64_t temporary_floats = 16U * 2U * 256U;
+      const auto shared_bytes = (maximum_k + temporary_floats) * sizeof(float);
+      if (shared_bytes > static_cast<std::uint64_t>(
+                             std::numeric_limits<int>::max()))
+        fail("H3 ConvRot dynamic shared-memory request overflows CUDA int");
+      check(cuFuncSetAttribute(
+                h3_convrot_functions_.encode,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                static_cast<int>(shared_bytes)),
+            "cuFuncSetAttribute H3 ConvRot dynamic shared memory");
+      check(cuFuncSetAttribute(
+                h3_convrot_functions_.compact_encode,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                static_cast<int>(shared_bytes)),
+            "cuFuncSetAttribute H3 compact AdaLN dynamic shared memory");
+      check(cuFuncSetAttribute(
+                h3_convrot_functions_.swiglu_encode,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                static_cast<int>(shared_bytes)),
+            "cuFuncSetAttribute H3 ConvRot SwiGLU dynamic shared memory");
+      check(cuFuncSetAttribute(
+                h3_convrot_functions_.swiglu_bf16_encode,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                static_cast<int>(shared_bytes)),
+            "cuFuncSetAttribute H3 ConvRot BF16 SwiGLU dynamic shared memory");
+    }
     if (!h3_groupwise_plans_.empty())
       check(cuModuleGetFunction(&h3_groupwise_dequant_function_, module_->get(),
                                 "dif_h3_groupwise_dequant"),
@@ -4702,6 +6384,8 @@ public:
     excluded_tensors.insert(replaced_constant_tensors.begin(),
                             replaced_constant_tensors.end());
     buffers_.allocate(program_, memory_plan_, excluded_tensors, arena_.get());
+    repeated_invariant_cache_storage_ = std::make_unique<Workspace>(
+        repeated_invariant_cache_bytes_, arena_.get());
     workspace_ = std::make_unique<Workspace>(workspace_bytes_, arena_.get());
     if (parallel_workspace_bytes_ != 0U) {
       const auto auxiliary_count =
@@ -4737,6 +6421,13 @@ public:
           std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
       h3_w8a8_tail_ready_event_ =
           std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+    }
+    if (!h3_w8a8_mlp_plans_.empty() ||
+        !h3_w8a8_attention_plans_.empty()) {
+      if (options.streamed_stage_threads == 0U)
+        fail("streamed staging worker count must be positive");
+      h3_w8a8_staging_pool_ =
+          std::make_unique<StagingPool>(options.streamed_stage_threads);
     }
     h3_groupwise_scratch_storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(h3_groupwise_scratch_bytes), arena_.get());
@@ -4775,6 +6466,99 @@ public:
             plan, h3_w8a8_tail_weight_storage_->pointer());
       assign_h3_w8a8_scratch(plan, h3_w8a8_scratch_storage_->pointer());
     }
+#if DIF_HAS_CUTLASS
+    if (options.h3_int8_cutlass_scaled_fc1 ||
+        options.h3_int8_cutlass_scaled_all) {
+      h3_int8_scaled_gemm_registry_ =
+          std::make_unique<H3Int8ScaledGemmRegistry>();
+      for (const auto &plan : h3_w8a8_mlp_plans_) {
+        for (std::uint64_t row_start = 0U; row_start < plan.rows;
+             row_start += plan.chunk_rows) {
+          const auto rows = static_cast<std::uint32_t>(
+              std::min<std::uint64_t>(plan.chunk_rows,
+                                      plan.rows - row_start));
+          h3_int8_scaled_gemm_registry_->add(
+              {rows, static_cast<std::uint32_t>(plan.packed_ffn),
+               static_cast<std::uint32_t>(plan.hidden)},
+              plan.input_i8_device, plan.fc1_weight_device,
+              plan.input_scale_device, plan.fc1_scale_device,
+              plan.fc1_accumulator_device, context_.stream());
+          if (plan.cutlass_scaled_fc2)
+            h3_int8_scaled_gemm_registry_->add(
+                {rows, static_cast<std::uint32_t>(plan.hidden),
+                 static_cast<std::uint32_t>(plan.ffn)},
+                plan.activation_i8_device, plan.fc2_weight_device,
+                plan.activation_scale_device, plan.fc2_scale_device,
+                plan.fc2_accumulator_device, context_.stream());
+        }
+      }
+      for (const auto &plan : h3_w8a8_attention_plans_) {
+        for (std::uint64_t row_start = 0U; row_start < plan.rows;
+             row_start += kH3W8A8ProjectionChunkRows) {
+          const auto rows = static_cast<std::uint32_t>(
+              std::min<std::uint64_t>(kH3W8A8ProjectionChunkRows,
+                                      plan.rows - row_start));
+          if (plan.has_qkv_projection && plan.cutlass_scaled)
+            h3_int8_scaled_gemm_registry_->add(
+                {rows, static_cast<std::uint32_t>(plan.packed_inner),
+                 static_cast<std::uint32_t>(plan.hidden)},
+                plan.activation_i8_device + row_start * plan.hidden,
+                plan.qkv_weight_device,
+                plan.activation_scale_device + row_start * sizeof(float),
+                plan.qkv_scale_device, plan.accumulator_device,
+                context_.stream());
+          if (plan.has_output_projection && plan.cutlass_scaled)
+            h3_int8_scaled_gemm_registry_->add(
+                {rows, static_cast<std::uint32_t>(plan.hidden),
+                 static_cast<std::uint32_t>(plan.inner)},
+                plan.activation_i8_device, plan.output_weight_device,
+                plan.activation_scale_device, plan.output_scale_device,
+                plan.accumulator_device, context_.stream());
+        }
+      }
+    }
+#endif
+    if (options.h3_int8_cublaslt_tune) {
+      if (!h3_int8_gemm_registry_)
+        fail("H3 INT8 cuBLASLt tuning requires the cuBLASLt projection path");
+      for (const auto &plan : h3_w8a8_mlp_plans_) {
+        for (std::uint64_t row_start = 0U; row_start < plan.rows;
+             row_start += plan.chunk_rows) {
+          const auto rows = static_cast<std::uint32_t>(
+              std::min<std::uint64_t>(plan.chunk_rows,
+                                      plan.rows - row_start));
+          h3_int8_gemm_registry_->tune(
+              {rows, static_cast<std::uint32_t>(plan.packed_ffn),
+               static_cast<std::uint32_t>(plan.hidden)},
+              plan.input_i8_device, plan.fc1_weight_device,
+              plan.fc1_accumulator_device, *workspace_, context_.stream());
+          h3_int8_gemm_registry_->tune(
+              {rows, static_cast<std::uint32_t>(plan.hidden),
+               static_cast<std::uint32_t>(plan.ffn)},
+              plan.activation_i8_device, plan.fc2_weight_device,
+              plan.fc2_accumulator_device, *workspace_, context_.stream());
+        }
+      }
+      for (const auto &plan : h3_w8a8_attention_plans_) {
+        for (std::uint64_t row_start = 0U; row_start < plan.rows;
+             row_start += kH3W8A8ProjectionChunkRows) {
+          const auto rows = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+              kH3W8A8ProjectionChunkRows, plan.rows - row_start));
+          if (plan.has_qkv_projection)
+            h3_int8_gemm_registry_->tune(
+                {rows, static_cast<std::uint32_t>(plan.packed_inner),
+                 static_cast<std::uint32_t>(plan.hidden)},
+                plan.activation_i8_device, plan.qkv_weight_device,
+                plan.accumulator_device, *workspace_, context_.stream());
+          if (plan.has_output_projection)
+            h3_int8_gemm_registry_->tune(
+                {rows, static_cast<std::uint32_t>(plan.hidden),
+                 static_cast<std::uint32_t>(plan.inner)},
+                plan.activation_i8_device, plan.output_weight_device,
+                plan.accumulator_device, *workspace_, context_.stream());
+        }
+      }
+    }
     for (const auto &[output, root] : reshape_aliases_) {
       if (!buffers_.contains(root))
         fail("reshape alias root has no prepared device storage: " +
@@ -4797,7 +6581,8 @@ public:
             ? std::unordered_set<std::uint32_t>(
                   promoted_streamed_constants_.begin(),
                   promoted_streamed_constants_.end())
-            : std::unordered_set<std::uint32_t>{});
+            : std::unordered_set<std::uint32_t>{},
+        options.profile_pipeline);
     if (options.pinned_io_staging) {
       auto input_bytes = std::uint64_t{0U};
       auto output_bytes = std::uint64_t{0U};
@@ -5013,12 +6798,89 @@ public:
     }
     const auto resident_h2d_start = std::chrono::steady_clock::now();
     upload_resident_constants(program_, constants_, buffers_, context_.stream());
-    for (const auto &plan : h3_w8a8_mlp_plans_)
-      if (plan.resident)
+    constexpr std::size_t h3_resident_staging_slots = 2U;
+    std::array<std::unique_ptr<PinnedHostWorkspace>,
+               h3_resident_staging_slots>
+        h3_resident_staging;
+    std::array<std::unique_ptr<Event>, h3_resident_staging_slots>
+        h3_resident_copy_done;
+    std::array<bool, h3_resident_staging_slots> h3_resident_copy_recorded{};
+    auto h3_resident_staging_bytes = std::uint64_t{0U};
+    if (options.pipelined_resident_upload) {
+      for (const auto &plan : h3_w8a8_attention_plans_)
+        if (plan.resident)
+          h3_resident_staging_bytes =
+              std::max(h3_resident_staging_bytes,
+                       plan.quantized_weight_bytes);
+      for (const auto &plan : h3_w8a8_mlp_plans_)
+        if (plan.resident)
+          h3_resident_staging_bytes =
+              std::max(h3_resident_staging_bytes,
+                       plan.quantized_weight_bytes);
+      if (h3_resident_staging_bytes != 0U) {
+        if (h3_resident_staging_bytes >
+            options.streamed_pinned_budget_bytes /
+                h3_resident_staging_slots)
+          fail("pipelined H3 resident upload exceeds the pinned budget: slots=" +
+               std::to_string(h3_resident_staging_slots) +
+               " buffer_bytes=" +
+               std::to_string(h3_resident_staging_bytes) + " budget_bytes=" +
+               std::to_string(options.streamed_pinned_budget_bytes));
+        for (std::size_t slot = 0U; slot < h3_resident_staging_slots; ++slot) {
+          h3_resident_staging[slot] = std::make_unique<PinnedHostWorkspace>(
+              static_cast<std::size_t>(h3_resident_staging_bytes));
+          h3_resident_copy_done[slot] =
+              std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
+        }
+      }
+    }
+    auto h3_resident_turn = std::size_t{0U};
+    const H3HostCopy h3_resident_host_copy =
+        [&](std::uint8_t *destination, const std::uint8_t *source,
+            std::size_t bytes) {
+          h3_w8a8_staging_pool_->copy(destination, source, bytes);
+        };
+    const auto upload_h3_resident = [&](auto &plan) {
+      if (!plan.resident)
+        return;
+      if (options.lazy_resident_upload)
+        return;
+      if (h3_resident_staging_bytes == 0U) {
         upload_h3_w8a8_weights(plan, context_.stream());
-    for (const auto &plan : h3_w8a8_attention_plans_)
-      if (plan.resident)
-        upload_h3_w8a8_weights(plan, context_.stream());
+        plan.uploaded = true;
+        return;
+      }
+      const auto slot = h3_resident_turn % h3_resident_staging_slots;
+      if (h3_resident_copy_recorded[slot])
+        check(counted_event_synchronize(h3_resident_copy_done[slot]->get()),
+              "cuEventSynchronize H3 resident staging reuse");
+      (void)stage_h3_w8a8_weights(
+          plan, h3_resident_staging[slot]->data(),
+          h3_resident_staging_bytes, context_.stream(),
+          h3_resident_host_copy);
+      check(counted_event_record(h3_resident_copy_done[slot]->get(),
+                                 context_.stream()),
+            "cuEventRecord H3 resident staging copy");
+      h3_resident_copy_recorded[slot] = true;
+      plan.uploaded = true;
+      ++h3_resident_turn;
+    };
+    // The cache is written attention then MLP for every layer. Merge the two
+    // prepared plan lists by layer so a cold upload walks the file once in
+    // physical order instead of seeking through all MLPs and then all
+    // attention projections.
+    auto attention_index = std::size_t{0U};
+    auto mlp_index = std::size_t{0U};
+    while (attention_index < h3_w8a8_attention_plans_.size() ||
+           mlp_index < h3_w8a8_mlp_plans_.size()) {
+      if (attention_index < h3_w8a8_attention_plans_.size() &&
+          (mlp_index == h3_w8a8_mlp_plans_.size() ||
+           h3_w8a8_attention_plans_[attention_index].layer <=
+               h3_w8a8_mlp_plans_[mlp_index].layer))
+        upload_h3_resident(h3_w8a8_attention_plans_[attention_index++]);
+      else
+        upload_h3_resident(h3_w8a8_mlp_plans_[mlp_index++]);
+    }
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
@@ -5125,35 +6987,29 @@ public:
     for (const auto &description : program_.tensors) {
       if (description.has_role(ir::TensorRole::Constant) &&
           !description.has_role(ir::TensorRole::Streamed))
-        constants_.at(description.id).discard_mapped_pages();
+        constants_.at(description.id).evict_mapped_pages();
     }
     if (!options.lazy_resident_upload)
       for (const auto id : promoted_streamed_constants_)
-        constants_.at(id).discard_mapped_pages();
+        constants_.at(id).evict_mapped_pages();
     for (auto &plan : h3_w8a8_mlp_plans_) {
-      plan.fc1_weight.discard_mapped_pages();
-      plan.fc1_scale.discard_mapped_pages();
-      plan.fc2_weight.discard_mapped_pages();
-      plan.fc2_scale.discard_mapped_pages();
+      if (!plan.uploaded)
+        continue;
+      evict_h3_w8a8_weights(plan);
     }
     for (auto &plan : h3_w8a8_attention_plans_) {
-      if (plan.has_qkv_projection) {
-        plan.qkv_weight.discard_mapped_pages();
-        plan.qkv_scale.discard_mapped_pages();
-      }
-      if (plan.has_output_projection) {
-        plan.output_weight.discard_mapped_pages();
-        plan.output_scale.discard_mapped_pages();
-      }
+      if (!plan.uploaded)
+        continue;
+      evict_h3_w8a8_weights(plan);
     }
     for (auto &plan : h3_groupwise_plans_) {
       for (auto &projection : plan.projections) {
-        projection.weight.discard_mapped_pages();
-        projection.scale.discard_mapped_pages();
+        projection.weight.evict_mapped_pages();
+        projection.scale.evict_mapped_pages();
       }
     }
     for (auto &plan : h3_modulation_cache_plans_)
-      plan.modulation.discard_mapped_pages();
+      plan.modulation.evict_mapped_pages();
     const auto preparation_stop = std::chrono::steady_clock::now();
     preparation_milliseconds_ =
         std::chrono::duration<double, std::milli>(preparation_stop -
@@ -5166,6 +7022,13 @@ public:
       fail("run iterations must be nonzero");
     if (options.lazy_resident_upload != lazy_resident_upload_)
       fail("lazy resident upload is fixed when the plan is prepared");
+    auto requested_captures = options.capture_intermediate_tensors;
+    std::sort(requested_captures.begin(), requested_captures.end());
+    if (requested_captures != capture_intermediate_tensors_)
+      fail("intermediate capture tensors are fixed when the plan is prepared");
+    if (!capture_intermediate_tensors_.empty() &&
+        (options.warmups != 0U || options.iterations != 1U))
+      fail("intermediate capture requires zero warmups and one iteration");
     LaunchTelemetry run_telemetry;
     TelemetryScope telemetry_scope(run_telemetry);
     streamed_prefetcher_->set_release_mapped_pages_per_copy(
@@ -5182,6 +7045,30 @@ public:
       bindings.insert_or_assign(desc.id, found->second);
     }
     validate_inputs(program_, bindings);
+    auto repeated_cache_ready = repeated_invariant_valid_;
+    if (repeated_cache_ready) {
+      for (const auto input_id : repeated_invariant_input_tensors_) {
+        const auto &actual = bindings.at(input_id);
+        const auto found = repeated_invariant_input_snapshots_.find(input_id);
+        if (found == repeated_invariant_input_snapshots_.end() ||
+            found->second.size() != actual.byte_size() ||
+            std::memcmp(found->second.data(), actual.data(),
+                        actual.byte_size()) != 0) {
+          repeated_cache_ready = false;
+          break;
+        }
+      }
+    }
+    if (!repeated_cache_ready && !repeated_invariant_operations_.empty()) {
+      repeated_invariant_input_snapshots_.clear();
+      for (const auto input_id : repeated_invariant_input_tensors_) {
+        const auto &actual = bindings.at(input_id);
+        repeated_invariant_input_snapshots_.emplace(
+            input_id,
+            std::vector<std::uint8_t>(actual.data(),
+                                      actual.data() + actual.byte_size()));
+      }
+    }
     if (!h3_modulation_cache_plans_.empty() &&
         !h3_modulation_input_path_.empty()) {
       const auto &actual = bindings.at(
@@ -5220,9 +7107,17 @@ public:
 
     auto h3_w8a8_tail_streamed_bytes = std::uint64_t{0U};
     auto h3_w8a8_tail_host_stage_milliseconds = 0.0;
-    auto stage_h3_w8a8_tail = [&](const auto &plan, bool profile) {
-      if (plan.resident)
+    const H3HostCopy h3_tail_host_copy =
+        [&](std::uint8_t *destination, const std::uint8_t *source,
+            std::size_t bytes) {
+          h3_w8a8_staging_pool_->copy(destination, source, bytes);
+        };
+    auto stage_h3_w8a8_tail = [&](auto &plan, bool profile) {
+      const auto populate_resident = plan.resident && !plan.uploaded;
+      if (plan.resident && !populate_resident)
         return;
+      if (populate_resident && !lazy_resident_upload_)
+        fail("H3 resident projection was not populated during preparation");
       if (!h3_w8a8_tail_stage_ || h3_w8a8_tail_stage_half_bytes_ == 0U)
         fail("H3 W8A8 tail plan lacks reusable host staging");
       const auto half = h3_w8a8_tail_stage_turn_ % 2U;
@@ -5233,7 +7128,7 @@ public:
           options.h3_w8a8_tail_uploads_on_copy_stream;
       const auto tail_stream =
           tail_copy_stream ? context_.copy_stream() : context_.stream();
-      if (tail_copy_stream) {
+      if (tail_copy_stream && !populate_resident) {
         // The reusable tail device storage is shared by every tail layer:
         // the copy stream must not overwrite it before the previous tail
         // layer's kernels (already submitted on the compute stream) have
@@ -5251,7 +7146,12 @@ public:
           h3_w8a8_tail_stage_->data()) +
           half * h3_w8a8_tail_stage_half_bytes_;
       const auto bytes = stage_h3_w8a8_weights(
-          plan, staging, h3_w8a8_tail_stage_half_bytes_, tail_stream);
+          plan, staging, h3_w8a8_tail_stage_half_bytes_, tail_stream,
+          h3_tail_host_copy);
+      if (populate_resident) {
+        evict_h3_w8a8_weights(plan);
+        plan.uploaded = true;
+      }
       if (profile) {
         h3_w8a8_tail_streamed_bytes += bytes;
         h3_w8a8_tail_host_stage_milliseconds +=
@@ -5318,8 +7218,16 @@ public:
           });
       if (h3_w8a8_qkv != h3_w8a8_attention_plans_.end()) {
         stage_h3_w8a8_tail(*h3_w8a8_qkv, profile);
-        launch_h3_w8a8_qkv(*h3_w8a8_qkv, h3_w8a8_functions_, buffers_,
-                            context_.cublas(), context_.stream());
+        launch_h3_w8a8_qkv(*h3_w8a8_qkv, h3_w8a8_functions_,
+                            h3_convrot_functions_, buffers_, context_.cublas(),
+#if DIF_HAS_CUTLASS
+                            h3_int8_gemm_registry_.get(),
+                            h3_int8_scaled_gemm_registry_.get(),
+#else
+                            h3_int8_gemm_registry_.get(),
+#endif
+                            workspace_.get(),
+                            context_.stream());
       }
       else if (const auto h3_w8a8_output = std::find_if(
                    h3_w8a8_attention_plans_.begin(),
@@ -5330,8 +7238,13 @@ public:
                h3_w8a8_output != h3_w8a8_attention_plans_.end()) {
         if (!h3_w8a8_output->has_qkv_projection)
           stage_h3_w8a8_tail(*h3_w8a8_output, profile);
-        launch_h3_w8a8_output(*h3_w8a8_output, h3_w8a8_functions_, buffers_,
-                              context_.cublas(), context_.stream());
+        launch_h3_w8a8_output(*h3_w8a8_output, h3_w8a8_functions_,
+                              h3_convrot_functions_, buffers_,
+                              context_.cublas(), h3_int8_gemm_registry_.get(),
+#if DIF_HAS_CUTLASS
+                              h3_int8_scaled_gemm_registry_.get(),
+#endif
+                              workspace_.get(), context_.stream());
       }
       else if (const auto h3_w8a8_mlp = std::find_if(
           h3_w8a8_mlp_plans_.begin(), h3_w8a8_mlp_plans_.end(),
@@ -5340,8 +7253,15 @@ public:
           });
                h3_w8a8_mlp != h3_w8a8_mlp_plans_.end()) {
         stage_h3_w8a8_tail(*h3_w8a8_mlp, profile);
-        launch_h3_w8a8_mlp(*h3_w8a8_mlp, h3_w8a8_functions_, buffers_,
-                            context_.cublas(), context_.stream());
+        launch_h3_w8a8_mlp(*h3_w8a8_mlp, h3_w8a8_functions_,
+                            h3_convrot_functions_, buffers_, context_.cublas(),
+#if DIF_HAS_CUTLASS
+                            h3_int8_gemm_registry_.get(),
+                            h3_int8_scaled_gemm_registry_.get(), workspace_.get(),
+#else
+                            h3_int8_gemm_registry_.get(), workspace_.get(),
+#endif
+                            context_.stream());
       }
       else if (const auto fused_swiglu = std::find_if(
           fused_linear_swiglu_plans_.begin(),
@@ -5431,18 +7351,61 @@ public:
       std::unique_ptr<Event> stop;
     };
     std::vector<OperationEventPair> profile_operation_events;
+    std::vector<bool> profile_reused_invariant_operations;
     if (options.profile_pipeline) {
       const auto count = program_.operations.size() *
                          static_cast<std::size_t>(options.iterations);
       profile_operation_events.reserve(count);
+      profile_reused_invariant_operations.assign(count, false);
       for (std::size_t index = 0U; index < count; ++index)
         profile_operation_events.push_back(
             {std::make_unique<Event>(), std::make_unique<Event>()});
     }
+    TensorMap captured_intermediates;
+    const auto capture_intermediate_outputs =
+        [&](std::uint32_t operation_id, CUstream stream) {
+          const auto outputs = captured_tensors_by_producer_.find(operation_id);
+          if (outputs == captured_tensors_by_producer_.end())
+            return;
+          for (const auto tensor_id : outputs->second) {
+            const auto *description = program_.tensor(tensor_id);
+            if (!description)
+              fail("captured intermediate tensor is missing");
+            auto tensor = zeros(*description);
+            check(counted_memcpy_dtoh(tensor.mutable_data(),
+                                      buffers_.at(tensor_id),
+                                      tensor.byte_size(), stream),
+                  "cuMemcpyDtoHAsync captured intermediate");
+            if (!captured_intermediates.emplace(tensor_id, std::move(tensor))
+                     .second)
+              fail("captured intermediate tensor was produced more than once");
+          }
+        };
+    const auto preserve_repeated_invariant_outputs =
+        [&](std::uint32_t operation_id, CUstream stream) {
+          const auto outputs =
+              repeated_invariant_outputs_by_producer_.find(operation_id);
+          if (outputs == repeated_invariant_outputs_by_producer_.end())
+            return;
+          if (!repeated_invariant_cache_storage_ ||
+              repeated_invariant_cache_storage_->pointer() == 0U)
+            fail("repeated-invariant output cache is not allocated");
+          for (const auto tensor_id : outputs->second) {
+            const auto *description = program_.tensor(tensor_id);
+            if (!description)
+              fail("repeated-invariant output tensor is missing");
+            const auto offset = repeated_invariant_cache_offsets_.at(tensor_id);
+            check(counted_memcpy_dtod(
+                      repeated_invariant_cache_storage_->pointer() + offset,
+                      buffers_.at(tensor_id), description->byte_count(), stream),
+                  "cuMemcpyDtoDAsync preserve repeated-invariant output");
+          }
+        };
     auto execute_parallel_group = [&](std::size_t first,
                                       std::uint32_t iteration,
                                       bool profile,
-                                      const std::vector<bool> *prefetched) {
+                                      const std::vector<bool> *prefetched,
+                                      bool preserve_invariants) {
       const auto found = parallel_linear_groups_.find(first);
       if (found == parallel_linear_groups_.end())
         return false;
@@ -5482,6 +7445,9 @@ public:
         }
         linear_plans_.at(operation.id)->launch(
             operation, buffers_, context_.cublas_lt(), workspace, stream);
+        capture_intermediate_outputs(operation.id, stream);
+        if (preserve_invariants)
+          preserve_repeated_invariant_outputs(operation.id, stream);
         if (timing)
           check(counted_event_record(timing->stop->get(), stream),
                 "cuEventRecord profiled parallel Linear stop");
@@ -5498,17 +7464,62 @@ public:
               "cuStreamWaitEvent parallel Linear completion");
       return true;
     };
-    auto execute = [&](std::uint32_t iteration, bool profile) {
+    auto execute = [&](std::uint32_t iteration, bool profile,
+                       bool reuse_invariants) {
       if (program_.operations.empty())
         return;
+      if (reuse_invariants) {
+        if (!repeated_invariant_cache_storage_ ||
+            repeated_invariant_cache_storage_->pointer() == 0U)
+          fail("repeated-invariant output cache is not allocated");
+        for (const auto &[tensor_id, offset] :
+             repeated_invariant_cache_offsets_) {
+          const auto *description = program_.tensor(tensor_id);
+          if (!description)
+            fail("repeated-invariant output tensor is missing");
+          check(counted_memcpy_dtod(
+                    buffers_.at(tensor_id),
+                    repeated_invariant_cache_storage_->pointer() + offset,
+                    description->byte_count(), context_.stream()),
+                "cuMemcpyDtoDAsync restore repeated-invariant output");
+        }
+      }
+      const auto reused = [&](std::size_t index) {
+        return reuse_invariants && repeated_invariant_operations_.contains(
+                                       program_.operations.at(index).id);
+      };
+      const auto mark_reused = [&](std::size_t index) {
+        if (profile)
+          profile_reused_invariant_operations.at(
+              static_cast<std::size_t>(iteration) *
+                  program_.operations.size() +
+              index) = true;
+      };
+      const auto prefetch = [&](std::size_t index) {
+        return !reused(index) && streamed_prefetcher_->prefetch(index);
+      };
       if (!options.overlap_streaming) {
         for (std::size_t index = 0; index < program_.operations.size(); ++index) {
+          if (reused(index)) {
+            mark_reused(index);
+            capture_intermediate_outputs(program_.operations.at(index).id,
+                                         context_.stream());
+            // Preserve the semantic operation timeline even when its pure
+            // value is restored from the repeated-invariant cache. Streamed
+            // slot overwrite planning names the latest prior operation by
+            // index; without a current-iteration completion record, it can
+            // wait on that operation's stale event from the previous
+            // evaluation and overwrite a lower-index live tenant.
+            streamed_prefetcher_->complete(index);
+            continue;
+          }
           if (parallel_linear_followups_.contains(index))
             continue;
           const auto &op = program_.operations[index];
-          const auto ready = streamed_prefetcher_->prefetch(index);
+          const auto ready = prefetch(index);
           streamed_prefetcher_->wait(index, ready);
-          if (execute_parallel_group(index, iteration, profile, nullptr))
+          if (execute_parallel_group(index, iteration, profile, nullptr,
+                                     !reuse_invariants))
             continue;
           OperationEventPair *timing = nullptr;
           if (profile && !skipped_operations_.contains(op.id)) {
@@ -5520,6 +7531,9 @@ public:
                   "cuEventRecord profiled operation start");
           }
           execute_operation(op, profile);
+          capture_intermediate_outputs(op.id, context_.stream());
+          if (!reuse_invariants)
+            preserve_repeated_invariant_outputs(op.id, context_.stream());
           if (timing)
             check(counted_event_record(timing->stop->get(), context_.stream()),
                   "cuEventRecord profiled operation stop");
@@ -5532,17 +7546,28 @@ public:
       std::vector<bool> prefetched(operation_count, false);
       for (std::size_t ahead = 0U; ahead < depth && ahead < operation_count;
            ++ahead)
-        prefetched[ahead] = streamed_prefetcher_->prefetch(ahead);
+        prefetched[ahead] = prefetch(ahead);
       for (std::size_t index = 0; index < operation_count; ++index) {
+        if (reused(index)) {
+          mark_reused(index);
+          capture_intermediate_outputs(program_.operations.at(index).id,
+                                       context_.stream());
+          // See the serial path above: skipped semantic positions still need
+          // current-iteration completion fences for streamed-slot safety.
+          streamed_prefetcher_->complete(index);
+          if (index + depth < operation_count)
+            prefetched[index + depth] = prefetch(index + depth);
+          continue;
+        }
         if (parallel_linear_followups_.contains(index)) {
           if (index + depth < operation_count)
-            prefetched[index + depth] =
-                streamed_prefetcher_->prefetch(index + depth);
+            prefetched[index + depth] = prefetch(index + depth);
           continue;
         }
         const auto &op = program_.operations[index];
         streamed_prefetcher_->wait(index, prefetched[index]);
-        if (execute_parallel_group(index, iteration, profile, &prefetched)) {
+        if (execute_parallel_group(index, iteration, profile, &prefetched,
+                                   !reuse_invariants)) {
           continue;
         }
         OperationEventPair *timing = nullptr;
@@ -5555,6 +7580,9 @@ public:
                 "cuEventRecord profiled operation start");
         }
         execute_operation(op, profile);
+        capture_intermediate_outputs(op.id, context_.stream());
+        if (!reuse_invariants)
+          preserve_repeated_invariant_outputs(op.id, context_.stream());
         if (timing)
           check(counted_event_record(timing->stop->get(), context_.stream()),
                 "cuEventRecord profiled operation stop");
@@ -5566,18 +7594,25 @@ public:
         // is guaranteed recorded before the copy stream is asked to wait
         // on it.
         if (index + depth < operation_count)
-          prefetched[index + depth] =
-              streamed_prefetcher_->prefetch(index + depth);
+          prefetched[index + depth] = prefetch(index + depth);
       }
     };
 
     for (std::uint32_t warmup = 0; warmup < options.warmups; ++warmup) {
-      execute(0U, false);
+      execute(0U, false, repeated_cache_ready);
+      if (!repeated_invariant_operations_.empty())
+        repeated_cache_ready = true;
       streamed_prefetcher_->complete_iteration();
       check(counted_stream_synchronize(context_.stream()), "warmup synchronization");
     }
+    const auto repeated_invariant_executions =
+        repeated_invariant_operations_.empty() || repeated_cache_ready
+            ? 0U
+            : 1U;
     if (options.profile_pipeline)
-      streamed_prefetcher_->begin_profile(options.iterations);
+      streamed_prefetcher_->begin_profile(
+          options.iterations, repeated_invariant_operations_,
+          repeated_invariant_executions);
 
     RunResult result;
     result.preparation_milliseconds = preparation_milliseconds_;
@@ -5586,6 +7621,10 @@ public:
     result.backend_name = name();
     result.device_name = device_name_;
     result.generated_source_hash = source_hash_;
+    result.repeated_invariant_operation_count =
+        static_cast<std::uint32_t>(repeated_invariant_operations_.size());
+    result.repeated_invariant_persistent_bytes =
+        repeated_invariant_persistent_bytes_;
     result.linear_tuning_results = linear_tuning_results_;
     result.selected_linear_algorithms = selected_linear_algorithms_;
     result.primitive_fusions.reserve(fused_linear_swiglu_plans_.size());
@@ -5615,12 +7654,21 @@ public:
            plan.fc2_operation,
            plan.residual_operation,
            plan.layer,
-           kH3W8A8MlpChunkRows,
+           plan.chunk_rows,
            plan.quantized_weight_bytes,
            plan.scratch_bytes,
            plan.eliminated_intermediate_bytes,
-           "approximate_w8a8_established_h3_gate",
-           "serenity_h3_w8a8_chunked_mlp_residual",
+           plan.convrot ? "approximate_native_h256_convrot_int8_gate"
+                        : "approximate_w8a8_established_h3_gate",
+           plan.cutlass_scaled_fc2
+               ? "native_h256_convrot_int8_cutlass_scaled_all_compact_adaln_chunked_mlp_residual"
+               : plan.cutlass_scaled_fc1
+               ? "native_h256_convrot_int8_cutlass_scaled_fc1_chunked_mlp_residual"
+               : plan.compact_adaln.enabled
+               ? "native_h256_convrot_int8_compact_adaln_chunked_mlp_residual"
+               : (plan.convrot
+                      ? "native_h256_convrot_int8_chunked_mlp_residual"
+                      : "serenity_h3_w8a8_chunked_mlp_residual"),
            plan.cache_path.string(),
            plan.resident});
     result.h3_w8a8_attentions.reserve(h3_w8a8_attention_plans_.size());
@@ -5635,8 +7683,15 @@ public:
            plan.quantized_weight_bytes,
            plan.scratch_bytes,
            plan.eliminated_intermediate_bytes,
-           "approximate_w8a8_established_h3_gate",
-           "serenity_h3_w8a8_direct_qkv_output_residual",
+           plan.convrot ? "approximate_native_h256_convrot_int8_gate"
+                        : "approximate_w8a8_established_h3_gate",
+           plan.cutlass_scaled
+               ? "native_h256_convrot_int8_cutlass_scaled_all_compact_adaln_direct_qkv_output_residual"
+               : plan.compact_adaln.enabled
+               ? "native_h256_convrot_int8_compact_adaln_direct_qkv_output_residual"
+               : plan.convrot
+               ? "native_h256_convrot_int8_direct_qkv_output_residual"
+               : "serenity_h3_w8a8_direct_qkv_output_residual",
            plan.cache_path.string(),
            plan.resident});
     result.h3_ck_attentions.reserve(h3_ck_attention_plans_.size());
@@ -5645,8 +7700,8 @@ public:
           {operation_id,
            static_cast<std::uint32_t>(plan->target_sm()),
            plan->scratch_bytes(),
-           "approximate_ck_int8_established_h3_gate",
-           "serenity_comfy_kitchen_sage_bf16",
+           plan->classification(),
+           plan->implementation(),
            plan->path().string()});
     result.h3_groupwise_int8.reserve(h3_groupwise_plans_.size());
     for (const auto &plan : h3_groupwise_plans_)
@@ -5679,11 +7734,17 @@ public:
            h3_modulation_input_path_.string()});
     std::vector<double> elapsed;
     elapsed.reserve(options.iterations);
+    auto reused_invariant_during_measurement = false;
     for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
         Event start;
         Event stop;
         check(counted_event_record(start.get(), context_.stream()), "cuEventRecord start");
-        execute(iteration, options.profile_pipeline);
+        const auto reuse_invariants = repeated_cache_ready;
+        reused_invariant_during_measurement =
+            reused_invariant_during_measurement || reuse_invariants;
+        execute(iteration, options.profile_pipeline, reuse_invariants);
+        if (!repeated_invariant_operations_.empty())
+          repeated_cache_ready = true;
         streamed_prefetcher_->complete_iteration();
         check(counted_event_record(stop.get(), context_.stream()), "cuEventRecord stop");
         check(counted_event_synchronize(stop.get()), "cuEventSynchronize");
@@ -5692,6 +7753,10 @@ public:
               "cuEventElapsedTime");
         elapsed.push_back(milliseconds);
     }
+    if (!repeated_invariant_operations_.empty())
+      repeated_invariant_valid_ = true;
+    result.repeated_invariant_cache_hit =
+        reused_invariant_during_measurement;
     result.minimum_milliseconds = *std::min_element(elapsed.begin(), elapsed.end());
     result.maximum_milliseconds = *std::max_element(elapsed.begin(), elapsed.end());
     result.mean_milliseconds =
@@ -5727,6 +7792,13 @@ public:
         operation_elapsed.reserve(options.iterations);
         for (std::uint32_t iteration = 0U; iteration < options.iterations;
              ++iteration) {
+          if (profile_reused_invariant_operations.at(
+                  static_cast<std::size_t>(iteration) *
+                      program_.operations.size() +
+                  operation_index)) {
+            operation_elapsed.push_back(0.0);
+            continue;
+          }
           const auto &timing = profile_operation_events.at(
               static_cast<std::size_t>(iteration) *
                   program_.operations.size() +
@@ -5846,6 +7918,7 @@ public:
       streamed_prefetcher_->release_mapped_pages();
     result.preparation_telemetry = preparation_telemetry_;
     result.run_telemetry = run_telemetry;
+    result.captured_intermediates = std::move(captured_intermediates);
     if (options.profile_pipeline) {
       const auto print = [](const char *phase, const LaunchTelemetry &t) {
         std::cerr << "CUDA_LAUNCH_TELEMETRY phase=" << phase
@@ -5861,6 +7934,8 @@ public:
                   << " h2d_bytes=" << t.h2d_bytes
                   << " d2h_copies=" << t.d2h_copies
                   << " d2h_bytes=" << t.d2h_bytes
+                  << " d2d_copies=" << t.d2d_copies
+                  << " d2d_bytes=" << t.d2d_bytes
                   << " event_records=" << t.event_records
                   << " stream_wait_events=" << t.stream_wait_events
                   << " host_event_syncs=" << t.host_event_synchronizes
@@ -5885,19 +7960,50 @@ public:
 #endif
     if (!fused_linear_swiglu_plans_.empty())
       result += "-wmma-swiglu";
-    if (!h3_w8a8_mlp_plans_.empty() ||
-        !h3_w8a8_attention_plans_.empty())
+    const auto has_h3_convrot =
+        std::any_of(h3_w8a8_mlp_plans_.begin(), h3_w8a8_mlp_plans_.end(),
+                    [](const auto &plan) { return plan.convrot; }) ||
+        std::any_of(h3_w8a8_attention_plans_.begin(),
+                    h3_w8a8_attention_plans_.end(),
+                    [](const auto &plan) { return plan.convrot; });
+    if (has_h3_convrot)
+      result += "-h3-convrot-int8";
+    else if (!h3_w8a8_mlp_plans_.empty() ||
+             !h3_w8a8_attention_plans_.empty())
       result += "-h3-w8a8";
+    if (h3_int8_gemm_registry_)
+      result += "-h3-int8-cublaslt";
+#if DIF_HAS_CUTLASS
+    if (h3_int8_scaled_gemm_registry_) {
+      const auto scaled_all =
+          std::any_of(h3_w8a8_mlp_plans_.begin(),
+                      h3_w8a8_mlp_plans_.end(),
+                      [](const auto &plan) { return plan.cutlass_scaled_fc2; });
+      result += scaled_all ? "-h3-int8-scaled-all"
+                           : "-h3-int8-scaled-fc1";
+    }
+#endif
+    if (!h3_compact_adaln_plans_.empty())
+      result += "-h3-compact-adaln";
     if (!h3_groupwise_plans_.empty())
       result += "-h3-groupwise-int8";
     if (!h3_ck_attention_plans_.empty())
-      result += "-ck-int8";
+      result += h3_ck_attention_plan_ && h3_ck_attention_plan_->owned_dense()
+                    ? "-owned-h3-dense-int8"
+                    : "-legacy-ck-int8";
     if (!h3_modulation_cache_plans_.empty())
       result += "-h3-modcache";
+    if (!repeated_invariant_operations_.empty())
+      result += "-repeat-cache";
     if (!fused_launch_inputs_.empty())
       result += "-packed-int5";
-    if (uses_cudnn_attention_)
+    if (uses_cudnn_attention_) {
       result += "-cudnn";
+      if (cudnn_attention_heuristic_ == 1U)
+        result += "-heur-b";
+      else if (cudnn_attention_heuristic_ == 2U)
+        result += "-heur-fallback";
+    }
     return result;
   }
   double preparation_milliseconds() const override {
@@ -5926,6 +8032,7 @@ private:
   std::unique_ptr<Workspace> h3_w8a8_scratch_storage_;
   std::unique_ptr<Workspace> h3_w8a8_tail_weight_storage_;
   std::unique_ptr<PinnedHostWorkspace> h3_w8a8_tail_stage_;
+  std::unique_ptr<StagingPool> h3_w8a8_staging_pool_;
   std::array<std::unique_ptr<Event>, 2> h3_w8a8_tail_stage_events_;
   std::unique_ptr<Event> h3_w8a8_tail_order_event_;
   std::unique_ptr<Event> h3_w8a8_tail_ready_event_;
@@ -5933,11 +8040,24 @@ private:
   std::array<bool, 2> h3_w8a8_tail_stage_armed_{};
   std::unique_ptr<Workspace> h3_groupwise_scratch_storage_;
   std::unique_ptr<Workspace> h3_modulation_storage_;
+  std::unique_ptr<Workspace> repeated_invariant_cache_storage_;
   std::unique_ptr<StreamedPrefetcher> streamed_prefetcher_;
   std::unordered_map<std::uint32_t, CUfunction> functions_;
   std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
       fused_launch_inputs_;
   std::unordered_set<std::uint32_t> skipped_operations_;
+  std::unordered_set<std::uint32_t> repeated_invariant_operations_;
+  std::unordered_set<std::uint32_t> repeated_invariant_persistent_tensors_;
+  std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
+      repeated_invariant_outputs_by_producer_;
+  std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
+      captured_tensors_by_producer_;
+  std::unordered_map<std::uint32_t, std::uint64_t>
+      repeated_invariant_cache_offsets_;
+  std::vector<std::uint32_t> repeated_invariant_input_tensors_;
+  std::vector<std::uint32_t> capture_intermediate_tensors_;
+  std::unordered_map<std::uint32_t, std::vector<std::uint8_t>>
+      repeated_invariant_input_snapshots_;
   std::unordered_map<std::uint32_t, std::shared_ptr<LinearPlan>> linear_plans_;
   std::unordered_map<std::size_t, std::vector<std::size_t>>
       parallel_linear_groups_;
@@ -5953,12 +8073,18 @@ private:
   LinearHeuristicCacheStats linear_heuristic_cache_stats_;
   std::vector<H3W8A8MlpPlan> h3_w8a8_mlp_plans_;
   std::vector<H3W8A8AttentionPlan> h3_w8a8_attention_plans_;
+  std::vector<H3CompactAdaLNPlan> h3_compact_adaln_plans_;
+  std::unique_ptr<H3Int8GemmRegistry> h3_int8_gemm_registry_;
+#if DIF_HAS_CUTLASS
+  std::unique_ptr<H3Int8ScaledGemmRegistry> h3_int8_scaled_gemm_registry_;
+#endif
   std::vector<H3GroupwiseBlockPlan> h3_groupwise_plans_;
   std::vector<H3ModulationCachePlan> h3_modulation_cache_plans_;
   Tensor h3_modulation_expected_input_;
   std::filesystem::path h3_modulation_input_path_;
   std::uint32_t h3_modulation_slices_{};
   H3W8A8Functions h3_w8a8_functions_;
+  H3ConvRotFunctions h3_convrot_functions_;
   CUfunction h3_groupwise_dequant_function_{};
   std::shared_ptr<CkAttentionPlan> h3_ck_attention_plan_;
   std::unordered_map<std::uint32_t, std::shared_ptr<CkAttentionPlan>>
@@ -5983,6 +8109,8 @@ private:
   std::uint64_t h3_w8a8_tail_stage_half_bytes_{};
   std::uint64_t h3_w8a8_tail_stage_turn_{};
   std::uint64_t resident_bytes_{};
+  std::uint64_t repeated_invariant_persistent_bytes_{};
+  std::uint64_t repeated_invariant_cache_bytes_{};
   std::uint64_t resident_weight_bytes_{};
   std::uint64_t free_bytes_before_{};
   std::uint32_t streamed_prefetch_depth_{1};
@@ -5990,6 +8118,7 @@ private:
   std::unordered_set<std::uint32_t> reshape_alias_operations_;
   std::unordered_map<std::uint32_t, std::uint32_t> reshape_aliases_;
   bool lazy_resident_upload_{};
+  bool repeated_invariant_valid_{};
   std::unique_ptr<Workspace> promoted_constant_storage_;
   std::uint64_t promoted_constant_bytes_{};
   LaunchTelemetry preparation_telemetry_;
@@ -6001,6 +8130,7 @@ private:
   std::uint64_t resident_major_page_faults_{};
   std::uint64_t resident_prefault_checksum_{};
   bool uses_cudnn_attention_{};
+  std::uint32_t cudnn_attention_heuristic_{};
 };
 
 class CudaExecutor final : public Executor {

@@ -43,7 +43,9 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
                            &replaced_constant_tensors,
                        const std::unordered_map<std::uint32_t, std::uint32_t>
                            &tensor_aliases,
-                       bool verify_program) {
+                       bool verify_program,
+                       const std::unordered_set<std::uint32_t>
+                           &persistent_internal_tensors) {
   if (verify_program)
     ir::verify(program);
   (void)align_up(0U, alignment);
@@ -106,11 +108,17 @@ MemoryPlan plan_memory(const ir::Program &program, std::uint64_t alignment,
         fail("memory plan may replace only semantic constant tensors");
       continue;
     }
+    const auto persistent_internal =
+        persistent_internal_tensors.contains(tensor.id);
+    if (persistent_internal &&
+        tensor.roles != static_cast<std::uint32_t>(ir::TensorRole::Internal))
+      fail("memory-plan persistent tensor must be an internal tensor");
     const auto streamed = tensor.has_role(ir::TensorRole::Streamed);
     const auto protected_role = tensor.has_role(ir::TensorRole::Input) ||
                                 (tensor.has_role(ir::TensorRole::Constant) &&
                                  !streamed) ||
-                                tensor.has_role(ir::TensorRole::Output);
+                                tensor.has_role(ir::TensorRole::Output) ||
+                                persistent_internal;
     const auto produced = producer.find(tensor.id);
     const auto consumed = last_consumer.find(tensor.id);
     const auto first_used = first_consumer.find(tensor.id);

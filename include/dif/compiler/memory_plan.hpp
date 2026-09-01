@@ -41,6 +41,8 @@ MemoryPlan plan_memory(const ir::Program &program,
                            &replaced_constant_tensors = {},
                        const std::unordered_map<std::uint32_t, std::uint32_t>
                            &tensor_aliases = {},
-                       bool verify_program = true);
+                       bool verify_program = true,
+                       const std::unordered_set<std::uint32_t>
+                           &persistent_internal_tensors = {});
 
 } // namespace dif::compiler

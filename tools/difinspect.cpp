@@ -68,8 +68,13 @@ int main(int argc, char **argv) {
     }
     for (const auto &op : program.operations) {
       std::cout << "op id=" << op.id << " code=" << dif::ir::opcode_name(op.opcode)
-                << " inputs=" << op.inputs.size() << " outputs=" << op.outputs.size()
-                << " attrs=" << op.attributes.size() << "\n";
+                << " inputs=";
+      for (std::size_t i = 0; i < op.inputs.size(); ++i)
+        std::cout << (i ? "," : "") << op.inputs[i];
+      std::cout << " outputs=";
+      for (std::size_t i = 0; i < op.outputs.size(); ++i)
+        std::cout << (i ? "," : "") << op.outputs[i];
+      std::cout << " attrs=" << op.attributes.size() << "\n";
     }
     std::optional<dif::compiler::StreamedResidencyPlan> residency;
     std::optional<dif::compiler::ReshapeAliasPlan> reshape_alias_plan;

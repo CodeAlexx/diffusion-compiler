@@ -6,6 +6,7 @@
 namespace dif::runtime {
 
 struct CutlassGemmHandle;
+struct CutlassInt8ScaledGemmHandle;
 
 struct CutlassGemmResources {
   const char *name{};
@@ -39,5 +40,24 @@ bool launch_cutlass_gemm(CutlassGemmHandle *handle, std::uintptr_t stream,
 CutlassGemmResources cutlass_gemm_resources(CutlassGemmHandle *handle);
 
 void destroy_cutlass_gemm(CutlassGemmHandle *handle);
+
+// Prepared SM80+ INT8 GEMM with source-faithful dynamic row scale and static
+// output-channel scale fused into a BF16 epilogue:
+//   BF16 D[m,n] = BF16(I32(A[m,k] * B[n,k]^T) * row[m] * column[n]).
+// The handle owns only prepared kernel metadata; all device pointers may be
+// rebound per launch so one shape plan is reusable across model blocks.
+CutlassInt8ScaledGemmHandle *create_cutlass_int8_scaled_gemm(
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    std::uintptr_t input, std::uintptr_t weight, std::uintptr_t row_scale,
+    std::uintptr_t column_scale, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity);
+
+bool launch_cutlass_int8_scaled_gemm(
+    CutlassInt8ScaledGemmHandle *handle, std::uintptr_t input,
+    std::uintptr_t weight, std::uintptr_t row_scale,
+    std::uintptr_t column_scale, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity);
+
+void destroy_cutlass_int8_scaled_gemm(CutlassInt8ScaledGemmHandle *handle);
 
 } // namespace dif::runtime

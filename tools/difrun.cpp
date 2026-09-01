@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -67,8 +68,20 @@ void usage() {
                " [--absorb-linear-bias OP_ID]"
                " [--persist-linear-heuristics]"
                " [--cutlass-linear OP_ID:SCHEDULE_ID]"
+               " [--resident-streamed-constant TENSOR_ID]"
                " [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-layer N]"
                " [--h3-w8a8-resident-layers N]"
+               " [--h3-convrot-int8-checkpoint FILE.safetensors]"
+               " [--h3-convrot-int8-layer N]"
+               " [--h3-convrot-int8-resident-layers N]"
+               " [--h3-int8-mlp-chunk-rows N]"
+               " [--h3-int8-cublaslt]"
+               " [--h3-int8-cublaslt-rank N]"
+               " [--h3-int8-cublaslt-tune]"
+               " [--h3-int8-cutlass-scaled-fc1]"
+               " [--h3-int8-cutlass-scaled-all]"
+               " [--h3-int8-compact-adaln]"
+               " [--cudnn-attention-heuristic a|b|fallback|autotune]"
                " [--h3-groupwise-cache FILE.safetensors]"
                " [--h3-groupwise-layer N]"
                " [--h3-modulation-cache FILE.safetensors]"
@@ -78,6 +91,7 @@ void usage() {
                " [--h3-modulation-steps N]"
                " [--h3-modulation-total-layers N]"
                " [--h3-ck-attention-dso FILE.so]"
+               " [--h3-int8-attention-layers N]"
                " [--profile-pipeline] [--serial-streaming] [--map-inputs]"
                " [--streamed-keep-pages] [--streamed-staging-buffers N]"
                " [--streamed-prefetch-depth N] [--streamed-stage-threads N]"
@@ -155,6 +169,13 @@ int main(int argc, char **argv) {
       else if (option == "--cutlass-linear" && i + 1 < argc)
         options.cutlass_linear_operations.push_back(
             cutlass_choice(argv[++i]));
+      else if (option == "--resident-streamed-constant" && i + 1 < argc) {
+        const auto id = number(argv[++i], "resident streamed constant id");
+        if (id > std::numeric_limits<std::uint32_t>::max())
+          dif::fail("resident streamed constant id exceeds U32 range");
+        options.resident_streamed_constants.push_back(
+            static_cast<std::uint32_t>(id));
+      }
       else if (option == "--h3-w8a8-cache" && i + 1 < argc)
         options.h3_w8a8_cache = argv[++i];
       else if (option == "--h3-w8a8-layer" && i + 1 < argc)
@@ -163,6 +184,48 @@ int main(int argc, char **argv) {
       else if (option == "--h3-w8a8-resident-layers" && i + 1 < argc)
         options.h3_w8a8_resident_layers = static_cast<std::uint32_t>(
             number(argv[++i], "H3 W8A8 resident layers"));
+      else if (option == "--h3-convrot-int8-checkpoint" && i + 1 < argc)
+        options.h3_convrot_int8_checkpoint = argv[++i];
+      else if (option == "--h3-convrot-int8-layer" && i + 1 < argc)
+        options.h3_convrot_int8_layer = static_cast<std::uint32_t>(
+            number(argv[++i], "H3 ConvRot INT8 layer"));
+      else if (option == "--h3-convrot-int8-resident-layers" && i + 1 < argc)
+        options.h3_convrot_int8_resident_layers =
+            static_cast<std::uint32_t>(number(
+                argv[++i], "H3 ConvRot INT8 resident layers"));
+      else if (option == "--h3-int8-mlp-chunk-rows" && i + 1 < argc) {
+        const auto rows = number(argv[++i], "H3 INT8 MLP chunk rows");
+        if (rows == 0U || rows > std::numeric_limits<std::uint32_t>::max())
+          dif::fail("H3 INT8 MLP chunk rows must be in U32 range and nonzero");
+        options.h3_int8_mlp_chunk_rows = static_cast<std::uint32_t>(rows);
+      }
+      else if (option == "--h3-int8-cublaslt")
+        options.h3_int8_cublaslt = true;
+      else if (option == "--h3-int8-cublaslt-rank" && i + 1 < argc)
+        options.h3_int8_cublaslt_heuristic_rank =
+            static_cast<std::uint32_t>(number(
+                argv[++i], "H3 INT8 cuBLASLt heuristic rank"));
+      else if (option == "--h3-int8-cublaslt-tune")
+        options.h3_int8_cublaslt_tune = true;
+      else if (option == "--h3-int8-cutlass-scaled-fc1")
+        options.h3_int8_cutlass_scaled_fc1 = true;
+      else if (option == "--h3-int8-cutlass-scaled-all")
+        options.h3_int8_cutlass_scaled_all = true;
+      else if (option == "--h3-int8-compact-adaln")
+        options.h3_int8_compact_adaln = true;
+      else if (option == "--cudnn-attention-heuristic" && i + 1 < argc) {
+        const std::string name = argv[++i];
+        if (name == "a")
+          options.cudnn_attention_heuristic = 0U;
+        else if (name == "b")
+          options.cudnn_attention_heuristic = 1U;
+        else if (name == "fallback")
+          options.cudnn_attention_heuristic = 2U;
+        else if (name == "autotune")
+          options.cudnn_attention_heuristic = 3U;
+        else
+          dif::fail("cuDNN attention heuristic must be a, b, fallback, or autotune");
+      }
       else if (option == "--h3-groupwise-cache" && i + 1 < argc)
         options.h3_groupwise_cache = argv[++i];
       else if (option == "--h3-groupwise-layer" && i + 1 < argc)
@@ -185,6 +248,13 @@ int main(int argc, char **argv) {
             number(argv[++i], "H3 modulation total layers"));
       else if (option == "--h3-ck-attention-dso" && i + 1 < argc)
         options.h3_ck_attention_dso = argv[++i];
+      else if (option == "--h3-int8-attention-layers" && i + 1 < argc) {
+        const auto layers = number(argv[++i], "H3 INT8 attention layers");
+        if (layers == 0U || layers > std::numeric_limits<std::uint32_t>::max())
+          dif::fail("H3 INT8 attention layers must be in U32 range and nonzero");
+        options.h3_int8_attention_layers =
+            static_cast<std::uint32_t>(layers);
+      }
       else if (option == "--trace-ops")
         options.trace_operations = true;
       else if (option == "--streamed-keep-pages")

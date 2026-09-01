@@ -59,6 +59,23 @@ struct RunOptions {
   // Explicit compiler-selected semantic Reshape operations whose internal
   // outputs alias their immutable inputs in the prepared execution plan.
   std::vector<std::uint32_t> alias_reshape_operations;
+  // Compiler-proven pure operations whose external inputs remain stable over
+  // repeated executions of one prepared plan. The CUDA runtime executes the
+  // region once, preserves every crossing output in dedicated device storage,
+  // and reuses it only while the declared input bytes remain unchanged. This
+  // is generic cross-evaluation execution policy, not model-specific runtime
+  // semantics; invalid regions fail closed during preparation.
+  std::vector<std::uint32_t> repeated_invariant_operations;
+  // Diagnostic-only tensor boundaries to copy immediately after their
+  // semantic producer during a single measured execution. This is explicit
+  // parity-harness policy and is never enabled by a production plan because
+  // the readback intentionally perturbs timing.
+  std::vector<std::uint32_t> capture_intermediate_tensors;
+  // Exact cuDNN attention engine heuristic selected by the compiler plan:
+  // 0=A (default), 1=B, 2=FALLBACK. This changes only plan discovery; the
+  // semantic Attention operation, dtype, accumulation, and outputs remain
+  // source-faithful and every non-default candidate must pass parity/timing.
+  std::uint32_t cudnn_attention_heuristic{};
   // Accepted MiniMax-H3 W8A8 precision route. The cache is the Serenity
   // resident row-scale SafeTensors store; the backend recognizes and replaces
   // only an exclusive Linear->SwiGlu->Linear->ResidualGate MLP chain.
@@ -68,6 +85,45 @@ struct RunOptions {
   // store for the tail, matching Serenity's production low-memory policy.
   std::uint32_t h3_w8a8_resident_layers{
       std::numeric_limits<std::uint32_t>::max()};
+  // Project-owned ConvRot INT8 cache derived from the official H3 checkpoint.
+  // Projection weights are rotated offline in normalized 256-wide Hadamard
+  // groups; matching activations are rotated online before dynamic per-row
+  // INT8 quantization. This is an explicit approximate precision policy over
+  // the unchanged H3 DiffIR Linear semantics, not a model executor or new IR
+  // op. No ComfyUI checkpoint weights participate in this route.
+  std::filesystem::path h3_convrot_int8_checkpoint;
+  std::uint32_t h3_convrot_int8_layer{};
+  std::uint32_t h3_convrot_int8_resident_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  // Explicit compiler-selected row tile for direct H3 INT8 MLP projections.
+  // Larger tiles trade reusable scratch capacity for fewer, fuller GEMMs. The
+  // choice is prepared once, reported in the result, and must be replayed by
+  // an admitted execution plan; it does not alter DiffIR semantics.
+  std::uint32_t h3_int8_mlp_chunk_rows{1024U};
+  // Use shape-prepared cuBLASLt IMMA plans for direct H3 INT8 projections
+  // instead of the legacy cublasGemmEx dispatcher. Off by default until the
+  // complete-model numerical, memory, and timing candidate is admitted.
+  bool h3_int8_cublaslt{false};
+  std::uint32_t h3_int8_cublaslt_heuristic_rank{};
+  bool h3_int8_cublaslt_tune{false};
+  // Candidate ConvRot path: fuse FC1's dynamic row/static channel scaling
+  // into an INT8 tensor-core GEMM epilogue and preserve the observable BF16
+  // projection boundary without materializing an I32 output tensor. Off by
+  // default until whole-step parity and timing admit it.
+  bool h3_int8_cutlass_scaled_fc1{false};
+  // Candidate ConvRot path: extend the same source-observable scaled BF16
+  // CUTLASS epilogue to QKV, attention output, FC1, and FC2. This removes all
+  // reusable I32 projection scratch from the prepared 50-block executor while
+  // retaining the exact cuDNN attention route. Off by default until complete
+  // trajectory and decoded-quality gates admit it.
+  bool h3_int8_cutlass_scaled_all{false};
+  // Candidate prepared lowering for ConvRot H3 blocks: consume compact
+  // creator AdaLN tables directly inside RMSNorm/ConvRot encode and residual
+  // epilogues. This removes the six sequence-expanded modulation tensors and
+  // two normalized activation tensors per block without changing DiffIR
+  // semantics. Off by default until exact boundary and decoded quality gates
+  // admit it.
+  bool h3_int8_compact_adaln{false};
   // Accepted MiniMax-H3 groupwise INT8 weight-only route. The Serenity cache
   // stores transformed I8 projection weights with compact F16 group scales;
   // the backend dequantizes each projection into shared BF16 scratch below
@@ -88,10 +144,18 @@ struct RunOptions {
   // the source schedule cache. A nonzero value validates cache provenance
   // against the complete checkpoint block count, not the sliced graph count.
   std::uint32_t h3_modulation_total_layers{};
-  // Accepted architecture-tagged Comfy Kitchen H3 attention route. This is an
-  // explicit approximate backend under the semantic Attention operation; an
-  // empty path retains the exact DiffIR-selected implementation.
+  // Explicit architecture-tagged H3 attention DSO route. Project-owned dense
+  // INT8 and legacy development-oracle ABIs are identified separately in the
+  // run receipt; an empty path retains the exact DiffIR-selected
+  // implementation. A production admission must use project-owned code.
   std::filesystem::path h3_ck_attention_dso;
+  // Contiguous transformer-block Attention range replaced in program order by
+  // the selected H3 INT8 DSO. Operations before and after the range remain on
+  // exact cuDNN. This is explicit compiler policy for quality/performance
+  // sweeps and is reported through the admitted primitive list.
+  std::uint32_t h3_int8_attention_first_layer{};
+  std::uint32_t h3_int8_attention_layers{
+      std::numeric_limits<std::uint32_t>::max()};
   std::uint32_t linear_tuning_warmups{3};
   std::uint32_t linear_tuning_iterations{10};
   std::uint32_t linear_tuning_sessions{3};
@@ -109,11 +173,12 @@ struct RunOptions {
   bool profile_pipeline{false};
   // W1-R streamed-transport policy. Default preserves the historical
   // behavior exactly: mapped streamed constants madvise(MADV_DONTNEED)
-  // their source pages after every staging copy, which forces a refault
-  // on every warmup and iteration. When false, pages are kept across the
-  // passes of one run and dropped once at run end instead. Outputs are
-  // byte-identical either way; only host paging behavior changes. Any
-  // non-default choice must enter difopt candidate identity.
+  // their source ranges after every staging copy. This drops process page
+  // tables without intentionally evicting the shared file-cache pages; a
+  // later pass may incur minor refaults but not a deliberate disk reread.
+  // When false, mappings remain populated through the run. Outputs are byte-
+  // identical either way; only host paging behavior changes. Any non-default
+  // choice must enter difopt candidate identity.
   bool streamed_release_mapped_pages_per_copy{true};
   // Pinned staging ring for streamed constants and how many operations
   // ahead the overlapped scheduler prefetches. Defaults (2 buffers,
@@ -126,10 +191,11 @@ struct RunOptions {
   // Worker threads for the mmap->pinned staging copy (1 = the historical
   // single-threaded memcpy on the submitting thread).
   std::uint32_t streamed_stage_threads{1};
-  // Upload compiler-promoted reusable constants through a bounded two-slot
-  // pinned staging pipeline during preparation. This overlaps mmap-to-pinned
-  // host copies with the previous H2D transfer; policy remains explicit and
-  // the pinned footprint is checked against streamed_pinned_budget_bytes.
+  // Upload compiler-promoted reusable constants and explicit resident H3 INT8
+  // plan weights through a bounded two-slot pinned staging pipeline during
+  // preparation. This overlaps mmap-to-pinned host copies with the previous
+  // H2D transfer; policy remains explicit and the pinned footprint is checked
+  // against streamed_pinned_budget_bytes.
   bool pipelined_resident_upload{false};
   // Allocate selected persistent constants at prepare, but populate their
   // dedicated device storage at first semantic use. The first execution can
@@ -319,6 +385,8 @@ struct LaunchTelemetry {
   std::uint64_t h2d_bytes{};
   std::uint64_t d2h_copies{};
   std::uint64_t d2h_bytes{};
+  std::uint64_t d2d_copies{};
+  std::uint64_t d2d_bytes{};
   std::uint64_t event_records{};
   std::uint64_t stream_wait_events{};
   std::uint64_t host_event_synchronizes{};
@@ -358,6 +426,7 @@ struct PipelineProfile {
 
 struct RunResult {
   TensorMap outputs;
+  TensorMap captured_intermediates;
   double preparation_milliseconds{};
   double mean_milliseconds{};
   double minimum_milliseconds{};
@@ -380,6 +449,9 @@ struct RunResult {
   std::vector<H3CKAttentionResult> h3_ck_attentions;
   std::vector<H3GroupwiseInt8Result> h3_groupwise_int8;
   std::vector<H3ModulationCacheResult> h3_modulation_caches;
+  std::uint32_t repeated_invariant_operation_count{};
+  std::uint64_t repeated_invariant_persistent_bytes{};
+  bool repeated_invariant_cache_hit{};
   PipelineProfile pipeline_profile;
   // CUDA backend only; other executors leave these zeroed. The preparation
   // phase counters describe the one-time prepare() of the executing plan;

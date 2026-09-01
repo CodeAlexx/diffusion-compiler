@@ -1213,6 +1213,57 @@ void test_h3_conditioning_layout() {
              digest(plan.adaln_indices) ==
                  "c1dbd818693e1d201de0bd3ec8e87deaa2fb28cc8f7a1a0b2b2a297a9d96e019",
          "H3 row timestep and AdaLN plans are byte-exact to source");
+
+  const std::vector<float> video_sigmas = {1.0F, 0.25F, 0.0F};
+  const std::vector<float> audio_sigmas = {1.0F, 0.5F, 0.0F};
+  const auto fl_schedule = dif::frontend::make_h3_schedule_timestep_table(
+      video_sigmas, audio_sigmas, true, false);
+  expect(fl_schedule.evaluations == 2U && fl_schedule.tables == 3U &&
+             fl_schedule.timesteps ==
+                 std::vector<float>({0.0F, 0.999F, 0.999F,
+                                     0.5F, 0.75F, 0.999F}),
+         "H3 FL2VA prepared timestep slices preserve creator sorted-unique indices");
+  const auto ref_schedule = dif::frontend::make_h3_schedule_timestep_table(
+      video_sigmas, audio_sigmas, true, true);
+  expect(ref_schedule.evaluations == 2U && ref_schedule.tables == 4U &&
+             ref_schedule.timesteps ==
+                 std::vector<float>({0.0F, 0.999F, 1.0F, 1.0F,
+                                     0.5F, 0.75F, 0.999F, 1.0F}),
+         "H3 Ref2VA prepared timestep slices preserve creator sorted-unique indices");
+
+  const std::vector<dif::frontend::H3ReferenceGeometry> references = {
+      {dif::frontend::H3ReferenceKind::Image, 1U, 4U, 6U, 0U},
+      {dif::frontend::H3ReferenceKind::Video, 3U, 6U, 4U, 2U},
+      {dif::frontend::H3ReferenceKind::Audio, 0U, 0U, 0U, 3U},
+  };
+  const std::vector<std::int32_t> ref_text_tags = {1, 0, 1, 0, 1};
+  const auto ref_layout = dif::frontend::make_h3_ref2va_layout(
+      ref_text_tags, references, 3U, 4U, 6U, 4U, 1U, 2U, 2U);
+  expect(ref_layout.sequence_length == 65U &&
+             ref_layout.text_indices.size() == 5U &&
+             ref_layout.video_indices.size() == 42U &&
+             ref_layout.audio_indices.size() == 18U &&
+             ref_layout.num_condition_video_rows == 24U &&
+             ref_layout.num_condition_audio_rows == 10U,
+         "H3 Ref2VA layout preserves ordered mixed-reference row counts");
+  expect(digest(ref_layout.position_ids) ==
+             "9ae67e9914dc784fc136710f2c1d01324604d26ceaeda92ca9939f55954fef38" &&
+             digest(ref_layout.token_tags) ==
+                 "f68263bad5e8bebd13ba6ae653dbe87e3395dae46e6a4eb70bf072570fff7282" &&
+             digest(ref_layout.text_indices) ==
+                 "e528f4309e1413e6bc35aea5d8db8519384d2fcc33f9dd5d1126d73f104cf92a" &&
+             digest(ref_layout.video_indices) ==
+                 "3770b65430e6d89f17194ee974ae5d62f1032bff1a00eece38a6ce9673408098" &&
+             digest(ref_layout.audio_indices) ==
+                 "2e7b932c2f86d861770a277c779dc63c50dc7f46378229664f6203ca050502e2",
+         "H3 Ref2VA positions, tags, and row indices are byte-exact to pinned creator packing_ref2va.py");
+  expect(digest(ref_layout.text_map) ==
+             "a4ae6210aca2932ba47c663f871be66f2ca989ee0f664109a7b963bb3335c791" &&
+             digest(ref_layout.video_map) ==
+                 "27542ead508d1e38b85708e5caba6cc74677d3e2e8db58da28b230d6213b13a1" &&
+             digest(ref_layout.audio_map) ==
+                 "37be623b2544f4effd2822deaf62d8043bc9667effbc5cc5a61c2becf855d266",
+         "H3 Ref2VA inverse modality maps are byte-exact to creator indices");
 }
 
 void test_krea2_rotary_layout_mask_and_broadcast_oracle() {
@@ -2266,6 +2317,75 @@ void test_prepared_execution_reuses_constants() {
          "prepared execution reuses constants with new dynamic input");
 }
 
+void test_cuda_repeated_invariant_execution_cache() {
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {2}},
+      {2, DType::F32, TensorRole::Input, {2}},
+      {3, DType::F32, TensorRole::Constant, {2}},
+      {4, DType::F32, TensorRole::Internal, {2}},
+      {5, DType::F32, TensorRole::Output, {2}},
+  };
+  program.operations = {
+      {11, Opcode::Add, {1, 3}, {4}, {}},
+      {12, Opcode::Multiply, {4, 2}, {5}, {}},
+  };
+  dif::ir::verify(program);
+
+  const dif::runtime::TensorMap constants = {
+      {3, f32_tensor({2}, {5.0F, 7.0F})},
+  };
+  dif::runtime::RunOptions cached_options;
+  cached_options.warmups = 0U;
+  cached_options.iterations = 1U;
+  cached_options.minimum_free_bytes = 0U;
+  cached_options.repeated_invariant_operations = {11U};
+  cached_options.capture_intermediate_tensors = {4U};
+  auto cached = dif::runtime::make_cuda_executor()->prepare(
+      program, constants, cached_options);
+
+  dif::runtime::TensorMap first_inputs = {
+      {1, f32_tensor({2}, {1.0F, 2.0F})},
+      {2, f32_tensor({2}, {10.0F, 10.0F})},
+  };
+  const auto first = cached->run(first_inputs, cached_options);
+  expect(float_values(first.outputs.at(5U)) ==
+             std::vector<float>({60.0F, 90.0F}) &&
+             float_values(first.captured_intermediates.at(4U)) ==
+                 std::vector<float>({6.0F, 9.0F}) &&
+             !first.repeated_invariant_cache_hit,
+         "repeated-invariant cache executes and preserves its first boundary");
+
+  dif::runtime::TensorMap second_inputs = {
+      {1, f32_tensor({2}, {1.0F, 2.0F})},
+      {2, f32_tensor({2}, {20.0F, 30.0F})},
+  };
+  const auto second = cached->run(second_inputs, cached_options);
+  expect(float_values(second.outputs.at(5U)) ==
+             std::vector<float>({120.0F, 270.0F}) &&
+             second.captured_intermediates.at(4U).bytes ==
+                 first.captured_intermediates.at(4U).bytes &&
+             second.repeated_invariant_cache_hit &&
+             second.repeated_invariant_operation_count == 1U &&
+             second.repeated_invariant_persistent_bytes == 2U * sizeof(float) &&
+             second.run_telemetry.d2d_copies == 1U &&
+             second.run_telemetry.d2d_bytes == 2U * sizeof(float),
+         "repeated-invariant cache restores exact device bytes on reuse");
+
+  dif::runtime::TensorMap changed_inputs = {
+      {1, f32_tensor({2}, {3.0F, 4.0F})},
+      {2, f32_tensor({2}, {20.0F, 30.0F})},
+  };
+  const auto changed = cached->run(changed_inputs, cached_options);
+  expect(float_values(changed.outputs.at(5U)) ==
+             std::vector<float>({160.0F, 330.0F}) &&
+             !changed.repeated_invariant_cache_hit,
+         "repeated-invariant cache fails closed when an input changes");
+}
+
 void test_verifier_rejects_multiple_writers() {
   auto program = rms_program(1, 4);
   program.operations.push_back(program.operations.front());
@@ -2921,6 +3041,8 @@ void test_safetensors_streaming_writer() {
   const auto mapped_packed =
       dif::weights::map_safetensor(metadata, "packed\\\"weight");
   const auto mapped_scales = dif::weights::map_safetensor(metadata, "scales");
+  expect(mapped_packed.mapping == mapped_scales.mapping,
+         "SafeTensors entries share one read-only file mapping");
   expect(mapped_packed.byte_size() == packed.size() &&
              std::equal(packed.begin(), packed.end(), mapped_packed.data()),
          "streaming SafeTensors writer preserves packed bytes");
@@ -3661,6 +3783,7 @@ int main() {
   test_h3_latent_handoff();
   test_h3_media_handoff();
   test_prepared_execution_reuses_constants();
+  test_cuda_repeated_invariant_execution_cache();
   test_verifier_rejects_multiple_writers();
   test_audio_opcode_verifier_contract();
   test_audio_bigvgan_frontend_contract();

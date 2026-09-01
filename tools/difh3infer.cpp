@@ -16,12 +16,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -46,13 +49,30 @@ struct Options {
   std::filesystem::path output_raw;
   std::filesystem::path output_decoded;
   std::filesystem::path first_evaluation_input_directory;
+  std::filesystem::path capture_denoiser_directory;
   std::filesystem::path cache_directory;
   std::filesystem::path h3_w8a8_cache;
+  std::filesystem::path h3_convrot_int8_checkpoint;
   std::filesystem::path h3_ck_attention_dso;
   std::filesystem::path h3_modulation_cache;
   std::filesystem::path h3_modulation_source_index;
   std::uint32_t h3_w8a8_resident_layers{
       std::numeric_limits<std::uint32_t>::max()};
+  std::uint32_t h3_convrot_int8_resident_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  std::uint32_t h3_int8_mlp_chunk_rows{1024U};
+  std::uint32_t h3_int8_attention_first_layer{};
+  std::uint32_t h3_int8_attention_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  std::vector<std::uint32_t> resident_streamed_constants;
+  bool h3_int8_cublaslt{false};
+  std::uint32_t h3_int8_cublaslt_heuristic_rank{};
+  bool h3_int8_cublaslt_tune{false};
+  bool h3_int8_cutlass_scaled_fc1{false};
+  bool h3_int8_cutlass_scaled_all{false};
+  bool h3_int8_compact_adaln{false};
+  bool h3_cache_text_refiner{false};
+  std::uint32_t cudnn_attention_heuristic{};
   std::uint32_t h3_modulation_steps{};
   std::uint64_t all_text_tokens{};
   std::uint64_t latent_frames{};
@@ -64,12 +84,16 @@ struct Options {
   std::uint32_t schedule_points{};
   std::uint32_t maximum_evaluations{};
   std::vector<dif::frontend::H3KeyframeAnchor> keyframes;
+  std::vector<dif::frontend::H3ReferenceGeometry> references;
+  std::vector<std::uint32_t> capture_denoiser_tensors;
   std::uint64_t minimum_free_bytes{4096ULL * 1024ULL * 1024ULL};
   bool verify_shards{false};
   bool profile_pipeline{false};
   // Shared streamed-weight staging policy (Wave-1 runtime knobs). Defaults
   // mirror RunOptions exactly, so an unflagged run is the historical path.
   bool streamed_keep_pages{false};
+  bool pipelined_resident_upload{false};
+  bool lazy_resident_upload{false};
   std::uint32_t streamed_staging_buffers{};
   std::uint32_t streamed_prefetch_depth{};
   std::uint32_t streamed_stage_threads{};
@@ -88,7 +112,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N --keyframes none|first|last|first-last --output-latent FILE.diftensor --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors] [--h3-w8a8-resident-layers N] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
+      << "usage: difh3infer --backend cpu|cuda --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors --h3-convrot-int8-resident-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -103,6 +127,91 @@ keyframes(const std::string &name) {
   if (name == "first-last")
     return {H3KeyframeAnchor::First, H3KeyframeAnchor::Last};
   dif::fail("keyframes must be none, first, last, or first-last");
+}
+
+dif::frontend::H3ReferenceGeometry
+reference_geometry(const std::string &specification) {
+  std::array<std::string, 5> fields;
+  std::size_t start = 0U;
+  for (std::size_t field = 0U; field < fields.size(); ++field) {
+    const auto separator = specification.find(':', start);
+    if ((field + 1U < fields.size() && separator == std::string::npos) ||
+        (field + 1U == fields.size() && separator != std::string::npos))
+      dif::fail("reference geometry must be KIND:T:H:W:A");
+    fields[field] = specification.substr(
+        start, separator == std::string::npos ? separator : separator - start);
+    if (separator == std::string::npos)
+      break;
+    start = separator + 1U;
+  }
+  dif::frontend::H3ReferenceKind kind;
+  if (fields[0] == "image")
+    kind = dif::frontend::H3ReferenceKind::Image;
+  else if (fields[0] == "video")
+    kind = dif::frontend::H3ReferenceKind::Video;
+  else if (fields[0] == "audio")
+    kind = dif::frontend::H3ReferenceKind::Audio;
+  else
+    dif::fail("reference kind must be image, video, or audio");
+  return {kind, number(fields[1], "reference latent frames"),
+          number(fields[2], "reference latent height"),
+          number(fields[3], "reference latent width"),
+          number(fields[4], "reference audio latents")};
+}
+
+std::vector<std::uint32_t>
+h3_text_refiner_invariant_operations(const dif::ir::Program &program) {
+  const auto *text = program.tensor(3U);
+  if (!text || !text->has_role(dif::ir::TensorRole::Input) ||
+      text->dims.size() != 2U)
+    dif::fail("H3 text-refiner cache requires canonical text input tensor 3");
+
+  std::unordered_map<std::uint32_t, const dif::ir::Operation *> producers;
+  for (const auto &operation : program.operations)
+    for (const auto output : operation.outputs)
+      producers.emplace(output, &operation);
+
+  for (const auto &update : program.operations) {
+    if (update.opcode != dif::ir::Opcode::IndexedUpdateRows ||
+        update.inputs.size() != 3U)
+      continue;
+    const auto *candidate = program.tensor(update.inputs.at(1));
+    if (!candidate || candidate->dims.size() != 2U ||
+        candidate->dims.front() != text->dims.front())
+      continue;
+
+    std::unordered_set<std::uint32_t> operation_ids;
+    std::unordered_set<std::uint32_t> external_inputs;
+    std::function<void(std::uint32_t)> visit = [&](std::uint32_t tensor_id) {
+      const auto produced = producers.find(tensor_id);
+      if (produced == producers.end()) {
+        const auto *description = program.tensor(tensor_id);
+        if (!description)
+          dif::fail("H3 text-refiner dependency references a missing tensor");
+        if (description->has_role(dif::ir::TensorRole::Input))
+          external_inputs.insert(tensor_id);
+        else if (!description->has_role(dif::ir::TensorRole::Constant))
+          dif::fail("H3 text-refiner dependency is neither input nor constant");
+        return;
+      }
+      if (!operation_ids.insert(produced->second->id).second)
+        return;
+      for (const auto input : produced->second->inputs)
+        visit(input);
+    };
+    visit(update.inputs.at(1));
+    if (external_inputs != std::unordered_set<std::uint32_t>{3U})
+      continue;
+    std::vector<std::uint32_t> result;
+    result.reserve(operation_ids.size());
+    for (const auto &operation : program.operations)
+      if (operation_ids.contains(operation.id))
+        result.push_back(operation.id);
+    if (result.empty())
+      dif::fail("H3 text-refiner cache found an empty invariant region");
+    return result;
+  }
+  dif::fail("H3 text-refiner cache could not identify the creator dependency frontier");
 }
 
 Options parse(int argc, char **argv) {
@@ -161,6 +270,9 @@ Options parse(int argc, char **argv) {
       options.patch_width = number(value("--patch-w"), "patch width");
     else if (option == "--keyframes")
       options.keyframes = keyframes(value("--keyframes"));
+    else if (option == "--reference-geometry")
+      options.references.push_back(
+          reference_geometry(value("--reference-geometry")));
     else if (option == "--output-latent")
       options.output_latent = value("--output-latent");
     else if (option == "--output-audio")
@@ -171,6 +283,9 @@ Options parse(int argc, char **argv) {
       options.output_handoff = value("--output-handoff");
     else if (option == "--h3-w8a8-cache")
       options.h3_w8a8_cache = value("--h3-w8a8-cache");
+    else if (option == "--h3-convrot-int8-checkpoint")
+      options.h3_convrot_int8_checkpoint =
+          value("--h3-convrot-int8-checkpoint");
     else if (option == "--h3-w8a8-resident-layers") {
       const auto layers =
           number(value("--h3-w8a8-resident-layers"), "resident layers");
@@ -178,8 +293,79 @@ Options parse(int argc, char **argv) {
         dif::fail("H3 W8A8 resident layer count exceeds U32 range");
       options.h3_w8a8_resident_layers = static_cast<std::uint32_t>(layers);
     }
+    else if (option == "--h3-convrot-int8-resident-layers") {
+      const auto layers = number(value("--h3-convrot-int8-resident-layers"),
+                                 "ConvRot INT8 resident layers");
+      if (layers > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 ConvRot INT8 resident layer count exceeds U32 range");
+      options.h3_convrot_int8_resident_layers =
+          static_cast<std::uint32_t>(layers);
+    }
+    else if (option == "--h3-int8-mlp-chunk-rows") {
+      const auto rows = number(value("--h3-int8-mlp-chunk-rows"),
+                               "H3 INT8 MLP chunk rows");
+      if (rows == 0U || rows > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 INT8 MLP chunk rows must be in U32 range and nonzero");
+      options.h3_int8_mlp_chunk_rows = static_cast<std::uint32_t>(rows);
+    }
+    else if (option == "--h3-int8-cublaslt")
+      options.h3_int8_cublaslt = true;
+    else if (option == "--h3-int8-cublaslt-rank") {
+      const auto rank = number(value("--h3-int8-cublaslt-rank"),
+                               "H3 INT8 cuBLASLt heuristic rank");
+      if (rank > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 INT8 cuBLASLt heuristic rank exceeds U32 range");
+      options.h3_int8_cublaslt_heuristic_rank =
+          static_cast<std::uint32_t>(rank);
+    }
+    else if (option == "--h3-int8-cublaslt-tune")
+      options.h3_int8_cublaslt_tune = true;
+    else if (option == "--h3-int8-cutlass-scaled-fc1")
+      options.h3_int8_cutlass_scaled_fc1 = true;
+    else if (option == "--h3-int8-cutlass-scaled-all")
+      options.h3_int8_cutlass_scaled_all = true;
+    else if (option == "--h3-int8-compact-adaln")
+      options.h3_int8_compact_adaln = true;
+    else if (option == "--h3-cache-text-refiner")
+      options.h3_cache_text_refiner = true;
+    else if (option == "--resident-streamed-constant") {
+      const auto id = number(value("--resident-streamed-constant"),
+                             "resident streamed constant id");
+      if (id > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("resident streamed constant id exceeds U32 range");
+      options.resident_streamed_constants.push_back(
+          static_cast<std::uint32_t>(id));
+    }
+    else if (option == "--cudnn-attention-heuristic") {
+      const auto name = value("--cudnn-attention-heuristic");
+      if (name == "a")
+        options.cudnn_attention_heuristic = 0U;
+      else if (name == "b")
+        options.cudnn_attention_heuristic = 1U;
+      else if (name == "fallback")
+        options.cudnn_attention_heuristic = 2U;
+      else if (name == "autotune")
+        options.cudnn_attention_heuristic = 3U;
+      else
+        dif::fail("cuDNN attention heuristic must be a, b, fallback, or autotune");
+    }
     else if (option == "--h3-ck-attention-dso")
       options.h3_ck_attention_dso = value("--h3-ck-attention-dso");
+    else if (option == "--h3-int8-attention-first-layer") {
+      const auto layer = number(value("--h3-int8-attention-first-layer"),
+                                "first H3 INT8 attention layer");
+      if (layer > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("first H3 INT8 attention layer exceeds U32 range");
+      options.h3_int8_attention_first_layer =
+          static_cast<std::uint32_t>(layer);
+    }
+    else if (option == "--h3-int8-attention-layers") {
+      const auto layers = number(value("--h3-int8-attention-layers"),
+                                 "H3 INT8 attention layers");
+      if (layers == 0U || layers > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 INT8 attention layers must be in U32 range and nonzero");
+      options.h3_int8_attention_layers = static_cast<std::uint32_t>(layers);
+    }
     else if (option == "--h3-modulation-cache")
       options.h3_modulation_cache = value("--h3-modulation-cache");
     else if (option == "--h3-modulation-source-index")
@@ -199,6 +385,16 @@ Options parse(int argc, char **argv) {
     else if (option == "--first-eval-input-dir")
       options.first_evaluation_input_directory =
           value("--first-eval-input-dir");
+    else if (option == "--capture-denoiser-dir")
+      options.capture_denoiser_directory = value("--capture-denoiser-dir");
+    else if (option == "--capture-denoiser-tensor") {
+      const auto tensor_id = number(value("--capture-denoiser-tensor"),
+                                    "captured denoiser tensor id");
+      if (tensor_id == 0U || tensor_id > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("captured denoiser tensor id must be in the U32 positive range");
+      options.capture_denoiser_tensors.push_back(
+          static_cast<std::uint32_t>(tensor_id));
+    }
     else if (option == "--max-evaluations") {
       const auto evaluations =
           number(value("--max-evaluations"), "maximum evaluations");
@@ -220,6 +416,10 @@ Options parse(int argc, char **argv) {
       options.profile_pipeline = true;
     else if (option == "--streamed-keep-pages")
       options.streamed_keep_pages = true;
+    else if (option == "--pipelined-resident-upload")
+      options.pipelined_resident_upload = true;
+    else if (option == "--lazy-resident-upload")
+      options.lazy_resident_upload = true;
     else if (option == "--streamed-staging-buffers")
       options.streamed_staging_buffers = static_cast<std::uint32_t>(
           number(value("--streamed-staging-buffers"), "staging buffers"));
@@ -255,6 +455,11 @@ Options parse(int argc, char **argv) {
   if (options.h3_modulation_cache.empty() !=
       options.h3_modulation_source_index.empty())
     dif::fail("H3 modulation cache and source index must be supplied together");
+  if (!options.h3_w8a8_cache.empty() &&
+      !options.h3_convrot_int8_checkpoint.empty())
+    dif::fail("select at most one H3 direct INT8 precision route");
+  if (!options.keyframes.empty() && !options.references.empty())
+    dif::fail("FL2VA keyframes and Ref2VA references are mutually exclusive");
   const auto supplied_schedule = !options.video_sigmas.empty() ||
                                  !options.audio_sigmas.empty();
   if ((options.schedule_points != 0U) == supplied_schedule ||
@@ -430,10 +635,19 @@ int main(int argc, char **argv) {
     }
     input_io_ms += elapsed_milliseconds(timed_io_start);
     const auto initial_layout_start = std::chrono::steady_clock::now();
-    const auto layout = dif::frontend::make_h3_t2va_layout(
-        tags, options.latent_frames, options.latent_height,
-        options.latent_width, options.audio_latents, 1U, options.patch_height,
-        options.patch_width, options.keyframes);
+    const auto layout = options.references.empty()
+                            ? dif::frontend::make_h3_t2va_layout(
+                                  tags, options.latent_frames,
+                                  options.latent_height, options.latent_width,
+                                  options.audio_latents, 1U,
+                                  options.patch_height, options.patch_width,
+                                  options.keyframes)
+                            : dif::frontend::make_h3_ref2va_layout(
+                                  tags, options.references,
+                                  options.latent_frames,
+                                  options.latent_height, options.latent_width,
+                                  options.audio_latents, 1U,
+                                  options.patch_height, options.patch_width);
     const auto initial_layout_ms = elapsed_milliseconds(initial_layout_start);
     timed_io_start = std::chrono::steady_clock::now();
     auto text = dif::runtime::read_tensor(options.text);
@@ -474,6 +688,17 @@ int main(int argc, char **argv) {
             : std::min<std::size_t>(steps, options.maximum_evaluations);
     if (options.maximum_evaluations > steps)
       dif::fail("maximum evaluations exceed the released schedule");
+    if (options.capture_denoiser_tensors.empty() !=
+        options.capture_denoiser_directory.empty())
+      dif::fail("denoiser capture requires both a directory and tensor ids");
+    if (!options.capture_denoiser_directory.empty()) {
+      if (std::filesystem::exists(options.capture_denoiser_directory) &&
+          !std::filesystem::is_empty(options.capture_denoiser_directory))
+        dif::fail("denoiser capture directory is not empty: " +
+                  options.capture_denoiser_directory.string());
+      std::filesystem::create_directories(
+          options.capture_denoiser_directory);
+    }
     if (!options.first_evaluation_input_directory.empty()) {
       if (std::filesystem::exists(options.first_evaluation_input_directory) &&
           !std::filesystem::is_empty(
@@ -498,6 +723,9 @@ int main(int argc, char **argv) {
     run_options.profile_pipeline = options.profile_pipeline;
     if (options.streamed_keep_pages)
       run_options.streamed_release_mapped_pages_per_copy = false;
+    run_options.pipelined_resident_upload =
+        options.pipelined_resident_upload;
+    run_options.lazy_resident_upload = options.lazy_resident_upload;
     if (options.streamed_staging_buffers != 0U)
       run_options.streamed_staging_buffers = options.streamed_staging_buffers;
     if (options.streamed_prefetch_depth != 0U)
@@ -510,10 +738,37 @@ int main(int argc, char **argv) {
     if (options.pinned_io)
       run_options.pinned_io_staging = true;
     auto denoiser_run_options = run_options;
+    denoiser_run_options.capture_intermediate_tensors =
+        options.capture_denoiser_tensors;
     denoiser_run_options.h3_w8a8_cache = options.h3_w8a8_cache;
     denoiser_run_options.h3_w8a8_resident_layers =
         options.h3_w8a8_resident_layers;
+    denoiser_run_options.h3_convrot_int8_checkpoint =
+        options.h3_convrot_int8_checkpoint;
+    denoiser_run_options.h3_convrot_int8_resident_layers =
+        options.h3_convrot_int8_resident_layers;
+    denoiser_run_options.h3_int8_mlp_chunk_rows =
+        options.h3_int8_mlp_chunk_rows;
+    denoiser_run_options.h3_int8_cublaslt = options.h3_int8_cublaslt;
+    denoiser_run_options.h3_int8_cublaslt_heuristic_rank =
+        options.h3_int8_cublaslt_heuristic_rank;
+    denoiser_run_options.h3_int8_cublaslt_tune =
+        options.h3_int8_cublaslt_tune;
+    denoiser_run_options.h3_int8_cutlass_scaled_fc1 =
+        options.h3_int8_cutlass_scaled_fc1;
+    denoiser_run_options.h3_int8_cutlass_scaled_all =
+        options.h3_int8_cutlass_scaled_all;
+    denoiser_run_options.h3_int8_compact_adaln =
+        options.h3_int8_compact_adaln;
+    denoiser_run_options.resident_streamed_constants =
+        options.resident_streamed_constants;
+    denoiser_run_options.cudnn_attention_heuristic =
+        options.cudnn_attention_heuristic;
     denoiser_run_options.h3_ck_attention_dso = options.h3_ck_attention_dso;
+    denoiser_run_options.h3_int8_attention_first_layer =
+        options.h3_int8_attention_first_layer;
+    denoiser_run_options.h3_int8_attention_layers =
+        options.h3_int8_attention_layers;
     denoiser_run_options.h3_modulation_cache = options.h3_modulation_cache;
     denoiser_run_options.h3_modulation_source_index =
         options.h3_modulation_source_index;
@@ -537,6 +792,10 @@ int main(int argc, char **argv) {
     std::size_t h3_w8a8_resident_attention_count = 0U;
     std::size_t h3_ck_attention_count = 0U;
     std::size_t h3_modulation_cache_count = 0U;
+    std::uint32_t repeated_invariant_operation_count = 0U;
+    std::uint64_t repeated_invariant_persistent_bytes = 0U;
+    std::size_t repeated_invariant_cache_hits = 0U;
+    std::string attention_class{"exact_program_declared"};
     std::string backend_name;
     std::string device_name;
     const auto denoiser_wall_start = std::chrono::steady_clock::now();
@@ -551,6 +810,9 @@ int main(int argc, char **argv) {
           program.tensor(3U)->dims[0] != tags.size() ||
           program.tensor(5U)->dims[0] != layout.sequence_length)
         dif::fail("native H3 layout disagrees with denoiser geometry");
+      if (options.h3_cache_text_refiner)
+        denoiser_run_options.repeated_invariant_operations =
+            h3_text_refiner_invariant_operations(program);
       const auto [video_output, audio_output] = denoiser_outputs(program);
       auto inputs = dif::weights::load_weight_bundle(
           dif::weights::read_weight_bundle(options.denoiser_bundle), program,
@@ -635,6 +897,17 @@ int main(int argc, char **argv) {
         denoiser_run_options.h3_modulation_slice =
             static_cast<std::uint32_t>(step);
         auto result = prepared->run(inputs, denoiser_run_options);
+        for (const auto tensor_id : options.capture_denoiser_tensors) {
+          const auto captured = result.captured_intermediates.find(tensor_id);
+          if (captured == result.captured_intermediates.end())
+            dif::fail("requested denoiser capture was not returned for tensor " +
+                      std::to_string(tensor_id));
+          dif::runtime::write_tensor(
+              captured->second,
+              options.capture_denoiser_directory /
+                  ("step-" + std::to_string(step) + "-tensor-" +
+                   std::to_string(tensor_id) + ".diftensor"));
+        }
         if (step == 0U) {
           h3_w8a8_mlp_count = result.h3_w8a8_mlps.size();
           h3_w8a8_attention_count = result.h3_w8a8_attentions.size();
@@ -647,11 +920,18 @@ int main(int argc, char **argv) {
                             result.h3_w8a8_attentions.end(),
                             [](const auto &plan) { return plan.resident; }));
           h3_ck_attention_count = result.h3_ck_attentions.size();
+          if (!result.h3_ck_attentions.empty())
+            attention_class = result.h3_ck_attentions.front().classification;
           h3_modulation_cache_count = result.h3_modulation_caches.size();
-          if (!options.h3_w8a8_cache.empty() &&
+          repeated_invariant_operation_count =
+              result.repeated_invariant_operation_count;
+          repeated_invariant_persistent_bytes =
+              result.repeated_invariant_persistent_bytes;
+          if ((!options.h3_w8a8_cache.empty() ||
+               !options.h3_convrot_int8_checkpoint.empty()) &&
               (h3_w8a8_mlp_count == 0U ||
                h3_w8a8_attention_count == 0U))
-            dif::fail("requested H3 W8A8 cache did not cover both projection and MLP chains");
+            dif::fail("requested H3 direct INT8 checkpoint did not cover both projection and MLP chains");
           if (!options.h3_ck_attention_dso.empty() &&
               h3_ck_attention_count == 0U)
             dif::fail("requested H3 CK attention DSO was not admitted");
@@ -659,6 +939,8 @@ int main(int argc, char **argv) {
               h3_modulation_cache_count == 0U)
             dif::fail("requested H3 modulation schedule cache was not admitted");
         }
+        if (result.repeated_invariant_cache_hit)
+          ++repeated_invariant_cache_hits;
         denoiser_kernel_ms += result.mean_milliseconds;
         if (step == 0U)
           denoiser_free_before = result.free_bytes_before;
@@ -720,7 +1002,10 @@ int main(int argc, char **argv) {
         std::cout << "H3_STEP index=" << step
                   << " video_t=" << video_timestep
                   << " audio_t=" << audio_timestep
-                  << " denoiser_ms=" << result.mean_milliseconds << "\n";
+                  << " denoiser_ms=" << result.mean_milliseconds
+                  << " text_refiner_cache="
+                  << (result.repeated_invariant_cache_hit ? "hit" : "miss")
+                  << "\n";
       }
     }
     const auto denoiser_wall_ms =
@@ -801,16 +1086,19 @@ int main(int argc, char **argv) {
                 << device_name << "\" schedule_points="
                 << video_sigmas.size() << " model_evaluations=" << steps
                 << " executed_evaluations=" << evaluations
+                << " task="
+                << (!options.references.empty()
+                        ? "ref2va"
+                        : (options.keyframes.empty() ? "t2va" : "fl2va"))
                 << " sequence=" << layout.sequence_length
-                << " attention_class="
-                << (h3_ck_attention_count == 0U
-                        ? "exact_program_declared"
-                        : "approximate_ck_int8_established_h3_gate")
+                << " attention_class=" << attention_class
                 << " projection_class="
                 << (h3_w8a8_mlp_count == 0U &&
                             h3_w8a8_attention_count == 0U
                         ? "exact_checkpoint_dtype"
-                        : "approximate_w8a8_established_h3_gate")
+                        : (!options.h3_convrot_int8_checkpoint.empty()
+                               ? "approximate_native_h256_convrot_int8_gate"
+                               : "approximate_w8a8_established_h3_gate"))
                 << " h3_w8a8_mlps=" << h3_w8a8_mlp_count
                 << " h3_w8a8_attentions=" << h3_w8a8_attention_count
                 << " h3_w8a8_resident_mlps="
@@ -819,6 +1107,22 @@ int main(int argc, char **argv) {
                 << h3_w8a8_resident_attention_count
                 << " h3_ck_attentions=" << h3_ck_attention_count
                 << " h3_modulation_caches=" << h3_modulation_cache_count
+                << " repeated_invariant_ops="
+                << repeated_invariant_operation_count
+                << " repeated_invariant_persistent_bytes="
+                << repeated_invariant_persistent_bytes
+                << " repeated_invariant_cache_hits="
+                << repeated_invariant_cache_hits
+                << " resident_upload="
+                << (options.lazy_resident_upload
+                        ? "lazy_first_use"
+                        : (options.pipelined_resident_upload
+                               ? "pinned_pipeline"
+                               : "pageable_direct"))
+                << " stage_threads="
+                << (options.streamed_stage_threads == 0U
+                        ? 1U
+                        : options.streamed_stage_threads)
                 << " denoiser_kernel_sum_ms=" << denoiser_kernel_ms
                 << " denoiser_wall_ms=" << denoiser_wall_ms
                 << " denoiser_resident_bytes=" << denoiser_resident
@@ -975,6 +1279,8 @@ int main(int argc, char **argv) {
               << " sequence=" << layout.sequence_length
               << " video_rows=" << layout.video_indices.size()
               << " condition_rows=" << layout.num_condition_video_rows
+              << " condition_audio_rows="
+              << layout.num_condition_audio_rows
               << " audio_rows=" << layout.audio_indices.size()
               << " denoiser_prepare_ms=" << denoiser_prepare_ms
               << " denoiser_kernel_sum_ms=" << denoiser_kernel_ms

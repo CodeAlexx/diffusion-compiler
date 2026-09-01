@@ -34,6 +34,10 @@ struct SafeTensorFile {
   std::filesystem::path path;
   std::uint64_t file_size{};
   std::uint64_t data_offset{};
+  // All tensors from one SafeTensors file share one read-only mapping.  This
+  // keeps checkpoint mapping O(files), rather than mapping the complete file
+  // again for every tensor entry.
+  std::shared_ptr<const runtime::MappedStorage> mapping;
   std::map<std::string, SafeTensorEntry, std::less<>> tensors;
   std::map<std::string, SafeTensorMetadataEntry, std::less<>> metadata_tensors;
 

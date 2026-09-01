@@ -132,6 +132,46 @@ The original numbers remain the frozen pre-optimization baseline. Successor
 plans continue to use the same prompt, seed, BF16 quality class, scheduler,
 and output gate.
 
+## MiniMax-H3 ConvRot INT8 development checkpoint
+
+The current H3 optimization checkpoint uses the project-owned native ConvRot
+INT8 projection cache with exact cuDNN attention. It does not use Sage, SOL,
+SLA, ComfyUI weights, or an approximate-attention path. Measurements below are
+from one RTX 3090 Ti at its deliberate 300 W power limit and a real-dimensional
+Ref2VA execution fixture: 1024x576, 124 delivered frames, sequence length
+23,185, 50 transformer blocks, and eight schedule points / seven denoiser
+evaluations.
+
+| Measurement | Exact streamed BF16 | Resident ConvRot INT8 + exact cuDNN |
+|---|---:|---:|
+| First measured denoiser evaluation | 30.998 s device / 33.230 s wall | 19.872 s device |
+| Hot denoiser evaluation median | not yet captured | 18.082 s |
+| Seven-evaluation denoise | not yet captured | 128.510 s device / 131.023 s wall |
+| Runtime-accounted VRAM requirement | 6.332 GB | 22.941 GB |
+
+An explicit auxiliary-residency diagnostic measured an 18.053 s hot median
+with a 23.008 GB accounted requirement and 1.231 GB reported free. It removed
+repeated hot H2D staging but improved only about 29 ms, so transfer is no longer
+the main hot-step bottleneck. Relative to the 30.998 s streamed-BF16 device
+checkpoint, the current best repeated evaluation is 1.717x faster. This is a
+development comparison, not yet a matched prompt-to-video claim.
+
+The native 50-block ConvRot cache is 19,279,810,048 bytes and fits without OOM.
+The scaled CUTLASS projection path reduced reusable scratch by 176,160,768
+bytes. Its complete seven-evaluation video latent, audio rows, and final audio
+latent are bit-identical to the prior accepted ConvRot control: cosine 1,
+relative L2 0, norm ratio 1, zero nonfinites, and zero bit mismatches.
+
+Nsight attributes 67.9% of hot device kernel time to exact cuDNN attention and
+24.5% to the scaled INT8 projection GEMMs. A 15.229 s candidate using
+approximate CK attention crossed the provisional 2x per-evaluation timing bar
+but failed the unchanged trajectory gate (video relative L2 `0.02756`, final
+audio-latent relative L2 `0.06401`) and was rejected.
+
+The required literal-input FL2VA and Ref2VA prompt-to-video, decoded visual,
+and audio acceptance runs remain open. No 2x prompt-to-video result is claimed
+until both complete paths pass those gates.
+
 ## Build and test
 
 Requirements are CMake 3.24 or newer, a C++20 compiler, and Ninja or another

@@ -12,7 +12,26 @@
 
 namespace dif::runtime {
 
-class MappedStorage;
+class MappedStorage {
+public:
+  ~MappedStorage();
+  MappedStorage(const MappedStorage &) = delete;
+  MappedStorage &operator=(const MappedStorage &) = delete;
+
+  const std::uint8_t *data() const;
+  std::size_t size() const;
+  void discard(std::size_t offset, std::size_t bytes) const;
+  void evict(std::size_t offset, std::size_t bytes) const;
+
+private:
+  friend std::shared_ptr<const MappedStorage>
+  map_readonly_file(const std::filesystem::path &path);
+  MappedStorage(void *address, std::size_t size, int descriptor);
+
+  void *address_{};
+  std::size_t size_{};
+  int descriptor_{-1};
+};
 
 struct Tensor {
   Tensor() = default;
@@ -35,6 +54,7 @@ struct Tensor {
   std::size_t byte_size() const;
   bool is_mapped() const { return static_cast<bool>(mapping); }
   void discard_mapped_pages() const;
+  void evict_mapped_pages() const;
 
   std::span<float> f32();
   std::span<const float> f32() const;
@@ -49,6 +69,12 @@ struct TensorSlice {
 
 Tensor read_tensor(const std::filesystem::path &path);
 Tensor map_tensor(const std::filesystem::path &path);
+std::shared_ptr<const MappedStorage>
+map_readonly_file(const std::filesystem::path &path);
+Tensor map_tensor_slice(std::shared_ptr<const MappedStorage> storage,
+                        ir::DType dtype, std::vector<std::uint64_t> dims,
+                        std::uint64_t file_offset,
+                        std::uint64_t byte_count);
 Tensor map_tensor_slice(const std::filesystem::path &path, ir::DType dtype,
                         std::vector<std::uint64_t> dims,
                         std::uint64_t file_offset,
