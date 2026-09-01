@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic PyTorch fixtures for the DiffIR audio opcodes (Conv1d 47,
-SnakeBeta 48) — gate 1 of docs/BIGVGAN_DECODE_PLAN.md.
+SnakeBeta 48).
 
 Per case this writes the operation inputs and the torch-computed expected
 output:

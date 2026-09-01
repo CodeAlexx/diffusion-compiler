@@ -12,9 +12,8 @@
 //                         --output C.diftensor [--backend cuda|cpu]
 //                         [--cache-dir DIR] [--min-free-mib N] [--depth N]
 //
-// The `--depth` form of `program` builds a truncated tower (the parity ladder
-// of docs/QWEN3VL_CONDITIONER_PLAN.md §5) so a depth-k program can be compared
-// against the oracle's raw hidden_states[k].
+// The `--depth` form of `program` builds a truncated parity ladder so a
+// depth-k program can be compared against the oracle's raw hidden_states[k].
 
 #include "dif/frontend/qwen3vl_conditioner.hpp"
 #include "dif/frontend/krea2.hpp"

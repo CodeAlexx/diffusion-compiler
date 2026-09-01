@@ -16,8 +16,7 @@ namespace dif::frontend {
 // six Linears (q, k, v, out, fc1, fc2), the base model FROZEN, and only the
 // adapters trained.
 //
-// Mixed-precision contract (docs/MIXED_PRECISION_TRAINING_GATE_2026-08-31.md
-// + flame lora.rs):
+// Mixed-precision contract (source-faithful to flame lora.rs):
 //   - compute_dtype BF16 (default): every base weight, activation,
 //     modulation vector, and RoPE table is BF16 storage (F32 register math,
 //     one round per stored tensor — note the BF16 cos/sin tables are the

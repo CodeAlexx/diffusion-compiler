@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Torch reference exporter for the BigVGAN native audio decode gates
-(docs/BIGVGAN_DECODE_PLAN.md gates 2 and 3).
+"""Torch reference exporter for the BigVGAN native audio decode gates.
 
 Subcommands:
 

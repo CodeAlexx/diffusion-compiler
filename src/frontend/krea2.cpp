@@ -4,6 +4,7 @@
 #include "dif/support/error.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <unordered_map>
 #include <utility>
@@ -15,9 +16,14 @@ Krea2Architecture inspect_krea2_architecture(const Krea2Config &config) {
       Krea2Config::kVaeCompression * Krea2Config::kPatch;
   if (config.batch == 0U || config.width == 0U || config.height == 0U ||
       config.text_tokens == 0U || config.text_tokens > 512U ||
+      (config.prenorm_reduction_tile != 2048U &&
+       config.prenorm_reduction_tile != 8192U) ||
+      (config.postnorm_reduction_tile != 2048U &&
+       config.postnorm_reduction_tile != 8192U) ||
       config.width % alignment != 0U || config.height % alignment != 0U)
-    fail("Krea 2 requires a positive batch, 1..512 text tokens, and image "
-         "dimensions divisible by VAE compression * patch (16)");
+    fail("Krea 2 requires a positive batch, 1..512 text tokens, a creator "
+         "RMS reduction tile, and image dimensions divisible by VAE "
+         "compression * patch (16)");
 
   Krea2Architecture result;
   result.latent_height = config.height / Krea2Config::kVaeCompression;
@@ -44,6 +50,195 @@ Krea2Architecture inspect_krea2_architecture(const Krea2Config &config) {
                            Krea2Config::kPatch * Krea2Config::kPatch;
   result.patch_output_dim = result.patch_input_dim;
   return result;
+}
+
+Krea2Schedule make_krea2_schedule(const Krea2Config &model,
+                                  const Krea2ScheduleConfig &schedule_config) {
+  const auto architecture = inspect_krea2_architecture(model);
+  constexpr auto alignment = Krea2Config::kVaeCompression * Krea2Config::kPatch;
+  if (schedule_config.steps == 0U || schedule_config.minimum_resolution == 0U ||
+      schedule_config.maximum_resolution == 0U ||
+      schedule_config.minimum_resolution > schedule_config.maximum_resolution ||
+      !std::isfinite(schedule_config.minimum_mu) ||
+      !std::isfinite(schedule_config.maximum_mu) ||
+      !(schedule_config.sigma > 0.0) || !std::isfinite(schedule_config.sigma) ||
+      (schedule_config.fixed_mu.has_value() &&
+       !std::isfinite(*schedule_config.fixed_mu)))
+    fail("Krea 2 schedule configuration is invalid");
+
+  const auto minimum_grid = schedule_config.minimum_resolution / alignment;
+  const auto maximum_grid = schedule_config.maximum_resolution / alignment;
+  if (minimum_grid == 0U || maximum_grid == 0U ||
+      minimum_grid > std::numeric_limits<std::uint64_t>::max() / minimum_grid ||
+      maximum_grid > std::numeric_limits<std::uint64_t>::max() / maximum_grid)
+    fail("Krea 2 schedule resolution geometry overflows");
+  const auto x1 = minimum_grid * minimum_grid;
+  const auto x2 = maximum_grid * maximum_grid;
+  if (x1 == x2)
+    fail("Krea 2 schedule interpolation endpoints must differ");
+
+  Krea2Schedule result;
+  if (schedule_config.fixed_mu.has_value()) {
+    result.mu = *schedule_config.fixed_mu;
+  } else {
+    const auto slope =
+        (schedule_config.maximum_mu - schedule_config.minimum_mu) /
+        static_cast<double>(x2 - x1);
+    result.mu = slope * static_cast<double>(architecture.image_tokens) +
+                (schedule_config.minimum_mu - slope * static_cast<double>(x1));
+  }
+
+  const auto points = schedule_config.steps + 1U;
+  const auto step = -1.0F / static_cast<float>(schedule_config.steps);
+  const auto halfway = points / 2U;
+  const auto shifted = static_cast<float>(std::exp(result.mu));
+  const auto exponent = static_cast<float>(schedule_config.sigma);
+  result.timesteps.reserve(points);
+  for (std::uint32_t index = 0U; index < points; ++index) {
+    // torch.linspace constructs the F32 CPU grid from both endpoints with an
+    // FMA. Preserve each subsequent eager tensor-op rounding boundary from
+    // sampling.py instead of simplifying shift/(shift + (1/t - 1)^sigma).
+    const auto base = index < halfway
+                          ? std::fma(step, static_cast<float>(index), 1.0F)
+                          : std::fma(-step,
+                                     static_cast<float>(points - index - 1U),
+                                     0.0F);
+    volatile float reciprocal = 1.0F / base;
+    volatile float unshifted = reciprocal - 1.0F;
+    volatile float powered = std::pow(unshifted, exponent);
+    volatile float denominator = shifted + powered;
+    // PyTorch's scalar/tensor reverse-divide kernel materializes the tensor
+    // reciprocal and then multiplies by the scalar. That eager boundary differs
+    // from one scalar IEEE division at 15/53 Raw schedule points.
+    volatile float inverse_denominator = 1.0F / denominator;
+    volatile float timestep = shifted * inverse_denominator;
+    result.timesteps.push_back(static_cast<float>(timestep));
+  }
+  if (result.timesteps.size() != points || result.timesteps.front() != 1.0F ||
+      result.timesteps.back() != 0.0F)
+    fail("Krea 2 schedule lost its 1-to-0 endpoints");
+  return result;
+}
+
+Krea2CfgEulerBuild
+make_krea2_cfg_euler_step(std::vector<std::uint64_t> sample_shape) {
+  using namespace ir;
+  if (sample_shape.empty())
+    fail("Krea 2 CFG/Euler sample shape must be non-empty");
+  std::uint64_t elements = 1U;
+  for (const auto dimension : sample_shape) {
+    if (dimension == 0U ||
+        elements > std::numeric_limits<std::uint64_t>::max() / dimension)
+      fail("Krea 2 CFG/Euler sample shape is invalid");
+    elements *= dimension;
+  }
+  (void)elements;
+
+  Krea2CfgEulerBuild build;
+  auto &program = build.program;
+  std::uint32_t next_tensor = 1U;
+  std::uint32_t next_operation = 1U;
+  const auto add_tensor = [&](DType dtype, std::uint32_t roles,
+                              std::vector<std::uint64_t> dims) {
+    const auto id = next_tensor++;
+    program.tensors.push_back({id, dtype, roles, std::move(dims)});
+    return id;
+  };
+  const auto add_operation = [&](Opcode opcode,
+                                 std::vector<std::uint32_t> inputs,
+                                 std::vector<std::uint32_t> outputs) {
+    program.operations.push_back(
+        {next_operation++, opcode, std::move(inputs), std::move(outputs), {}});
+  };
+
+  build.sample_input = add_tensor(DType::BF16, TensorRole::Input, sample_shape);
+  build.conditional_velocity_input =
+      add_tensor(DType::BF16, TensorRole::Input, sample_shape);
+  build.unconditional_velocity_input =
+      add_tensor(DType::BF16, TensorRole::Input, sample_shape);
+  build.guidance_input = add_tensor(DType::BF16, TensorRole::Input, {1U});
+  build.current_timestep_input =
+      add_tensor(DType::F32, TensorRole::Input, {1U});
+  build.next_timestep_input = add_tensor(DType::F32, TensorRole::Input, {1U});
+  build.negative_one_constant =
+      add_tensor(DType::BF16, TensorRole::Constant, {1U});
+
+  const auto negative_one =
+      add_tensor(DType::BF16, TensorRole::Internal, sample_shape);
+  add_operation(Opcode::BroadcastTo, {build.negative_one_constant},
+                {negative_one});
+  const auto negative_unconditional =
+      add_tensor(DType::BF16, TensorRole::Internal, sample_shape);
+  add_operation(Opcode::Multiply,
+                {build.unconditional_velocity_input, negative_one},
+                {negative_unconditional});
+  build.difference_output =
+      add_tensor(DType::BF16, TensorRole::Output, sample_shape);
+  add_operation(Opcode::Add,
+                {build.conditional_velocity_input, negative_unconditional},
+                {build.difference_output});
+
+  const auto guidance =
+      add_tensor(DType::BF16, TensorRole::Internal, sample_shape);
+  add_operation(Opcode::BroadcastTo, {build.guidance_input}, {guidance});
+  build.guided_delta_output =
+      add_tensor(DType::BF16, TensorRole::Output, sample_shape);
+  add_operation(Opcode::Multiply, {build.difference_output, guidance},
+                {build.guided_delta_output});
+  build.velocity_output =
+      add_tensor(DType::BF16, TensorRole::Output, sample_shape);
+  add_operation(Opcode::Add,
+                {build.conditional_velocity_input, build.guided_delta_output},
+                {build.velocity_output});
+  build.sample_output =
+      add_tensor(DType::BF16, TensorRole::Output, sample_shape);
+  add_operation(Opcode::EulerVelocityStep,
+                {build.sample_input, build.velocity_output,
+                 build.current_timestep_input, build.next_timestep_input},
+                {build.sample_output});
+
+  verify(program);
+  return build;
+}
+
+Krea2EulerBuild
+make_krea2_euler_step(std::vector<std::uint64_t> sample_shape) {
+  using namespace ir;
+  if (sample_shape.empty())
+    fail("Krea 2 Euler sample shape must be non-empty");
+  std::uint64_t elements = 1U;
+  for (const auto dimension : sample_shape) {
+    if (dimension == 0U ||
+        elements > std::numeric_limits<std::uint64_t>::max() / dimension)
+      fail("Krea 2 Euler sample shape is invalid");
+    elements *= dimension;
+  }
+  (void)elements;
+
+  Krea2EulerBuild build;
+  auto &program = build.program;
+  build.sample_input = 1U;
+  build.velocity_input = 2U;
+  build.current_timestep_input = 3U;
+  build.next_timestep_input = 4U;
+  build.sample_output = 5U;
+  program.tensors = {
+      {build.sample_input, DType::BF16, TensorRole::Input, sample_shape},
+      {build.velocity_input, DType::BF16, TensorRole::Input, sample_shape},
+      {build.current_timestep_input, DType::F32, TensorRole::Input, {1U}},
+      {build.next_timestep_input, DType::F32, TensorRole::Input, {1U}},
+      {build.sample_output, DType::BF16, TensorRole::Output, sample_shape},
+  };
+  program.operations = {
+      {1U,
+       Opcode::EulerVelocityStep,
+       {build.sample_input, build.velocity_input,
+        build.current_timestep_input, build.next_timestep_input},
+       {build.sample_output},
+       {}},
+  };
+  verify(program);
+  return build;
 }
 
 Krea2TimeConditioningBuild
@@ -109,7 +304,10 @@ make_krea2_time_conditioning(const Krea2Config &config) {
       DType::BF16, TensorRole::Internal,
       {config.batch, Krea2Config::kFeatures});
   add_operation(Opcode::Linear,
-                {embedding_bf16, tmlp0_weight, tmlp0_bias}, {tmlp0});
+                {embedding_bf16, tmlp0_weight, tmlp0_bias}, {tmlp0},
+                {Attribute::u64(
+                    AttrKey::LinearBiasMode,
+                    static_cast<std::uint64_t>(LinearBiasMode::Addmm))});
   const auto tmlp0_activated = add_tensor(
       DType::BF16, TensorRole::Internal,
       {config.batch, Krea2Config::kFeatures});
@@ -127,7 +325,10 @@ make_krea2_time_conditioning(const Krea2Config &config) {
       {config.batch, Krea2Config::kFeatures});
   add_operation(Opcode::Linear,
                 {tmlp0_activated, tmlp2_weight, tmlp2_bias},
-                {build.timestep_output});
+                {build.timestep_output},
+                {Attribute::u64(
+                    AttrKey::LinearBiasMode,
+                    static_cast<std::uint64_t>(LinearBiasMode::Addmm))});
 
   const auto tproj_activated = add_tensor(
       DType::BF16, TensorRole::Internal,
@@ -144,7 +345,10 @@ make_krea2_time_conditioning(const Krea2Config &config) {
       {config.batch, 6U * Krea2Config::kFeatures});
   add_operation(Opcode::Linear,
                 {tproj_activated, tproj1_weight, tproj1_bias},
-                {build.modulation_output});
+                {build.modulation_output},
+                {Attribute::u64(
+                    AttrKey::LinearBiasMode,
+                    static_cast<std::uint64_t>(LinearBiasMode::Addmm))});
 
   verify(program);
   return build;
@@ -259,7 +463,9 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
                 {build.input_normalized},
                 {Attribute::f64(AttrKey::Epsilon, 1.0e-5),
                  Attribute::f64(AttrKey::WeightOffset, 1.0),
-                 Attribute::u64(AttrKey::BlockSize, 256U)});
+                 Attribute::u64(AttrKey::BlockSize, 512U),
+                 Attribute::u64(AttrKey::ReductionTileSize,
+                                config.prenorm_reduction_tile)});
   const auto prescale_plus_one = add_bf16(sequence_shape);
   add_operation(Opcode::Add, {ones, prescale}, {prescale_plus_one});
   const auto prenorm_scaled = add_bf16(sequence_shape);
@@ -298,14 +504,14 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
       add_checkpoint("attn.qknorm.knorm.scale", {head_dim});
   build.query = add_bf16({batch, sequence, heads, head_dim}, true);
   build.key = add_bf16({batch, sequence, kv_heads, head_dim}, true);
-  const auto norm_attributes =
+  const auto qk_norm_attributes =
       std::vector<Attribute>{Attribute::f64(AttrKey::Epsilon, 1.0e-5),
                              Attribute::f64(AttrKey::WeightOffset, 1.0),
                              Attribute::u64(AttrKey::BlockSize, 128U)};
   add_operation(Opcode::RmsNorm, {q_shaped, qnorm}, {build.query},
-                norm_attributes);
+                qk_norm_attributes);
   add_operation(Opcode::RmsNorm, {k_shaped, knorm}, {build.key},
-                norm_attributes);
+                qk_norm_attributes);
 
   build.rotary_pair_axes =
       add_tensor(DType::I32, TensorRole::Constant, {head_dim / 2U});
@@ -381,7 +587,12 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
   const auto post_normalized = add_bf16(sequence_shape);
   add_operation(Opcode::RmsNorm,
                 {build.attention_residual, postnorm_weight},
-                {post_normalized}, norm_attributes);
+                {post_normalized},
+                {Attribute::f64(AttrKey::Epsilon, 1.0e-5),
+                 Attribute::f64(AttrKey::WeightOffset, 1.0),
+                 Attribute::u64(AttrKey::BlockSize, 512U),
+                 Attribute::u64(AttrKey::ReductionTileSize,
+                                config.postnorm_reduction_tile)});
   const auto postscale_plus_one = add_bf16(sequence_shape);
   add_operation(Opcode::Add, {ones, postscale}, {postscale_plus_one});
   const auto postnorm_scaled = add_bf16(sequence_shape);
@@ -397,15 +608,18 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
       add_checkpoint("mlp.up.weight", {mlp, features});
   const auto mlp_down_weight =
       add_checkpoint("mlp.down.weight", {features, mlp});
-  const auto mlp_gate = add_bf16({rows, mlp});
-  const auto mlp_up = add_bf16({rows, mlp});
+  build.mlp_gate = add_bf16({rows, mlp}, true);
+  build.mlp_up = add_bf16({rows, mlp}, true);
   add_operation(Opcode::Linear, {mlp_input_flat, mlp_gate_weight},
-                {mlp_gate});
-  add_operation(Opcode::Linear, {mlp_input_flat, mlp_up_weight}, {mlp_up});
-  const auto mlp_gate_activated = add_bf16({rows, mlp});
-  add_operation(Opcode::SiLU, {mlp_gate}, {mlp_gate_activated});
+                {build.mlp_gate});
+  add_operation(Opcode::Linear, {mlp_input_flat, mlp_up_weight},
+                {build.mlp_up});
+  build.mlp_gate_activated = add_bf16({rows, mlp}, true);
+  add_operation(Opcode::SiLU, {build.mlp_gate},
+                {build.mlp_gate_activated});
   build.mlp_activation = add_bf16({rows, mlp}, true);
-  add_operation(Opcode::Multiply, {mlp_gate_activated, mlp_up},
+  add_operation(Opcode::Multiply,
+                {build.mlp_gate_activated, build.mlp_up},
                 {build.mlp_activation});
   build.mlp_output = add_bf16({rows, features}, true);
   add_operation(Opcode::Linear, {build.mlp_activation, mlp_down_weight},
@@ -749,28 +963,43 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
   const auto timestep_f32 =
       add_tensor(DType::F32, TensorRole::Internal, {batch});
   operation(Opcode::Cast, {build.timestep_input}, {timestep_f32});
-  const auto timestep_embedding = add_tensor(
+  const auto timestep_embedding_f32 = add_tensor(
       DType::F32, TensorRole::Internal,
       {batch, Krea2Config::kTimestepDim});
-  operation(Opcode::SinusoidalTimestep, {timestep_f32}, {timestep_embedding},
+  operation(Opcode::SinusoidalTimestep, {timestep_f32},
+            {timestep_embedding_f32},
             {Attribute::boolean(AttrKey::FlipSinToCos, true),
              Attribute::f64(AttrKey::DownscaleFreqShift, 0.0),
              Attribute::f64(AttrKey::Scale, 1000.0),
              Attribute::f64(AttrKey::MaxPeriod, 10000.0)});
-  const auto timestep_embedding_bf16 =
-      bf16({batch, Krea2Config::kTimestepDim});
-  operation(Opcode::Cast, {timestep_embedding}, {timestep_embedding_bf16});
+  build.timestep_embedding = bf16(
+      {batch, Krea2Config::kTimestepDim},
+      capture_block_outputs ? static_cast<std::uint32_t>(TensorRole::Output)
+                            : static_cast<std::uint32_t>(TensorRole::Internal));
+  operation(Opcode::Cast, {timestep_embedding_f32},
+            {build.timestep_embedding});
   const auto tmlp0_weight = checkpoint(
       "tmlp.0.weight", {features, Krea2Config::kTimestepDim});
   const auto tmlp0_bias = checkpoint("tmlp.0.bias", {features});
-  const auto tmlp0 = bf16({batch, features});
+  build.timestep_first_linear = bf16(
+      {batch, features},
+      capture_block_outputs ? static_cast<std::uint32_t>(TensorRole::Output)
+                            : static_cast<std::uint32_t>(TensorRole::Internal));
   operation(Opcode::Linear,
-            {timestep_embedding_bf16, tmlp0_weight, tmlp0_bias}, {tmlp0});
+            {build.timestep_embedding, tmlp0_weight, tmlp0_bias},
+            {build.timestep_first_linear},
+            {Attribute::u64(
+                AttrKey::LinearBiasMode,
+                static_cast<std::uint64_t>(LinearBiasMode::Addmm))});
   const auto gelu_attributes = std::vector<Attribute>{Attribute::u64(
       AttrKey::Approximation,
       static_cast<std::uint64_t>(GeluApproximation::Tanh))};
-  const auto tmlp0_activated = bf16({batch, features});
-  operation(Opcode::Gelu, {tmlp0}, {tmlp0_activated}, gelu_attributes);
+  build.timestep_first_activation = bf16(
+      {batch, features},
+      capture_block_outputs ? static_cast<std::uint32_t>(TensorRole::Output)
+                            : static_cast<std::uint32_t>(TensorRole::Internal));
+  operation(Opcode::Gelu, {build.timestep_first_linear},
+            {build.timestep_first_activation}, gelu_attributes);
   const auto tmlp2_weight =
       checkpoint("tmlp.2.weight", {features, features});
   const auto tmlp2_bias = checkpoint("tmlp.2.bias", {features});
@@ -779,10 +1008,17 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
       capture_block_outputs ? static_cast<std::uint32_t>(TensorRole::Output)
                             : static_cast<std::uint32_t>(TensorRole::Internal));
   operation(Opcode::Linear,
-            {tmlp0_activated, tmlp2_weight, tmlp2_bias},
-            {build.timestep_output});
-  const auto tproj_activated = bf16({batch, features});
-  operation(Opcode::Gelu, {build.timestep_output}, {tproj_activated},
+            {build.timestep_first_activation, tmlp2_weight, tmlp2_bias},
+            {build.timestep_output},
+            {Attribute::u64(
+                AttrKey::LinearBiasMode,
+                static_cast<std::uint64_t>(LinearBiasMode::Addmm))});
+  build.timestep_projection_activation = bf16(
+      {batch, features},
+      capture_block_outputs ? static_cast<std::uint32_t>(TensorRole::Output)
+                            : static_cast<std::uint32_t>(TensorRole::Internal));
+  operation(Opcode::Gelu, {build.timestep_output},
+            {build.timestep_projection_activation},
             gelu_attributes);
   const auto tproj_weight =
       checkpoint("tproj.1.weight", {6U * features, features});
@@ -791,8 +1027,12 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
       {batch, 6U * features},
       capture_block_outputs ? static_cast<std::uint32_t>(TensorRole::Output)
                             : static_cast<std::uint32_t>(TensorRole::Internal));
-  operation(Opcode::Linear, {tproj_activated, tproj_weight, tproj_bias},
-            {build.modulation_output});
+  operation(Opcode::Linear,
+            {build.timestep_projection_activation, tproj_weight, tproj_bias},
+            {build.modulation_output},
+            {Attribute::u64(
+                AttrKey::LinearBiasMode,
+                static_cast<std::uint64_t>(LinearBiasMode::Addmm))});
 
   auto combined = bf16(sequence_shape);
   operation(Opcode::Concat, {build.context_input, build.projected_image},
@@ -843,57 +1083,39 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
     build.block_outputs.push_back(combined);
   }
 
+  const auto combined_flat = bf16({batch * sequence, features});
+  operation(Opcode::Reshape, {combined}, {combined_flat});
   const auto last_norm_weight = checkpoint("last.norm.scale", {features});
-  const auto normalized = bf16(sequence_shape);
-  operation(Opcode::RmsNorm, {combined, last_norm_weight}, {normalized},
-            {Attribute::f64(AttrKey::Epsilon, 1.0e-5),
-             Attribute::f64(AttrKey::WeightOffset, 1.0),
-             Attribute::u64(AttrKey::BlockSize, 256U)});
   const auto last_modulation =
       checkpoint("last.modulation.lin", {2U, features});
-  const auto last_modulation_3d = bf16({1U, 2U, features});
-  operation(Opcode::Reshape, {last_modulation}, {last_modulation_3d});
-  const auto last_modulation_batch = bf16({batch, 2U, features});
-  operation(Opcode::BroadcastTo, {last_modulation_3d},
-            {last_modulation_batch});
-  const auto timestep_3d = bf16({batch, 1U, features});
-  operation(Opcode::Reshape, {build.timestep_output}, {timestep_3d});
-  const auto timestep_two = bf16({batch, 2U, features});
-  operation(Opcode::BroadcastTo, {timestep_3d}, {timestep_two});
-  const auto last_parameters = bf16({batch, 2U, features});
-  operation(Opcode::Add, {timestep_two, last_modulation_batch},
-            {last_parameters});
-  const auto scale = bf16({batch, 1U, features});
-  const auto shift = bf16({batch, 1U, features});
-  operation(Opcode::Slice, {last_parameters}, {scale},
-            {Attribute::u64(AttrKey::Axis, 1U),
-             Attribute::u64(AttrKey::Start, 0U)});
-  operation(Opcode::Slice, {last_parameters}, {shift},
-            {Attribute::u64(AttrKey::Axis, 1U),
-             Attribute::u64(AttrKey::Start, 1U)});
-  const auto scale_sequence = bf16(sequence_shape);
-  const auto shift_sequence = bf16(sequence_shape);
-  operation(Opcode::BroadcastTo, {scale}, {scale_sequence});
-  operation(Opcode::BroadcastTo, {shift}, {shift_sequence});
-  const auto ones = bf16(sequence_shape);
-  operation(Opcode::Fill, {}, {ones},
-            {Attribute::f64(AttrKey::Value, 1.0)});
-  const auto scale_plus_one = bf16(sequence_shape);
-  operation(Opcode::Add, {ones, scale_sequence}, {scale_plus_one});
-  const auto scaled = bf16(sequence_shape);
-  operation(Opcode::Multiply, {scale_plus_one, normalized}, {scaled});
-  const auto modulated = bf16(sequence_shape);
-  operation(Opcode::Add, {scaled, shift_sequence}, {modulated});
-  const auto modulated_flat = bf16({batch * sequence, features});
-  operation(Opcode::Reshape, {modulated}, {modulated_flat});
+  // The official compiled last layer keeps RMSNorm and its shared scale/shift
+  // modulation in one F32 region. Materializing the intermediate BF16 tensors
+  // changes the released velocity, so encode the generic fused contract.
+  build.last_modulated = bf16(
+      {batch * sequence, features},
+      capture_block_outputs ? static_cast<std::uint32_t>(TensorRole::Output)
+                            : static_cast<std::uint32_t>(TensorRole::Internal));
+  operation(
+      Opcode::RmsNormModulate,
+      {combined_flat, last_norm_weight, build.timestep_output, last_modulation},
+      {build.last_modulated},
+      {Attribute::f64(AttrKey::Epsilon, 1.0e-5),
+       Attribute::f64(AttrKey::WeightOffset, 1.0),
+       Attribute::u64(AttrKey::BlockSize, 512U),
+       Attribute::u64(AttrKey::ReductionTileSize, 8192U),
+       Attribute::u64(
+           AttrKey::ModulationLayout,
+           static_cast<std::uint64_t>(ModulationLayout::SharedVectorDelta))});
   const auto last_weight =
       checkpoint("last.linear.weight", {architecture.patch_output_dim, features});
   const auto last_bias =
       checkpoint("last.linear.bias", {architecture.patch_output_dim});
   const auto final_flat =
       bf16({batch * sequence, architecture.patch_output_dim});
-  operation(Opcode::Linear, {modulated_flat, last_weight, last_bias},
-            {final_flat});
+  operation(Opcode::Linear, {build.last_modulated, last_weight, last_bias},
+            {final_flat},
+            {Attribute::u64(AttrKey::WorkspaceLimitBytes,
+                            1U * 1024U * 1024U)});
   const auto final_sequence =
       bf16({batch, sequence, architecture.patch_output_dim});
   operation(Opcode::Reshape, {final_flat}, {final_sequence});

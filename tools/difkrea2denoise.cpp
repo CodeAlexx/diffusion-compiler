@@ -190,18 +190,21 @@ int main(int argc, char **argv) {
     const auto result =
         dif::runtime::make_cuda_executor()->run(build.program, bindings, options);
 
-    const std::vector<std::pair<std::string, std::uint32_t>> boundaries{
+    std::vector<std::pair<std::string, std::uint32_t>> boundaries{
         {"projected_image", build.projected_image},
+        {"timestep_embedding", build.timestep_embedding},
+        {"timestep_first_linear", build.timestep_first_linear},
+        {"timestep_first_activation", build.timestep_first_activation},
         {"timestep_output", build.timestep_output},
+        {"timestep_projection_activation",
+         build.timestep_projection_activation},
         {"modulation_output", build.modulation_output},
-        {"block_1", build.block_outputs[0]},
-        {"block_3", build.block_outputs[2]},
-        {"block_7", build.block_outputs[6]},
-        {"block_14", build.block_outputs[13]},
-        {"block_21", build.block_outputs[20]},
-        {"block_28", build.block_outputs[27]},
-        {"velocity_output", build.velocity_output},
     };
+    for (std::size_t index = 0U; index < build.block_outputs.size(); ++index)
+      boundaries.emplace_back("block_" + std::to_string(index + 1U),
+                              build.block_outputs[index]);
+    boundaries.emplace_back("last_modulated", build.last_modulated);
+    boundaries.emplace_back("velocity_output", build.velocity_output);
     std::vector<dif::weights::SafeTensorWriteSpec> specs;
     for (const auto &[name, id] : boundaries) {
       const auto &tensor = result.outputs.at(id);
@@ -253,8 +256,14 @@ int main(int argc, char **argv) {
     for (const auto &[name, id] : boundaries) {
       if (!first) report << ",\n";
       first = false;
-      auto reference = dif::weights::map_safetensor(fixture, name);
       const auto &actual = result.outputs.at(id);
+      const auto *reference_entry = fixture.find(name);
+      if (!reference_entry) {
+        report << "    " << std::quoted(name)
+               << ": {\"reference\":\"not captured by creator fixture\"}";
+        continue;
+      }
+      auto reference = dif::weights::map_safetensor(fixture, name);
       if (reference.dims != actual.dims &&
           reference.element_count() == actual.element_count())
         reference.dims = actual.dims;

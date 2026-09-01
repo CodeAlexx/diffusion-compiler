@@ -187,6 +187,9 @@ boundaries(const dif::frontend::Krea2BlockBuild &build, bool final_only) {
       {"output_projection", build.output_projection},
       {"attention_residual", build.attention_residual},
       {"mlp_input", build.mlp_input},
+      {"mlp_gate", build.mlp_gate},
+      {"mlp_up", build.mlp_up},
+      {"mlp_gate_activated", build.mlp_gate_activated},
       {"mlp_activation", build.mlp_activation},
       {"mlp_output", build.mlp_output},
       {"final_output", build.final_output},
@@ -221,6 +224,10 @@ int main(int argc, char **argv) {
     const auto arguments = parse(argc, argv);
     dif::frontend::Krea2Config config;
     config.streamed_constants = false;
+    config.prenorm_reduction_tile = 8192U;
+    // This expanded oracle compiles postnorm at a generalized call site and
+    // selected a 2048-wide reduction. Production block.forward uses 8192.
+    config.postnorm_reduction_tile = 2048U;
     const auto build =
         dif::frontend::make_krea2_block(config, arguments.block,
                                         !arguments.final_only);

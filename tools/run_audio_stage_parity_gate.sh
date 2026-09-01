@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# CPU stage-parity gate for the native BigVGAN audio decoder (gate 3 of
-# docs/BIGVGAN_DECODE_PLAN.md): the DiffIR CPU executor vs the pinned torch
-# oracle on the accepted run's REAL [584,32] audio state rows, at every
+# CPU stage-parity gate for the native BigVGAN audio decoder: the DiffIR CPU
+# executor vs the pinned torch oracle on the accepted run's REAL [584,32]
+# audio state rows, at every
 # staged boundary (pre, stage0..stage6, tail).
 #
 # usage: bash tools/run_audio_stage_parity_gate.sh WORKDIR [--measure]

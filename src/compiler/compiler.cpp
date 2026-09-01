@@ -171,7 +171,7 @@ void emit_lowbit_linear(std::ostringstream &out, const ir::Program &program,
 }
 
 
-// BigVGAN audio decode emitters (chunk 6 of docs/BIGVGAN_DECODE_PLAN.md).
+// BigVGAN audio decode emitters.
 // Contract: generic launch — one thread per output element, geometry baked
 // as literals, F32 accumulation, dif_load/dif_store storage boundary. The
 // loop order mirrors the CPU reference exactly (forward: in-channel outer,
@@ -257,6 +257,119 @@ void emit_conv1d(std::ostringstream &out, const ir::Program &program,
   }
   out << (biased ? "acc+=dif_load(bias,oc);" : "")
       << "dif_store(y,i,acc);}}\n";
+}
+
+void emit_channel_rms_norm(std::ostringstream &out,
+                           const ir::Program &program,
+                           const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto axis = op.u64(ir::AttrKey::Axis, 1U);
+  const auto channels = input->dims[axis];
+  std::uint64_t inner = 1U;
+  for (std::size_t index = static_cast<std::size_t>(axis + 1U);
+       index < input->dims.size(); ++index)
+    inner *= input->dims[index];
+  const auto vectors = input->element_count() / channels;
+  const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  const auto epsilon = static_cast<float>(
+      op.f64(ir::AttrKey::Epsilon, 1.0e-12));
+  const auto scale = std::sqrt(static_cast<float>(channels));
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,const dif_scalar* gamma,dif_scalar* y){"
+         "extern __shared__ float reduction[];unsigned long long vector="
+         "(unsigned long long)blockIdx.x;if(vector>="
+      << vectors << "ULL)return;unsigned long long c=threadIdx.x;"
+      << "unsigned long long leading=vector/" << inner
+      << "ULL,trailing=vector%" << inner
+      << "ULL;unsigned long long index=(leading*" << channels
+      << "ULL+c)*" << inner
+      << "ULL+trailing;float value=c<" << channels
+      << "ULL?dif_load(x,index):0.0f;reduction[c]=value*value;"
+         "__syncthreads();";
+  for (auto stride = block / 2U; stride != 0U; stride /= 2U)
+    out << "if(c<" << stride << "ULL)reduction[c]+=reduction[c+" << stride
+        << "ULL];__syncthreads();";
+  out << "if(c<" << channels
+      << "ULL){float denominator=fmaxf(sqrtf(reduction[0])," << epsilon
+      << "f);float normalized=dif_round(value/denominator);"
+         "float scaled=dif_round(normalized*"
+      << scale
+      << "f);dif_store(y,index,scaled*dif_load(gamma,c));}}\n"
+      << std::defaultfloat;
+}
+
+void emit_upsample_nearest_2d(std::ostringstream &out,
+                              const ir::Program &program,
+                              const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto channels = input->dims[1];
+  const auto input_h = input->dims[2];
+  const auto input_w = input->dims[3];
+  const auto output_h = output->dims[2];
+  const auto output_w = output->dims[3];
+  const auto scale_h = op.u64(ir::AttrKey::ScaleH, 1U);
+  const auto scale_w = op.u64(ir::AttrKey::ScaleW, 1U);
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << output->element_count() << "ULL){unsigned long long ow=i%"
+      << output_w << "ULL,oh=(i/" << output_w << "ULL)%" << output_h
+      << "ULL,c=(i/" << output_w * output_h << "ULL)%" << channels
+      << "ULL,b=i/" << channels * output_h * output_w
+      << "ULL;unsigned long long source=((b*" << channels
+      << "ULL+c)*" << input_h << "ULL+oh/" << scale_h << "ULL)*"
+      << input_w << "ULL+ow/" << scale_w
+      << "ULL;dif_store(y,i,dif_load(x,source));}}\n";
+}
+
+void emit_pad_constant(std::ostringstream &out, const ir::Program &program,
+                       const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto top = op.u64(ir::AttrKey::PadTop, 0U);
+  const auto west = op.u64(ir::AttrKey::PadWest, 0U);
+  const auto value = static_cast<float>(op.f64(ir::AttrKey::Value, 0.0));
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << output->element_count() << "ULL){";
+  if (input->dims.size() == 4U) {
+    out << "unsigned long long ow=i%" << output->dims[3]
+        << "ULL,oh=(i/" << output->dims[3] << "ULL)%" << output->dims[2]
+        << "ULL,c=(i/" << output->dims[2] * output->dims[3] << "ULL)%"
+        << output->dims[1] << "ULL,b=i/"
+        << output->dims[1] * output->dims[2] * output->dims[3]
+        << "ULL;if(oh<" << top << "ULL||oh>=" << top + input->dims[2]
+        << "ULL||ow<" << west << "ULL||ow>=" << west + input->dims[3]
+        << "ULL){dif_store(y,i," << value
+        << "f);return;}unsigned long long source=((b*" << input->dims[1]
+        << "ULL+c)*" << input->dims[2] << "ULL+oh-" << top << "ULL)*"
+        << input->dims[3] << "ULL+ow-" << west
+        << "ULL;dif_store(y,i,dif_load(x,source));}}\n";
+  } else {
+    const auto front = op.u64(ir::AttrKey::PadFront, 0U);
+    out << "unsigned long long ow=i%" << output->dims[4]
+        << "ULL,oh=(i/" << output->dims[4] << "ULL)%" << output->dims[3]
+        << "ULL,ot=(i/" << output->dims[3] * output->dims[4] << "ULL)%"
+        << output->dims[2] << "ULL,c=(i/"
+        << output->dims[2] * output->dims[3] * output->dims[4] << "ULL)%"
+        << output->dims[1] << "ULL,b=i/"
+        << output->dims[1] * output->dims[2] * output->dims[3] *
+               output->dims[4]
+        << "ULL;if(ot<" << front << "ULL||ot>="
+        << front + input->dims[2] << "ULL||oh<" << top << "ULL||oh>="
+        << top + input->dims[3] << "ULL||ow<" << west << "ULL||ow>="
+        << west + input->dims[4] << "ULL){dif_store(y,i," << value
+        << "f);return;}unsigned long long source=(((b*" << input->dims[1]
+        << "ULL+c)*" << input->dims[2] << "ULL+ot-" << front << "ULL)*"
+        << input->dims[3] << "ULL+oh-" << top << "ULL)*" << input->dims[4]
+        << "ULL+ow-" << west
+        << "ULL;dif_store(y,i,dif_load(x,source));}}\n";
+  }
+  out << std::defaultfloat;
 }
 
 void emit_snake_beta(std::ostringstream &out, const ir::Program &program,
@@ -606,9 +719,21 @@ void emit_rotary_apply(std::ostringstream &out, const ir::Program &program,
       << typed_load(input->dtype) << "(x,base+2ULL*pair),odd="
       << typed_load(input->dtype)
       << "(x,base+2ULL*pair+1ULL),c=dif_load_f32(cosine,table),"
-         "s=dif_load_f32(sine,table);"
+         "s=dif_load_f32(sine,table),first,second,result;"
+         "if(d&1ULL){asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(first):"
+         "\"f\"(even),\"f\"(s));"
+         "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(second):"
+         "\"f\"(odd),\"f\"(c));"
+         "asm volatile(\"add.rn.f32 %0,%1,%2;\":\"=f\"(result):"
+         "\"f\"(first),\"f\"(second));}else{"
+         "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(first):"
+         "\"f\"(even),\"f\"(c));"
+         "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(second):"
+         "\"f\"(odd),\"f\"(s));"
+         "asm volatile(\"sub.rn.f32 %0,%1,%2;\":\"=f\"(result):"
+         "\"f\"(first),\"f\"(second));}"
       << typed_store(input->dtype)
-      << "(y,i,(d&1ULL)?even*s+odd*c:even*c-odd*s);}else "
+      << "(y,i,result);}else "
       << typed_store(input->dtype) << "(y,i," << typed_load(input->dtype)
       << "(x,i));}}\n";
 }
@@ -893,8 +1018,9 @@ void emit_sinusoidal_timestep(std::ostringstream &out,
          "column%"
       << half << "ULL;float exponent=(-" << log_period
       << "f*(float)component)/" << denominator
-      << "f;float frequency=expf(exponent);float angle=" << scale
-      << "f*(dif_load_f32(timesteps,row)*frequency);float s=sinf(angle),"
+      << "f;float frequency=expf(exponent);float scaled_timestep="
+      << "dif_load_f32(timesteps,row)*" << scale
+      << "f;float angle=scaled_timestep*frequency;float s=sinf(angle),"
          "c=cosf(angle);dif_store_f32(y,i,"
       << (flip ? "(column<" + std::to_string(half) + "ULL?c:s)"
                : "(column<" + std::to_string(half) + "ULL?s:c)")
@@ -1098,13 +1224,93 @@ void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
   weight_offset_literal << std::scientific << std::setprecision(9)
                         << static_cast<float>(weight_offset);
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  const auto reduction_tile = op.u64(ir::AttrKey::ReductionTileSize, 0U);
+  const auto triton_blocked_reduction =
+      block == 512U && columns == block * 12U && reduction_tile == 8192U;
+  const auto triton_chunked_reduction =
+      block == 512U && columns == block * 12U && reduction_tile == 2048U;
+  const auto triton_per_row_reduction = block == 128U && columns == 128U;
   out << std::setprecision(17) << "extern \"C\" __global__ void "
       << function_name(op)
       << "(const dif_scalar* x,const dif_scalar* weight,dif_scalar* y){\n"
          "  extern __shared__ float reduction[];unsigned long long row=blockIdx.x;"
          "float local=0.0f;if(row>="
       << rows << "ULL)return;\n";
-  if (columns % 4U == 0U && block >= 128U) {
+  if (triton_blocked_reduction) {
+    out << "  unsigned long long base=row*" << columns
+        << "ULL+(unsigned long long)threadIdx.x*8ULL;"
+           "float v0=dif_load(x,base),v1=dif_load(x,base+1ULL),"
+           "v2=dif_load(x,base+2ULL),v3=dif_load(x,base+3ULL),"
+           "v4=dif_load(x,base+4ULL),v5=dif_load(x,base+5ULL),"
+           "v6=dif_load(x,base+6ULL),v7=dif_load(x,base+7ULL);"
+           "local=v1*v1;local=fmaf(v0,v0,local);"
+           "local=fmaf(v2,v2,local);local=fmaf(v3,v3,local);"
+           "local=fmaf(v4,v4,local);local=fmaf(v5,v5,local);"
+           "local=fmaf(v6,v6,local);local=fmaf(v7,v7,local);"
+           "if(threadIdx.x<256U){float square,value;"
+           "value=dif_load(x,base+4096ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;value=dif_load(x,base+4097ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;value=dif_load(x,base+4098ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;value=dif_load(x,base+4099ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;value=dif_load(x,base+4100ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;value=dif_load(x,base+4101ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;value=dif_load(x,base+4102ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;value=dif_load(x,base+4103ULL);"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
+           "local=square+local;}"
+           "for(unsigned delta=16U;delta>0U;delta>>=1U)"
+           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
+           "unsigned lane=threadIdx.x&31U,warp=threadIdx.x>>5U;"
+           "if(lane==0U)reduction[warp]=local;__syncthreads();"
+           "if(warp==0U){local=lane<16U?reduction[lane]:0.0f;"
+           "for(unsigned delta=8U;delta>0U;delta>>=1U)"
+           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
+           "if(lane==0U)reduction[0]=local;}__syncthreads();\n";
+  } else if (triton_chunked_reduction) {
+    out << "  unsigned long long base=row*" << columns
+        << "ULL+(unsigned long long)threadIdx.x*4ULL;float a0,a1,a2,a3;"
+           "float m0=dif_load(x,base+2048ULL),m1=dif_load(x,base+2049ULL),"
+           "m2=dif_load(x,base+2050ULL),m3=dif_load(x,base+2051ULL);"
+           "float l0=dif_load(x,base),l1=dif_load(x,base+1ULL),"
+           "l2=dif_load(x,base+2ULL),l3=dif_load(x,base+3ULL);"
+           "a0=fmaf(l0,l0,m0*m0);a1=fmaf(l1,l1,m1*m1);"
+           "a2=fmaf(l2,l2,m2*m2);a3=fmaf(l3,l3,m3*m3);"
+           "float h0=dif_load(x,base+4096ULL),h1=dif_load(x,base+4097ULL),"
+           "h2=dif_load(x,base+4098ULL),h3=dif_load(x,base+4099ULL);"
+           "a0=fmaf(h0,h0,a0);a1=fmaf(h1,h1,a1);"
+           "a2=fmaf(h2,h2,a2);a3=fmaf(h3,h3,a3);"
+           "local=((a0+a1)+a2)+a3;"
+           "for(unsigned delta=16U;delta>0U;delta>>=1U)"
+           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
+           "unsigned lane=threadIdx.x&31U,warp=threadIdx.x>>5U;"
+           "if(lane==0U)reduction[warp]=local;__syncthreads();"
+           "if(warp==0U){local=lane<16U?reduction[lane]:0.0f;"
+           "for(unsigned delta=8U;delta>0U;delta>>=1U)"
+           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
+           "if(lane==0U)reduction[0]=local;}__syncthreads();\n";
+  } else if (triton_per_row_reduction) {
+    out << "  if(threadIdx.x<16U){unsigned long long base=row*128ULL+"
+           "(unsigned long long)threadIdx.x*8ULL;"
+           "float v0=dif_load(x,base),v1=dif_load(x,base+1ULL),"
+           "v2=dif_load(x,base+2ULL),v3=dif_load(x,base+3ULL),"
+           "v4=dif_load(x,base+4ULL),v5=dif_load(x,base+5ULL),"
+           "v6=dif_load(x,base+6ULL),v7=dif_load(x,base+7ULL);"
+           "local=v1*v1;local=fmaf(v0,v0,local);"
+           "local=fmaf(v2,v2,local);local=fmaf(v3,v3,local);"
+           "local=fmaf(v4,v4,local);local=fmaf(v5,v5,local);"
+           "local=fmaf(v6,v6,local);local=fmaf(v7,v7,local);}"
+           "else local=0.0f;"
+           "if(threadIdx.x<32U){for(unsigned delta=8U;delta>0U;delta>>=1U)"
+           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
+           "if(threadIdx.x==0U)reduction[0]=local;}__syncthreads();\n";
+  } else if (columns % 4U == 0U && block >= 128U && block < 512U) {
     out << "  if(threadIdx.x<128U){for(unsigned long long pack=threadIdx.x;pack<"
         << columns / 4U
         << "ULL;pack+=128ULL){unsigned long long col=pack*4ULL;unsigned long "
@@ -1127,9 +1333,19 @@ void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
            "stride)reduction[threadIdx.x]+=reduction[threadIdx.x+stride];"
            "__syncthreads();}\n";
   }
-  out << "  float inv=rsqrtf(reduction[0]/" << columns << ".0f+"
-      << static_cast<float>(epsilon)
-      << "f);for(unsigned long long col=threadIdx.x;col<" << columns
+  if (triton_blocked_reduction || triton_chunked_reduction ||
+      triton_per_row_reduction) {
+    out << "  float mean,mean_eps,inv;asm volatile(\"div.full.f32 %0,%1,%2;\""
+           ":\"=f\"(mean):\"f\"(reduction[0]),\"f\"("
+        << columns
+        << ".0f));mean_eps=mean+" << static_cast<float>(epsilon)
+        << "f;asm volatile(\"rsqrt.approx.ftz.f32 %0,%1;\""
+           ":\"=f\"(inv):\"f\"(mean_eps));";
+  } else {
+    out << "  float inv=rsqrtf(reduction[0]/" << columns << ".0f+"
+        << static_cast<float>(epsilon) << "f);";
+  }
+  out << "for(unsigned long long col=threadIdx.x;col<" << columns
       << "ULL;col+=blockDim.x){unsigned long long i=row*" << columns
       << "ULL+col;dif_store(y,i,dif_load(x,i)*inv*(dif_load(weight,col)+"
       << weight_offset_literal.str() << "f));}}\n";
@@ -1174,6 +1390,132 @@ void emit_rms_norm_modulate(std::ostringstream &out, const ir::Program &program,
   const auto rows = shape[0];
   const auto cols = shape[1];
   const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
+  const auto layout = static_cast<ir::ModulationLayout>(op.u64(
+      ir::AttrKey::ModulationLayout,
+      static_cast<std::uint64_t>(ir::ModulationLayout::ExplicitScaleShift)));
+  if (layout == ir::ModulationLayout::SharedVectorDelta) {
+    const auto vectors = program.tensor(op.inputs[2])->dims[0];
+    const auto rows_per_vector = rows / vectors;
+    const auto weight_offset = op.f64(ir::AttrKey::WeightOffset, 0.0);
+    std::ostringstream weight_offset_literal;
+    weight_offset_literal << std::scientific << std::setprecision(9)
+                          << static_cast<float>(weight_offset);
+    const auto reduction_tile =
+        op.u64(ir::AttrKey::ReductionTileSize, 0U);
+    if (program.tensor(op.inputs[0])->dtype != ir::DType::BF16 ||
+        op.u64(ir::AttrKey::BlockSize, 256U) != 512U || cols != 6144U ||
+        (reduction_tile != 2048U && reduction_tile != 8192U))
+      fail("CUDA shared-vector rms_norm_modulate currently requires the "
+           "source-faithful BF16 6144-wide reduction");
+    if (reduction_tile == 2048U) {
+      out << std::setprecision(17) << "extern \"C\" __global__ void "
+          << function_name(op)
+          << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* "
+             "vector,const dif_scalar* delta,dif_scalar* y){extern __shared__ "
+             "float reduction[];unsigned long long row=blockIdx.x;unsigned tid="
+             "threadIdx.x;if(row>="
+          << rows << "ULL)return;unsigned long long base=row*6144ULL+(unsigned "
+             "long long)tid*4ULL;float a0,a1,a2,a3;float m0=dif_load(x,base+"
+             "2048ULL),m1=dif_load(x,base+2049ULL),m2=dif_load(x,base+2050ULL),"
+             "m3=dif_load(x,base+2051ULL);float l0=dif_load(x,base),l1="
+             "dif_load(x,base+1ULL),l2=dif_load(x,base+2ULL),l3=dif_load(x,"
+             "base+3ULL);a0=fmaf(l0,l0,m0*m0);a1=fmaf(l1,l1,m1*m1);a2=fmaf("
+             "l2,l2,m2*m2);a3=fmaf(l3,l3,m3*m3);float h0=dif_load(x,base+"
+             "4096ULL),h1=dif_load(x,base+4097ULL),h2=dif_load(x,base+4098ULL),"
+             "h3=dif_load(x,base+4099ULL);a0=fmaf(h0,h0,a0);a1=fmaf(h1,h1,a1);"
+             "a2=fmaf(h2,h2,a2);a3=fmaf(h3,h3,a3);float local=((a0+a1)+a2)+a3;"
+             "for(unsigned delta_step=16U;delta_step>0U;delta_step>>=1U)local+="
+             "__shfl_xor_sync(0xffffffffU,local,delta_step);unsigned lane=tid&"
+             "31U,warp=tid>>5U;if(lane==0U)reduction[warp]=local;__syncthreads();"
+             "if(warp==0U){local=lane<16U?reduction[lane]:0.0f;for(unsigned "
+             "delta_step=8U;delta_step>0U;delta_step>>=1U)local+="
+             "__shfl_xor_sync(0xffffffffU,local,delta_step);if(lane==0U)"
+             "reduction[0]=local;}__syncthreads();float mean,mean_eps,inv;asm "
+             "volatile(\"div.full.f32 %0,%1,%2;\":\"=f\"(mean):\"f\"(reduction[0]),"
+             "\"f\"(6144.0f));mean_eps=mean+"
+          << static_cast<float>(epsilon)
+          << "f;asm volatile(\"rsqrt.approx.ftz.f32 %0,%1;\":\"=f\"(inv):"
+             "\"f\"(mean_eps));unsigned long long shared_base=(row/"
+          << rows_per_vector
+          << "ULL)*6144ULL;for(unsigned long long col=tid;col<6144ULL;col+="
+             "blockDim.x){unsigned long long i=row*6144ULL+col;float xv="
+             "dif_load(x,i),wv=dif_load(weight,col),base_value=dif_load(vector,"
+             "shared_base+col),scale_delta=dif_load(delta,col),shift_delta="
+             "dif_load(delta,6144ULL+col);float normalized,weighted,scale,"
+             "scale_one,shift,result;asm volatile(\"mul.rn.f32 %0,%1,%2;\""
+             ":\"=f\"(normalized):\"f\"(xv),\"f\"(inv));float weight_value=wv+"
+          << weight_offset_literal.str()
+          << "f;asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(weighted):"
+             "\"f\"(normalized),\"f\"(weight_value));asm volatile(\"add.rn.f32 "
+             "%0,%1,%2;\":\"=f\"(scale):\"f\"(base_value),\"f\"(scale_delta));"
+             "scale_one=scale+1.0f;asm volatile("
+             "\"add.rn.f32 %0,%1,%2;\":\"=f\"(shift):\"f\"(base_value),"
+             "\"f\"(shift_delta));result=fmaf(scale_one,weighted,shift);"
+             "dif_store(y,i,result);}}\n";
+      return;
+    }
+    out << std::setprecision(17) << "extern \"C\" __global__ void "
+        << function_name(op)
+        << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* "
+           "vector,const dif_scalar* delta,dif_scalar* y){extern __shared__ "
+           "float reduction[];unsigned long long row=blockIdx.x;unsigned tid="
+           "threadIdx.x;if(row>="
+        << rows << "ULL)return;unsigned long long base=row*" << cols
+        << "ULL+(unsigned long long)tid*8ULL;float v0=dif_load(x,base),"
+           "v1=dif_load(x,base+1ULL),v2=dif_load(x,base+2ULL),"
+           "v3=dif_load(x,base+3ULL),v4=dif_load(x,base+4ULL),"
+           "v5=dif_load(x,base+5ULL),v6=dif_load(x,base+6ULL),"
+           "v7=dif_load(x,base+7ULL);float local=v1*v1;"
+           "local=fmaf(v0,v0,local);local=fmaf(v2,v2,local);"
+           "local=fmaf(v3,v3,local);local=fmaf(v4,v4,local);"
+           "local=fmaf(v5,v5,local);local=fmaf(v6,v6,local);"
+           "local=fmaf(v7,v7,local);if(tid<256U){float square,value;"
+           "value=dif_load(x,base+4096ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;"
+           "value=dif_load(x,base+4097ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;"
+           "value=dif_load(x,base+4098ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;"
+           "value=dif_load(x,base+4099ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;"
+           "value=dif_load(x,base+4100ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;"
+           "value=dif_load(x,base+4101ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;"
+           "value=dif_load(x,base+4102ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;"
+           "value=dif_load(x,base+4103ULL);asm volatile(\"mul.rn.f32 %0,%1,%1;\""
+           ":\"=f\"(square):\"f\"(value));local=square+local;}"
+           "for(unsigned delta_step=16U;delta_step>0U;delta_step>>=1U)"
+           "local+=__shfl_xor_sync(0xffffffffU,local,delta_step);"
+           "unsigned lane=tid&31U,warp=tid>>5U;if(lane==0U)reduction[warp]="
+           "local;__syncthreads();if(warp==0U){local=lane<16U?reduction[lane]:"
+           "0.0f;for(unsigned delta_step=8U;delta_step>0U;delta_step>>=1U)"
+           "local+=__shfl_xor_sync(0xffffffffU,local,delta_step);if(lane==0U)"
+           "reduction[0]=local;}__syncthreads();float mean,mean_eps,inv;"
+           "asm volatile(\"div.full.f32 %0,%1,%2;\":\"=f\"(mean):\"f\"(reduction[0]),"
+           "\"f\"(6144.0f));mean_eps=mean+"
+        << static_cast<float>(epsilon)
+        << "f;asm volatile(\"rsqrt.approx.ftz.f32 %0,%1;\":\"=f\"(inv):"
+           "\"f\"(mean_eps));unsigned long long shared_base=(row/"
+        << rows_per_vector
+        << "ULL)*6144ULL;for(unsigned long long col=tid;col<6144ULL;col+="
+           "blockDim.x){unsigned long long i=row*6144ULL+col;float xv="
+           "dif_load(x,i),wv=dif_load(weight,col),base_value=dif_load(vector,"
+           "shared_base+col),scale_delta=dif_load(delta,col),shift_delta="
+           "dif_load(delta,6144ULL+col);float normalized,weighted,scale,"
+           "scale_one,shift,result;asm volatile(\"mul.rn.f32 %0,%1,%2;\""
+           ":\"=f\"(normalized):\"f\"(xv),\"f\"(inv));float weight_value=wv+"
+        << weight_offset_literal.str()
+        << "f;asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(weighted):"
+           "\"f\"(normalized),\"f\"(weight_value));asm volatile(\"add.rn.f32 "
+           "%0,%1,%2;\":\"=f\"(scale):\"f\"(base_value),\"f\"(scale_delta));"
+           "scale_one=scale+1.0f;asm volatile("
+           "\"add.rn.f32 %0,%1,%2;\":\"=f\"(shift):\"f\"(base_value),"
+           "\"f\"(shift_delta));result=fmaf(scale_one,weighted,shift);"
+           "dif_store(y,i,result);}}\n";
+    return;
+  }
   const bool weighted = op.inputs.size() == 4;
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
   const auto *scale = program.tensor(op.inputs[weighted ? 2U : 1U]);
@@ -2442,7 +2784,8 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       }
       continue;
     }
-    if (op.opcode == ir::Opcode::Barrier ||
+    if (op.opcode == ir::Opcode::Barrier || op.opcode == ir::Opcode::Conv2d ||
+        op.opcode == ir::Opcode::Conv3d ||
         (op.opcode == ir::Opcode::Attention &&
          op.u64(ir::AttrKey::Implementation, 1U) == 2U))
       continue;
@@ -2641,6 +2984,19 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::Conv1d:
       emit_conv1d(source, program, op);
+      break;
+    case ir::Opcode::Conv2d:
+      break;
+    case ir::Opcode::ChannelRmsNorm:
+      emit_channel_rms_norm(source, program, op);
+      break;
+    case ir::Opcode::UpsampleNearest2d:
+      emit_upsample_nearest_2d(source, program, op);
+      break;
+    case ir::Opcode::PadConstant:
+      emit_pad_constant(source, program, op);
+      break;
+    case ir::Opcode::Conv3d:
       break;
     case ir::Opcode::SnakeBeta:
       emit_snake_beta(source, program, op);

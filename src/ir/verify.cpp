@@ -22,11 +22,11 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::Concat;
+  return opcode >= Opcode::Add && opcode <= Opcode::Conv3d;
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::Permutation7;
+  return key >= AttrKey::Epsilon && key <= AttrKey::PadBack;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -492,6 +492,13 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto block = op.u64(AttrKey::BlockSize, 256U);
     if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
       fail("rms_norm block size must be a power of two in [32,1024]");
+    const auto reduction_tile = op.u64(AttrKey::ReductionTileSize, 0U);
+    if (reduction_tile != 0U && reduction_tile != 2048U &&
+        reduction_tile != 8192U)
+      fail("rms_norm reduction tile must be zero, 2048, or 8192");
+    if (reduction_tile != 0U &&
+        (block != 512U || input.dims.back() != 6144U))
+      fail("tiled rms_norm currently requires block 512 and width 6144");
     return;
   }
 
@@ -753,6 +760,41 @@ void verify_operation(const Program &program, const Operation &op) {
     if ((op.inputs.size() != 3 && op.inputs.size() != 4) || op.outputs.size() != 1)
       fail("rms_norm_modulate expects x,[weight],scale,shift and one output");
     const auto &x = tensor_or_fail(program, op.inputs[0], op);
+    const auto layout = static_cast<ModulationLayout>(op.u64(
+        AttrKey::ModulationLayout,
+        static_cast<std::uint64_t>(ModulationLayout::ExplicitScaleShift)));
+    if (layout == ModulationLayout::SharedVectorDelta) {
+      if (op.inputs.size() != 4U)
+        fail("shared-vector rms_norm_modulate expects x,weight,vector,delta");
+      const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+      const auto &vector = tensor_or_fail(program, op.inputs[2], op);
+      const auto &delta = tensor_or_fail(program, op.inputs[3], op);
+      const auto &out = tensor_or_fail(program, op.outputs[0], op);
+      same_shape_dtype(x, out, op);
+      if (!supported_float(x.dtype) || x.dims.size() != 2U ||
+          weight.dtype != x.dtype || weight.dims.size() != 1U ||
+          weight.dims[0] != x.dims[1] || vector.dtype != x.dtype ||
+          vector.dims.size() != 2U || vector.dims[1] != x.dims[1] ||
+          vector.dims[0] == 0U || x.dims[0] % vector.dims[0] != 0U ||
+          delta.dtype != x.dtype || delta.dims.size() != 2U ||
+          delta.dims[0] != 2U || delta.dims[1] != x.dims[1])
+        fail("shared-vector rms_norm_modulate requires x/out [rows,hidden], "
+             "weight [hidden], vector [batch,hidden], delta [2,hidden]");
+      if (!(op.f64(AttrKey::Epsilon, 1.0e-5) > 0.0) ||
+          !std::isfinite(op.f64(AttrKey::WeightOffset, 0.0)))
+        fail("shared-vector rms_norm_modulate has invalid norm attributes");
+      const auto block = op.u64(AttrKey::BlockSize, 256U);
+      const auto reduction_tile = op.u64(AttrKey::ReductionTileSize, 0U);
+      if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U ||
+          (reduction_tile != 0U && reduction_tile != 2048U &&
+           reduction_tile != 8192U) ||
+          (reduction_tile != 0U &&
+           (block != 512U || x.dims[1] != 6144U)))
+        fail("shared-vector rms_norm_modulate has invalid reduction geometry");
+      return;
+    }
+    if (layout != ModulationLayout::ExplicitScaleShift)
+      fail("rms_norm_modulate has an unknown modulation layout");
     const auto scale_index = op.inputs.size() == 4 ? 2U : 1U;
     const auto shift_index = op.inputs.size() == 4 ? 3U : 2U;
     const auto &scale = tensor_or_fail(program, op.inputs[scale_index], op);
@@ -829,6 +871,18 @@ void verify_operation(const Program &program, const Operation &op) {
           bias.dims[0] != weight.dims[0])
         fail("linear bias must have the graph dtype and shape [N]");
     }
+    const auto bias_mode = op.u64(
+        AttrKey::LinearBiasMode,
+        static_cast<std::uint64_t>(LinearBiasMode::Epilogue));
+    if (bias_mode != static_cast<std::uint64_t>(LinearBiasMode::Epilogue) &&
+        bias_mode != static_cast<std::uint64_t>(LinearBiasMode::Addmm))
+      fail("linear bias mode must be epilogue or addmm");
+    if (op.inputs.size() != 3U &&
+        bias_mode != static_cast<std::uint64_t>(LinearBiasMode::Epilogue))
+      fail("linear addmm bias mode requires a bias input");
+    if (op.find(AttrKey::WorkspaceLimitBytes) &&
+        op.u64(AttrKey::WorkspaceLimitBytes, 0U) == 0U)
+      fail("linear workspace limit must be positive when specified");
     const auto implementation = op.u64(AttrKey::Implementation, 1U);
     if (implementation != 1U && implementation != 2U && implementation != 3U)
       fail("linear implementation must be 1 (native), 2 (tf32), or 3 "
@@ -1372,6 +1426,195 @@ void verify_operation(const Program &program, const Operation &op) {
           bias.dims[0] != out_channels)
         fail("conv1d bias must be a [C_out] vector of the input dtype");
     }
+    return;
+  }
+
+  if (op.opcode == Opcode::Conv2d) {
+    if ((op.inputs.size() != 2U && op.inputs.size() != 3U) ||
+        op.outputs.size() != 1U)
+      fail("conv2d expects input, weight, optional bias, and one output");
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || weight.dtype != input.dtype ||
+        out.dtype != input.dtype || input.dims.size() != 4U ||
+        weight.dims.size() != 4U || out.dims.size() != 4U)
+      fail("conv2d requires NCHW input/output and OIHW weights of one float dtype");
+    const auto stride_h = op.u64(AttrKey::StrideH, 1U);
+    const auto stride_w = op.u64(AttrKey::StrideW, 1U);
+    const auto dilation_h = op.u64(AttrKey::DilationH, 1U);
+    const auto dilation_w = op.u64(AttrKey::DilationW, 1U);
+    const auto pad_top = op.u64(AttrKey::PadTop, 0U);
+    const auto pad_bottom = op.u64(AttrKey::PadBottom, 0U);
+    const auto pad_west = op.u64(AttrKey::PadWest, 0U);
+    const auto pad_east = op.u64(AttrKey::PadEast, 0U);
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    constexpr auto kLimit = std::uint64_t{1} << 20U;
+    if (stride_h == 0U || stride_w == 0U || dilation_h == 0U ||
+        dilation_w == 0U || groups == 0U || stride_h > kLimit ||
+        stride_w > kLimit || dilation_h > kLimit || dilation_w > kLimit ||
+        pad_top > kLimit || pad_bottom > kLimit || pad_west > kLimit ||
+        pad_east > kLimit)
+      fail("conv2d attributes are invalid or out of range");
+    const auto batch = input.dims[0];
+    const auto in_channels = input.dims[1];
+    const auto height = input.dims[2];
+    const auto width = input.dims[3];
+    const auto out_channels = weight.dims[0];
+    const auto kernel_h = weight.dims[2];
+    const auto kernel_w = weight.dims[3];
+    if (in_channels % groups != 0U || out_channels % groups != 0U ||
+        weight.dims[1] != in_channels / groups || kernel_h == 0U ||
+        kernel_w == 0U)
+      fail("conv2d weight/groups geometry is invalid");
+    const auto effective_h = dilation_h * (kernel_h - 1U) + 1U;
+    const auto effective_w = dilation_w * (kernel_w - 1U) + 1U;
+    const auto padded_h = height + pad_top + pad_bottom;
+    const auto padded_w = width + pad_west + pad_east;
+    if (padded_h < effective_h || padded_w < effective_w)
+      fail("conv2d kernel does not fit its padded input");
+    const auto output_h = (padded_h - effective_h) / stride_h + 1U;
+    const auto output_w = (padded_w - effective_w) / stride_w + 1U;
+    if (out.dims != std::vector<std::uint64_t>{batch, out_channels, output_h,
+                                               output_w})
+      fail("conv2d output geometry does not match its attributes");
+    if (op.inputs.size() == 3U) {
+      const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+      if (bias.dtype != input.dtype ||
+          bias.dims != std::vector<std::uint64_t>{out_channels})
+        fail("conv2d bias must be a [C_out] vector of the input dtype");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::PadConstant) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || out.dtype != input.dtype ||
+        (input.dims.size() != 4U && input.dims.size() != 5U) ||
+        out.dims.size() != input.dims.size())
+      fail("pad_constant requires matching float NCHW or NCDHW tensors");
+    const auto front = op.u64(AttrKey::PadFront, 0U);
+    const auto back = op.u64(AttrKey::PadBack, 0U);
+    const auto top = op.u64(AttrKey::PadTop, 0U);
+    const auto bottom = op.u64(AttrKey::PadBottom, 0U);
+    const auto west = op.u64(AttrKey::PadWest, 0U);
+    const auto east = op.u64(AttrKey::PadEast, 0U);
+    constexpr auto kLimit = std::uint64_t{1} << 20U;
+    if (front > kLimit || back > kLimit || top > kLimit ||
+        bottom > kLimit || west > kLimit || east > kLimit ||
+        !std::isfinite(op.f64(AttrKey::Value, 0.0)))
+      fail("pad_constant attributes are invalid or out of range");
+    auto expected = input.dims;
+    if (expected.size() == 5U)
+      expected[2] += front + back;
+    else if (front != 0U || back != 0U)
+      fail("rank-4 pad_constant cannot use front/back padding");
+    const auto height_axis = expected.size() - 2U;
+    const auto width_axis = expected.size() - 1U;
+    expected[height_axis] += top + bottom;
+    expected[width_axis] += west + east;
+    if (out.dims != expected)
+      fail("pad_constant output geometry does not match its attributes");
+    return;
+  }
+
+  if (op.opcode == Opcode::Conv3d) {
+    if ((op.inputs.size() != 2U && op.inputs.size() != 3U) ||
+        op.outputs.size() != 1U)
+      fail("conv3d expects input, weight, optional bias, and one output");
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || weight.dtype != input.dtype ||
+        out.dtype != input.dtype || input.dims.size() != 5U ||
+        weight.dims.size() != 5U || out.dims.size() != 5U)
+      fail("conv3d requires NCDHW input/output and OIDHW weights of one float dtype");
+    const auto stride_t = op.u64(AttrKey::StrideT, 1U);
+    const auto stride_h = op.u64(AttrKey::StrideH, 1U);
+    const auto stride_w = op.u64(AttrKey::StrideW, 1U);
+    const auto dilation_t = op.u64(AttrKey::DilationT, 1U);
+    const auto dilation_h = op.u64(AttrKey::DilationH, 1U);
+    const auto dilation_w = op.u64(AttrKey::DilationW, 1U);
+    const auto front = op.u64(AttrKey::PadFront, 0U);
+    const auto back = op.u64(AttrKey::PadBack, 0U);
+    const auto top = op.u64(AttrKey::PadTop, 0U);
+    const auto bottom = op.u64(AttrKey::PadBottom, 0U);
+    const auto west = op.u64(AttrKey::PadWest, 0U);
+    const auto east = op.u64(AttrKey::PadEast, 0U);
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    constexpr auto kLimit = std::uint64_t{1} << 20U;
+    if (stride_t == 0U || stride_h == 0U || stride_w == 0U ||
+        dilation_t == 0U || dilation_h == 0U || dilation_w == 0U ||
+        groups == 0U || stride_t > kLimit || stride_h > kLimit ||
+        stride_w > kLimit || dilation_t > kLimit ||
+        dilation_h > kLimit || dilation_w > kLimit || front > kLimit ||
+        back > kLimit || top > kLimit || bottom > kLimit || west > kLimit ||
+        east > kLimit)
+      fail("conv3d attributes are invalid or out of range");
+    const auto in_channels = input.dims[1];
+    const auto out_channels = weight.dims[0];
+    if (in_channels % groups != 0U || out_channels % groups != 0U ||
+        weight.dims[1] != in_channels / groups || weight.dims[2] == 0U ||
+        weight.dims[3] == 0U || weight.dims[4] == 0U)
+      fail("conv3d weight/groups geometry is invalid");
+    const auto effective_t = dilation_t * (weight.dims[2] - 1U) + 1U;
+    const auto effective_h = dilation_h * (weight.dims[3] - 1U) + 1U;
+    const auto effective_w = dilation_w * (weight.dims[4] - 1U) + 1U;
+    const auto padded_t = input.dims[2] + front + back;
+    const auto padded_h = input.dims[3] + top + bottom;
+    const auto padded_w = input.dims[4] + west + east;
+    if (padded_t < effective_t || padded_h < effective_h ||
+        padded_w < effective_w)
+      fail("conv3d kernel does not fit its padded input");
+    const std::vector<std::uint64_t> expected{
+        input.dims[0], out_channels,
+        (padded_t - effective_t) / stride_t + 1U,
+        (padded_h - effective_h) / stride_h + 1U,
+        (padded_w - effective_w) / stride_w + 1U};
+    if (out.dims != expected)
+      fail("conv3d output geometry does not match its attributes");
+    if (op.inputs.size() == 3U) {
+      const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+      if (bias.dtype != input.dtype ||
+          bias.dims != std::vector<std::uint64_t>{out_channels})
+        fail("conv3d bias must be a [C_out] vector of the input dtype");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::ChannelRmsNorm) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &gamma = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    const auto axis = op.u64(AttrKey::Axis, 1U);
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-12);
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (!supported_float(input.dtype) || input.dims.size() < 2U ||
+        axis >= input.dims.size() || gamma.dtype != input.dtype ||
+        gamma.dims != std::vector<std::uint64_t>{input.dims[axis]} ||
+        !(epsilon > 0.0) || block < input.dims[axis] || block > 1024U ||
+        (block & (block - 1U)) != 0U)
+      fail("channel_rms_norm requires float input/output, [C] gamma, a valid axis, and positive epsilon");
+    return;
+  }
+
+  if (op.opcode == Opcode::UpsampleNearest2d) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const auto scale_h = op.u64(AttrKey::ScaleH, 1U);
+    const auto scale_w = op.u64(AttrKey::ScaleW, 1U);
+    if (!supported_float(input.dtype) || input.dims.size() != 4U ||
+        out.dtype != input.dtype || out.dims.size() != 4U || scale_h == 0U ||
+        scale_w == 0U || scale_h > 1024U || scale_w > 1024U ||
+        out.dims != std::vector<std::uint64_t>{
+                        input.dims[0], input.dims[1],
+                        input.dims[2] * scale_h, input.dims[3] * scale_w})
+      fail("upsample_nearest_2d requires NCHW float tensors and valid integer scales");
     return;
   }
 

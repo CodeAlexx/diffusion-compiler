@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Artifact gate for the native BigVGAN audio decode (gate 4 of
-docs/BIGVGAN_DECODE_PLAN.md): compare a decoded WAV against the accepted
-artifact's audio.wav.
+"""Artifact gate for the native BigVGAN audio decode: compare a decoded WAV
+against the accepted artifact's audio.wav.
 
 Bars (from the plan's honest-bar reasoning — byte-identity of the file is
 NOT the bar; different executor, different reduction order):

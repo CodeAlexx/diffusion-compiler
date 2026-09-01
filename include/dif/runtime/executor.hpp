@@ -290,6 +290,7 @@ struct LaunchTelemetry {
   std::uint64_t cublaslt_matmuls{};
   std::uint64_t cublas_gemms{};
   std::uint64_t cudnn_attention_dispatches{};
+  std::uint64_t cudnn_convolution_dispatches{};
   std::uint64_t cutlass_launches{};
   std::uint64_t ck_attention_dispatches{};
   std::uint64_t h2d_copies{};

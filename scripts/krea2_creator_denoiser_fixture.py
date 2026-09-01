@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Creator-oracle fixture for one complete real-dimension Krea 2 evaluation.
 
-The 26.28 GB Raw checkpoint cannot reside on a 24 GB GPU. This development
+The 26.28 GB Raw/Turbo checkpoint cannot reside on a 24 GB GPU. This development
 oracle therefore mirrors the official module equations while loading one
 block at a time. PyTorch is never part of the accepted native production path.
 """
@@ -27,7 +27,7 @@ IMAGE_TOKENS = 4096
 PATCH_FEATURES = 64
 SEQUENCE = TEXT_TOKENS + IMAGE_TOKENS
 SEED = 20260831
-CAPTURE_LAYERS = {0, 2, 6, 13, 20, 27}
+CAPTURE_LAYERS = set(range(28))
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +35,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--creator", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--text-fixture", type=Path, required=True)
+    parser.add_argument(
+        "--tokenizer-fixture",
+        type=Path,
+        help="tokenizer inputs paired with a native conditioning fixture",
+    )
+    parser.add_argument(
+        "--image-fixture",
+        type=Path,
+        help="sampler fixture supplying initial_image_tokens",
+    )
+    parser.add_argument(
+        "--image-key",
+        default="initial_image_tokens",
+        help="tensor name to read from --image-fixture",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--timestep", type=float, default=1.0)
@@ -76,16 +91,32 @@ def main() -> None:
 
     with safe_open(args.text_fixture, framework="pt", device="cpu") as source:
         context_cpu = source.get_tensor("conditioning_output")
-        text_mask_cpu = source.get_tensor("validity_mask")
+        if "validity_mask" in source.keys():
+            text_mask_cpu = source.get_tensor("validity_mask")
+        elif args.tokenizer_fixture is None:
+            raise ValueError(
+                "text fixture has no validity_mask; provide --tokenizer-fixture"
+            )
+    if "text_mask_cpu" not in locals():
+        with safe_open(args.tokenizer_fixture, framework="pt", device="cpu") as source:
+            text_mask_cpu = source.get_tensor("attention_mask")[:, 34:]
     if tuple(context_cpu.shape) != (1, TEXT_TOKENS, FEATURES):
         raise ValueError(f"unexpected text context shape {tuple(context_cpu.shape)}")
     if tuple(text_mask_cpu.shape) != (1, TEXT_TOKENS):
         raise ValueError(f"unexpected text mask shape {tuple(text_mask_cpu.shape)}")
 
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)
-    image_tokens_cpu = torch.randn(
-        (1, IMAGE_TOKENS, PATCH_FEATURES), generator=generator, dtype=torch.float32
-    ).to(torch.bfloat16)
+    if args.image_fixture is None:
+        generator = torch.Generator(device="cpu").manual_seed(args.seed)
+        image_tokens_cpu = torch.randn(
+            (1, IMAGE_TOKENS, PATCH_FEATURES),
+            generator=generator,
+            dtype=torch.float32,
+        ).to(torch.bfloat16)
+    else:
+        with safe_open(args.image_fixture, framework="pt", device="cpu") as source:
+            image_tokens_cpu = source.get_tensor(args.image_key)
+    if tuple(image_tokens_cpu.shape) != (1, IMAGE_TOKENS, PATCH_FEATURES):
+        raise ValueError(f"unexpected image-token shape {tuple(image_tokens_cpu.shape)}")
     timestep_cpu = torch.tensor([args.timestep], dtype=torch.bfloat16)
     positions_cpu = torch.zeros((1, SEQUENCE, 3), dtype=torch.float32)
     image_y = torch.arange(64, dtype=torch.float32)[:, None]
@@ -134,20 +165,28 @@ def main() -> None:
         top_started = time.perf_counter()
         with torch.inference_mode():
             projected_image = first(image_tokens)
-            time_vector = tmlp(
-                temb(
-                    timestep,
-                    TIMESTEP_DIM,
-                    device=image_tokens.device,
-                    dtype=image_tokens.dtype,
-                )
+            timestep_embedding = temb(
+                timestep,
+                TIMESTEP_DIM,
+                device=image_tokens.device,
+                dtype=image_tokens.dtype,
             )
-            modulation = tproj(time_vector)
+            timestep_first_linear = tmlp[0](timestep_embedding)
+            timestep_first_activation = tmlp[1](timestep_first_linear)
+            time_vector = tmlp[2](timestep_first_activation)
+            timestep_projection_activation = tproj[0](time_vector)
+            modulation = tproj[1](timestep_projection_activation)
             sequence = torch.cat((context, projected_image), dim=1)
         torch.cuda.synchronize()
         top_seconds = time.perf_counter() - top_started
         captures["projected_image"] = projected_image.cpu()
+        captures["timestep_embedding"] = timestep_embedding.cpu()
+        captures["timestep_first_linear"] = timestep_first_linear.cpu()
+        captures["timestep_first_activation"] = timestep_first_activation.cpu()
         captures["timestep_output"] = time_vector.cpu()
+        captures["timestep_projection_activation"] = (
+            timestep_projection_activation.cpu()
+        )
         captures["modulation_output"] = modulation.cpu()
         del first, tmlp, tproj, projected_image
         torch.cuda.empty_cache()
@@ -193,6 +232,8 @@ def main() -> None:
             "creator_commit": SOURCE_COMMIT,
             "checkpoint": str(args.checkpoint),
             "text_fixture": str(args.text_fixture),
+            "image_fixture": str(args.image_fixture) if args.image_fixture else "",
+            "image_key": args.image_key,
             "seed": str(args.seed),
             "timestep": repr(args.timestep),
             "geometry": "B1_text512_image4096_D6144_patch64",
@@ -203,6 +244,8 @@ def main() -> None:
         "creator_commit": SOURCE_COMMIT,
         "checkpoint": str(args.checkpoint),
         "text_fixture": str(args.text_fixture),
+        "image_fixture": str(args.image_fixture) if args.image_fixture else None,
+        "image_key": args.image_key,
         "seed": args.seed,
         "timestep": args.timestep,
         "dtype": "BF16",

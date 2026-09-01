@@ -2,7 +2,7 @@
 # The accepted MiniMax-H3 generation, from LITERAL PROMPT TEXT, entirely
 # native: no PyTorch, Python, Serenity, Mojo/MAX, Rust FFI, or model worker
 # executes any part of the neural graph.  ffmpeg is the declared mux
-# boundary.  Evidence: docs/H3_NATIVE_PROMPT_TO_MP4_GATE_2026-08-31.md
+# boundary. The script emits the reproducible evidence manifest beside output.
 #
 #   scripts/h3_native_prompt_to_mp4.sh PROMPT.txt OUTDIR
 #

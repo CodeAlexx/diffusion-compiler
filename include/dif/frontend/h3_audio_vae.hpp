@@ -9,8 +9,8 @@
 
 namespace dif::frontend {
 
-// Released MiniMax-H3 BigVGAN audio decoder configuration
-// (audio_vae/metadata.json + config.yaml; docs/BIGVGAN_DECODE_PLAN.md §1).
+// Released MiniMax-H3 BigVGAN audio decoder configuration, sourced from
+// audio_vae/metadata.json and config.yaml.
 struct AudioBigVganConfig {
   std::uint64_t latent_channels{32};
   std::uint64_t latent_dim{2048};

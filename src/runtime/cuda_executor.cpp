@@ -5,6 +5,7 @@
 #include "dif/ir/verify.hpp"
 #if DIF_HAS_CUDNN
 #include "dif/runtime/cudnn_attention.hpp"
+#include "dif/runtime/cudnn_conv.hpp"
 #endif
 #if DIF_HAS_CUTLASS
 #include "dif/runtime/cutlass_gemm.hpp"
@@ -167,6 +168,11 @@ void count_cublaslt_matmul() {
 void count_cudnn_attention_dispatch() {
   if (active_telemetry)
     ++active_telemetry->cudnn_attention_dispatches;
+}
+
+void count_cudnn_convolution_dispatch() {
+  if (active_telemetry)
+    ++active_telemetry->cudnn_convolution_dispatches;
 }
 
 void count_cutlass_launch() {
@@ -463,6 +469,73 @@ struct CudnnAttentionKeyHash {
     return result;
   }
 };
+
+struct CudnnConv2dKey {
+  ir::DType dtype{};
+  std::array<std::uint64_t, 4> input{};
+  std::array<std::uint64_t, 4> weight{};
+  std::array<std::uint64_t, 4> output{};
+  std::uint64_t stride_h{}, stride_w{};
+  std::uint64_t pad_h{}, pad_w{};
+  std::uint64_t dilation_h{}, dilation_w{};
+  std::uint64_t groups{};
+  std::uint64_t workspace_limit{};
+  bool biased{};
+
+  bool operator==(const CudnnConv2dKey &) const = default;
+};
+
+struct CudnnConv2dKeyHash {
+  std::size_t operator()(const CudnnConv2dKey &key) const noexcept {
+    std::size_t result = 0xcbf29ce484222325ULL;
+    auto mix = [&](std::uint64_t value) {
+      result ^= static_cast<std::size_t>(value);
+      result *= 0x100000001b3ULL;
+    };
+    mix(static_cast<std::uint64_t>(key.dtype));
+    for (const auto value : key.input) mix(value);
+    for (const auto value : key.weight) mix(value);
+    for (const auto value : key.output) mix(value);
+    mix(key.stride_h); mix(key.stride_w); mix(key.pad_h); mix(key.pad_w);
+    mix(key.dilation_h); mix(key.dilation_w); mix(key.groups);
+    mix(key.workspace_limit); mix(key.biased ? 1U : 0U);
+    return result;
+  }
+};
+
+struct CudnnConv3dKey {
+  ir::DType dtype{};
+  std::array<std::uint64_t, 5> input{};
+  std::array<std::uint64_t, 5> weight{};
+  std::array<std::uint64_t, 5> output{};
+  std::uint64_t stride_t{}, stride_h{}, stride_w{};
+  std::uint64_t pad_t{}, pad_h{}, pad_w{};
+  std::uint64_t dilation_t{}, dilation_h{}, dilation_w{};
+  std::uint64_t groups{};
+  std::uint64_t workspace_limit{};
+  bool biased{};
+
+  bool operator==(const CudnnConv3dKey &) const = default;
+};
+
+struct CudnnConv3dKeyHash {
+  std::size_t operator()(const CudnnConv3dKey &key) const noexcept {
+    std::size_t result = 0xcbf29ce484222325ULL;
+    auto mix = [&](std::uint64_t value) {
+      result ^= static_cast<std::size_t>(value);
+      result *= 0x100000001b3ULL;
+    };
+    mix(static_cast<std::uint64_t>(key.dtype));
+    for (const auto value : key.input) mix(value);
+    for (const auto value : key.weight) mix(value);
+    for (const auto value : key.output) mix(value);
+    mix(key.stride_t); mix(key.stride_h); mix(key.stride_w);
+    mix(key.pad_t); mix(key.pad_h); mix(key.pad_w);
+    mix(key.dilation_t); mix(key.dilation_h); mix(key.dilation_w);
+    mix(key.groups); mix(key.workspace_limit); mix(key.biased ? 1U : 0U);
+    return result;
+  }
+};
 #endif
 
 class LinearPlan {
@@ -499,6 +572,16 @@ public:
     check(cublasLtMatmulDescCreate(&operation_, compute, CUDA_R_32F),
           "cublasLtMatmulDescCreate");
     has_bias_ = op.inputs.size() == 3U;
+    bias_mode_ = static_cast<ir::LinearBiasMode>(op.u64(
+        ir::AttrKey::LinearBiasMode,
+        static_cast<std::uint64_t>(ir::LinearBiasMode::Epilogue)));
+    if (bias_mode_ == ir::LinearBiasMode::Addmm) {
+      if (!has_bias_)
+        fail("cuBLASLt addmm bias mode requires a bias input");
+      if (m != 1)
+        fail("cuBLASLt addmm bias mode currently requires one output row");
+      bias_bytes_ = program.tensor(op.inputs[2])->byte_count();
+    }
     const cublasOperation_t trans_a =
         has_bias_ ? CUBLAS_OP_T : CUBLAS_OP_N;
     const cublasOperation_t trans_b =
@@ -509,7 +592,7 @@ public:
     check(cublasLtMatmulDescSetAttribute(operation_, CUBLASLT_MATMUL_DESC_TRANSB,
                                          &trans_b, sizeof(trans_b)),
           "cublasLtMatmulDescSetAttribute trans B");
-    if (has_bias_) {
+    if (has_bias_ && bias_mode_ == ir::LinearBiasMode::Epilogue) {
       constexpr cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
       check(cublasLtMatmulDescSetAttribute(
                 operation_, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
@@ -551,9 +634,13 @@ public:
     check(cublasLtMatmulPreferenceCreate(&preference),
           "cublasLtMatmulPreferenceCreate");
     try {
-      const auto preference_workspace =
+      const auto default_workspace =
           input->dtype == ir::DType::F32 ? 1U * 1024U * 1024U
                                          : workspace_bytes;
+      workspace_limit_bytes_ = static_cast<std::size_t>(op.u64(
+          ir::AttrKey::WorkspaceLimitBytes, default_workspace));
+      const auto preference_workspace =
+          std::min(default_workspace, workspace_limit_bytes_);
       check(cublasLtMatmulPreferenceSetAttribute(
                 preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                 &preference_workspace, sizeof(preference_workspace)),
@@ -600,6 +687,8 @@ public:
             " storage=" + std::to_string(static_cast<int>(storage)) +
             " compute=" + std::to_string(static_cast<int>(compute)) +
             " bias=" + std::to_string(has_bias_ ? 1 : 0) +
+            " bias_mode=" +
+            std::to_string(static_cast<std::uint64_t>(bias_mode_)) +
             " workspace=" + std::to_string(preference_workspace) +
             " ltver=" + std::to_string(cublasLtGetVersion()) +
             " arch=sm_" + std::to_string(major) + std::to_string(minor);
@@ -882,11 +971,11 @@ private:
       cublasLtHandle_t handle, const Workspace &workspace, CUstream stream,
       const cublasLtMatmulHeuristicResult_t &heuristic) const {
     constexpr float alpha = 1.0F;
-    constexpr float beta = 0.0F;
+    const float beta = bias_mode_ == ir::LinearBiasMode::Addmm ? 1.0F : 0.0F;
     const auto input_pointer = reinterpret_cast<const void *>(buffers.at(op.inputs[0]));
     const auto weight_pointer = reinterpret_cast<const void *>(buffers.at(op.inputs[1]));
     const auto output_pointer = reinterpret_cast<void *>(buffers.at(op.outputs[0]));
-    if (has_bias_) {
+    if (has_bias_ && bias_mode_ == ir::LinearBiasMode::Epilogue) {
       const auto bias_pointer =
           reinterpret_cast<const void *>(buffers.at(op.inputs[2]));
       const auto status = cublasLtMatmulDescSetAttribute(
@@ -894,6 +983,14 @@ private:
           sizeof(bias_pointer));
       if (status != CUBLAS_STATUS_SUCCESS)
         return status;
+    }
+    if (bias_mode_ == ir::LinearBiasMode::Addmm) {
+      const auto copy_status = cuMemcpyDtoDAsync(
+          static_cast<CUdeviceptr>(buffers.at(op.outputs[0])),
+          static_cast<CUdeviceptr>(buffers.at(op.inputs[2])), bias_bytes_,
+          stream);
+      if (copy_status != CUDA_SUCCESS)
+        return CUBLAS_STATUS_EXECUTION_FAILED;
     }
     const auto matrix_a_pointer = has_bias_ ? weight_pointer : input_pointer;
     const auto matrix_b_pointer = has_bias_ ? input_pointer : weight_pointer;
@@ -904,7 +1001,8 @@ private:
         handle, operation_, &alpha, matrix_a_pointer, matrix_a,
         matrix_b_pointer, matrix_b, &beta, output_pointer, output_,
         output_pointer, output_, &heuristic.algo, workspace.data(),
-        workspace.size(), reinterpret_cast<cudaStream_t>(stream));
+        std::min(workspace.size(), workspace_limit_bytes_),
+        reinterpret_cast<cudaStream_t>(stream));
   }
 
   static std::int32_t
@@ -1039,6 +1137,9 @@ private:
   std::vector<cublasLtMatmulHeuristicResult_t> heuristics_;
   cublasLtMatmulHeuristicResult_t heuristic_{};
   bool has_bias_{};
+  ir::LinearBiasMode bias_mode_{ir::LinearBiasMode::Epilogue};
+  std::uint64_t bias_bytes_{};
+  std::size_t workspace_limit_bytes_{};
   bool persist_{};
   LinearHeuristicCacheStats *cache_stats_{};
   std::filesystem::path tuned_cache_file_;
@@ -3832,6 +3933,11 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
       block = 128U;
     grid = static_cast<unsigned>(dims[0] * dims[1]);
     shared = block * sizeof(float);
+  } else if (op.opcode == ir::Opcode::ChannelRmsNorm) {
+    const auto *input = program.tensor(op.inputs[0]);
+    const auto axis = op.u64(ir::AttrKey::Axis, 1U);
+    grid = static_cast<unsigned>(input->element_count() / input->dims[axis]);
+    shared = block * sizeof(float);
   } else if (op.opcode == ir::Opcode::Attention) {
     const auto &dims = program.tensor(op.inputs[0])->dims;
     const auto batched = dims.size() == 4U;
@@ -4065,6 +4171,12 @@ public:
                        std::shared_ptr<CudnnAttentionPlan>,
                        CudnnAttentionKeyHash>
         cudnn_plan_cache;
+    std::unordered_map<CudnnConv2dKey, std::shared_ptr<CudnnConv2dPlan>,
+                       CudnnConv2dKeyHash>
+        cudnn_conv_plan_cache;
+    std::unordered_map<CudnnConv3dKey, std::shared_ptr<CudnnConv3dPlan>,
+                       CudnnConv3dKeyHash>
+        cudnn_conv3d_plan_cache;
     for (const auto &op : program_.operations) {
       if (op.opcode != ir::Opcode::Attention ||
           op.u64(ir::AttrKey::Implementation, 1U) != 2U ||
@@ -4103,12 +4215,122 @@ public:
           std::max(cudnn_workspace_bytes_, found->second->workspace_bytes());
       uses_cudnn_attention_ = true;
     }
+    for (const auto &op : program_.operations) {
+      if (op.opcode != ir::Opcode::Conv2d)
+        continue;
+      const auto *input = program_.tensor(op.inputs.at(0));
+      const auto *weight = program_.tensor(op.inputs.at(1));
+      const auto *output = program_.tensor(op.outputs.at(0));
+      if (!input || !weight || !output)
+        fail("cuDNN Conv2d references a missing tensor");
+      const auto pad_top = op.u64(ir::AttrKey::PadTop, 0U);
+      const auto pad_bottom = op.u64(ir::AttrKey::PadBottom, 0U);
+      const auto pad_west = op.u64(ir::AttrKey::PadWest, 0U);
+      const auto pad_east = op.u64(ir::AttrKey::PadEast, 0U);
+      if (pad_top != pad_bottom || pad_west != pad_east)
+        fail("cuDNN Conv2d currently requires symmetric spatial padding");
+      auto dims4 = [](const std::vector<std::uint64_t> &dims) {
+        return std::array<std::uint64_t, 4>{dims[0], dims[1], dims[2],
+                                            dims[3]};
+      };
+      constexpr std::uint64_t default_workspace = 64ULL * 1024ULL * 1024ULL;
+      const auto limit = op.u64(ir::AttrKey::WorkspaceLimitBytes,
+                                default_workspace);
+      if (limit == 0U || limit > std::numeric_limits<std::size_t>::max())
+        fail("cuDNN Conv2d workspace limit is invalid");
+      const CudnnConv2dKey key{
+          input->dtype,
+          dims4(input->dims),
+          dims4(weight->dims),
+          dims4(output->dims),
+          op.u64(ir::AttrKey::StrideH, 1U),
+          op.u64(ir::AttrKey::StrideW, 1U),
+          pad_top,
+          pad_west,
+          op.u64(ir::AttrKey::DilationH, 1U),
+          op.u64(ir::AttrKey::DilationW, 1U),
+          op.u64(ir::AttrKey::Groups, 1U),
+          limit,
+          op.inputs.size() == 3U,
+      };
+      auto found = cudnn_conv_plan_cache.find(key);
+      if (found == cudnn_conv_plan_cache.end()) {
+        auto plan = std::make_shared<CudnnConv2dPlan>(
+            *input, *weight, *output, key.stride_h, key.stride_w, key.pad_h,
+            key.pad_w, key.dilation_h, key.dilation_w, key.groups, key.biased,
+            static_cast<std::size_t>(key.workspace_limit));
+        found = cudnn_conv_plan_cache.emplace(key, std::move(plan)).first;
+      }
+      cudnn_conv_plans_.emplace(op.id, found->second);
+      cudnn_workspace_bytes_ =
+          std::max(cudnn_workspace_bytes_, found->second->workspace_bytes());
+    }
+    for (const auto &op : program_.operations) {
+      if (op.opcode != ir::Opcode::Conv3d)
+        continue;
+      const auto *input = program_.tensor(op.inputs.at(0));
+      const auto *weight = program_.tensor(op.inputs.at(1));
+      const auto *output = program_.tensor(op.outputs.at(0));
+      if (!input || !weight || !output)
+        fail("cuDNN Conv3d references a missing tensor");
+      const auto front = op.u64(ir::AttrKey::PadFront, 0U);
+      const auto back = op.u64(ir::AttrKey::PadBack, 0U);
+      const auto top = op.u64(ir::AttrKey::PadTop, 0U);
+      const auto bottom = op.u64(ir::AttrKey::PadBottom, 0U);
+      const auto west = op.u64(ir::AttrKey::PadWest, 0U);
+      const auto east = op.u64(ir::AttrKey::PadEast, 0U);
+      if (front != back || top != bottom || west != east)
+        fail("cuDNN Conv3d currently requires symmetric padding; materialize asymmetric padding with PadConstant");
+      auto dims5 = [](const std::vector<std::uint64_t> &dims) {
+        return std::array<std::uint64_t, 5>{dims[0], dims[1], dims[2],
+                                            dims[3], dims[4]};
+      };
+      constexpr std::uint64_t default_workspace = 64ULL * 1024ULL * 1024ULL;
+      const auto limit = op.u64(ir::AttrKey::WorkspaceLimitBytes,
+                                default_workspace);
+      if (limit == 0U || limit > std::numeric_limits<std::size_t>::max())
+        fail("cuDNN Conv3d workspace limit is invalid");
+      const CudnnConv3dKey key{
+          input->dtype,
+          dims5(input->dims),
+          dims5(weight->dims),
+          dims5(output->dims),
+          op.u64(ir::AttrKey::StrideT, 1U),
+          op.u64(ir::AttrKey::StrideH, 1U),
+          op.u64(ir::AttrKey::StrideW, 1U),
+          front,
+          top,
+          west,
+          op.u64(ir::AttrKey::DilationT, 1U),
+          op.u64(ir::AttrKey::DilationH, 1U),
+          op.u64(ir::AttrKey::DilationW, 1U),
+          op.u64(ir::AttrKey::Groups, 1U),
+          limit,
+          op.inputs.size() == 3U,
+      };
+      auto found = cudnn_conv3d_plan_cache.find(key);
+      if (found == cudnn_conv3d_plan_cache.end()) {
+        auto plan = std::make_shared<CudnnConv3dPlan>(
+            *input, *weight, *output, key.stride_t, key.stride_h,
+            key.stride_w, key.pad_t, key.pad_h, key.pad_w,
+            key.dilation_t, key.dilation_h, key.dilation_w, key.groups,
+            key.biased, static_cast<std::size_t>(key.workspace_limit));
+        found = cudnn_conv3d_plan_cache.emplace(key, std::move(plan)).first;
+      }
+      cudnn_conv3d_plans_.emplace(op.id, found->second);
+      cudnn_workspace_bytes_ =
+          std::max(cudnn_workspace_bytes_, found->second->workspace_bytes());
+    }
 #else
     for (const auto &op : program_.operations) {
       if (op.opcode == ir::Opcode::Attention &&
           op.u64(ir::AttrKey::Implementation, 1U) == 2U &&
           !h3_ck_attention_plans_.contains(op.id))
         fail("DiffIR requests cuDNN attention but this CUDA backend was built without cuDNN");
+      if (op.opcode == ir::Opcode::Conv2d)
+        fail("DiffIR requests Conv2d but this CUDA backend was built without cuDNN");
+      if (op.opcode == ir::Opcode::Conv3d)
+        fail("DiffIR requests Conv3d but this CUDA backend was built without cuDNN");
     }
 #endif
     if (options.streamed_prefetch_depth == 0U)
@@ -4867,6 +5089,30 @@ public:
                                                   context_.stream());
       }
 #if DIF_HAS_CUDNN
+      else if (op.opcode == ir::Opcode::Conv2d) {
+        count_cudnn_convolution_dispatch();
+        cudnn_conv_plans_.at(op.id)->execute(
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
+            op.inputs.size() == 3U
+                ? static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2)))
+                : 0U,
+            static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+            reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
+            reinterpret_cast<std::uintptr_t>(context_.stream()));
+      }
+      else if (op.opcode == ir::Opcode::Conv3d) {
+        count_cudnn_convolution_dispatch();
+        cudnn_conv3d_plans_.at(op.id)->execute(
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
+            op.inputs.size() == 3U
+                ? static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2)))
+                : 0U,
+            static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+            reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
+            reinterpret_cast<std::uintptr_t>(context_.stream()));
+      }
       else if (op.opcode == ir::Opcode::Attention &&
                op.u64(ir::AttrKey::Implementation, 1U) == 2U) {
         count_cudnn_attention_dispatch();
@@ -5241,6 +5487,8 @@ public:
                   << " cublaslt_matmuls=" << t.cublaslt_matmuls
                   << " cublas_gemms=" << t.cublas_gemms
                   << " cudnn_attention=" << t.cudnn_attention_dispatches
+                  << " cudnn_convolution="
+                  << t.cudnn_convolution_dispatches
                   << " cutlass=" << t.cutlass_launches
                   << " ck_attention=" << t.ck_attention_dispatches
                   << " h2d_copies=" << t.h2d_copies
@@ -5341,6 +5589,10 @@ private:
 #if DIF_HAS_CUDNN
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnAttentionPlan>>
       cudnn_attention_plans_;
+  std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv2dPlan>>
+      cudnn_conv_plans_;
+  std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv3dPlan>>
+      cudnn_conv3d_plans_;
 #endif
   std::string device_name_;
   std::string source_hash_;

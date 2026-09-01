@@ -194,6 +194,12 @@ AutodiffResult differentiate(const ir::Program &forward,
       break;
     }
     case ir::Opcode::RmsNormModulate: {
+      const auto layout = static_cast<ir::ModulationLayout>(operation.u64(
+          ir::AttrKey::ModulationLayout,
+          static_cast<std::uint64_t>(
+              ir::ModulationLayout::ExplicitScaleShift)));
+      if (layout == ir::ModulationLayout::SharedVectorDelta)
+        fail("shared-vector rms_norm_modulate backward is not implemented");
       const bool weighted = operation.inputs.size() == 4U;
       const auto x = operation.inputs[0];
       const auto scale = operation.inputs[weighted ? 2U : 1U];

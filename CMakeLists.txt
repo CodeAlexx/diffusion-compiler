@@ -27,6 +27,7 @@ add_library(difcore
   src/frontend/h3_audio_vae.cpp
   src/frontend/qwen3vl_conditioner.cpp
   src/frontend/krea2.cpp
+  src/frontend/krea2_vae.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
   src/frontend/lora.cpp
@@ -48,6 +49,7 @@ add_library(difcore
     src/support/sha256.cpp
     src/support/wav.cpp
     src/support/json.cpp
+    src/support/png.cpp
     src/tune/database.cpp
     src/training/autodiff.cpp
     src/training/checkpoint.cpp
@@ -101,7 +103,8 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
                  PATH_SUFFIXES lib lib64)
   endif()
   if(DIF_ENABLE_CUDNN AND DIF_CUDNN_INCLUDE_DIR AND DIF_CUDNN_LIBRARY)
-    target_sources(difcore PRIVATE src/runtime/cudnn_attention.cpp)
+    target_sources(difcore PRIVATE src/runtime/cudnn_attention.cpp
+                                   src/runtime/cudnn_conv.cpp)
     target_include_directories(
         difcore SYSTEM PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cudnn_frontend/include"
@@ -207,6 +210,10 @@ add_executable(difkrea2text tools/difkrea2text.cpp)
 target_link_libraries(difkrea2text PRIVATE difcore)
 add_executable(difkrea2denoise tools/difkrea2denoise.cpp)
 target_link_libraries(difkrea2denoise PRIVATE difcore)
+add_executable(difkrea2sample tools/difkrea2sample.cpp)
+target_link_libraries(difkrea2sample PRIVATE difcore)
+add_executable(difkrea2vae tools/difkrea2vae.cpp)
+target_link_libraries(difkrea2vae PRIVATE difcore)
 
 if(DIF_ENABLE_OPENCL)
   find_path(DIF_OPENCL_INCLUDE_DIR CL/cl.h

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # 100-step F32 activation-path LoRA training parity gate vs PyTorch.
-# Recorded evidence and frozen admission bars:
-#   docs/LORA_TRAINING_GATE_2026-08-31.md
+# Frozen admission bars are encoded below and emitted with each gate run.
 #
 # Run the WHOLE script under the machine-wide GPU lock:
 #   flock /tmp/dc-gpu.lock -c 'bash tools/run_lora_training_gate.sh WORKDIR'

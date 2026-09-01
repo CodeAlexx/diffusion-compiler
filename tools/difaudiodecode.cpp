@@ -1,5 +1,5 @@
-// difaudiodecode — native BigVGAN audio decode (chunk 7 of
-// docs/BIGVGAN_DECODE_PLAN.md). Replaces the Mojo fresh-process bridge:
+// difaudiodecode — native BigVGAN audio decode. Replaces the Mojo
+// fresh-process bridge:
 // loads the recorded [2T, 32] audio state rows, unpacks them to the
 // [2, 32, T] latent (rearrange.mojo semantics), runs the self-contained
 // decoder program (denormalization is IN-PROGRAM), and writes the stereo

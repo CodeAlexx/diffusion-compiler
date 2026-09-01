@@ -82,8 +82,27 @@ def main() -> None:
 
     if args.input_fixture:
         with safe_open(args.input_fixture, framework="pt", device="cpu") as previous:
-            sequence_cpu = previous.get_tensor("final_output")
-            modulation_cpu = previous.get_tensor("modulation_input")
+            names = set(previous.keys())
+            if "final_output" in names:
+                sequence_cpu = previous.get_tensor("final_output")
+            elif "sequence_input" in names:
+                sequence_cpu = previous.get_tensor("sequence_input")
+            elif {"context_input", "projected_image"} <= names:
+                sequence_cpu = torch.cat(
+                    (
+                        previous.get_tensor("context_input"),
+                        previous.get_tensor("projected_image"),
+                    ),
+                    dim=1,
+                )
+            else:
+                raise ValueError("input fixture has no usable block sequence")
+            modulation_name = (
+                "modulation_input" if "modulation_input" in names else "modulation_output"
+            )
+            modulation_cpu = previous.get_tensor(modulation_name).reshape(
+                1, 6 * FEATURES
+            )
             positions_cpu = previous.get_tensor("positions")
             validity_cpu = previous.get_tensor("validity_mask")
         sequence = sequence_cpu.cuda()
@@ -148,9 +167,10 @@ def main() -> None:
 
         post_normalized = block.postnorm(attention_residual)
         mlp_input = (1 + postscale[:, None, :]) * post_normalized + postshift[:, None, :]
-        mlp_gate = torch.nn.functional.silu(block.mlp.gate(mlp_input))
+        mlp_gate = block.mlp.gate(mlp_input)
+        mlp_gate_activated = torch.nn.functional.silu(mlp_gate)
         mlp_up = block.mlp.up(mlp_input)
-        mlp_activation = mlp_gate * mlp_up
+        mlp_activation = mlp_gate_activated * mlp_up
         mlp_output = block.mlp.down(mlp_activation)
         final_output = attention_residual + postgate[:, None, :] * mlp_output
     torch.cuda.synchronize()
@@ -173,6 +193,10 @@ def main() -> None:
             "output_projection": output_projection.reshape(SEQUENCE, FEATURES).cpu(),
             "attention_residual": attention_residual.cpu(),
             "mlp_input": mlp_input.cpu(),
+            "mlp_gate": mlp_gate.reshape(SEQUENCE, MLP_DIM).cpu(),
+            "mlp_up": mlp_up.reshape(SEQUENCE, MLP_DIM).cpu(),
+            "mlp_gate_activated": mlp_gate_activated.reshape(
+                SEQUENCE, MLP_DIM).cpu(),
             "mlp_activation": mlp_activation.reshape(SEQUENCE, MLP_DIM).cpu(),
             "mlp_output": mlp_output.reshape(SEQUENCE, FEATURES).cpu(),
             "final_output": final_output.cpu(),

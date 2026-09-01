@@ -2,8 +2,7 @@
 """Qwen3-VL conditioner PyTorch reference oracle (dev-only; torch is never a
 runtime dependency of the compiler).
 
-Produces the fixtures the native DiffIR conditioner port is gated against,
-per docs/QWEN3VL_CONDITIONER_PLAN.md §5:
+Produces the fixtures the native DiffIR conditioner port is gated against:
 
   * gate 2  - embedding output              embed_tokens(ids)      [S, 5120] BF16
   * gate 3  - per-op fixtures at ENCODER shapes:
@@ -94,7 +93,7 @@ LAYER_PARAMS = (
     "mlp.down_proj.weight",
 )
 
-# .diftensor container (docs/RUNTIME_MODULES.md); same encoding as
+# Canonical .diftensor container; same encoding as
 # tools/export_dit_backward_fixtures.py and tools/import_serenity_h3_inputs.py.
 DIFTENSOR_DTYPE_CODES = {torch.float32: 1, torch.bfloat16: 2}
 
@@ -529,8 +528,8 @@ def main() -> None:
 
     ids = read_ids(args.ids_json)
     seq = len(ids)
-    print(f"Qwen3-VL conditioner oracle | transformers Qwen3VLTextDecoderLayer, "
-          f"streamed one layer at a time")
+    print("Qwen3-VL conditioner oracle | transformers Qwen3VLTextDecoderLayer, "
+          "streamed one layer at a time")
     print(f"  checkpoint      {args.text_encoder}")
     print(f"  index sha256    {hashlib.sha256(index_path.read_bytes()).hexdigest()}")
     print(f"  tensors indexed {len(weight_map)}")

@@ -2,7 +2,7 @@
 """Deterministic PyTorch reference for the BF16 DiT-block LoRA training gate.
 
 Mirrors dif::frontend::make_dit_lora_training exactly, with the repository's
-BF16 dtype contract (docs/DIT_BACKWARD_GATE_2026-08-31.md): BF16-valued
+BF16 dtype contract: BF16-valued
 tensors, F32 reference math, ONE round-to-nearest-even at each stored-tensor
 boundary — i.e. a q() fake-quant after every DiffIR operation output.
 Torch's own BF16 autograd (per-primitive rounding at torch-op granularity)

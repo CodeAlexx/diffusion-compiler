@@ -13,7 +13,7 @@ namespace dif::frontend {
 // fixed depth and read as the RAW residual stream (pre-final-norm).
 //
 // Every field below is taken from the checkpoint's own text_encoder
-// config.json (docs/QWEN3VL_CONDITIONER_PLAN.md §1), not from documentation.
+// config.json, not from secondary documentation.
 // `executed_layers` is the extraction rule: transformers' hidden_states[k] is
 // the raw state AFTER k layers, so H3's "hidden layer 50" means layers 0..49
 // run and `model.norm` is NOT applied.

@@ -1012,6 +1012,11 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::EulerVelocityStep:
     case Opcode::Permute:
     case Opcode::Concat:
+    case Opcode::Conv2d:
+    case Opcode::ChannelRmsNorm:
+    case Opcode::UpsampleNearest2d:
+    case Opcode::PadConstant:
+    case Opcode::Conv3d:
       // These generic operations currently have CPU and NVIDIA production
       // implementations. Keep OpenCL fail-closed until each lowering has its
       // own parity gate.

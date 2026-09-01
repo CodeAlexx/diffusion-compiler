@@ -77,6 +77,11 @@ bool dtype_uniform(ir::Opcode opcode) {
   case ir::Opcode::LayerNorm:
   case ir::Opcode::Clamp:
   case ir::Opcode::QkNormPartialRope:
+  case ir::Opcode::Conv2d:
+  case ir::Opcode::ChannelRmsNorm:
+  case ir::Opcode::UpsampleNearest2d:
+  case ir::Opcode::PadConstant:
+  case ir::Opcode::Conv3d:
     return true;
   default:
     return false;

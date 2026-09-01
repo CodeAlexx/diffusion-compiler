@@ -4,6 +4,7 @@
 #include "dif/ir/ir.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,11 @@ struct Krea2Config {
   std::uint64_t width{1024U};
   std::uint64_t height{1024U};
   std::uint64_t text_tokens{512U};
+  // The real creator block.forward path selects static 8192-wide reductions
+  // for both norms. Keep the attributes separate so expanded development
+  // oracles can record a different compiler-selected call-site shape.
+  std::uint64_t prenorm_reduction_tile{8192U};
+  std::uint64_t postnorm_reduction_tile{8192U};
   bool streamed_constants{true};
 };
 
@@ -49,6 +55,68 @@ struct Krea2Architecture {
 };
 
 Krea2Architecture inspect_krea2_architecture(const Krea2Config &config);
+
+// Official sampling.py schedule policy. Raw uses the resolution-derived shift;
+// Turbo may pin mu explicitly. Values preserve torch.linspace and eager F32
+// tensor-operation boundaries rather than using an algebraically simplified
+// shifted-sigma expression.
+struct Krea2ScheduleConfig {
+  std::uint32_t steps{52U};
+  std::uint64_t minimum_resolution{256U};
+  std::uint64_t maximum_resolution{1280U};
+  double minimum_mu{0.5};
+  double maximum_mu{1.15};
+  double sigma{1.0};
+  std::optional<double> fixed_mu;
+};
+
+struct Krea2Schedule {
+  double mu{};
+  std::vector<float> timesteps;
+};
+
+Krea2Schedule make_krea2_schedule(
+    const Krea2Config &model = {},
+    const Krea2ScheduleConfig &schedule = {});
+
+// Source-ordered Raw CFG and Euler update:
+//   difference = cond - uncond
+//   guided = difference * guidance
+//   velocity = cond + guided
+//   next_sample = sample + (next-current) * velocity
+// Each intermediate is stored in the sample dtype, matching eager BF16.
+struct Krea2CfgEulerBuild {
+  ir::Program program;
+  std::uint32_t sample_input{};
+  std::uint32_t conditional_velocity_input{};
+  std::uint32_t unconditional_velocity_input{};
+  std::uint32_t guidance_input{};
+  std::uint32_t current_timestep_input{};
+  std::uint32_t next_timestep_input{};
+  std::uint32_t negative_one_constant{};
+  std::uint32_t difference_output{};
+  std::uint32_t guided_delta_output{};
+  std::uint32_t velocity_output{};
+  std::uint32_t sample_output{};
+};
+
+Krea2CfgEulerBuild
+make_krea2_cfg_euler_step(std::vector<std::uint64_t> sample_shape);
+
+// Source-ordered Turbo Euler update when classifier-free guidance is disabled:
+//   next_sample = sample + (next-current) * velocity
+// This deliberately omits the unconditional branch and all CFG tensor work.
+struct Krea2EulerBuild {
+  ir::Program program;
+  std::uint32_t sample_input{};
+  std::uint32_t velocity_input{};
+  std::uint32_t current_timestep_input{};
+  std::uint32_t next_timestep_input{};
+  std::uint32_t sample_output{};
+};
+
+Krea2EulerBuild
+make_krea2_euler_step(std::vector<std::uint64_t> sample_shape);
 
 // Source-faithful real-dimension scaffold for mmdit.py:388-389:
 // BF16 t -> F32 -> temb(256, period=1e4, tfactor=1e3, cos then sin) -> BF16
@@ -99,6 +167,9 @@ struct Krea2BlockBuild {
   std::uint32_t output_projection{};
   std::uint32_t attention_residual{};
   std::uint32_t mlp_input{};
+  std::uint32_t mlp_gate{};
+  std::uint32_t mlp_up{};
+  std::uint32_t mlp_gate_activated{};
   std::uint32_t mlp_activation{};
   std::uint32_t mlp_output{};
   std::uint32_t final_output{};
@@ -152,9 +223,14 @@ struct Krea2DenoiserBuild {
   std::uint32_t rotary_pair_indices{};
   std::uint32_t rotary_axis_dims{};
   std::uint32_t projected_image{};
+  std::uint32_t timestep_embedding{};
+  std::uint32_t timestep_first_linear{};
+  std::uint32_t timestep_first_activation{};
   std::uint32_t timestep_output{};
+  std::uint32_t timestep_projection_activation{};
   std::uint32_t modulation_output{};
   std::vector<std::uint32_t> block_outputs;
+  std::uint32_t last_modulated{};
   std::uint32_t velocity_output{};
   std::vector<std::uint32_t> checkpoint_tensors;
   std::vector<std::string> checkpoint_names;

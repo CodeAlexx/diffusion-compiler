@@ -8,9 +8,8 @@
 # gradients, final parameters, and final F32 moments, with difcompare.
 #
 # Admission bars set AFTER measurement at BOTH 2-block and 4-block depth
-# (2026-08-31, 100 steps, RTX 3090 Ti, torch 2.10.0+cu128; full log in
-# docs/DIT_BACKWARD_GATE_2026-08-31.md).  Measured worst (union of depths,
-# both backends):
+# (2026-08-31, 100 steps, RTX 3090 Ti, torch 2.10.0+cu128). Measured worst
+# (union of depths, both backends):
 #   losses  max_abs 3.6e-7  rel_l2 4.4e-7  cos 1.0
 #   grad1   max_abs 1.9e-9  rel_l2 7.7e-7  cos 1.0
 #   grad    max_abs 2.5e-7  rel_l2 3.3e-3  cos 0.999995

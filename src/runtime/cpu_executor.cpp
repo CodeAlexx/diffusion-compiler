@@ -445,7 +445,10 @@ void sinusoidal_timestep(const ir::Operation &op, TensorMap &tensors) {
       const auto exponent =
           -log_period * static_cast<float>(column) / denominator;
       const auto frequency = std::exp(exponent);
-      const auto angle = scale * (timestep * frequency);
+      // The creator materializes `(t.float() * tfactor)` before broadcasting
+      // the frequency multiply. Preserve that F32 boundary and operation order.
+      volatile float scaled_timestep = timestep * scale;
+      const auto angle = scaled_timestep * frequency;
       const auto sine = std::sin(angle);
       const auto cosine = std::cos(angle);
       store_float(output, row * width + column, flip ? cosine : sine);
@@ -765,6 +768,44 @@ void indexed_update_rows(const ir::Operation &op, TensorMap &tensors) {
 
 void rms_norm_modulate(const ir::Operation &op, TensorMap &tensors) {
   const auto &x_tensor = tensors.at(op.inputs[0]);
+  const auto layout = static_cast<ir::ModulationLayout>(op.u64(
+      ir::AttrKey::ModulationLayout,
+      static_cast<std::uint64_t>(ir::ModulationLayout::ExplicitScaleShift)));
+  if (layout == ir::ModulationLayout::SharedVectorDelta) {
+    const auto &weight = tensors.at(op.inputs[1]);
+    const auto &vector = tensors.at(op.inputs[2]);
+    const auto &delta = tensors.at(op.inputs[3]);
+    auto &out = tensors.at(op.outputs[0]);
+    const auto rows = x_tensor.dims[0];
+    const auto cols = x_tensor.dims[1];
+    const auto vectors = vector.dims[0];
+    const auto rows_per_vector = rows / vectors;
+    const auto epsilon =
+        static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+    const auto weight_offset =
+        static_cast<float>(op.f64(ir::AttrKey::WeightOffset, 0.0));
+    for (std::uint64_t row = 0; row < rows; ++row) {
+      float sum = 0.0F;
+      for (std::uint64_t col = 0; col < cols; ++col) {
+        const auto value = load_float(x_tensor, row * cols + col);
+        sum += value * value;
+      }
+      const auto inverse =
+          1.0F / std::sqrt(sum / static_cast<float>(cols) + epsilon);
+      const auto vector_base = (row / rows_per_vector) * cols;
+      for (std::uint64_t col = 0; col < cols; ++col) {
+        const auto base = load_float(vector, vector_base + col);
+        const auto scale = base + load_float(delta, col);
+        const auto shift = base + load_float(delta, cols + col);
+        const auto normalized = load_float(x_tensor, row * cols + col) *
+                                inverse *
+                                (load_float(weight, col) + weight_offset);
+        store_float(out, row * cols + col,
+                    (1.0F + scale) * normalized + shift);
+      }
+    }
+    return;
+  }
   const bool weighted = op.inputs.size() == 4;
   const auto &scale = tensors.at(op.inputs[weighted ? 2 : 1]);
   const auto &shift = tensors.at(op.inputs[weighted ? 3 : 2]);
@@ -1700,6 +1741,259 @@ void conv1d(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+float round_to_dtype(float value, ir::DType dtype) {
+  if (dtype == ir::DType::BF16)
+    return bf16_to_float(float_to_bf16(value));
+  if (dtype == ir::DType::F16)
+    return f16_to_float(float_to_f16(value));
+  return value;
+}
+
+void conv2d(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto *bias = op.inputs.size() == 3U ? &tensors.at(op.inputs[2]) : nullptr;
+  auto &out = tensors.at(op.outputs[0]);
+  const auto stride_h = op.u64(ir::AttrKey::StrideH, 1U);
+  const auto stride_w = op.u64(ir::AttrKey::StrideW, 1U);
+  const auto dilation_h = op.u64(ir::AttrKey::DilationH, 1U);
+  const auto dilation_w = op.u64(ir::AttrKey::DilationW, 1U);
+  const auto pad_top = op.u64(ir::AttrKey::PadTop, 0U);
+  const auto pad_west = op.u64(ir::AttrKey::PadWest, 0U);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto batch = input.dims[0];
+  const auto in_channels = input.dims[1];
+  const auto input_h = input.dims[2];
+  const auto input_w = input.dims[3];
+  const auto out_channels = weight.dims[0];
+  const auto kernel_h = weight.dims[2];
+  const auto kernel_w = weight.dims[3];
+  const auto output_h = out.dims[2];
+  const auto output_w = out.dims[3];
+  const auto in_per_group = in_channels / groups;
+  const auto out_per_group = out_channels / groups;
+  for (std::uint64_t b = 0U; b < batch; ++b) {
+    for (std::uint64_t oc = 0U; oc < out_channels; ++oc) {
+      const auto group = oc / out_per_group;
+      for (std::uint64_t oh = 0U; oh < output_h; ++oh) {
+        for (std::uint64_t ow = 0U; ow < output_w; ++ow) {
+          float accumulator = 0.0F;
+          for (std::uint64_t ic = 0U; ic < in_per_group; ++ic) {
+            const auto source_channel = group * in_per_group + ic;
+            for (std::uint64_t kh = 0U; kh < kernel_h; ++kh) {
+              const auto ih = static_cast<std::int64_t>(oh * stride_h +
+                                                        kh * dilation_h) -
+                              static_cast<std::int64_t>(pad_top);
+              if (ih < 0 || ih >= static_cast<std::int64_t>(input_h))
+                continue;
+              for (std::uint64_t kw = 0U; kw < kernel_w; ++kw) {
+                const auto iw = static_cast<std::int64_t>(ow * stride_w +
+                                                          kw * dilation_w) -
+                                static_cast<std::int64_t>(pad_west);
+                if (iw < 0 || iw >= static_cast<std::int64_t>(input_w))
+                  continue;
+                const auto input_index =
+                    ((b * in_channels + source_channel) * input_h +
+                     static_cast<std::uint64_t>(ih)) *
+                        input_w +
+                    static_cast<std::uint64_t>(iw);
+                const auto weight_index =
+                    ((oc * in_per_group + ic) * kernel_h + kh) * kernel_w + kw;
+                accumulator += load_float(input, input_index) *
+                               load_float(weight, weight_index);
+              }
+            }
+          }
+          if (bias)
+            accumulator += load_float(*bias, oc);
+          const auto output_index =
+              ((b * out_channels + oc) * output_h + oh) * output_w + ow;
+          store_float(out, output_index, accumulator);
+        }
+      }
+    }
+  }
+}
+
+void pad_constant(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto value = static_cast<float>(op.f64(ir::AttrKey::Value, 0.0));
+  for (std::uint64_t index = 0U; index < out.element_count(); ++index)
+    store_float(out, index, value);
+  const auto top = op.u64(ir::AttrKey::PadTop, 0U);
+  const auto west = op.u64(ir::AttrKey::PadWest, 0U);
+  if (input.dims.size() == 4U) {
+    const auto channels = input.dims[1];
+    const auto input_h = input.dims[2];
+    const auto input_w = input.dims[3];
+    const auto output_h = out.dims[2];
+    const auto output_w = out.dims[3];
+    for (std::uint64_t b = 0U; b < input.dims[0]; ++b)
+      for (std::uint64_t c = 0U; c < channels; ++c)
+        for (std::uint64_t y = 0U; y < input_h; ++y)
+          for (std::uint64_t x = 0U; x < input_w; ++x) {
+            const auto source = ((b * channels + c) * input_h + y) * input_w + x;
+            const auto target =
+                ((b * channels + c) * output_h + y + top) * output_w + x + west;
+            store_float(out, target, load_float(input, source));
+          }
+    return;
+  }
+  const auto channels = input.dims[1];
+  const auto input_t = input.dims[2];
+  const auto input_h = input.dims[3];
+  const auto input_w = input.dims[4];
+  const auto output_t = out.dims[2];
+  const auto output_h = out.dims[3];
+  const auto output_w = out.dims[4];
+  const auto front = op.u64(ir::AttrKey::PadFront, 0U);
+  for (std::uint64_t b = 0U; b < input.dims[0]; ++b)
+    for (std::uint64_t c = 0U; c < channels; ++c)
+      for (std::uint64_t t = 0U; t < input_t; ++t)
+        for (std::uint64_t y = 0U; y < input_h; ++y)
+          for (std::uint64_t x = 0U; x < input_w; ++x) {
+            const auto source =
+                (((b * channels + c) * input_t + t) * input_h + y) * input_w + x;
+            const auto target =
+                (((b * channels + c) * output_t + t + front) * output_h + y + top) *
+                    output_w +
+                x + west;
+            store_float(out, target, load_float(input, source));
+          }
+}
+
+void conv3d(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto *bias = op.inputs.size() == 3U ? &tensors.at(op.inputs[2]) : nullptr;
+  auto &out = tensors.at(op.outputs[0]);
+  const auto stride_t = op.u64(ir::AttrKey::StrideT, 1U);
+  const auto stride_h = op.u64(ir::AttrKey::StrideH, 1U);
+  const auto stride_w = op.u64(ir::AttrKey::StrideW, 1U);
+  const auto dilation_t = op.u64(ir::AttrKey::DilationT, 1U);
+  const auto dilation_h = op.u64(ir::AttrKey::DilationH, 1U);
+  const auto dilation_w = op.u64(ir::AttrKey::DilationW, 1U);
+  const auto front = op.u64(ir::AttrKey::PadFront, 0U);
+  const auto top = op.u64(ir::AttrKey::PadTop, 0U);
+  const auto west = op.u64(ir::AttrKey::PadWest, 0U);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto in_channels = input.dims[1];
+  const auto out_channels = weight.dims[0];
+  const auto in_per_group = in_channels / groups;
+  const auto out_per_group = out_channels / groups;
+  for (std::uint64_t b = 0U; b < input.dims[0]; ++b)
+    for (std::uint64_t oc = 0U; oc < out_channels; ++oc) {
+      const auto group = oc / out_per_group;
+      for (std::uint64_t ot = 0U; ot < out.dims[2]; ++ot)
+        for (std::uint64_t oh = 0U; oh < out.dims[3]; ++oh)
+          for (std::uint64_t ow = 0U; ow < out.dims[4]; ++ow) {
+            float accumulator = 0.0F;
+            for (std::uint64_t ic = 0U; ic < in_per_group; ++ic)
+              for (std::uint64_t kt = 0U; kt < weight.dims[2]; ++kt) {
+                const auto it = static_cast<std::int64_t>(ot * stride_t + kt * dilation_t) -
+                                static_cast<std::int64_t>(front);
+                if (it < 0 || it >= static_cast<std::int64_t>(input.dims[2]))
+                  continue;
+                for (std::uint64_t kh = 0U; kh < weight.dims[3]; ++kh) {
+                  const auto ih = static_cast<std::int64_t>(oh * stride_h + kh * dilation_h) -
+                                  static_cast<std::int64_t>(top);
+                  if (ih < 0 || ih >= static_cast<std::int64_t>(input.dims[3]))
+                    continue;
+                  for (std::uint64_t kw = 0U; kw < weight.dims[4]; ++kw) {
+                    const auto iw = static_cast<std::int64_t>(ow * stride_w + kw * dilation_w) -
+                                    static_cast<std::int64_t>(west);
+                    if (iw < 0 || iw >= static_cast<std::int64_t>(input.dims[4]))
+                      continue;
+                    const auto source_channel = group * in_per_group + ic;
+                    const auto input_index =
+                        (((b * in_channels + source_channel) * input.dims[2] +
+                          static_cast<std::uint64_t>(it)) *
+                             input.dims[3] +
+                         static_cast<std::uint64_t>(ih)) *
+                            input.dims[4] +
+                        static_cast<std::uint64_t>(iw);
+                    const auto weight_index =
+                        (((oc * in_per_group + ic) * weight.dims[2] + kt) *
+                             weight.dims[3] +
+                         kh) *
+                            weight.dims[4] +
+                        kw;
+                    accumulator += load_float(input, input_index) *
+                                   load_float(weight, weight_index);
+                  }
+                }
+              }
+            if (bias)
+              accumulator += load_float(*bias, oc);
+            const auto output_index =
+                (((b * out_channels + oc) * out.dims[2] + ot) * out.dims[3] +
+                 oh) *
+                    out.dims[4] +
+                ow;
+            store_float(out, output_index, accumulator);
+          }
+    }
+}
+
+void channel_rms_norm(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &gamma = tensors.at(op.inputs[1]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto axis = op.u64(ir::AttrKey::Axis, 1U);
+  const auto channels = input.dims[axis];
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-12));
+  std::uint64_t inner = 1U;
+  for (std::size_t index = static_cast<std::size_t>(axis + 1U);
+       index < input.dims.size(); ++index)
+    inner *= input.dims[index];
+  const auto outer = input.element_count() / (channels * inner);
+  const auto scale = std::sqrt(static_cast<float>(channels));
+  for (std::uint64_t leading = 0U; leading < outer; ++leading) {
+    for (std::uint64_t trailing = 0U; trailing < inner; ++trailing) {
+      float squared = 0.0F;
+      for (std::uint64_t channel = 0U; channel < channels; ++channel) {
+        const auto index = (leading * channels + channel) * inner + trailing;
+        const auto value = load_float(input, index);
+        squared += value * value;
+      }
+      const auto denominator = std::max(std::sqrt(squared), epsilon);
+      for (std::uint64_t channel = 0U; channel < channels; ++channel) {
+        const auto index = (leading * channels + channel) * inner + trailing;
+        const auto normalized = round_to_dtype(load_float(input, index) /
+                                                   denominator,
+                                               input.dtype);
+        const auto scaled = round_to_dtype(normalized * scale, input.dtype);
+        store_float(out, index, scaled * load_float(gamma, channel));
+      }
+    }
+  }
+}
+
+void upsample_nearest_2d(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto scale_h = op.u64(ir::AttrKey::ScaleH, 1U);
+  const auto scale_w = op.u64(ir::AttrKey::ScaleW, 1U);
+  const auto batch = input.dims[0];
+  const auto channels = input.dims[1];
+  const auto input_h = input.dims[2];
+  const auto input_w = input.dims[3];
+  const auto output_h = out.dims[2];
+  const auto output_w = out.dims[3];
+  for (std::uint64_t b = 0U; b < batch; ++b)
+    for (std::uint64_t c = 0U; c < channels; ++c)
+      for (std::uint64_t oh = 0U; oh < output_h; ++oh)
+        for (std::uint64_t ow = 0U; ow < output_w; ++ow) {
+          const auto input_index =
+              ((b * channels + c) * input_h + oh / scale_h) * input_w +
+              ow / scale_w;
+          const auto output_index =
+              ((b * channels + c) * output_h + oh) * output_w + ow;
+          store_float(out, output_index, load_float(input, input_index));
+        }
+}
+
 // BigVGAN SnakeBeta: y = x + (exp(beta_c) + eps)^-1 * sin(exp(alpha_c) * x)^2,
 // alpha/beta stored in LOG space as [C] vectors (linear treatment is a
 // near-identity trap; see the audio decode plan).
@@ -1933,6 +2227,21 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::Conv1d:
       conv1d(op, tensors);
+      break;
+    case ir::Opcode::Conv2d:
+      conv2d(op, tensors);
+      break;
+    case ir::Opcode::ChannelRmsNorm:
+      channel_rms_norm(op, tensors);
+      break;
+    case ir::Opcode::UpsampleNearest2d:
+      upsample_nearest_2d(op, tensors);
+      break;
+    case ir::Opcode::PadConstant:
+      pad_constant(op, tensors);
+      break;
+    case ir::Opcode::Conv3d:
+      conv3d(op, tensors);
       break;
     case ir::Opcode::SnakeBeta:
       snake_beta(op, tensors);

@@ -2,7 +2,7 @@
 # M2: BF16 LoRA DiT-block training gate — N-step adapter-only AdamW training
 # of make_dit_lora_training vs the exactly-mirrored PyTorch reference, on
 # CPU and CUDA, plus checkpoint-resume byte-identity and .alpha-guarded
-# export.  Recorded evidence: docs/M2_DIT_LORA_TRAINING_GATE_2026-08-31.md.
+# export. Each run emits the measured evidence used by the frozen bars below.
 #
 # usage: flock /tmp/dc-gpu.lock -c \
 #   'bash tools/run_dit_lora_gate.sh WORKDIR [BLOCKS] [STEPS] [--measure]'

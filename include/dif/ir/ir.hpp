@@ -97,6 +97,18 @@ enum class Opcode : std::uint32_t {
   // Concatenate equal-rank tensors along an explicit axis. The operation is
   // physical (not a view): output storage follows row-major tensor order.
   Concat = 59,
+  // NCHW cross-correlation with OIHW weights and optional [C_out] bias.
+  Conv2d = 60,
+  // Channel-axis RMS normalization with the explicit creator storage
+  // boundaries used by image/video VAEs.
+  ChannelRmsNorm = 61,
+  // Integer nearest-neighbor spatial expansion for NCHW tensors.
+  UpsampleNearest2d = 62,
+  // Constant padding for NCHW/NCDHW tensors. Spatial padding uses the shared
+  // 2D attributes; rank-5 tensors additionally use front/back.
+  PadConstant = 63,
+  // NCDHW cross-correlation with OIDHW weights and optional [C_out] bias.
+  Conv3d = 64,
 };
 
 enum class AttrKey : std::uint32_t {
@@ -154,11 +166,46 @@ enum class AttrKey : std::uint32_t {
   Permutation5 = 52,
   Permutation6 = 53,
   Permutation7 = 54,
+  // Biased Linear lowering contract. The default vendor epilogue is a
+  // different BF16 rounding boundary from creator-style addmm (prefill C with
+  // bias, then GEMM with beta=1).
+  LinearBiasMode = 55,
+  // Optional reduction tile used when source-faithful floating-point order is
+  // part of the executable contract. Zero keeps the backend default.
+  ReductionTileSize = 56,
+  // RmsNormModulate input contract. ExplicitScaleShift consumes materialized
+  // scale/shift tensors. SharedVectorDelta consumes a per-batch vector and a
+  // [2,hidden] delta table without introducing intermediate dtype stores.
+  ModulationLayout = 57,
+  // Backend-neutral maximum temporary workspace admitted for an operation.
+  // This can also freeze source-observable vendor algorithm selection.
+  WorkspaceLimitBytes = 58,
+  StrideH = 59,
+  StrideW = 60,
+  DilationH = 61,
+  DilationW = 62,
+  PadTop = 63,
+  PadBottom = 64,
+  PadWest = 65,
+  PadEast = 66,
+  ScaleH = 67,
+  ScaleW = 68,
+  StrideT = 69,
+  DilationT = 70,
+  PadFront = 71,
+  PadBack = 72,
 };
 
 // Gelu carries an explicit approximation because exact-erf and tanh GELU are
 // observably different source semantics.  Krea 2 uses the tanh form.
 enum class GeluApproximation : std::uint64_t { Tanh = 1 };
+
+enum class LinearBiasMode : std::uint64_t { Epilogue = 1, Addmm = 2 };
+
+enum class ModulationLayout : std::uint64_t {
+  ExplicitScaleShift = 1,
+  SharedVectorDelta = 2,
+};
 
 // RotaryApply names the channel pairing explicitly.  Interleaved rotates
 // adjacent pairs (2d,2d+1), which is the layout used by Krea 2 and several

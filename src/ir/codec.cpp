@@ -280,6 +280,16 @@ std::string_view opcode_name(Opcode opcode) {
     return "permute";
   case Opcode::Concat:
     return "concat";
+  case Opcode::Conv2d:
+    return "conv2d";
+  case Opcode::ChannelRmsNorm:
+    return "channel_rms_norm";
+  case Opcode::UpsampleNearest2d:
+    return "upsample_nearest_2d";
+  case Opcode::PadConstant:
+    return "pad_constant";
+  case Opcode::Conv3d:
+    return "conv3d";
   }
   return "invalid";
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Per-opcode PyTorch fixture gate for the DiffIR audio opcodes (Conv1d,
-# SnakeBeta) — gate 1 of docs/BIGVGAN_DECODE_PLAN.md.
+# SnakeBeta).
 #
 # usage: bash tools/run_audio_opcode_gate.sh WORKDIR [--measure] [--backend cpu|cuda|both]
 #

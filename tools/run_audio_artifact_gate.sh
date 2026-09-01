@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Artifact + perf gate for the native BigVGAN audio decode (gates 4-5 of
-# docs/BIGVGAN_DECODE_PLAN.md): decode the accepted run's FINAL audio rows
-# with difaudiodecode and compare against the accepted audio.wav; measure
+# Artifact + perf gate for the native BigVGAN audio decode: decode the
+# accepted run's FINAL audio rows with difaudiodecode and compare against the
+# accepted audio.wav; measure
 # the fresh-process wall under mem_safe_runtime.sh.
 #
 # usage: flock /tmp/dc-gpu.lock -c 'bash tools/run_audio_artifact_gate.sh WORKDIR [cuda|cpu]'

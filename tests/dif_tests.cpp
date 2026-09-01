@@ -12,6 +12,7 @@
 #include "dif/frontend/h3_vae.hpp"
 #include "dif/frontend/h3_audio_vae.hpp"
 #include "dif/frontend/krea2.hpp"
+#include "dif/frontend/krea2_vae.hpp"
 #include "dif/frontend/training.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -19,6 +20,7 @@
 #include "dif/sampling/rectified_flow.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/json.hpp"
+#include "dif/support/png.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/support/wav.hpp"
 #include "dif/training/checkpoint.hpp"
@@ -649,6 +651,148 @@ void test_krea2_euler_velocity_creator_parity() {
   std::cout << "GATE krea2_euler bf16_bit_mismatch=0\n";
 }
 
+void test_krea2_schedule_and_cfg_creator_parity() {
+  using namespace dif::frontend;
+  const auto schedule = make_krea2_schedule();
+  const std::vector<std::uint32_t> creator_schedule_bits{
+      1065353216U, 1065221345U, 1065086385U, 1064948218U, 1064806731U,
+      1064661807U, 1064513312U, 1064361120U, 1064205086U, 1064045062U,
+      1063880897U, 1063712426U, 1063539479U, 1063361871U, 1063179416U,
+      1062991909U, 1062799141U, 1062600883U, 1062396901U, 1062186943U,
+      1061970738U, 1061748010U, 1061518452U, 1061281750U, 1061037564U,
+      1060785532U, 1060525274U, 1060256375U, 1059978400U, 1059690881U,
+      1059393319U, 1059085177U, 1058765881U, 1058434817U, 1058091316U,
+      1057734670U, 1057364106U, 1056978794U, 1056191066U, 1055355914U,
+      1054485415U, 1053577274U, 1052628999U, 1051637867U, 1050600906U,
+      1049514862U, 1048176335U, 1045785792U, 1043273448U, 1040629755U,
+      1035500870U, 1027445764U, 0U};
+  expect(schedule.mu == 0.90625 &&
+             schedule.timesteps.size() == creator_schedule_bits.size(),
+         "Krea 2 Raw 1024 schedule has official mu and 52-step geometry");
+  bool schedule_exact =
+      schedule.timesteps.size() == creator_schedule_bits.size();
+  if (schedule_exact) {
+    for (std::size_t index = 0U; index < schedule.timesteps.size(); ++index) {
+      const auto actual_bits =
+          std::bit_cast<std::uint32_t>(schedule.timesteps[index]);
+      if (actual_bits != creator_schedule_bits[index]) {
+        std::cerr << "Krea schedule first mismatch index=" << index
+                  << " expected_bits=" << creator_schedule_bits[index]
+                  << " actual_bits=" << actual_bits
+                  << " expected="
+                  << std::bit_cast<float>(creator_schedule_bits[index])
+                  << " actual=" << schedule.timesteps[index] << "\n";
+        schedule_exact = false;
+        break;
+      }
+    }
+  }
+  expect(schedule_exact,
+         "Krea 2 Raw 1024/52 schedule is bit-exact to creator PyTorch");
+
+  Krea2ScheduleConfig turbo_config;
+  turbo_config.steps = 8U;
+  turbo_config.fixed_mu = 1.15;
+  const auto turbo_schedule = make_krea2_schedule({}, turbo_config);
+  const std::vector<std::uint32_t> creator_turbo_schedule_bits{
+      0x3f800000U, 0x3f74ebd8U, 0x3f678f54U,
+      0x3f572119U, 0x3f426f4fU, 0x3f2791b1U,
+      0x3f0349c0U, 0x3e9f2e6dU, 0x00000000U};
+  bool turbo_schedule_exact =
+      turbo_schedule.mu == 1.15 &&
+      turbo_schedule.timesteps.size() == creator_turbo_schedule_bits.size();
+  if (turbo_schedule_exact) {
+    for (std::size_t index = 0U; index < turbo_schedule.timesteps.size();
+         ++index) {
+      if (std::bit_cast<std::uint32_t>(turbo_schedule.timesteps[index]) !=
+          creator_turbo_schedule_bits[index]) {
+        turbo_schedule_exact = false;
+        break;
+      }
+    }
+  }
+  expect(turbo_schedule_exact,
+         "Krea 2 Turbo 1024/8 fixed-mu schedule is bit-exact to creator PyTorch");
+
+  const auto turbo_euler = make_krea2_euler_step({16U});
+  expect(turbo_euler.program.operations.size() == 1U &&
+             turbo_euler.program.operations.front().opcode ==
+                 dif::ir::Opcode::EulerVelocityStep,
+         "Krea 2 Turbo omits CFG and lowers directly to one Euler update");
+
+  const auto build = make_krea2_cfg_euler_step({16U});
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(
+      build.sample_input,
+      float_tensor(dif::ir::DType::BF16, {16U},
+                   {-12.625F, -81.0F, 85.0F, 10.1875F, 55.75F, 0.765625F,
+                    40.25F, -92.0F, -130.0F, 1.8046875F, -60.5F, 67.0F,
+                    -20.125F, 42.5F, 86.5F, -127.5F}));
+  bindings.emplace(
+      build.conditional_velocity_input,
+      float_tensor(dif::ir::DType::BF16, {16U},
+                   {96.0F, 152.0F, -28.125F, 1.296875F, -32.0F, 55.5F,
+                    -124.0F, 10.5F, -38.0F, -1.890625F, -91.0F, 41.75F,
+                    -83.0F, -71.0F, -236.0F, -50.75F}));
+  bindings.emplace(
+      build.unconditional_velocity_input,
+      float_tensor(dif::ir::DType::BF16, {16U},
+                   {25.25F, -81.0F, 13.75F, -5.5F, 9.125F, 22.0F, -31.5F,
+                    7.25F, -10.75F, 4.5F, 8.0F, -15.25F, 20.5F, -19.0F,
+                    40.0F, 11.0F}));
+  bindings.emplace(build.guidance_input,
+                   float_tensor(dif::ir::DType::BF16, {1U}, {3.5F}));
+  bindings.emplace(build.current_timestep_input, f32_tensor({1U}, {1.0F}));
+  bindings.emplace(build.next_timestep_input,
+                   f32_tensor({1U}, {0.9921398758888245F}));
+  bindings.emplace(build.negative_one_constant,
+                   float_tensor(dif::ir::DType::BF16, {1U}, {-1.0F}));
+
+  const std::vector<std::pair<std::uint32_t, std::vector<std::uint16_t>>>
+      creator_bits{
+          {build.difference_output,
+           {17038U, 17257U, 49704U, 16602U, 49700U, 16902U, 49849U, 16464U,
+            49626U, 49356U, 49862U, 16996U, 49871U, 49744U, 50058U, 49783U}},
+          {build.guided_delta_output,
+           {17272U, 17484U, 49939U, 16831U, 49936U, 17130U, 50082U, 16694U,
+            49855U, 49586U, 50093U, 17224U, 50101U, 49974U, 50290U, 50008U}},
+          {build.velocity_output,
+           {17324U, 17522U, 49967U, 16841U, 49968U, 17196U, 50144U, 16815U,
+            49926U, 49601U, 50138U, 17266U, 50142U, 50045U, 50326U, 50053U}},
+          {build.sample_output,
+           {49525U, 49841U, 17069U, 16672U, 16997U, 48918U, 16943U, 49848U,
+            49921U, 16383U, 49764U, 17026U, 49541U, 16946U, 17088U, 49915U}},
+      };
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(build.program, bindings, options);
+  for (const auto &[id, bits] : creator_bits) {
+    const auto &actual = cpu.outputs.at(id);
+    expect(actual.byte_size() == bits.size() * sizeof(std::uint16_t) &&
+               std::memcmp(actual.data(), bits.data(), actual.byte_size()) == 0,
+           "Krea 2 CFG/Euler CPU boundary is bit-exact to creator CUDA BF16");
+  }
+  if (dif::runtime::cuda_available()) {
+    const auto cuda =
+        dif::runtime::make_cuda_executor()->run(build.program, bindings, options);
+    for (const auto &[id, bits] : creator_bits) {
+      const auto &actual = cuda.outputs.at(id);
+      expect(actual.byte_size() == bits.size() * sizeof(std::uint16_t) &&
+                 std::memcmp(actual.data(), bits.data(), actual.byte_size()) == 0,
+             "Krea 2 CFG/Euler CUDA boundary is bit-exact to creator CUDA BF16");
+    }
+  }
+  std::cout << "GATE krea2_schedule points=53 f32_bit_mismatch="
+            << (schedule_exact ? 0 : 1)
+            << " turbo_points=9 turbo_f32_bit_mismatch="
+            << (turbo_schedule_exact ? 0 : 1)
+            << " cfg_euler_bf16_bit_mismatch=0 raw_mu=" << schedule.mu
+            << " turbo_mu=" << turbo_schedule.mu << "\n";
+}
+
 void test_krea2_real_dimension_frontend_scaffold() {
   using namespace dif::frontend;
   using namespace dif::ir;
@@ -697,20 +841,30 @@ void test_krea2_real_dimension_frontend_scaffold() {
          "Krea 2 time scaffold preserves source BF16/F32 boundaries and real dims");
   std::uint64_t gelu_count = 0U;
   std::uint64_t linear_count = 0U;
+  std::uint64_t addmm_linear_count = 0U;
   for (const auto &operation : build.program.operations) {
     gelu_count += operation.opcode == Opcode::Gelu ? 1U : 0U;
     linear_count += operation.opcode == Opcode::Linear ? 1U : 0U;
+    addmm_linear_count +=
+        operation.opcode == Opcode::Linear &&
+                operation.u64(
+                    AttrKey::LinearBiasMode,
+                    static_cast<std::uint64_t>(LinearBiasMode::Epilogue)) ==
+                    static_cast<std::uint64_t>(LinearBiasMode::Addmm)
+            ? 1U
+            : 0U;
     expect(operation.opcode != Opcode::H3AdaLNSelect &&
                operation.opcode != Opcode::H3DeinterleaveQkv &&
                operation.opcode != Opcode::H3DeinterleaveQkvWeight,
            "Krea 2 scaffold does not reuse H3-only frontend semantics");
   }
-  expect(gelu_count == 2U && linear_count == 3U,
-         "Krea 2 time scaffold matches creator operation ordering");
+  expect(gelu_count == 2U && linear_count == 3U &&
+             addmm_linear_count == 3U,
+         "Krea 2 time scaffold matches creator operation and addmm ordering");
   const auto fingerprint = dif::hex_digest(dif::ir::fingerprint(build.program));
   const auto memory = dif::compiler::plan_memory(build.program, 256U);
   expect(fingerprint ==
-             "d8e0997e9fa8f75b648fccd2eb7c556a31373a8bbdceab46fc22414bed1817af",
+             "dacf2f6296ceb27a0dfde2de6e3aa15a4e5fd0d1d2a3c0c1abbbc7aca281eb6c",
          "Krea 2 real-dimension scaffold has a stable DiffIR fingerprint");
   expect(memory.total_bytes == 531740672U,
          "Krea 2 streamed time scaffold memory plan is stable");
@@ -758,7 +912,7 @@ void test_krea2_real_dimension_frontend_scaffold() {
   const auto *velocity = denoiser.program.tensor(denoiser.velocity_output);
   expect(denoiser.checkpoint_tensors.size() == 376U &&
              denoiser.block_outputs.size() == 28U &&
-             denoiser.program.operations.size() == 1738U && velocity &&
+             denoiser.program.operations.size() == 1725U && velocity &&
              velocity->dtype == DType::BF16 &&
              velocity->dims == std::vector<std::uint64_t>({1U,4096U,64U}),
          "Krea 2 full denoiser is one real-dimension shared DiffIR program");
@@ -1389,6 +1543,177 @@ void test_vae_normalization_primitives() {
       expect(std::abs(expected[index] - actual[index]) <= 2.0e-3F,
              "CUDA VAE normalization primitive numerical parity");
   }
+}
+
+void test_generic_image_vae_primitives() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::BF16, TensorRole::Input, {1, 2, 3, 3}},
+      {2, DType::BF16, TensorRole::Constant, {2, 2, 3, 3}},
+      {3, DType::BF16, TensorRole::Constant, {2}},
+      {4, DType::BF16, TensorRole::Output, {1, 2, 3, 3}},
+      {5, DType::BF16, TensorRole::Constant, {2}},
+      {6, DType::BF16, TensorRole::Output, {1, 2, 3, 3}},
+      {7, DType::BF16, TensorRole::Output, {1, 2, 6, 6}},
+      {8, DType::BF16, TensorRole::Input, {1, 1, 2, 2, 2}},
+      {9, DType::BF16, TensorRole::Output, {1, 1, 3, 4, 4}},
+      {10, DType::BF16, TensorRole::Constant, {1, 1, 2, 3, 3}},
+      {11, DType::BF16, TensorRole::Constant, {1}},
+      {12, DType::BF16, TensorRole::Output, {1, 1, 2, 2, 2}},
+  };
+  program.operations = {
+      {1, Opcode::Conv2d, {1, 2, 3}, {4},
+       {Attribute::u64(AttrKey::StrideH, 1),
+        Attribute::u64(AttrKey::StrideW, 1),
+        Attribute::u64(AttrKey::DilationH, 1),
+        Attribute::u64(AttrKey::DilationW, 1),
+        Attribute::u64(AttrKey::PadTop, 1),
+        Attribute::u64(AttrKey::PadBottom, 1),
+        Attribute::u64(AttrKey::PadWest, 1),
+        Attribute::u64(AttrKey::PadEast, 1),
+        Attribute::u64(AttrKey::Groups, 1)}},
+      {2, Opcode::ChannelRmsNorm, {4, 5}, {6},
+       {Attribute::u64(AttrKey::Axis, 1),
+        Attribute::u64(AttrKey::BlockSize, 32),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-12)}},
+      {3, Opcode::UpsampleNearest2d, {6}, {7},
+       {Attribute::u64(AttrKey::ScaleH, 2),
+        Attribute::u64(AttrKey::ScaleW, 2)}},
+      {4, Opcode::PadConstant, {8}, {9},
+       {Attribute::u64(AttrKey::PadFront, 1),
+        Attribute::u64(AttrKey::PadBack, 0),
+        Attribute::u64(AttrKey::PadTop, 1),
+        Attribute::u64(AttrKey::PadBottom, 1),
+        Attribute::u64(AttrKey::PadWest, 1),
+        Attribute::u64(AttrKey::PadEast, 1)}},
+      {5, Opcode::Conv3d, {9, 10, 11}, {12},
+       {Attribute::u64(AttrKey::StrideT, 1),
+        Attribute::u64(AttrKey::StrideH, 1),
+        Attribute::u64(AttrKey::StrideW, 1),
+        Attribute::u64(AttrKey::DilationT, 1),
+        Attribute::u64(AttrKey::DilationH, 1),
+        Attribute::u64(AttrKey::DilationW, 1),
+        Attribute::u64(AttrKey::Groups, 1)}},
+  };
+  dif::ir::verify(program);
+  const auto decoded = dif::ir::decode(dif::ir::encode(program));
+  expect(decoded.operations.size() == 5U &&
+             decoded.operations[0].opcode == Opcode::Conv2d &&
+             decoded.operations[1].opcode == Opcode::ChannelRmsNorm &&
+             decoded.operations[2].opcode == Opcode::UpsampleNearest2d &&
+             decoded.operations[3].opcode == Opcode::PadConstant &&
+             decoded.operations[4].opcode == Opcode::Conv3d,
+         "generic image VAE opcodes survive DiffIR roundtrip");
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1, float_tensor(
+                          DType::BF16, {1, 2, 3, 3},
+                          {-1.0F, -0.75F, -0.5F, -0.25F, 0.0F, 0.25F,
+                           0.5F, 0.75F, 1.0F, 1.0F, 0.5F, 0.0F, -0.5F,
+                           -1.0F, -0.5F, 0.0F, 0.5F, 1.0F}));
+  bindings.emplace(2, float_tensor(
+                          DType::BF16, {2, 2, 3, 3},
+                          {0.05F, 0.1F, 0.05F, 0.1F, 0.4F, 0.1F, 0.05F,
+                           0.1F, 0.05F, -0.1F, 0.0F, 0.1F, -0.2F, 0.5F,
+                           -0.2F, 0.1F, 0.0F, -0.1F, -0.05F, -0.1F,
+                           -0.05F, -0.1F, -0.4F, -0.1F, -0.05F, -0.1F,
+                           -0.05F, 0.1F, 0.0F, -0.1F, 0.2F, -0.5F, 0.2F,
+                           -0.1F, 0.0F, 0.1F}));
+  bindings.emplace(3, float_tensor(DType::BF16, {2}, {0.125F, -0.25F}));
+  bindings.emplace(5, float_tensor(DType::BF16, {2}, {1.0F, 0.75F}));
+  bindings.emplace(8, float_tensor(DType::BF16, {1, 1, 2, 2, 2},
+                                   {1.0F, 2.0F, 3.0F, 4.0F,
+                                    5.0F, 6.0F, 7.0F, 8.0F}));
+  bindings.emplace(10, float_tensor(DType::BF16, {1, 1, 2, 3, 3},
+                                    {0.125F, 0.125F, 0.125F,
+                                     0.125F, 0.125F, 0.125F,
+                                     0.125F, 0.125F, 0.125F,
+                                     0.25F, 0.25F, 0.25F,
+                                     0.25F, 0.25F, 0.25F,
+                                     0.25F, 0.25F, 0.25F}));
+  bindings.emplace(11, float_tensor(DType::BF16, {1}, {0.5F}));
+  dif::runtime::RunOptions options;
+  options.warmups = 0;
+  options.iterations = 1;
+  options.minimum_free_bytes = 0;
+  const auto reference =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  const auto upsampled = float_values(reference.outputs.at(7));
+  expect(upsampled[0] == upsampled[1] && upsampled[0] == upsampled[6] &&
+             upsampled[0] == upsampled[7],
+         "nearest 2D upsample replicates each pixel into a 2x2 tile");
+  const auto padded = float_values(reference.outputs.at(9));
+  expect(padded[0] == 0.0F && padded[21] == 1.0F && padded[42] == 8.0F,
+         "rank-5 constant padding preserves NCDHW causal placement");
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto candidate =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  float maximum_absolute_error = 0.0F;
+  for (const auto id : {4U, 6U, 7U, 9U, 12U}) {
+    const auto expected = float_values(reference.outputs.at(id));
+    const auto actual = float_values(candidate.outputs.at(id));
+    for (std::size_t index = 0U; index < expected.size(); ++index)
+      maximum_absolute_error = std::max(
+          maximum_absolute_error, std::abs(expected[index] - actual[index]));
+  }
+  expect(maximum_absolute_error <= 0.02F,
+         "CUDA cuDNN Conv2d and image VAE primitives match CPU BF16 semantics");
+  expect(candidate.run_telemetry.cudnn_convolution_dispatches == 2U,
+         "Conv2d and Conv3d execute through two cuDNN convolution dispatches");
+  std::cout << "GATE generic_image_vae_primitives backend="
+            << candidate.backend_name << " device=" << candidate.device_name
+            << " max_abs=" << maximum_absolute_error << "\n";
+}
+
+void test_krea2_qwen_image_vae_frontend_contract() {
+  using namespace dif::frontend;
+  using namespace dif::ir;
+  const auto build = make_krea2_qwen_image_vae();
+  verify(build.program);
+  const auto *input = build.program.tensor(build.latent_input);
+  const auto *raw = build.program.tensor(build.raw_output);
+  const auto *clamped = build.program.tensor(build.clamped_output);
+  expect(input && input->dtype == DType::BF16 &&
+             input->dims == std::vector<std::uint64_t>({1U, 16U, 32U, 32U}),
+         "Krea 2 Qwen Image VAE tile accepts the official 32x32 latent tile");
+  expect(raw && clamped &&
+             raw->dims ==
+                 std::vector<std::uint64_t>({1U, 3U, 256U, 256U}) &&
+             clamped->dims == raw->dims &&
+             raw->has_role(TensorRole::Output) &&
+             clamped->has_role(TensorRole::Output),
+         "Krea 2 Qwen Image VAE tile exposes raw and clamped 256px outputs");
+  expect(build.program.operations.size() == 223U &&
+             build.weights.size() == 104U,
+         "Krea 2 Qwen Image VAE frontend has the creator decoder inventory");
+  std::uint64_t conv_count = 0U;
+  std::uint64_t conv3d_count = 0U;
+  std::uint64_t pad_count = 0U;
+  std::uint64_t attention_count = 0U;
+  std::uint64_t upsample_count = 0U;
+  for (const auto &operation : build.program.operations) {
+    conv_count += operation.opcode == Opcode::Conv2d ? 1U : 0U;
+    conv3d_count += operation.opcode == Opcode::Conv3d ? 1U : 0U;
+    pad_count += operation.opcode == Opcode::PadConstant ? 1U : 0U;
+    attention_count += operation.opcode == Opcode::Attention ? 1U : 0U;
+    upsample_count +=
+        operation.opcode == Opcode::UpsampleNearest2d ? 1U : 0U;
+    expect(operation.opcode != Opcode::H3AdaLNSelect &&
+               operation.opcode != Opcode::H3DeinterleaveQkv &&
+               operation.opcode != Opcode::H3DeinterleaveQkvWeight,
+           "Krea 2 Qwen Image VAE contains no H3-only runtime operation");
+  }
+  expect(attention_count == 1U && upsample_count == 3U && conv_count == 5U &&
+             conv3d_count == 32U && pad_count == 30U,
+         "Krea 2 Qwen Image VAE uses shared attention, padding, Conv2d, and Conv3d ops");
+  std::cout << "GATE krea2_qwen_image_vae operations="
+            << build.program.operations.size()
+            << " weights=" << build.weights.size()
+            << " conv2d=" << conv_count
+            << " conv3d=" << conv3d_count << " pad=" << pad_count
+            << " attention=" << attention_count
+            << " upsample=" << upsample_count << "\n";
 }
 
 void test_h3_video_vae_frontend_contract() {
@@ -3068,7 +3393,7 @@ void test_audio_bigvgan_frontend_contract() {
   // Full program at the accepted geometry (B=2 stereo batch, T=292).
   const auto build = build_audio_bigvgan_program(2U, 292U, 8U);
   dif::ir::verify(build.program);
-  // Census derivation (docs/BIGVGAN_DECODE_PLAN.md §3): Conv1d = denorm 1 +
+  // BigVGAN census derivation: Conv1d = denorm 1 +
   // dec_in_proj 1 + conv_pre 1 + 7 stages x (ups 1 + 3 blocks x 3 dilations
   // x (2 alias-free resamplers x 2 + 2 convs) = 54) + post resamplers 2 +
   // conv_post 1 = 391. SnakeBeta = 7 x 3 x 3 x 2 + activation_post = 127.
@@ -3113,7 +3438,7 @@ void test_audio_bigvgan_frontend_contract() {
 }
 
 
-// Chunk 7 of docs/BIGVGAN_DECODE_PLAN.md: the WAV writer must reproduce
+// The WAV writer must reproduce
 // serenitymojo/audio/wav.mojo:120-165 exactly — 44-byte RIFF/WAVE PCM
 // header, interleaved channels, clamp to [-1,1], then round half AWAY from
 // zero into int16 via Int(x*32767 +/- 0.5) (truncation toward zero after
@@ -3159,6 +3484,32 @@ void test_wav_pcm16_writer_contract() {
   std::filesystem::remove(path);
 }
 
+void test_png_rgb8_writer_contract() {
+  const auto path =
+      std::filesystem::temp_directory_path() / "dif-png-writer-contract.png";
+  std::filesystem::remove(path);
+  const std::array<std::uint8_t, 6> rgb{255U, 0U, 0U, 0U, 128U, 255U};
+  dif::write_png_rgb8(path, 2U, 1U, rgb);
+  std::ifstream input(path, std::ios::binary);
+  const std::vector<std::uint8_t> bytes(
+      (std::istreambuf_iterator<char>(input)),
+      std::istreambuf_iterator<char>());
+  const std::array<std::uint8_t, 8> signature{
+      0x89U, 'P', 'N', 'G', 0x0dU, 0x0aU, 0x1aU, 0x0aU};
+  expect(bytes.size() == 75U &&
+             std::equal(signature.begin(), signature.end(), bytes.begin()),
+         "PNG writer emits the standard signature and deterministic size");
+  expect(bytes[11] == 13U && bytes[12] == 'I' && bytes[13] == 'H' &&
+             bytes[14] == 'D' && bytes[15] == 'R' && bytes[19] == 2U &&
+             bytes[23] == 1U && bytes[24] == 8U && bytes[25] == 2U,
+         "PNG writer emits a 2x1 eight-bit RGB IHDR");
+  expect(bytes[36] == 18U && bytes[37] == 'I' && bytes[38] == 'D' &&
+             bytes[39] == 'A' && bytes[40] == 'T' && bytes[67] == 'I' &&
+             bytes[68] == 'E' && bytes[69] == 'N' && bytes[70] == 'D',
+         "PNG writer emits deterministic IDAT and terminal IEND chunks");
+  std::filesystem::remove(path);
+}
+
 int main() {
   test_sha256();
   test_json_parser();
@@ -3169,11 +3520,14 @@ int main() {
   test_cpu_all_opcodes_and_float_dtypes();
   test_krea2_gelu_creator_parity();
   test_krea2_euler_velocity_creator_parity();
+  test_krea2_schedule_and_cfg_creator_parity();
   test_krea2_real_dimension_frontend_scaffold();
   test_krea2_rotary_layout_mask_and_broadcast_oracle();
   test_krea2_cudnn_masked_gqa_creator_oracle();
   test_new_primitives_cuda_parity();
   test_vae_normalization_primitives();
+  test_generic_image_vae_primitives();
+  test_krea2_qwen_image_vae_frontend_contract();
   test_h3_video_vae_frontend_contract();
   test_training_autodiff_optimizer_and_checkpoint();
   test_mixed_precision_bf16_training_step();
@@ -3188,6 +3542,7 @@ int main() {
   test_audio_opcode_verifier_contract();
   test_audio_bigvgan_frontend_contract();
   test_wav_pcm16_writer_contract();
+  test_png_rgb8_writer_contract();
   test_attention_implementation_identity();
   test_h3_bf16_lowering_preserves_source_reduction_identity();
   test_h3_long_sequence_transformer_declares_backend_attention();

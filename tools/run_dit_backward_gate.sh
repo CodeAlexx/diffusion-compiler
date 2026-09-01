@@ -10,7 +10,7 @@
 # and never lowered to pass).
 #
 # Admission bars (set AFTER measurement, 2026-08-31, RTX 3090 Ti +
-# PyTorch 2.10.0+cu128 — see docs/DIT_BACKWARD_GATE_2026-08-31.md).
+# PyTorch 2.10.0+cu128).
 # Measured worst over all 104 comparisons (both backends):
 #   F32:  max_abs 4.77e-7 (rms_norm dx), rel_l2 2.69e-7, cos 1.0,
 #         norm_ratio [1.0, 1.0]

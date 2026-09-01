@@ -1,5 +1,5 @@
-// difaudioops — per-case runner for the audio opcode fixture gate (gate 1 of
-// docs/BIGVGAN_DECODE_PLAN.md). Mirrors tools/difditops.cpp: reads the
+// difaudioops — per-case runner for the audio opcode fixture gate. Mirrors
+// tools/difditops.cpp: reads the
 // fixture tensors exported by tools/export_audio_opcode_fixtures.py, builds
 // the single-operation DiffIR program with the case's exact attributes, runs
 // it on the selected backend, and writes actual.diftensor for difcompare.

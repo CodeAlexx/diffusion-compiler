@@ -4,8 +4,7 @@
 # Canonical source: /home/alex/mojodiffusion/scripts/mem_safe_runtime.sh
 #   (sha256 50a8bc29aac53240bba0cb7e7b7b1ed66e54f82687035b0da89a1d2cfa3c81d5,
 #    mtime 2026-08-18) — the copy referenced by the accepted H3 quality-gate
-#   artifact scripts (artifacts/h3-quality-natural-language-2026-08-30/…/run_*.sh)
-#   and by docs/H3_NATURAL_LANGUAGE_QUALITY_GATE_2026-08-30.md.
+#   artifact scripts (artifacts/h3-quality-natural-language-2026-08-30/…/run_*.sh).
 # A second, older copy exists at /home/alex/mojo1-migration/scripts/
 #   mem_safe_runtime.sh (sha256 1e7a5790…, 2026-08-12 snapshot); it predates the
 #   H3-training admission gate (H3_ALLOW_USER_SLICE) and the clean-service env
