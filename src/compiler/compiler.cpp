@@ -331,6 +331,50 @@ void emit_channel_rms_norm(std::ostringstream &out,
       << std::defaultfloat;
 }
 
+void emit_group_norm(std::ostringstream &out, const ir::Program &program,
+                     const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto channels = input->dims[1];
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto channels_per_group = channels / groups;
+  std::uint64_t inner = 1U;
+  for (std::size_t axis = 2U; axis < input->dims.size(); ++axis)
+    inner *= input->dims[axis];
+  const auto elements = channels_per_group * inner;
+  const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  const auto epsilon =
+      static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  out << std::scientific << std::setprecision(9)
+      << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* bias,dif_scalar* y){"
+         "extern __shared__ float reduction[];unsigned long long vector="
+         "(unsigned long long)blockIdx.x;if(vector>="
+      << input->dims[0] * groups
+      << "ULL)return;unsigned long long lane=threadIdx.x,group=vector%"
+      << groups << "ULL,batch=vector/" << groups
+      << "ULL,base=(batch*" << channels << "ULL+group*"
+      << channels_per_group << "ULL)*" << inner
+      << "ULL;float sum=0.0f,squares=0.0f;for(unsigned long long k=lane;k<"
+      << elements
+      << "ULL;k+=blockDim.x){float v=dif_load(x,base+k);sum+=v;squares=fmaf(v,v,squares);}"
+         "reduction[lane]=sum;reduction[blockDim.x+lane]=squares;__syncthreads();";
+  for (auto stride = block / 2U; stride != 0U; stride /= 2U)
+    out << "if(lane<" << stride
+        << "ULL){reduction[lane]+=reduction[lane+" << stride
+        << "ULL];reduction[blockDim.x+lane]+=reduction[blockDim.x+lane+"
+        << stride << "ULL];}__syncthreads();";
+  out << "float mean=reduction[0]/" << elements
+      << ".0f;float variance=fmaxf(reduction[blockDim.x]/" << elements
+      << ".0f-mean*mean,0.0f);float inv=rsqrtf(variance+" << epsilon
+      << "f);for(unsigned long long k=lane;k<" << elements
+      << "ULL;k+=blockDim.x){unsigned long long channel=group*"
+      << channels_per_group << "ULL+k/" << inner
+      << "ULL;float normalized=(dif_load(x,base+k)-mean)*inv;"
+         "dif_store(y,base+k,fmaf(normalized,dif_load(weight,channel),"
+         "dif_load(bias,channel)));}}\n"
+      << std::defaultfloat;
+}
+
 void emit_upsample_nearest_2d(std::ostringstream &out,
                               const ir::Program &program,
                               const ir::Operation &op) {
@@ -402,6 +446,57 @@ void emit_pad_constant(std::ostringstream &out, const ir::Program &program,
         << "ULL;dif_store(y,i,dif_load(x,source));}}\n";
   }
   out << std::defaultfloat;
+}
+
+void emit_pad_reflect(std::ostringstream &out, const ir::Program &program,
+                      const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto front = op.u64(ir::AttrKey::PadFront, 0U);
+  const auto top = op.u64(ir::AttrKey::PadTop, 0U);
+  const auto west = op.u64(ir::AttrKey::PadWest, 0U);
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << output->element_count() << "ULL){";
+  if (input->dims.size() == 4U) {
+    out << "unsigned long long ow=i%" << output->dims[3]
+        << "ULL,oh=(i/" << output->dims[3] << "ULL)%" << output->dims[2]
+        << "ULL,c=(i/" << output->dims[2] * output->dims[3] << "ULL)%"
+        << output->dims[1] << "ULL,b=i/"
+        << output->dims[1] * output->dims[2] * output->dims[3]
+        << "ULL;unsigned long long sy=oh<" << top << "ULL?" << top
+        << "ULL-oh:(oh-" << top << "ULL<" << input->dims[2] << "ULL?oh-"
+        << top << "ULL:2ULL*" << input->dims[2] << "ULL-2ULL-(oh-" << top
+        << "ULL));unsigned long long sx=ow<" << west << "ULL?" << west
+        << "ULL-ow:(ow-" << west << "ULL<" << input->dims[3] << "ULL?ow-"
+        << west << "ULL:2ULL*" << input->dims[3] << "ULL-2ULL-(ow-" << west
+        << "ULL));unsigned long long source=((b*" << input->dims[1]
+        << "ULL+c)*" << input->dims[2] << "ULL+sy)*" << input->dims[3]
+        << "ULL+sx;dif_store(y,i,dif_load(x,source));}}\n";
+  } else {
+    out << "unsigned long long ow=i%" << output->dims[4]
+        << "ULL,oh=(i/" << output->dims[4] << "ULL)%" << output->dims[3]
+        << "ULL,ot=(i/" << output->dims[3] * output->dims[4] << "ULL)%"
+        << output->dims[2] << "ULL,c=(i/"
+        << output->dims[2] * output->dims[3] * output->dims[4] << "ULL)%"
+        << output->dims[1] << "ULL,b=i/"
+        << output->dims[1] * output->dims[2] * output->dims[3] *
+               output->dims[4]
+        << "ULL;unsigned long long st=ot<" << front << "ULL?" << front
+        << "ULL-ot:(ot-" << front << "ULL<" << input->dims[2] << "ULL?ot-"
+        << front << "ULL:2ULL*" << input->dims[2] << "ULL-2ULL-(ot-" << front
+        << "ULL));unsigned long long sy=oh<" << top << "ULL?" << top
+        << "ULL-oh:(oh-" << top << "ULL<" << input->dims[3] << "ULL?oh-"
+        << top << "ULL:2ULL*" << input->dims[3] << "ULL-2ULL-(oh-" << top
+        << "ULL));unsigned long long sx=ow<" << west << "ULL?" << west
+        << "ULL-ow:(ow-" << west << "ULL<" << input->dims[4] << "ULL?ow-"
+        << west << "ULL:2ULL*" << input->dims[4] << "ULL-2ULL-(ow-" << west
+        << "ULL));unsigned long long source=(((b*" << input->dims[1]
+        << "ULL+c)*" << input->dims[2] << "ULL+st)*" << input->dims[3]
+        << "ULL+sy)*" << input->dims[4]
+        << "ULL+sx;dif_store(y,i,dif_load(x,source));}}\n";
+  }
 }
 
 void emit_snake_beta(std::ostringstream &out, const ir::Program &program,
@@ -589,13 +684,19 @@ void emit_silu(std::ostringstream &out, const ir::Program &program,
 void emit_gelu(std::ostringstream &out, const ir::Program &program,
                const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto approximation = static_cast<ir::GeluApproximation>(
+      op.u64(ir::AttrKey::Approximation, 0U));
   out << "extern \"C\" __global__ void " << function_name(op)
       << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
          "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count
-      << "ULL){float v=dif_load(x,i);float c=v*v*v;float z="
-         "7.978845608e-1f*(v+4.471500218e-2f*c);"
-         "dif_store(y,i,5.0e-1f*v*(1.0f+tanhf(z)));}}\n";
+      << count << "ULL){float v=dif_load(x,i);";
+  if (approximation == ir::GeluApproximation::ExactErf)
+    out << "dif_store(y,i,5.0e-1f*v*(1.0f+erff(v*7.071067812e-1f)));";
+  else
+    out << "float c=v*v*v;float z="
+           "7.978845608e-1f*(v+4.471500218e-2f*c);"
+           "dif_store(y,i,5.0e-1f*v*(1.0f+tanhf(z)));";
+  out << "}}\n";
 }
 
 // The training ops below may legally mix storage dtypes across their
@@ -1656,6 +1757,19 @@ void emit_bias_add(std::ostringstream &out, const ir::Program &program,
          "if(i<"
       << count
       << "ULL)dif_store(y,i,dif_load(x,i)+dif_load(bias,i%" << width
+      << "ULL));}\n";
+}
+
+void emit_linear_addmm_prefill(std::ostringstream &out,
+                               const ir::Program &program,
+                               const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto width = program.tensor(op.inputs[2])->element_count();
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* bias,"
+         "dif_scalar* y){(void)x;(void)weight;unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL)dif_store(y,i,dif_load(bias,i%" << width
       << "ULL));}\n";
 }
 
@@ -2814,6 +2928,16 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       } else if (op.u64(ir::AttrKey::Implementation, 1U) == 3U) {
         fail("direct packed INT5 Linear candidate is not an eligible exclusive "
              "dequantization chain");
+      } else if (op.inputs.size() == 3U &&
+                 op.u64(ir::AttrKey::LinearBiasMode,
+                        static_cast<std::uint64_t>(
+                            ir::LinearBiasMode::Epilogue)) ==
+                     static_cast<std::uint64_t>(
+                         ir::LinearBiasMode::Addmm)) {
+        generated.entrypoints.emplace(op.id, function_name(op));
+        begin_float_operation(source, operation_float_dtype(program, op));
+        emit_linear_addmm_prefill(source, program, op);
+        end_float_operation(source);
       }
       continue;
     }
@@ -3031,11 +3155,17 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
     case ir::Opcode::ChannelRmsNorm:
       emit_channel_rms_norm(source, program, op);
       break;
+    case ir::Opcode::GroupNorm:
+      emit_group_norm(source, program, op);
+      break;
     case ir::Opcode::UpsampleNearest2d:
       emit_upsample_nearest_2d(source, program, op);
       break;
     case ir::Opcode::PadConstant:
       emit_pad_constant(source, program, op);
+      break;
+    case ir::Opcode::PadReflect:
+      emit_pad_reflect(source, program, op);
       break;
     case ir::Opcode::Conv3d:
       break;

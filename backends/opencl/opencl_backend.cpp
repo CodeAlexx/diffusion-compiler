@@ -1017,6 +1017,8 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::UpsampleNearest2d:
     case Opcode::PadConstant:
     case Opcode::Conv3d:
+    case Opcode::GroupNorm:
+    case Opcode::PadReflect:
       // These generic operations currently have CPU and NVIDIA production
       // implementations. Keep OpenCL fail-closed until each lowering has its
       // own parity gate.

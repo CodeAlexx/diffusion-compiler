@@ -66,6 +66,89 @@ std::uint64_t checked_product(std::initializer_list<std::uint64_t> values) {
 
 } // namespace
 
+runtime::Tensor pack_h3_video_latent(const runtime::Tensor &video_latent,
+                                     std::uint64_t patch_height,
+                                     std::uint64_t patch_width) {
+  if (patch_height == 0U || patch_width == 0U ||
+      video_latent.dtype != ir::DType::F32 ||
+      video_latent.dims.size() != 5U || video_latent.dims[0] != 1U ||
+      video_latent.dims[1] != kVideoChannels ||
+      video_latent.dims[3] % patch_height != 0U ||
+      video_latent.dims[4] % patch_width != 0U)
+    fail("H3 video latent does not match [1,24,T,H,W] patch geometry");
+  const auto frames = video_latent.dims[2];
+  const auto height = video_latent.dims[3];
+  const auto width = video_latent.dims[4];
+  const auto patches_h = height / patch_height;
+  const auto patches_w = width / patch_width;
+  const auto columns =
+      checked_product({kVideoChannels, patch_height, patch_width});
+  runtime::Tensor rows{ir::DType::F32,
+                       {checked_product({frames, patches_h, patches_w}),
+                        columns},
+                       {}};
+  rows.bytes.resize(
+      static_cast<std::size_t>(rows.element_count() * sizeof(float)));
+  const auto input = video_latent.f32();
+  auto output = rows.f32();
+  for (std::uint64_t frame = 0U; frame < frames; ++frame) {
+    for (std::uint64_t patch_y = 0U; patch_y < patches_h; ++patch_y) {
+      for (std::uint64_t patch_x = 0U; patch_x < patches_w; ++patch_x) {
+        const auto row =
+            (frame * patches_h + patch_y) * patches_w + patch_x;
+        for (std::uint64_t channel = 0U; channel < kVideoChannels;
+             ++channel) {
+          for (std::uint64_t y = 0U; y < patch_height; ++y) {
+            for (std::uint64_t x = 0U; x < patch_width; ++x) {
+              const auto source =
+                  ((channel * frames + frame) * height +
+                   patch_y * patch_height + y) *
+                      width +
+                  patch_x * patch_width + x;
+              const auto column =
+                  (channel * patch_height + y) * patch_width + x;
+              output[static_cast<std::size_t>(row * columns + column)] =
+                  input[static_cast<std::size_t>(source)];
+            }
+          }
+        }
+      }
+    }
+  }
+  return rows;
+}
+
+runtime::Tensor pack_h3_audio_latent(const runtime::Tensor &audio_latent) {
+  if (audio_latent.dtype != ir::DType::F32 ||
+      audio_latent.dims.size() != 4U || audio_latent.dims[0] != 1U ||
+      audio_latent.dims[1] != kAudioLatentChannels ||
+      audio_latent.dims[2] != kAudioChannels)
+    fail("H3 audio latent does not match [1,32,2,T] geometry");
+  const auto time = audio_latent.dims[3];
+  runtime::Tensor rows{ir::DType::F32,
+                       {checked_product({kAudioChannels, time}),
+                        kAudioLatentChannels},
+                       {}};
+  rows.bytes.resize(
+      static_cast<std::size_t>(rows.element_count() * sizeof(float)));
+  const auto input = audio_latent.f32();
+  auto output = rows.f32();
+  for (std::uint64_t channel = 0U; channel < kAudioChannels; ++channel) {
+    for (std::uint64_t frame = 0U; frame < time; ++frame) {
+      const auto row = channel * time + frame;
+      for (std::uint64_t latent_channel = 0U;
+           latent_channel < kAudioLatentChannels; ++latent_channel) {
+        const auto source =
+            (latent_channel * kAudioChannels + channel) * time + frame;
+        output[static_cast<std::size_t>(row * kAudioLatentChannels +
+                                        latent_channel)] =
+            input[static_cast<std::size_t>(source)];
+      }
+    }
+  }
+  return rows;
+}
+
 runtime::Tensor unpack_h3_video_rows(const runtime::Tensor &video_rows,
                                      std::uint64_t condition_rows,
                                      std::uint64_t latent_frames,

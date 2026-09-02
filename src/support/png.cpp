@@ -10,6 +10,8 @@
 #include <span>
 #include <vector>
 
+#include <png.h>
+
 namespace dif {
 namespace {
 
@@ -56,6 +58,33 @@ void append_chunk(std::vector<std::uint8_t> &png,
 }
 
 } // namespace
+
+RgbImage read_png_rgb8(const std::filesystem::path &path) {
+  png_image image{};
+  image.version = PNG_IMAGE_VERSION;
+  const auto native_path = path.string();
+  if (!png_image_begin_read_from_file(&image, native_path.c_str()))
+    fail("cannot read PNG header: " + native_path + ": " + image.message);
+  struct Guard {
+    png_image *image;
+    ~Guard() { png_image_free(image); }
+  } guard{&image};
+  if (image.width == 0U || image.height == 0U)
+    fail("PNG has zero width or height: " + native_path);
+  image.format = PNG_FORMAT_RGB;
+  const auto byte_count = PNG_IMAGE_SIZE(image);
+  if (byte_count == 0U ||
+      byte_count != static_cast<png_alloc_size_t>(image.width) * image.height *
+                        3U)
+    fail("PNG RGB byte count is invalid: " + native_path);
+  RgbImage result{image.width, image.height,
+                  std::vector<std::uint8_t>(
+                      static_cast<std::size_t>(byte_count))};
+  if (!png_image_finish_read(&image, nullptr, result.pixels.data(), 0,
+                             nullptr))
+    fail("cannot decode PNG: " + native_path + ": " + image.message);
+  return result;
+}
 
 void write_png_rgb8(const std::filesystem::path &path, std::uint32_t width,
                     std::uint32_t height,

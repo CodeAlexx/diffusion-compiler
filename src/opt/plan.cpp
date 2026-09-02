@@ -1,8 +1,10 @@
 #include "dif/opt/plan.hpp"
 
 #include "dif/ir/verify.hpp"
+#include "dif/build_info.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/json.hpp"
+#include "dif/support/sha256.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -10,12 +12,13 @@
 #include <ios>
 #include <limits>
 #include <sstream>
+#include <span>
 
 namespace dif::opt {
 namespace {
 
 constexpr std::string_view kPlanKind = "diffusion-compiler-optimization-plan";
-constexpr int kPlanVersion = 1;
+constexpr int kPlanVersion = 2;
 
 std::string encode_ids(const std::vector<std::uint32_t> &values) {
   std::string out = "[";
@@ -61,6 +64,41 @@ const json::Value &required(const json::Value &object, const char *key) {
   if (!found)
     fail(std::string("optimization plan is missing \"") + key + "\"");
   return *found;
+}
+
+std::uint64_t unsigned_integer(const json::Value &value, const char *label) {
+  const auto number = value.number();
+  if (!(number >= 0.0) ||
+      number > static_cast<double>(std::numeric_limits<std::uint64_t>::max()) ||
+      number != std::floor(number))
+    fail(std::string("optimization plan ") + label +
+         " must be a nonnegative integer");
+  return static_cast<std::uint64_t>(number);
+}
+
+RewriteContext replay_program(const OptimizationPlan &plan,
+                              const RewriteContext &base) {
+  const auto base_program = program_fingerprint(base.program);
+  if (!plan.base_program_fingerprint.empty() &&
+      plan.base_program_fingerprint != base_program)
+    fail("optimization plan was recorded against program " +
+         plan.base_program_fingerprint + " but was replayed against " +
+         base_program);
+  const auto base_candidate = candidate_fingerprint(base);
+  if (!plan.base_fingerprint.empty() &&
+      plan.base_fingerprint != base_candidate)
+    fail("optimization plan base bindings do not match: recorded " +
+         plan.base_fingerprint + ", replayed " + base_candidate);
+  RewriteContext context = base;
+  for (const auto &transform : plan.transforms)
+    apply(transform, context);
+  ir::verify(context.program);
+  const auto produced = candidate_fingerprint(context);
+  if (!plan.candidate_fingerprint.empty() &&
+      plan.candidate_fingerprint != produced)
+    fail("replayed optimization plan produced candidate " + produced +
+         " but recorded " + plan.candidate_fingerprint);
+  return context;
 }
 
 } // namespace
@@ -118,6 +156,23 @@ std::string serialize_plan(const OptimizationPlan &plan) {
          json_quote(plan.candidate_program_fingerprint) + ",\n";
   out += "  \"candidate_fingerprint\": " +
          json_quote(plan.candidate_fingerprint) + ",\n";
+  if (plan.compatibility) {
+    const auto &compatibility = *plan.compatibility;
+    out += "  \"compatibility\": {\n";
+    out += "    \"compiler_revision\": " +
+           json_quote(compatibility.compiler_revision) + ",\n";
+    out += "    \"target_fingerprint\": " +
+           json_quote(compatibility.target_fingerprint) + ",\n";
+    out += "    \"runtime_budget_class\": " +
+           json_quote(compatibility.runtime_budget_class) + ",\n";
+    out += "    \"precision_policy\": " +
+           json_quote(compatibility.precision_policy) + ",\n";
+    out += "    \"minimum_usable_device_bytes\": " +
+           std::to_string(compatibility.minimum_usable_device_bytes) + ",\n";
+    out += "    \"required_workspace_bytes\": " +
+           std::to_string(compatibility.required_workspace_bytes) + "\n";
+    out += "  },\n";
+  }
   out += "  \"transforms\": [";
   for (std::size_t index = 0; index < plan.transforms.size(); ++index) {
     const auto &transform = plan.transforms[index];
@@ -142,7 +197,7 @@ OptimizationPlan parse_plan(std::string_view text) {
   if (required(document, "kind").string() != kPlanKind)
     fail("file is not a diffusion-compiler optimization plan");
   const auto version = required(document, "version").number();
-  if (version != static_cast<double>(kPlanVersion))
+  if (version != 1.0 && version != static_cast<double>(kPlanVersion))
     fail("unsupported optimization plan version");
   OptimizationPlan plan;
   plan.base_program_fingerprint =
@@ -152,6 +207,26 @@ OptimizationPlan parse_plan(std::string_view text) {
       required(document, "candidate_program_fingerprint").string();
   plan.candidate_fingerprint =
       required(document, "candidate_fingerprint").string();
+  if (const auto *compatibility = document.find("compatibility")) {
+    if (!compatibility->is_object())
+      fail("optimization plan compatibility must be an object");
+    PlanCompatibility value;
+    value.compiler_revision =
+        required(*compatibility, "compiler_revision").string();
+    value.target_fingerprint =
+        required(*compatibility, "target_fingerprint").string();
+    value.runtime_budget_class =
+        required(*compatibility, "runtime_budget_class").string();
+    value.precision_policy =
+        required(*compatibility, "precision_policy").string();
+    value.minimum_usable_device_bytes = unsigned_integer(
+        required(*compatibility, "minimum_usable_device_bytes"),
+        "minimum usable device bytes");
+    value.required_workspace_bytes = unsigned_integer(
+        required(*compatibility, "required_workspace_bytes"),
+        "required workspace bytes");
+    plan.compatibility = std::move(value);
+  }
   const auto &transforms = required(document, "transforms");
   if (!transforms.is_array())
     fail("optimization plan transforms must be an array");
@@ -195,29 +270,78 @@ OptimizationPlan read_plan(const std::filesystem::path &path) {
   return parse_plan(buffer.str());
 }
 
+void bind_plan_compatibility(
+    OptimizationPlan &plan, const target::TargetProfile &profile,
+    const target::RuntimeBudget &budget, std::string precision_policy,
+    std::uint64_t minimum_usable_device_bytes,
+    std::uint64_t required_workspace_bytes) {
+  if (minimum_usable_device_bytes > budget.usable_device_memory_bytes)
+    fail("cannot bind a plan requiring more usable device memory than the "
+         "current runtime budget");
+  if (required_workspace_bytes > budget.workspace_budget_bytes)
+    fail("cannot bind a plan requiring more workspace than the current "
+         "runtime budget");
+  plan.compatibility = PlanCompatibility{
+      std::string(build::compiler_revision()),
+      target::target_fingerprint(profile),
+      target::runtime_budget_class(budget),
+      std::move(precision_policy),
+      minimum_usable_device_bytes,
+      required_workspace_bytes,
+  };
+}
+
+void validate_plan_compatibility(
+    const OptimizationPlan &plan, const target::TargetProfile &profile,
+    const target::RuntimeBudget &budget, std::string_view precision_policy) {
+  if (!plan.compatibility)
+    return;
+  const auto &expected = *plan.compatibility;
+  if (expected.compiler_revision != build::compiler_revision())
+    fail("optimization plan compiler revision mismatch: recorded " +
+         expected.compiler_revision + ", current " +
+         std::string(build::compiler_revision()));
+  const auto target = target::target_fingerprint(profile);
+  if (expected.target_fingerprint != target)
+    fail("optimization plan target mismatch: recorded " +
+         expected.target_fingerprint + ", current " + target);
+  if (expected.precision_policy != precision_policy)
+    fail("optimization plan precision policy mismatch: recorded " +
+         expected.precision_policy + ", current " +
+         std::string(precision_policy));
+  const auto budget_class = target::runtime_budget_class(budget);
+  if (expected.runtime_budget_class != budget_class)
+    fail("optimization plan runtime budget class mismatch: recorded " +
+         expected.runtime_budget_class + ", current " + budget_class);
+  if (budget.usable_device_memory_bytes <
+      expected.minimum_usable_device_bytes)
+    fail("optimization plan runtime budget has insufficient usable device "
+         "memory");
+  if (budget.workspace_budget_bytes < expected.required_workspace_bytes)
+    fail("optimization plan runtime budget has insufficient workspace");
+}
+
+std::string plan_fingerprint(const OptimizationPlan &plan) {
+  const auto text = serialize_plan(plan);
+  const auto bytes = std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t *>(text.data()), text.size());
+  return hex_digest(sha256(bytes));
+}
+
 RewriteContext replay(const OptimizationPlan &plan,
                       const RewriteContext &base) {
-  const auto base_program = program_fingerprint(base.program);
-  if (!plan.base_program_fingerprint.empty() &&
-      plan.base_program_fingerprint != base_program)
-    fail("optimization plan was recorded against program " +
-         plan.base_program_fingerprint + " but was replayed against " +
-         base_program);
-  const auto base_candidate = candidate_fingerprint(base);
-  if (!plan.base_fingerprint.empty() &&
-      plan.base_fingerprint != base_candidate)
-    fail("optimization plan base bindings do not match: recorded " +
-         plan.base_fingerprint + ", replayed " + base_candidate);
-  RewriteContext context = base;
-  for (const auto &transform : plan.transforms)
-    apply(transform, context);
-  ir::verify(context.program);
-  const auto produced = candidate_fingerprint(context);
-  if (!plan.candidate_fingerprint.empty() &&
-      plan.candidate_fingerprint != produced)
-    fail("replayed optimization plan produced candidate " + produced +
-         " but recorded " + plan.candidate_fingerprint);
-  return context;
+  if (plan.compatibility)
+    fail("target-bound optimization plan requires a TargetProfile and "
+         "RuntimeBudget for replay");
+  return replay_program(plan, base);
+}
+
+RewriteContext replay(const OptimizationPlan &plan, const RewriteContext &base,
+                      const target::TargetProfile &profile,
+                      const target::RuntimeBudget &budget,
+                      std::string_view precision_policy) {
+  validate_plan_compatibility(plan, profile, budget, precision_policy);
+  return replay_program(plan, base);
 }
 
 RewriteContext apply_global_strategy(const OptimizationPlan &plan,

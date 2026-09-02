@@ -118,6 +118,13 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
           config.selected_hidden_states[index])
         fail("selected qwen3-vl hidden states must be strictly increasing");
   }
+  if (config.vision_token_count != 0U) {
+    if (config.deepstack_language_layers.size() != 3U ||
+        !std::is_sorted(config.deepstack_language_layers.begin(),
+                        config.deepstack_language_layers.end()) ||
+        config.deepstack_language_layers.back() >= config.executed_layers)
+      fail("qwen3-vl multimodal conditioning requires three ordered in-range deepstack layers");
+  }
 
   const auto sequence = sequence_length;
   const auto hidden = config.hidden_size;
@@ -135,6 +142,21 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
   // ---- inputs -------------------------------------------------------------
   build.token_ids_input_id = builder.add_tensor(
       DType::I32, static_cast<std::uint32_t>(TensorRole::Input), {sequence});
+  if (config.vision_token_count != 0U) {
+    build.vision_embeddings_input_id = builder.add_tensor(
+        DType::BF16, static_cast<std::uint32_t>(TensorRole::Input),
+        {config.vision_token_count, hidden});
+    build.vision_destination_map_input_id = builder.add_tensor(
+        DType::I32, static_cast<std::uint32_t>(TensorRole::Input), {sequence});
+    build.visual_positions_input_id = builder.add_tensor(
+        DType::I32, static_cast<std::uint32_t>(TensorRole::Input),
+        {config.vision_token_count});
+    for (std::size_t index = 0U;
+         index < config.deepstack_language_layers.size(); ++index)
+      build.vision_deepstack_input_ids.push_back(builder.add_tensor(
+          DType::BF16, static_cast<std::uint32_t>(TensorRole::Input),
+          {config.vision_token_count, hidden}));
+  }
   std::uint32_t attention_bias_id = 0U;
   if (config.use_attention_mask) {
     build.attention_mask_input_id = builder.add_tensor(
@@ -181,6 +203,14 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
   auto residual_id = builder.internal({sequence, hidden});
   builder.operation(Opcode::GatherRows, {embedding_id, build.token_ids_input_id},
                     {residual_id});
+  if (config.vision_token_count != 0U) {
+    const auto spliced = builder.internal({sequence, hidden});
+    builder.operation(Opcode::IndexedUpdateRows,
+                      {residual_id, build.vision_embeddings_input_id,
+                       build.vision_destination_map_input_id},
+                      {spliced});
+    residual_id = spliced;
+  }
 
   const auto rms_attributes = [&](void) {
     return std::vector<Attribute>{
@@ -318,6 +348,34 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     const auto layer_output_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::Add, {residual_id, down_id}, {layer_output_id});
     residual_id = layer_output_id;
+
+    if (config.vision_token_count != 0U) {
+      const auto deepstack = std::find(config.deepstack_language_layers.begin(),
+                                       config.deepstack_language_layers.end(),
+                                       layer);
+      if (deepstack != config.deepstack_language_layers.end()) {
+        const auto deepstack_index = static_cast<std::size_t>(std::distance(
+            config.deepstack_language_layers.begin(), deepstack));
+        const auto selected_visual_rows =
+            builder.internal({config.vision_token_count, hidden});
+        builder.operation(Opcode::GatherRows,
+                          {residual_id, build.visual_positions_input_id},
+                          {selected_visual_rows});
+        const auto injected_visual_rows =
+            builder.internal({config.vision_token_count, hidden});
+        builder.operation(
+            Opcode::Add,
+            {selected_visual_rows,
+             build.vision_deepstack_input_ids.at(deepstack_index)},
+            {injected_visual_rows});
+        const auto injected = builder.internal({sequence, hidden});
+        builder.operation(Opcode::IndexedUpdateRows,
+                          {residual_id, injected_visual_rows,
+                           build.vision_destination_map_input_id},
+                          {injected});
+        residual_id = injected;
+      }
+    }
 
     const auto hidden_state_index = layer + 1U;
     if (std::find(config.selected_hidden_states.begin(),

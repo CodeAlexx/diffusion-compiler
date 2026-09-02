@@ -3,6 +3,7 @@
 #include "dif/ir/verify.hpp"
 #include "dif/frontend/h3.hpp"
 #include "dif/frontend/h3_vae.hpp"
+#include "dif/frontend/h3_video_encoder.hpp"
 #include "dif/frontend/training.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
@@ -353,6 +354,7 @@ void usage() {
             << "  difc make-h3-token-refiner-bf16 OUT.difir S HIDDEN HEADS DIM FFN LAYERS BLOCK resident|streamed\n"
             << "  difc make-h3-denoiser OUT.difir VIDEO_TOKENS AUDIO_TOKENS TEXT_TOKENS TIMESTEP_TABLES resident|streamed generated|cudnn [LAYERS REFINER_LAYERS]\n"
             << "  difc make-h3-video-vae OUT.difir LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
+            << "  difc make-h3-video-encoder OUT.difir FRAMES HEIGHT WIDTH resident|streamed\n"
             << "  difc make-mlp-training OUT.difir ROWS INPUT_WIDTH HIDDEN_WIDTH OUTPUT_WIDTH [LR BETA1 BETA2 EPS WEIGHT_DECAY] [f32|bf16]\n"
             << "  difc make-rectified-flow-training OUT.difir ROWS LATENT_WIDTH TIMESTEP_WIDTH HIDDEN_WIDTH ACCUMULATION_STEPS [LR BETA1 BETA2 EPS WEIGHT_DECAY]\n"
             << "  difc make-h3-block-raw-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY BLOCK resident|streamed\n"
@@ -574,6 +576,28 @@ int main(int argc, char **argv) {
                 << " raw_output=" << build.raw_output_id
                 << " decoded_output=" << build.decoded_output_id
                 << " fingerprint="
+                << dif::hex_digest(dif::ir::fingerprint(build.program))
+                << "\n";
+      return 0;
+    }
+    if (command == "make-h3-video-encoder" && argc == 7) {
+      const std::string residency = argv[6];
+      if (residency != "resident" && residency != "streamed")
+        dif::fail("H3 video encoder residency must be resident or streamed");
+      dif::frontend::H3VideoEncoderConfig config;
+      config.frames = number(argv[3], "frames");
+      config.height = number(argv[4], "height");
+      config.width = number(argv[5], "width");
+      config.streamed_constants = residency == "streamed";
+      config.capture_boundaries = false;
+      const auto build = dif::frontend::make_h3_video_encoder(config);
+      dif::ir::write_file(build.program, argv[2]);
+      std::cout << "PROGRAM path=" << argv[2] << " input=" << config.frames
+                << "x" << config.height << "x" << config.width
+                << " constant_residency=" << residency
+                << " pixels_input=" << build.pixels_input
+                << " moments_output=" << build.moments_output
+                << " weights=" << build.weights.size() << " fingerprint="
                 << dif::hex_digest(dif::ir::fingerprint(build.program))
                 << "\n";
       return 0;

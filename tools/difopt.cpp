@@ -6,6 +6,7 @@
 #include "dif/opt/plan.hpp"
 #include "dif/opt/search.hpp"
 #include "dif/runtime/executor.hpp"
+#include "dif/runtime/device_probe.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
 #include "dif/tune/database.hpp"
@@ -98,6 +99,7 @@ void usage() {
       "search:\n"
       "  --objective latency|memory   default latency\n"
       "  --backend cpu|cuda           default cpu\n"
+      "  --precision-policy NAME      plan compatibility policy identity\n"
       "  --warmups N --iterations N   measurement shape\n"
       "  --min-free-mib N              CUDA pressure guard\n"
       "  --beam N --depth N --max-candidates N --margin F\n"
@@ -136,6 +138,7 @@ int main(int argc, char **argv) {
     std::filesystem::path weight_bundle;
     bool verify_shards = false;
     std::string backend = "cpu";
+    std::string precision_policy = "diffir-declared-v1";
     dif::frontend::H3DenoiserConfig h3;
     h3.video_tokens = 2;
     h3.audio_tokens = 1;
@@ -231,6 +234,8 @@ int main(int argc, char **argv) {
           dif::fail("objective must be latency or memory");
       } else if (option == "--backend")
         backend = value();
+      else if (option == "--precision-policy")
+        precision_policy = value();
       else if (option == "--warmups")
         options.warmups = static_cast<std::uint32_t>(number(value(), "warmups"));
       else if (option == "--iterations")
@@ -358,7 +363,19 @@ int main(int argc, char **argv) {
 
     if (!replay_path.empty()) {
       const auto plan = dif::opt::read_plan(replay_path);
-      const auto rebuilt = dif::opt::replay(plan, base);
+      dif::opt::RewriteContext rebuilt;
+      if (plan.compatibility) {
+        dif::runtime::BudgetRequest request;
+        request.reserved_device_memory_bytes = options.minimum_free_bytes;
+        const auto probe = dif::runtime::probe_device(
+            backend == "cuda" ? dif::runtime::ProbeBackend::Cuda
+                              : dif::runtime::ProbeBackend::Host,
+            0, request);
+        rebuilt = dif::opt::replay(plan, base, probe.target, probe.budget,
+                                   precision_policy);
+      } else {
+        rebuilt = dif::opt::replay(plan, base);
+      }
       const auto footprint = dif::opt::measure_memory(rebuilt);
       std::cout << "REPLAY transforms=" << plan.transforms.size()
                 << " candidate=" << dif::opt::candidate_fingerprint(rebuilt)
@@ -400,7 +417,7 @@ int main(int argc, char **argv) {
     if (!database_path.empty())
       database.emplace(database_path);
 
-    const auto result = dif::opt::optimize(
+    auto result = dif::opt::optimize(
         base, *executor, gate, options, database ? &*database : nullptr,
         reference_outputs.empty() ? nullptr : &reference_outputs,
         "source-capture");
@@ -466,8 +483,27 @@ int main(int argc, char **argv) {
               << result.effective_latency_tolerance
               << " reference_backend=" << result.reference_backend << "\n";
 
-    if (!plan_path.empty())
+    if (!plan_path.empty()) {
+      dif::runtime::BudgetRequest request;
+      request.reserved_device_memory_bytes = options.minimum_free_bytes;
+      const auto probe = dif::runtime::probe_device(
+          backend == "cuda" ? dif::runtime::ProbeBackend::Cuda
+                            : dif::runtime::ProbeBackend::Host,
+          0, request);
+      const auto required_device_bytes =
+          backend == "cuda"
+              ? std::max(winner.resident_bytes, winner.memory.planned_bytes)
+              : 0U;
+      dif::opt::bind_plan_compatibility(
+          result.plan, probe.target, probe.budget, precision_policy,
+          required_device_bytes, 0U);
       dif::opt::write_plan(result.plan, plan_path);
+      std::cout << "PLAN fingerprint="
+                << dif::opt::plan_fingerprint(result.plan)
+                << " target=" << dif::target::target_fingerprint(probe.target)
+                << " budget_class="
+                << dif::target::runtime_budget_class(probe.budget) << "\n";
+    }
     if (!journal_path.empty())
       write_text(journal_path, dif::opt::serialize_journal(result));
     if (!output_path.empty())

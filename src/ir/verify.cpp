@@ -22,7 +22,7 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::Conv3d;
+  return opcode >= Opcode::Add && opcode <= Opcode::PadReflect;
 }
 
 bool valid_attr_key(AttrKey key) {
@@ -111,9 +111,11 @@ void verify_operation(const Program &program, const Operation &op) {
       fail("gelu semantics admit f32, bf16, or f16");
     const auto *approximation = op.find(AttrKey::Approximation);
     if (approximation == nullptr || approximation->kind != AttrKind::U64 ||
-        approximation->bits !=
-            static_cast<std::uint64_t>(GeluApproximation::Tanh))
-      fail("gelu currently requires Approximation=1 (tanh)");
+        (approximation->bits !=
+             static_cast<std::uint64_t>(GeluApproximation::Tanh) &&
+         approximation->bits !=
+             static_cast<std::uint64_t>(GeluApproximation::ExactErf)))
+      fail("gelu requires an explicit tanh or exact-erf approximation");
     return;
   }
 
@@ -1599,6 +1601,59 @@ void verify_operation(const Program &program, const Operation &op) {
         !(epsilon > 0.0) || block < input.dims[axis] || block > 1024U ||
         (block & (block - 1U)) != 0U)
       fail("channel_rms_norm requires float input/output, [C] gamma, a valid axis, and positive epsilon");
+    return;
+  }
+
+  if (op.opcode == Opcode::GroupNorm) {
+    expect_counts(op, 3, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (!supported_float(input.dtype) ||
+        (input.dims.size() != 4U && input.dims.size() != 5U) ||
+        weight.dtype != input.dtype || bias.dtype != input.dtype ||
+        weight.dims != std::vector<std::uint64_t>{input.dims[1]} ||
+        bias.dims != weight.dims || groups == 0U ||
+        input.dims[1] % groups != 0U || !(epsilon > 0.0) ||
+        !std::isfinite(epsilon) || block == 0U || block > 1024U ||
+        (block & (block - 1U)) != 0U)
+      fail("group_norm requires matching NCHW/NCDHW float tensors, [C] affine vectors, valid groups, and positive epsilon");
+    return;
+  }
+
+  if (op.opcode == Opcode::PadReflect) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (!supported_float(input.dtype) || out.dtype != input.dtype ||
+        (input.dims.size() != 4U && input.dims.size() != 5U) ||
+        out.dims.size() != input.dims.size())
+      fail("pad_reflect requires matching float NCHW or NCDHW tensors");
+    const auto front = op.u64(AttrKey::PadFront, 0U);
+    const auto back = op.u64(AttrKey::PadBack, 0U);
+    const auto top = op.u64(AttrKey::PadTop, 0U);
+    const auto bottom = op.u64(AttrKey::PadBottom, 0U);
+    const auto west = op.u64(AttrKey::PadWest, 0U);
+    const auto east = op.u64(AttrKey::PadEast, 0U);
+    if ((input.dims.size() == 4U && (front != 0U || back != 0U)) ||
+        (input.dims.size() == 5U &&
+         (front >= input.dims[2] || back >= input.dims[2])) ||
+        top >= input.dims[input.dims.size() - 2U] ||
+        bottom >= input.dims[input.dims.size() - 2U] ||
+        west >= input.dims.back() || east >= input.dims.back())
+      fail("pad_reflect extents must be smaller than their source dimensions");
+    auto expected = input.dims;
+    if (expected.size() == 5U)
+      expected[2] += front + back;
+    expected[expected.size() - 2U] += top + bottom;
+    expected.back() += west + east;
+    if (out.dims != expected)
+      fail("pad_reflect output geometry does not match its attributes");
     return;
   }
 

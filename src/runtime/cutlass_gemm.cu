@@ -302,6 +302,108 @@ typename Int8ScaledDeviceGemm::Arguments int8_scaled_arguments(
       static_cast<int>(k), 0, 0);
 }
 
+using Int8F16Output = cutlass::half_t;
+using Int8F16OutputThreadMap =
+    cutlass::epilogue::threadblock::OutputTileThreadLayout<
+        Int8ThreadblockShape, Int8WarpShape, Int8F16Output,
+        kInt8OutputAlignment, kInt8EpilogueStages>;
+using Int8F16RowScale = cutlass::epilogue::threadblock::VisitorColBroadcast<
+    Int8F16OutputThreadMap, float,
+    cute::Stride<cute::_1, cute::_0, std::int64_t>>;
+using Int8F16ScaledRows = cutlass::epilogue::threadblock::Sm80EVT<
+    Int8MulRow, Int8Accum, Int8F16RowScale>;
+using Int8F16ColumnScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+    Int8F16OutputThreadMap, float,
+    cute::Stride<cute::_0, cute::_1, std::int64_t>>;
+using Int8F16MulColumn = cutlass::epilogue::threadblock::VisitorCompute<
+    cutlass::multiplies, Int8F16Output, float,
+    cutlass::FloatRoundStyle::round_to_nearest>;
+using Int8F16ScaledOutput = cutlass::epilogue::threadblock::Sm80EVT<
+    Int8F16MulColumn, Int8F16ScaledRows, Int8F16ColumnScale>;
+using Int8F16Bias = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+    Int8F16OutputThreadMap, Int8F16Output,
+    cute::Stride<cute::_0, cute::_1, std::int64_t>>;
+using Int8F16AddBias = cutlass::epilogue::threadblock::VisitorCompute<
+    cutlass::plus, Int8F16Output, float,
+    cutlass::FloatRoundStyle::round_to_nearest>;
+using Int8F16BiasedOutput = cutlass::epilogue::threadblock::Sm80EVT<
+    Int8F16AddBias, Int8F16ScaledOutput, Int8F16Bias>;
+using Int8F16Store = cutlass::epilogue::threadblock::VisitorAuxStore<
+    Int8F16OutputThreadMap, Int8F16Output,
+    cutlass::FloatRoundStyle::round_to_nearest,
+    cute::Stride<std::int64_t, cute::_1, std::int64_t>>;
+using Int8F16Epilogue = cutlass::epilogue::threadblock::Sm80EVT<
+    Int8F16Store, Int8F16BiasedOutput>;
+using Int8F16ScaledDefinition =
+    cutlass::gemm::kernel::DefaultGemmWithVisitor<
+        Int8Element, Int8LayoutA, cutlass::ComplexTransform::kNone,
+        kInt8Alignment, Int8Element, Int8LayoutB,
+        cutlass::ComplexTransform::kNone, kInt8Alignment,
+        Int8BaseEpilogueElement, Int8LayoutC, kInt8OutputAlignment,
+        Int8Accumulator, Int8Compute, cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80, Int8ThreadblockShape, Int8WarpShape,
+        Int8InstructionShape, Int8F16Epilogue,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        kInt8Stages, cutlass::arch::OpMultiplyAddSaturate,
+        kInt8EpilogueStages>;
+using Int8F16ScaledKernelBase =
+    typename Int8F16ScaledDefinition::GemmKernel;
+struct Int8F16ScaledKernel : Int8F16ScaledKernelBase {
+  using Mma = typename Int8F16ScaledDefinition::GemmBase::Mma;
+  using Epilogue = typename Int8F16ScaledDefinition::Epilogue;
+  using EpilogueOutputOp = typename Epilogue::OutputOp;
+  using Operator = typename Mma::Operator;
+  using WarpShape = typename Mma::Operator::Shape;
+  using InstructionShape = typename Mma::Policy::Operator::InstructionShape;
+  static constexpr auto kTransformA = cutlass::ComplexTransform::kNone;
+  static constexpr auto kTransformB = cutlass::ComplexTransform::kNone;
+  static constexpr int kAlignmentA = kInt8Alignment;
+  static constexpr int kAlignmentB = kInt8Alignment;
+  static constexpr int kAlignmentC = kInt8OutputAlignment;
+  static constexpr int kThreadCount = 32 * Mma::WarpCount::kCount;
+
+  static cutlass::Status can_implement(Arguments const &arguments) {
+    const auto &problem = arguments.problem_size;
+    if ((problem.k() % kAlignmentA) != 0 ||
+        (problem.k() % kAlignmentB) != 0 ||
+        (problem.n() % kAlignmentC) != 0)
+      return cutlass::Status::kErrorMisalignedOperand;
+    return cutlass::Status::kSuccess;
+  }
+};
+using Int8F16ScaledDeviceGemm =
+    cutlass::gemm::device::GemmUniversalAdapter<Int8F16ScaledKernel>;
+
+typename Int8F16ScaledDeviceGemm::Arguments int8_scaled_f16_arguments(
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    std::uintptr_t input, std::uintptr_t weight, std::uintptr_t row_scale,
+    std::uintptr_t column_scale, std::uintptr_t bias,
+    std::uintptr_t output) {
+  using namespace cute;
+  typename Int8F16Epilogue::Arguments callbacks{
+      {{{{},
+         {reinterpret_cast<const float *>(row_scale), 0.0F,
+          {_1{}, _0{}, static_cast<std::int64_t>(m)}},
+         {}},
+        {reinterpret_cast<const float *>(column_scale), 0.0F,
+         {_0{}, _1{}, static_cast<std::int64_t>(n)}},
+        {}},
+       {reinterpret_cast<const Int8F16Output *>(bias), Int8F16Output(0),
+        {_0{}, _1{}, static_cast<std::int64_t>(n)}},
+       {}},
+      {reinterpret_cast<Int8F16Output *>(output),
+       {static_cast<std::int64_t>(n), _1{},
+        static_cast<std::int64_t>(m) * n}}};
+  return typename Int8F16ScaledDeviceGemm::Arguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k)}, 1,
+      callbacks, reinterpret_cast<const Int8Element *>(input),
+      reinterpret_cast<const Int8Element *>(weight), nullptr, nullptr,
+      static_cast<std::int64_t>(m) * k,
+      static_cast<std::int64_t>(n) * k, 0, 0, static_cast<int>(k),
+      static_cast<int>(k), 0, 0);
+}
+
 } // namespace
 
 struct CutlassGemmHandle {
@@ -318,6 +420,19 @@ struct CutlassInt8ScaledGemmHandle {
   std::uintptr_t column_scale{};
   std::uintptr_t output{};
   Int8ScaledDeviceGemm gemm;
+};
+
+struct CutlassInt8ScaledF16GemmHandle {
+  std::uint32_t m{};
+  std::uint32_t n{};
+  std::uint32_t k{};
+  std::uintptr_t input{};
+  std::uintptr_t weight{};
+  std::uintptr_t row_scale{};
+  std::uintptr_t column_scale{};
+  std::uintptr_t bias{};
+  std::uintptr_t output{};
+  Int8F16ScaledDeviceGemm gemm;
 };
 
 const char *cutlass_gemm_schedule_name(std::uint32_t schedule) {
@@ -550,6 +665,89 @@ bool launch_cutlass_int8_scaled_gemm(
 
 void destroy_cutlass_int8_scaled_gemm(
     CutlassInt8ScaledGemmHandle *handle) {
+  delete handle;
+}
+
+CutlassInt8ScaledF16GemmHandle *create_cutlass_int8_scaled_f16_gemm(
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    std::uintptr_t input, std::uintptr_t weight, std::uintptr_t row_scale,
+    std::uintptr_t column_scale, std::uintptr_t bias, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity) {
+  auto handle = std::make_unique<CutlassInt8ScaledF16GemmHandle>();
+  handle->m = m;
+  handle->n = n;
+  handle->k = k;
+  handle->input = input;
+  handle->weight = weight;
+  handle->row_scale = row_scale;
+  handle->column_scale = column_scale;
+  handle->bias = bias;
+  handle->output = output;
+  auto arguments = int8_scaled_f16_arguments(
+      m, n, k, input, weight, row_scale, column_scale, bias, output);
+  auto status = Int8F16ScaledDeviceGemm::can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) {
+    set_error(error, error_capacity,
+              std::string("CUTLASS INT8 scaled F16 can_implement failed: ") +
+                  cutlassGetStatusString(status));
+    return nullptr;
+  }
+  if (Int8F16ScaledDeviceGemm::get_workspace_size(arguments) != 0U) {
+    set_error(error, error_capacity,
+              "CUTLASS INT8 scaled F16 GEMM unexpectedly requires workspace");
+    return nullptr;
+  }
+  status = handle->gemm.initialize(
+      arguments, nullptr, reinterpret_cast<cudaStream_t>(stream));
+  if (status != cutlass::Status::kSuccess) {
+    set_error(error, error_capacity,
+              std::string("CUTLASS INT8 scaled F16 initialize failed: ") +
+                  cutlassGetStatusString(status));
+    return nullptr;
+  }
+  return handle.release();
+}
+
+bool launch_cutlass_int8_scaled_f16_gemm(
+    CutlassInt8ScaledF16GemmHandle *handle, std::uintptr_t input,
+    std::uintptr_t weight, std::uintptr_t row_scale,
+    std::uintptr_t column_scale, std::uintptr_t bias, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity) {
+  if (!handle) {
+    set_error(error, error_capacity,
+              "null CUTLASS INT8 scaled F16 GEMM handle");
+    return false;
+  }
+  auto status = cutlass::Status::kSuccess;
+  if (input != handle->input || weight != handle->weight ||
+      row_scale != handle->row_scale ||
+      column_scale != handle->column_scale || bias != handle->bias ||
+      output != handle->output) {
+    auto arguments = int8_scaled_f16_arguments(
+        handle->m, handle->n, handle->k, input, weight, row_scale,
+        column_scale, bias, output);
+    status = handle->gemm.update(arguments);
+    if (status == cutlass::Status::kSuccess) {
+      handle->input = input;
+      handle->weight = weight;
+      handle->row_scale = row_scale;
+      handle->column_scale = column_scale;
+      handle->bias = bias;
+      handle->output = output;
+    }
+  }
+  if (status == cutlass::Status::kSuccess)
+    status = handle->gemm.run(reinterpret_cast<cudaStream_t>(stream));
+  if (status == cutlass::Status::kSuccess)
+    return true;
+  set_error(error, error_capacity,
+            std::string("CUTLASS INT8 scaled F16 launch failed: ") +
+                cutlassGetStatusString(status));
+  return false;
+}
+
+void destroy_cutlass_int8_scaled_f16_gemm(
+    CutlassInt8ScaledF16GemmHandle *handle) {
   delete handle;
 }
 

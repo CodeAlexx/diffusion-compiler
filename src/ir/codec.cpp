@@ -290,6 +290,10 @@ std::string_view opcode_name(Opcode opcode) {
     return "pad_constant";
   case Opcode::Conv3d:
     return "conv3d";
+  case Opcode::GroupNorm:
+    return "group_norm";
+  case Opcode::PadReflect:
+    return "pad_reflect";
   }
   return "invalid";
 }

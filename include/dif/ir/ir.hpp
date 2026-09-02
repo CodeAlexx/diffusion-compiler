@@ -109,6 +109,15 @@ enum class Opcode : std::uint32_t {
   PadConstant = 63,
   // NCDHW cross-correlation with OIDHW weights and optional [C_out] bias.
   Conv3d = 64,
+  // Group normalization over contiguous channel groups. For NCHW/NCDHW,
+  // each batch item is normalized independently across C/groups and every
+  // trailing spatial dimension. Frontends that require an isolated temporal
+  // axis express that distinction with Permute + Reshape before this op.
+  GroupNorm = 65,
+  // Edge-exclusive reflection padding for NCHW/NCDHW tensors. Each padded
+  // extent must be smaller than the corresponding source dimension, matching
+  // the common framework reflect-padding contract.
+  PadReflect = 66,
 };
 
 enum class AttrKey : std::uint32_t {
@@ -197,8 +206,9 @@ enum class AttrKey : std::uint32_t {
 };
 
 // Gelu carries an explicit approximation because exact-erf and tanh GELU are
-// observably different source semantics.  Krea 2 uses the tanh form.
-enum class GeluApproximation : std::uint64_t { Tanh = 1 };
+// observably different source semantics. Krea 2 and Qwen vision blocks use
+// the tanh form; Qwen vision mergers use the exact erf form.
+enum class GeluApproximation : std::uint64_t { Tanh = 1, ExactErf = 2 };
 
 enum class LinearBiasMode : std::uint64_t { Epilogue = 1, Addmm = 2 };
 

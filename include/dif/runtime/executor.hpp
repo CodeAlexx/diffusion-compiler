@@ -2,6 +2,7 @@
 
 #include "dif/ir/ir.hpp"
 #include "dif/runtime/tensor.hpp"
+#include "dif/target/profile.hpp"
 
 #include <array>
 #include <cstdint>
@@ -52,10 +53,38 @@ struct RunOptions {
   std::vector<std::uint32_t> absorb_linear_bias_operations;
   std::vector<CutlassLinearChoice> cutlass_linear_operations;
   std::vector<LinearAlgorithmChoice> linear_algorithm_choices;
+  // Require a cuBLASLt algorithm with no cross-CTA split-K reduction for
+  // ordinary Linear operations. The runtime fails closed when heuristics do
+  // not expose one; this is compiler execution policy, not a hidden fallback.
+  bool deterministic_linear_algorithms{false};
   // Explicit compiler-selected streamed constants to promote into persistent
   // device storage for the lifetime of this prepared execution. The runtime
   // validates and executes this list but never chooses it heuristically.
   std::vector<std::uint32_t> resident_streamed_constants;
+  // Generic compiler-selected ConvRot INT8 precision policy for ordinary
+  // BF16/F16 DiffIR Linear operations. The cache is sealed to the exact DiffIR
+  // fingerprint and stores one rotated I8 weight plus F32 output-channel
+  // scales per selected semantic weight tensor.  The runtime supplies the
+  // matching dynamic per-row activation transform and executes the same
+  // Linear result shape through the shared NVIDIA backend; no model-specific
+  // opcode or executor is introduced.
+  std::filesystem::path convrot_int8_checkpoint;
+  // Explicit prefix of eligible semantic Linear operations to lower through
+  // the generic ConvRot cache. Zero means every eligible Linear. This is
+  // compiler precision policy: later operations remain on their ordinary
+  // exact source-dtype lowering and continue to consume the original bundle
+  // weights.
+  std::uint32_t convrot_int8_linear_count{};
+  // Keep every selected generic ConvRot weight and scale in prepared device
+  // storage. The original semantic weights are excluded from the memory plan,
+  // so this is the repeated-execution route for decoder-style programs; the
+  // default two-slot route remains available for larger streamed models.
+  bool convrot_int8_resident{false};
+  // Higher-fidelity generic ConvRot lowering: keep the rotated checkpoint in
+  // INT8 storage, but rotate activations and dequantize the current weight in
+  // BF16 before the ordinary cuBLASLt Linear. This removes activation
+  // quantization while retaining the half-size checkpoint lifecycle.
+  bool convrot_int8_weight_only_quality{false};
   // Explicit compiler-selected semantic Reshape operations whose internal
   // outputs alias their immutable inputs in the prepared execution plan.
   std::vector<std::uint32_t> alias_reshape_operations;
@@ -93,6 +122,14 @@ struct RunOptions {
   // op. No ComfyUI checkpoint weights participate in this route.
   std::filesystem::path h3_convrot_int8_checkpoint;
   std::uint32_t h3_convrot_int8_layer{};
+  // Explicit compiler precision policy: only this many consecutive H3 blocks
+  // use ConvRot INT8. Remaining blocks retain ordinary BF16 DiffIR lowering.
+  // This is independent from residency, which controls where admitted
+  // ConvRot weights live without changing their numerical path.
+  std::uint32_t h3_convrot_int8_attention_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  std::uint32_t h3_convrot_int8_mlp_layers{
+      std::numeric_limits<std::uint32_t>::max()};
   std::uint32_t h3_convrot_int8_resident_layers{
       std::numeric_limits<std::uint32_t>::max()};
   // Explicit compiler-selected row tile for direct H3 INT8 MLP projections.
@@ -117,6 +154,24 @@ struct RunOptions {
   // retaining the exact cuDNN attention route. Off by default until complete
   // trajectory and decoded-quality gates admit it.
   bool h3_int8_cutlass_scaled_all{false};
+  // Higher-fidelity ConvRot activation quantization policy. Zero preserves
+  // the historical one-scale-per-row contract. A positive multiple of the
+  // 256-wide rotation group computes independent dynamic activation scales
+  // for each K chunk, evaluates the same INT8 dot product chunk-by-chunk, and
+  // accumulates the scaled partials in F32 before the observable BF16
+  // projection boundary. The official ConvRot checkpoint and its static
+  // per-output-channel weight scales are unchanged.
+  std::uint32_t h3_int8_convrot_scale_chunk{};
+  // Diagnostic separation of static grouped-weight scaling from dynamic
+  // activation scaling. When true, grouped ConvRot weights retain their
+  // configured K chunks while activations use the original global row scale.
+  bool h3_int8_convrot_global_activation_scale{false};
+  // Precision-correction rows for the H3 ConvRot projection chains. The
+  // selected sequence rows are recomputed from the same resident rotated I8
+  // weights with BF16 activations/dequantization and overwrite the approximate
+  // row results before downstream semantics consume them. This is explicit
+  // compiler precision policy; the runtime never guesses modality rows.
+  std::vector<std::uint32_t> h3_convrot_bf16_correction_rows;
   // Candidate prepared lowering for ConvRot H3 blocks: consume compact
   // creator AdaLN tables directly inside RMSNorm/ConvRot encode and residual
   // epilogues. This removes the six sequence-expanded modulation tensors and
@@ -130,6 +185,8 @@ struct RunOptions {
   // the unchanged DiffIR semantic boundary.
   std::filesystem::path h3_groupwise_cache;
   std::uint32_t h3_groupwise_layer{};
+  std::uint32_t h3_groupwise_layers{
+      std::numeric_limits<std::uint32_t>::max()};
   // Serenity's accepted prepared AdaLN path. The cache contains the BF16
   // modulation result for each block; the companion DiffTensor is the exact
   // activated BF16 timestep input used to build it and is checked byte-for-
@@ -268,6 +325,18 @@ struct LinearBiasFusionResult {
   std::uint32_t bias_operation_id{};
   std::uint64_t eliminated_intermediate_bytes{};
   std::string implementation;
+};
+
+struct ConvRotInt8LinearResult {
+  std::uint32_t operation_id{};
+  std::uint32_t weight_tensor_id{};
+  std::uint64_t rows{};
+  std::uint64_t output_columns{};
+  std::uint64_t contraction{};
+  std::uint64_t quantized_weight_bytes{};
+  std::string classification;
+  std::string implementation;
+  std::string cache_path;
 };
 
 // Counters for the persisted cuBLASLt Linear algorithm store: how many plans
@@ -425,6 +494,8 @@ struct PipelineProfile {
 };
 
 struct RunResult {
+  target::TargetProfile target_profile;
+  target::RuntimeBudget runtime_budget;
   TensorMap outputs;
   TensorMap captured_intermediates;
   double preparation_milliseconds{};
@@ -442,6 +513,7 @@ struct RunResult {
   std::vector<LinearAlgorithmChoice> selected_linear_algorithms;
   std::vector<PrimitiveFusionResult> primitive_fusions;
   std::vector<LinearBiasFusionResult> linear_bias_fusions;
+  std::vector<ConvRotInt8LinearResult> convrot_int8_linears;
   LinearHeuristicCacheStats linear_heuristic_cache;
   std::vector<GemmPrimitiveResult> gemm_primitives;
   std::vector<H3W8A8MlpResult> h3_w8a8_mlps;

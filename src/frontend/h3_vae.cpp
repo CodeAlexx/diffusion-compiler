@@ -1,4 +1,5 @@
 #include "dif/frontend/h3_vae.hpp"
+#include "dif/frontend/h3_constants.hpp"
 
 #include "dif/ir/verify.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -56,34 +57,12 @@ runtime::Tensor i32_tensor(std::vector<std::uint64_t> dims,
   return tensor;
 }
 
-constexpr std::array<float, 24> kLatentMean = {
-    0.858090341091156F,   -0.9606591463088989F, 1.0661640167236328F,
-    -0.5090325474739075F, -0.2727581858634949F, -1.3675414323806763F,
-    -0.2553254961967468F, -0.26907554268836975F, -0.5376840829849243F,
-    -0.0464097298681736F, 0.6657370328903198F,  0.19690127670764923F,
-    -0.5460608005523682F, -0.4035342037677765F, -0.23683024942874908F,
-    0.25928452610969543F, -0.30133944749832153F, 0.211341992020607F,
-    -1.1206848621368408F, 0.3581933379173279F,  -0.04225143790245056F,
-    0.2604829967021942F,  0.22864092886447906F, 0.7056031823158264F,
-};
-
-constexpr std::array<float, 24> kLatentStd = {
-    1.2223774194717407F, 1.2767263650894165F, 1.6831774711608887F,
-    1.7549455165863037F, 1.5636216402053833F, 2.194143533706665F,
-    0.9653137922286987F, 1.0569885969161987F, 0.841948926448822F,
-    0.7729952931404114F, 1.8955937623977661F, 0.946841835975647F,
-    0.7996809482574463F, 0.44988900423049927F, 0.7197399735450745F,
-    0.6936293244361877F, 2.961095094680786F,  2.7694199085235596F,
-    3.0496184825897217F, 2.1088054180145264F, 3.276226282119751F,
-    3.1627357006073F,    2.2816812992095947F, 2.6127843856811523F,
-};
-
 } // namespace
 
 H3VideoVaeBuild make_h3_video_vae_decoder(const H3VideoVaeConfig &config) {
   if (config.latent_frames == 0U || config.latent_height == 0U ||
       config.latent_width == 0U || config.layers == 0U ||
-      config.latent_channels != kLatentMean.size() ||
+      config.latent_channels != kH3VideoLatentMean.size() ||
       config.output_channels != 3U || config.heads == 0U ||
       config.head_dim == 0U || config.ffn == 0U ||
       config.register_tokens == 0U || config.patch_t == 0U ||
@@ -158,11 +137,11 @@ H3VideoVaeBuild make_h3_video_vae_decoder(const H3VideoVaeConfig &config) {
   const auto latent_std = add_generated(
       "dif.latents_std",
       float_tensor(DType::F32, {config.latent_channels},
-                   std::vector<float>(kLatentStd.begin(), kLatentStd.end())));
+      std::vector<float>(kH3VideoLatentStd.begin(), kH3VideoLatentStd.end())));
   const auto latent_mean = add_generated(
       "dif.latents_mean",
       float_tensor(DType::F32, {config.latent_channels},
-                   std::vector<float>(kLatentMean.begin(), kLatentMean.end())));
+      std::vector<float>(kH3VideoLatentMean.begin(), kH3VideoLatentMean.end())));
 
   std::vector<float> position_values;
   position_values.reserve(static_cast<std::size_t>(sequence * 3U));

@@ -132,45 +132,71 @@ The original numbers remain the frozen pre-optimization baseline. Successor
 plans continue to use the same prompt, seed, BF16 quality class, scheduler,
 and output gate.
 
-## MiniMax-H3 ConvRot INT8 development checkpoint
+## MiniMax-H3 FL2VA prompt-to-MP4 checkpoint
 
-The current H3 optimization checkpoint uses the project-owned native ConvRot
-INT8 projection cache with exact cuDNN attention. It does not use Sage, SOL,
-SLA, ComfyUI weights, or an approximate-attention path. Measurements below are
-from one RTX 3090 Ti at its deliberate 300 W power limit and a real-dimensional
-Ref2VA execution fixture: 1024x576, 124 delivered frames, sequence length
-23,185, 50 transformer blocks, and eight schedule points / seven denoiser
-evaluations.
+The current H3 product path executes literal FL2VA inputs through native
+presentation, Qwen3-VL vision/text conditioning, both keyframe encodes, seven
+denoiser evaluations, video/audio decode, and a saved H.264/AAC MP4. It uses
+native ConvRot INT8 projections and the project-owned CK INT8 attention DSO in
+the Compiler only; SerenityFlow and ComfyUI are unchanged. This is an
+approximate INT8 route, distinct from the exact BF16/cuDNN route.
 
-| Measurement | Exact streamed BF16 | Resident ConvRot INT8 + exact cuDNN |
-|---|---:|---:|
-| First measured denoiser evaluation | 30.998 s device / 33.230 s wall | 19.872 s device |
-| Hot denoiser evaluation median | not yet captured | 18.082 s |
-| Seven-evaluation denoise | not yet captured | 128.510 s device / 131.023 s wall |
-| Runtime-accounted VRAM requirement | 6.332 GB | 22.941 GB |
+The matched contract is one RTX 3090 Ti at 300 W, two keyframes, 832x480,
+124 delivered frames at 24 fps, 207 audio latents, 1,256 conditioner tokens,
+packed sequence length 16,880, and seven `res_multistep`/`simple` evaluations.
+The performance ratio uses only complete literal-prompt-to-saved-MP4 wall time.
 
-An explicit auxiliary-residency diagnostic measured an 18.053 s hot median
-with a 23.008 GB accounted requirement and 1.231 GB reported free. It removed
-repeated hot H2D staging but improved only about 29 ms, so transfer is no longer
-the main hot-step bottleneck. Relative to the 30.998 s streamed-BF16 device
-checkpoint, the current best repeated evaluation is 1.717x faster. This is a
-development comparison, not yet a matched prompt-to-video claim.
+| Complete-wall measurement | Time |
+|---|---:|
+| Fastest valid matched stock ComfyUI ConvRot INT8 baseline | 81.0952614400303 s |
+| Strict 2x Compiler ceiling | <40.54763072001515 s |
+| Fastest valid Compiler ConvRot INT8 + CK result | 78.88 s |
 
-The native 50-block ConvRot cache is 19,279,810,048 bytes and fits without OOM.
-The scaled CUTLASS projection path reduced reusable scratch by 176,160,768
-bytes. Its complete seven-evaluation video latent, audio rows, and final audio
-latent are bit-identical to the prior accepted ConvRot control: cosine 1,
-relative L2 0, norm ratio 1, zero nonfinites, and zero bit mismatches.
+The Compiler is currently **1.028083943x faster** than that baseline, a 2.732%
+wall-time reduction, but it is **38.33236928 s above** the strict 2x ceiling.
+It still needs a 48.596% reduction from its current best time. No 2x result is
+claimed.
 
-Nsight attributes 67.9% of hot device kernel time to exact cuDNN attention and
-24.5% to the scaled INT8 projection GEMMs. A 15.229 s candidate using
-approximate CK attention crossed the provisional 2x per-evaluation timing bar
-but failed the unchanged trajectory gate (video relative L2 `0.02756`, final
-audio-latent relative L2 `0.06401`) and was rejected.
+Diagnostic stage walls for the 78.88 s result were 0.23 s presentation, 1.10 s
+vision, 4.84/4.93 s concurrent keyframe encodes, 7.45 s conditioning, 55.47 s
+denoise, 5.70/13.61 s concurrent audio/video decode, and 0.48 s mux. These
+overlap and must not be summed or used instead of the complete wall.
 
-The required literal-input FL2VA and Ref2VA prompt-to-video, decoded visual,
-and audio acceptance runs remain open. No 2x prompt-to-video result is claimed
-until both complete paths pass those gates.
+The saved MP4 is 832x480 H.264 with 124 frames at 24 fps plus 32 kHz stereo AAC
+and passed direct visual inspection for coherent subject and camera motion. Its
+SHA-256 is
+`cfb0c6b8110ff2dda9a0a240e57b5a16476cff0b3c5c41872f131e2ebc21e64f`.
+Decoded video/audio numerical parity to the stock competitor is not fully
+accepted, so the result remains an approximate quality checkpoint as well as a
+rejected 2x performance result.
+
+An exact-output QKV/RMSNorm/RoPE fusion improved isolated hot denoiser
+evaluations but regressed complete wall to 84.49 s warm and 92.05 s cold; it
+was removed. Stage-level wins do not override the complete-wall decision.
+
+## Hardware target and observability foundation
+
+Phase A adds one model-neutral hardware target layer shared by the compiler,
+runtime, and tools. `difprobe` reports static target capability separately from
+the dynamic budget for the current execution:
+
+```sh
+build/difprobe
+build/difprobe --json
+```
+
+On the development RTX 3090 Ti it identifies Ampere `sm_86`, 84 SMs,
+25,248,202,752 bytes total VRAM, BF16/FP16/INT8 tensor-core support, no FP8 or
+NVFP4 support, and the installed CUDA driver/runtime, cuBLASLt, and cuDNN
+versions. Free/usable VRAM, host RAM, pinned staging, and workspace are dynamic
+budget fields and are not folded into static model semantics.
+
+The JSON document uses the versioned `diffusion-compiler-telemetry` schema.
+Optimization plans now serialize as version 2 with optional compiler revision,
+target-capability fingerprint, runtime-budget class, precision policy, and
+minimum VRAM/workspace requirements. Target-bound replay fails closed when any
+required compatibility condition changes; version-1 plans remain readable as
+explicitly unbound historical plans.
 
 ## Build and test
 
@@ -204,13 +230,15 @@ Core tools include:
 
 - `difc`, `difinspect`, and `difrun` for DiffIR construction, inspection, and
   execution.
+- `difprobe` for the shared hardware `TargetProfile` and current
+  `RuntimeBudget`, with stable JSON output.
 - `difweights`, `difcast`, `difcompare`, and `difquant` for model storage and
   numerical gates.
 - `difschedule` for authenticated flow schedules.
 - `difopt` and `diftune` for gated plan search and backend candidate tests.
 - `diftrain` for compiled forward/backward, optimizer state, and resume.
-- `difh3layout`, `difh3infer`, `difh3media`, and `difvaedecode` for the H3
-  proving path.
+- `difh3layout`, `difh3vision`, `difh3encode`, `difh3state`, `difh3infer`,
+  `difh3media`, and `difvaedecode` for the H3 proving path.
 - `difkrea2block`, `difkrea2denoise`, `difkrea2sample`, and `difkrea2vae` for
   the Krea 2 source-faithful gates and native image path.
 

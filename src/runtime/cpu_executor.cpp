@@ -91,14 +91,22 @@ void silu(const ir::Operation &op, TensorMap &tensors) {
 void gelu(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[0]);
   auto &out = tensors.at(op.outputs[0]);
+  const auto approximation = static_cast<ir::GeluApproximation>(
+      op.u64(ir::AttrKey::Approximation, 0U));
   constexpr float kSqrtTwoOverPi = 0.7978845608028654F;
   constexpr float kCubicCoefficient = 0.044715F;
   for (std::uint64_t i = 0; i < out.element_count(); ++i) {
     const auto value = load_float(input, i);
-    const auto cubic = value * value * value;
-    const auto inner = kSqrtTwoOverPi *
-                       (value + kCubicCoefficient * cubic);
-    store_float(out, i, 0.5F * value * (1.0F + std::tanh(inner)));
+    if (approximation == ir::GeluApproximation::ExactErf) {
+      store_float(out, i,
+                  0.5F * value *
+                      (1.0F + std::erf(value * 0.7071067811865475F)));
+    } else {
+      const auto cubic = value * value * value;
+      const auto inner =
+          kSqrtTwoOverPi * (value + kCubicCoefficient * cubic);
+      store_float(out, i, 0.5F * value * (1.0F + std::tanh(inner)));
+    }
   }
 }
 
@@ -1866,6 +1874,72 @@ void pad_constant(const ir::Operation &op, TensorMap &tensors) {
           }
 }
 
+std::uint64_t reflect_coordinate(std::uint64_t position,
+                                 std::uint64_t before,
+                                 std::uint64_t length) {
+  if (position < before)
+    return before - position;
+  const auto shifted = position - before;
+  if (shifted < length)
+    return shifted;
+  return 2U * length - 2U - shifted;
+}
+
+void pad_reflect(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto front = op.u64(ir::AttrKey::PadFront, 0U);
+  const auto top = op.u64(ir::AttrKey::PadTop, 0U);
+  const auto west = op.u64(ir::AttrKey::PadWest, 0U);
+  if (input.dims.size() == 4U) {
+    const auto channels = input.dims[1];
+    const auto input_h = input.dims[2];
+    const auto input_w = input.dims[3];
+    const auto output_h = out.dims[2];
+    const auto output_w = out.dims[3];
+    for (std::uint64_t b = 0U; b < input.dims[0]; ++b)
+      for (std::uint64_t c = 0U; c < channels; ++c)
+        for (std::uint64_t y = 0U; y < output_h; ++y)
+          for (std::uint64_t x = 0U; x < output_w; ++x) {
+            const auto source_y = reflect_coordinate(y, top, input_h);
+            const auto source_x = reflect_coordinate(x, west, input_w);
+            const auto source =
+                ((b * channels + c) * input_h + source_y) * input_w +
+                source_x;
+            const auto target =
+                ((b * channels + c) * output_h + y) * output_w + x;
+            store_float(out, target, load_float(input, source));
+          }
+    return;
+  }
+  const auto channels = input.dims[1];
+  const auto input_t = input.dims[2];
+  const auto input_h = input.dims[3];
+  const auto input_w = input.dims[4];
+  const auto output_t = out.dims[2];
+  const auto output_h = out.dims[3];
+  const auto output_w = out.dims[4];
+  for (std::uint64_t b = 0U; b < input.dims[0]; ++b)
+    for (std::uint64_t c = 0U; c < channels; ++c)
+      for (std::uint64_t t = 0U; t < output_t; ++t)
+        for (std::uint64_t y = 0U; y < output_h; ++y)
+          for (std::uint64_t x = 0U; x < output_w; ++x) {
+            const auto source_t = reflect_coordinate(t, front, input_t);
+            const auto source_y = reflect_coordinate(y, top, input_h);
+            const auto source_x = reflect_coordinate(x, west, input_w);
+            const auto source =
+                (((b * channels + c) * input_t + source_t) * input_h +
+                 source_y) *
+                    input_w +
+                source_x;
+            const auto target =
+                (((b * channels + c) * output_t + t) * output_h + y) *
+                    output_w +
+                x;
+            store_float(out, target, load_float(input, source));
+          }
+}
+
 void conv3d(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[0]);
   const auto &weight = tensors.at(op.inputs[1]);
@@ -1968,6 +2042,44 @@ void channel_rms_norm(const ir::Operation &op, TensorMap &tensors) {
                                                input.dtype);
         const auto scaled = round_to_dtype(normalized * scale, input.dtype);
         store_float(out, index, scaled * load_float(gamma, channel));
+      }
+    }
+  }
+}
+
+void group_norm(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &bias = tensors.at(op.inputs[2]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto channels = input.dims[1];
+  const auto channels_per_group = channels / groups;
+  std::uint64_t inner = 1U;
+  for (std::size_t axis = 2U; axis < input.dims.size(); ++axis)
+    inner *= input.dims[axis];
+  const auto elements_per_group = channels_per_group * inner;
+  for (std::uint64_t batch = 0U; batch < input.dims[0]; ++batch) {
+    for (std::uint64_t group = 0U; group < groups; ++group) {
+      const auto base = (batch * channels + group * channels_per_group) * inner;
+      float mean = 0.0F;
+      for (std::uint64_t index = 0U; index < elements_per_group; ++index)
+        mean += load_float(input, base + index);
+      mean /= static_cast<float>(elements_per_group);
+      float variance = 0.0F;
+      for (std::uint64_t index = 0U; index < elements_per_group; ++index) {
+        const auto centered = load_float(input, base + index) - mean;
+        variance += centered * centered;
+      }
+      variance /= static_cast<float>(elements_per_group);
+      const auto inverse = 1.0F / std::sqrt(variance + epsilon);
+      for (std::uint64_t index = 0U; index < elements_per_group; ++index) {
+        const auto channel = group * channels_per_group + index / inner;
+        const auto normalized = (load_float(input, base + index) - mean) * inverse;
+        store_float(out, base + index,
+                    normalized * load_float(weight, channel) +
+                        load_float(bias, channel));
       }
     }
   }
@@ -2245,6 +2357,12 @@ void execute_once(const ir::Program &program, TensorMap &tensors) {
       break;
     case ir::Opcode::Conv3d:
       conv3d(op, tensors);
+      break;
+    case ir::Opcode::GroupNorm:
+      group_norm(op, tensors);
+      break;
+    case ir::Opcode::PadReflect:
+      pad_reflect(op, tensors);
       break;
     case ir::Opcode::SnakeBeta:
       snake_beta(op, tensors);

@@ -82,6 +82,8 @@ bool dtype_uniform(ir::Opcode opcode) {
   case ir::Opcode::UpsampleNearest2d:
   case ir::Opcode::PadConstant:
   case ir::Opcode::Conv3d:
+  case ir::Opcode::GroupNorm:
+  case ir::Opcode::PadReflect:
     return true;
   default:
     return false;

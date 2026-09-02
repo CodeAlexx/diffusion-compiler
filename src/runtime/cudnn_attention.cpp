@@ -47,6 +47,7 @@ struct CudnnAttentionPlan::Impl {
   float scale{};
   bool additive_bias{};
   bool autotune{};
+  bool deterministic{};
   bool tuned{};
 
   ~Impl() {
@@ -157,14 +158,35 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
     mode = fe::HeurMode_t::A;
     impl_->autotune = true;
     break;
+  case 4U:
+    mode = fe::HeurMode_t::A;
+    impl_->deterministic = true;
+    break;
   default:
-    fail("cuDNN attention heuristic must be A, B, FALLBACK, or autotune");
+    fail("cuDNN attention heuristic must be A, B, FALLBACK, autotune, or deterministic");
   }
-  auto status = impl_->graph->build(
-      impl_->handle, {mode},
-      impl_->autotune ? fe::BuildPlanPolicy_t::ALL
-                      : fe::BuildPlanPolicy_t::HEURISTICS_CHOICE,
-      false);
+  auto status = fe::error_t{fe::error_code_t::OK, ""};
+  if (impl_->deterministic) {
+    status = impl_->graph->validate();
+    if (status.is_good())
+      status = impl_->graph->build_operation_graph(impl_->handle);
+    if (status.is_good())
+      status = impl_->graph->create_execution_plans({mode});
+    if (status.is_good())
+      impl_->graph->deselect_numeric_notes(
+          {fe::NumericalNote_t::NONDETERMINISTIC});
+    if (status.is_good())
+      status = impl_->graph->check_support(impl_->handle);
+    if (status.is_good())
+      status = impl_->graph->build_plans(
+          impl_->handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false);
+  } else {
+    status = impl_->graph->build(
+        impl_->handle, {mode},
+        impl_->autotune ? fe::BuildPlanPolicy_t::ALL
+                        : fe::BuildPlanPolicy_t::HEURISTICS_CHOICE,
+        false);
+  }
   if (!status.is_good())
     fail("cuDNN attention graph build: " + status.get_message());
   std::int64_t workspace = 0;

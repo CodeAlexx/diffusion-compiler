@@ -7,6 +7,7 @@ namespace dif::runtime {
 
 struct CutlassGemmHandle;
 struct CutlassInt8ScaledGemmHandle;
+struct CutlassInt8ScaledF16GemmHandle;
 
 struct CutlassGemmResources {
   const char *name{};
@@ -59,5 +60,23 @@ bool launch_cutlass_int8_scaled_gemm(
     std::uintptr_t stream, char *error, std::size_t error_capacity);
 
 void destroy_cutlass_int8_scaled_gemm(CutlassInt8ScaledGemmHandle *handle);
+
+// F16-output companion used by source-F16 semantic Linear operations.  The
+// INT8 dot product and F32 scale products are identical to the BF16 route;
+// only the observable 16-bit output conversion differs.
+CutlassInt8ScaledF16GemmHandle *create_cutlass_int8_scaled_f16_gemm(
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    std::uintptr_t input, std::uintptr_t weight, std::uintptr_t row_scale,
+    std::uintptr_t column_scale, std::uintptr_t bias, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity);
+
+bool launch_cutlass_int8_scaled_f16_gemm(
+    CutlassInt8ScaledF16GemmHandle *handle, std::uintptr_t input,
+    std::uintptr_t weight, std::uintptr_t row_scale,
+    std::uintptr_t column_scale, std::uintptr_t bias, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity);
+
+void destroy_cutlass_int8_scaled_f16_gemm(
+    CutlassInt8ScaledF16GemmHandle *handle);
 
 } // namespace dif::runtime

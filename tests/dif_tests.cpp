@@ -12,9 +12,12 @@
 #include "dif/frontend/h3_latents.hpp"
 #include "dif/frontend/h3_media.hpp"
 #include "dif/frontend/h3_vae.hpp"
+#include "dif/frontend/h3_video_encoder.hpp"
 #include "dif/frontend/h3_audio_vae.hpp"
 #include "dif/frontend/krea2.hpp"
 #include "dif/frontend/krea2_vae.hpp"
+#include "dif/frontend/qwen3vl_conditioner.hpp"
+#include "dif/frontend/qwen3vl_vision.hpp"
 #include "dif/frontend/training.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -24,6 +27,7 @@
 #include "dif/support/json.hpp"
 #include "dif/support/png.hpp"
 #include "dif/support/sha256.hpp"
+#include "dif/support/torch_cpu_rng.hpp"
 #include "dif/support/wav.hpp"
 #include "dif/training/checkpoint.hpp"
 #include "dif/weights/bundle.hpp"
@@ -223,6 +227,41 @@ void test_cpu_linear_bias() {
   for (std::size_t i = 0; i < expected.size(); ++i)
     expect(std::abs(output[i] - expected[i]) < 1.0e-6F,
            "CPU fused Linear bias result");
+
+  Program addmm;
+  addmm.tensors = {
+      {1, DType::BF16, TensorRole::Input, {3, 4}},
+      {2, DType::BF16, TensorRole::Constant, {5, 4}},
+      {3, DType::BF16, TensorRole::Constant, {5}},
+      {4, DType::BF16, TensorRole::Output, {3, 5}},
+  };
+  addmm.operations = {{1, Opcode::Linear, {1, 2, 3}, {4},
+                       {Attribute::u64(
+                           AttrKey::LinearBiasMode,
+                           static_cast<std::uint64_t>(
+                               LinearBiasMode::Addmm))}}};
+  dif::runtime::TensorMap addmm_inputs;
+  addmm_inputs.emplace(
+      1, float_tensor(DType::BF16, {3, 4},
+                      {1.0F, -2.0F, 3.0F, 0.5F, -4.0F, 5.0F, 0.25F,
+                       2.0F, 7.0F, -1.0F, -3.0F, 4.0F}));
+  addmm_inputs.emplace(
+      2, float_tensor(DType::BF16, {5, 4},
+                      {0.5F, 1.0F, -1.0F, 2.0F, -2.0F, 0.25F, 1.5F,
+                       0.5F, 3.0F, -0.5F, 0.75F, -1.0F, 1.0F, 1.0F,
+                       1.0F, 1.0F, -0.25F, 2.0F, -3.0F, 0.125F}));
+  addmm_inputs.emplace(
+      3, float_tensor(DType::BF16, {5},
+                      {0.125F, -0.25F, 0.5F, 1.0F, -2.0F}));
+  const auto addmm_cpu = executor->run(addmm, addmm_inputs, options);
+  if (dif::runtime::cuda_available()) {
+    const auto addmm_cuda =
+        dif::runtime::make_cuda_executor()->run(addmm, addmm_inputs, options);
+    const auto &reference = addmm_cpu.outputs.at(4);
+    const auto &candidate = addmm_cuda.outputs.at(4);
+    expect(reference.bytes == candidate.bytes,
+           "CUDA multi-row addmm prefill is bit-exact to BF16 CPU semantics");
+  }
 }
 
 void test_float_storage_conversions() {
@@ -311,6 +350,7 @@ dif::ir::Program all_opcodes_program(dif::ir::DType dtype) {
   program.tensors.push_back({78, dtype, output, {1, 2, 2, 2, 2}});
   program.tensors.push_back({79, dtype, input, {1, 2}});
   program.tensors.push_back({80, dtype, output, {1, 2}});
+  program.tensors.push_back({81, dtype, output, {1, 2}});
   program.operations = {
       {1, Opcode::Add, {1, 2}, {3}, {}},
       {2, Opcode::Multiply, {1, 2}, {4}, {}},
@@ -364,6 +404,10 @@ dif::ir::Program all_opcodes_program(dif::ir::DType dtype) {
        {Attribute::u64(
            AttrKey::Approximation,
            static_cast<std::uint64_t>(GeluApproximation::Tanh))}},
+      {27, Opcode::Gelu, {79}, {81},
+       {Attribute::u64(
+           AttrKey::Approximation,
+           static_cast<std::uint64_t>(GeluApproximation::ExactErf))}},
   };
   return program;
 }
@@ -498,6 +542,8 @@ void test_cpu_all_opcodes_and_float_dtypes() {
                8, 9, 10, 11, 12, 13, 14, 15},
           "CPU typed Unpatchify3D");
     check(80, {-0.1588079929F, 0.8411920071F}, "CPU typed tanh Gelu");
+    check(81, {-0.1586552539F, 0.8413447461F},
+          "CPU typed exact-erf Gelu");
   }
 }
 
@@ -966,6 +1012,16 @@ void test_backend_neutral_flow_scheduler() {
                  {0x00000000U, 0x3dccccd0U, 0x3e800000U, 0x3f000000U}),
          "shifted schedules are byte-exact to the pinned H3 source fixture");
 
+  const auto simple_av = dif::sampling::make_h3_simple_av_schedule(7U);
+  expect(simple_av.video_sigmas == floats_from_bits(
+             {0x3f800000U, 0x3f7c8470U, 0x3f77c517U, 0x3f70f966U,
+              0x3f6670b6U, 0x3f53e9c6U, 0x3f2abba6U, 0x00000000U}) &&
+             simple_av.audio_sigmas == floats_from_bits(
+                 {0x3f800000U, 0x3f729d96U, 0x3f61f9adU, 0x3f4ce541U,
+                  0x3f31537dU, 0x3f0bb9a8U, 0x3eaacca4U,
+                  0x00000000U}),
+         "H3 simple AV schedule is byte-exact to ComfyUI's 1000-point table and mapped audio shift");
+
   auto trajectory = floats_from_bits(
       {0x00000000U, 0x3de3166fU, 0x3e61aff2U, 0x3ea78611U,
        0x3edc233eU, 0x3f0704b2U, 0x3f1e4d7cU, 0x3f33a279U});
@@ -1003,6 +1059,94 @@ void test_backend_neutral_flow_scheduler() {
     expect(trajectory == expected_steps[step],
            "host H3 Euler trajectory is byte-exact to pinned source");
   }
+
+  // PyTorch 2.12.1 CPU oracle for ComfyUI sample_res_multistep, eta=0,
+  // cfg_pp=false.  This gates the interior second-order update separately
+  // from the Euler-only creator trajectory above.
+  auto res_trajectory =
+      floats_from_bits({0x00000000U, 0x3dcccccdU, 0x3e4ccccdU,
+                        0x3e99999aU, 0x3ecccccdU, 0x3f000000U,
+                        0x3f19999aU, 0x3f333333U});
+  const std::array<std::vector<float>, 4> res_velocities = {
+      std::vector<float>{-0.109375F, -0.078125F, -0.046875F, -0.015625F,
+                         0.015625F, 0.046875F, 0.078125F, 0.109375F},
+      std::vector<float>{-0.21875F, -0.15625F, -0.09375F, -0.03125F,
+                         0.03125F, 0.09375F, 0.15625F, 0.21875F},
+      std::vector<float>{-0.328125F, -0.234375F, -0.140625F, -0.046875F,
+                         0.046875F, 0.140625F, 0.234375F, 0.328125F},
+      std::vector<float>{-0.4375F, -0.3125F, -0.1875F, -0.0625F,
+                         0.0625F, 0.1875F, 0.3125F, 0.4375F}};
+  const auto res_schedule =
+      dif::sampling::make_exponential_shifted_schedule(5U, 12.0F);
+  dif::sampling::H3ResMultistepState res_state;
+  for (std::size_t step = 0U; step < res_velocities.size(); ++step)
+    dif::sampling::h3_res_multistep_step_in_place(
+        res_trajectory, res_velocities[step], 4U, 0U,
+        res_schedule.timesteps[step], res_schedule.sigmas[step],
+        res_schedule.sigmas[step + 1U], res_state);
+  const auto res_expected =
+      floats_from_bits({0xbedbc7b2U, 0xbe539250U, 0x3c835628U,
+                        0x3e7467ddU, 0x3eec327aU, 0x3f2f1882U,
+                        0x3f6817c7U, 0x3f908b87U});
+  float res_max_abs = 0.0F;
+  for (std::size_t index = 0U; index < res_trajectory.size(); ++index)
+    res_max_abs = std::max(
+        res_max_abs, std::abs(res_trajectory[index] - res_expected[index]));
+  expect(res_max_abs <= 2.0e-7F,
+         "H3 RES multistep trajectory matches PyTorch 2.12.1 scalar math");
+
+  // ComfyUI keeps H3 audio inside the same packed RES state as video.  The
+  // sampler carry runs on video sigma, while the network consumes physical
+  // audio on its mapped sigma.  This PyTorch fixture covers every conversion,
+  // the model-output wrapper, and the terminal process_latent_out scale.
+  auto audio_carry =
+      std::vector<float>{-0.75F, -0.25F, 0.25F, 0.75F};
+  const std::array<std::vector<float>, 7> physical_audio_velocities = {
+      std::vector<float>{-0.25F, -0.125F, 0.125F, 0.25F},
+      std::vector<float>{-0.28125F, -0.140625F, 0.140625F, 0.28125F},
+      std::vector<float>{-0.3125F, -0.15625F, 0.15625F, 0.3125F},
+      std::vector<float>{-0.34375F, -0.171875F, 0.171875F, 0.34375F},
+      std::vector<float>{-0.375F, -0.1875F, 0.1875F, 0.375F},
+      std::vector<float>{-0.40625F, -0.203125F, 0.203125F, 0.40625F},
+      std::vector<float>{-0.4375F, -0.21875F, 0.21875F, 0.4375F}};
+  const std::array<std::vector<float>, 7> expected_audio_inputs = {
+      floats_from_bits({0xbf400000U, 0xbe800000U, 0x3e800000U, 0x3f400000U}),
+      floats_from_bits({0xbf435899U, 0xbe83589aU, 0x3e83589aU, 0x3f435899U}),
+      floats_from_bits({0xbf486337U, 0xbe886338U, 0x3e886338U, 0x3f486337U}),
+      floats_from_bits({0xbf4f7c16U, 0xbe8f7c16U, 0x3e8f7c16U, 0x3f4f7c16U}),
+      floats_from_bits({0xbf59b6f7U, 0xbe99b6f8U, 0x3e99b6f8U, 0x3f59b6f7U}),
+      floats_from_bits({0xbf69157cU, 0xbea9157eU, 0x3ea9157eU, 0x3f69157cU}),
+      floats_from_bits({0xbf810a2cU, 0xbec2145dU, 0x3ec2145dU, 0x3f810a2cU})};
+  dif::sampling::H3ResMultistepState audio_res_state;
+  for (std::size_t step = 0U; step < physical_audio_velocities.size(); ++step) {
+    auto model_input = audio_carry;
+    dif::sampling::h3_av_audio_carry_to_model_input(
+        model_input, audio_carry, 4U, 0U, simple_av.video_sigmas[step],
+        simple_av.audio_sigmas[step]);
+    float input_max_abs = 0.0F;
+    for (std::size_t index = 0U; index < model_input.size(); ++index)
+      input_max_abs = std::max(
+          input_max_abs,
+          std::abs(model_input[index] - expected_audio_inputs[step][index]));
+    expect(input_max_abs <= 5.0e-7F,
+           "H3 packed audio carry maps to the physical model-input fixture");
+    dif::sampling::h3_res_multistep_av_audio_step_in_place(
+        audio_carry, model_input, physical_audio_velocities[step], 4U, 0U,
+        simple_av.video_sigmas[step], simple_av.audio_sigmas[step],
+        simple_av.video_sigmas[step + 1U], 4.0F, audio_res_state);
+  }
+  dif::sampling::h3_av_audio_carry_to_physical_in_place(
+      audio_carry, 4U, 0U, simple_av.video_sigmas.back(),
+      simple_av.audio_sigmas.back(), 4.0F);
+  const auto expected_physical_audio = floats_from_bits(
+      {0xbf93b88eU, 0xbee77122U, 0x3ee77122U, 0x3f93b88eU});
+  float audio_res_max_abs = 0.0F;
+  for (std::size_t index = 0U; index < audio_carry.size(); ++index)
+    audio_res_max_abs = std::max(
+        audio_res_max_abs,
+        std::abs(audio_carry[index] - expected_physical_audio[index]));
+  expect(audio_res_max_abs <= 3.0e-7F,
+         "H3 packed AV RES audio trajectory matches the ComfyUI wrapper fixture");
 
   Program program;
   program.tensors = {
@@ -1095,6 +1239,50 @@ void test_backend_neutral_flow_scheduler() {
   std::cout << "GATE flow_scheduler backend=" << candidate.backend_name
             << " device=" << candidate.device_name
             << " max_abs=" << maximum_absolute_error << "\n";
+}
+
+void test_h3_creator_noise_and_packing() {
+  dif::TorchCpuMt19937 generator(42U);
+  constexpr std::size_t video_value_count = 24U * 37U * 30U * 52U;
+  const auto video_values =
+      dif::torch_cpu_normal(generator, video_value_count);
+  dif::runtime::Tensor video_raw{dif::ir::DType::F32,
+                                 {1U, 24U, 37U, 30U, 52U}, {}};
+  video_raw.bytes.resize(video_values.size() * sizeof(float));
+  std::memcpy(video_raw.bytes.data(), video_values.data(),
+              video_raw.bytes.size());
+  const auto video_rows = dif::frontend::pack_h3_video_latent(video_raw);
+  expect(video_rows.dims ==
+             std::vector<std::uint64_t>({14430U, 96U}),
+         "H3 124-frame video noise packs to the creator's t=37 row geometry");
+
+  constexpr std::size_t audio_value_count = 32U * 2U * 207U;
+  const auto audio_values =
+      dif::torch_cpu_normal(generator, audio_value_count);
+  dif::runtime::Tensor audio_raw{dif::ir::DType::F32,
+                                 {1U, 32U, 2U, 207U}, {}};
+  audio_raw.bytes.resize(audio_values.size() * sizeof(float));
+  std::memcpy(audio_raw.bytes.data(), audio_values.data(),
+              audio_raw.bytes.size());
+  const auto audio_rows = dif::frontend::pack_h3_audio_latent(audio_raw);
+  expect(audio_rows.dims == std::vector<std::uint64_t>({414U, 32U}),
+         "H3 124-frame audio noise packs to the creator's 207-latent geometry");
+
+  if (dif::torch_cpu_normal_uses_avx2()) {
+    const auto video_hash = dif::hex_digest(dif::sha256(
+        {video_rows.data(), static_cast<std::size_t>(video_rows.byte_size())}));
+    const auto audio_hash = dif::hex_digest(dif::sha256(
+        {audio_rows.data(), static_cast<std::size_t>(audio_rows.byte_size())}));
+    expect(video_hash ==
+               "6207522013a69ed8fbc0ed924c58aaae985760dac4690908a8dc914d1406e0fe",
+           "H3 video noise is byte-exact to PyTorch 2.12.1 AVX2 seed 42");
+    expect(audio_hash ==
+               "31afc4bc194b6ab29f9162c01d0a7dac9176a5c6fb39c345bea4d1c41cb344e2",
+           "H3 audio noise continues the same PyTorch generator byte-exactly");
+    std::cout << "GATE h3_creator_noise rng=torch-cpu-avx2 seed=42"
+                 " video_rows=14430 audio_rows=414 video_sha256="
+              << video_hash << " audio_sha256=" << audio_hash << "\n";
+  }
 }
 
 void test_h3_latent_handoff() {
@@ -1726,6 +1914,78 @@ void test_generic_image_vae_primitives() {
             << " max_abs=" << maximum_absolute_error << "\n";
 }
 
+void test_group_norm_and_reflect_padding_primitives() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, 4, 1, 2}},
+      {2, DType::F32, TensorRole::Constant, {4}},
+      {3, DType::F32, TensorRole::Constant, {4}},
+      {4, DType::F32, TensorRole::Output, {1, 4, 1, 2}},
+      {5, DType::F32, TensorRole::Input, {1, 1, 1, 2, 3}},
+      {6, DType::F32, TensorRole::Output, {1, 1, 1, 4, 5}},
+  };
+  program.operations = {
+      {1, Opcode::GroupNorm, {1, 2, 3}, {4},
+       {Attribute::u64(AttrKey::Groups, 2U),
+        Attribute::u64(AttrKey::BlockSize, 32U),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-6)}},
+      {2, Opcode::PadReflect, {5}, {6},
+       {Attribute::u64(AttrKey::PadTop, 1U),
+        Attribute::u64(AttrKey::PadBottom, 1U),
+        Attribute::u64(AttrKey::PadWest, 1U),
+        Attribute::u64(AttrKey::PadEast, 1U)}},
+  };
+  dif::ir::verify(program);
+  const auto decoded = dif::ir::decode(dif::ir::encode(program));
+  expect(decoded.operations.size() == 2U &&
+             decoded.operations[0].opcode == Opcode::GroupNorm &&
+             decoded.operations[1].opcode == Opcode::PadReflect,
+         "group_norm and pad_reflect survive DiffIR roundtrip");
+
+  const dif::runtime::TensorMap bindings = {
+      {1, float_tensor(DType::F32, {1, 4, 1, 2},
+                       {1.0F, 2.0F, 3.0F, 4.0F,
+                        5.0F, 6.0F, 7.0F, 8.0F})},
+      {2, float_tensor(DType::F32, {4}, {1.0F, 1.0F, 1.0F, 1.0F})},
+      {3, float_tensor(DType::F32, {4}, {0.0F, 0.0F, 0.0F, 0.0F})},
+      {5, float_tensor(DType::F32, {1, 1, 1, 2, 3},
+                       {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F})},
+  };
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  const auto cpu = dif::runtime::make_cpu_executor()->run(program, bindings,
+                                                           options);
+  const auto normalized = float_values(cpu.outputs.at(4));
+  const std::vector<float> expected_norm = {
+      -1.3416402F, -0.4472134F, 0.4472134F, 1.3416402F,
+      -1.3416402F, -0.4472134F, 0.4472134F, 1.3416402F};
+  for (std::size_t index = 0U; index < normalized.size(); ++index)
+    expect(std::abs(normalized[index] - expected_norm[index]) < 2.0e-6F,
+           "group_norm matches the per-group population-variance equation");
+  expect(float_values(cpu.outputs.at(6)) ==
+             std::vector<float>{5.0F, 4.0F, 5.0F, 6.0F, 5.0F,
+                                2.0F, 1.0F, 2.0F, 3.0F, 2.0F,
+                                5.0F, 4.0F, 5.0F, 6.0F, 5.0F,
+                                2.0F, 1.0F, 2.0F, 3.0F, 2.0F},
+         "pad_reflect excludes the edge sample on both spatial axes");
+
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda = dif::runtime::make_cuda_executor()->run(program, bindings,
+                                                             options);
+  for (const auto output : {4U, 6U}) {
+    const auto expected = float_values(cpu.outputs.at(output));
+    const auto actual = float_values(cuda.outputs.at(output));
+    expect(expected.size() == actual.size(),
+           "CUDA group/pad output geometry matches CPU");
+    for (std::size_t index = 0U; index < expected.size(); ++index)
+      expect(std::abs(expected[index] - actual[index]) <= 3.0e-6F,
+             "CUDA group_norm/pad_reflect numerical parity");
+  }
+}
+
 void test_krea2_qwen_image_vae_frontend_contract() {
   using namespace dif::frontend;
   using namespace dif::ir;
@@ -1819,6 +2079,45 @@ void test_h3_video_vae_frontend_contract() {
   const auto generated = dif::compiler::emit_cuda(build.program);
   expect(generated.source.find("dif_store_f16(cosine") != std::string::npos,
          "CUDA rotary lowering honors F16 VAE cosine/sine storage");
+
+}
+
+void test_h3_video_encoder_frontend_contract() {
+  dif::frontend::H3VideoEncoderConfig config;
+  config.frames = 1U;
+  config.height = 256U;
+  config.width = 256U;
+  config.capture_boundaries = true;
+  const auto build = dif::frontend::make_h3_video_encoder(config);
+  dif::ir::verify(build.program);
+  const auto *input = build.program.tensor(build.pixels_input);
+  const auto *output = build.program.tensor(build.moments_output);
+  expect(input && input->dtype == dif::ir::DType::F32 &&
+             input->dims == std::vector<std::uint64_t>{1U, 3U, 1U, 256U,
+                                                       256U},
+         "H3 video encoder exposes the released F32 NCTHW pixel ABI");
+  expect(output && output->dtype == dif::ir::DType::F32 &&
+             output->dims == std::vector<std::uint64_t>{1U, 48U, 1U, 16U,
+                                                        16U},
+         "H3 video encoder emits mean/logvar moments at 16x spatial compression");
+  std::size_t conv3d = 0U;
+  std::size_t group_norm = 0U;
+  std::size_t reflect = 0U;
+  std::size_t constant_pad = 0U;
+  for (const auto &operation : build.program.operations) {
+    conv3d += operation.opcode == dif::ir::Opcode::Conv3d ? 1U : 0U;
+    group_norm += operation.opcode == dif::ir::Opcode::GroupNorm ? 1U : 0U;
+    reflect += operation.opcode == dif::ir::Opcode::PadReflect ? 1U : 0U;
+    constant_pad += operation.opcode == dif::ir::Opcode::PadConstant ? 1U : 0U;
+  }
+  expect(build.weights.size() == 118U && conv3d == 34U &&
+             group_norm == 25U && reflect == 30U && constant_pad == 30U,
+         "H3 encoder census matches 6 levels, 12 residual blocks, and quant_conv");
+  expect(build.program.operations.size() == 256U,
+         "H3 encoder graph preserves every padding, per-frame norm, conv, activation, and residual boundary");
+  const auto second = dif::frontend::make_h3_video_encoder(config);
+  expect(dif::ir::encode(build.program) == dif::ir::encode(second.program),
+         "H3 video encoder frontend is deterministic");
 }
 
 void test_training_autodiff_optimizer_and_checkpoint() {
@@ -2920,6 +3219,102 @@ void test_cuda_lazy_resident_upload() {
          "lazy resident constant uploads once and remains bit-exact");
 }
 
+void test_cuda_f16_biased_convrot_int8() {
+#if DIF_HAS_CUTLASS
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  constexpr auto streamed = TensorRole::Constant | TensorRole::Streamed;
+  Program program;
+  program.tensors = {
+      {1, DType::F16, TensorRole::Input, {4, 256}},
+      {2, DType::F16, streamed, {16, 256}},
+      {3, DType::F16, streamed, {16}},
+      {4, DType::F16, TensorRole::Output, {4, 16}},
+  };
+  program.operations = {{1, Opcode::Linear, {1, 2, 3}, {4}, {}}};
+  verify(program);
+
+  std::vector<float> input_values(4U * 256U);
+  for (std::size_t index = 0U; index < input_values.size(); ++index)
+    input_values[index] = static_cast<float>(static_cast<int>(index % 19U) - 9) /
+                          16.0F;
+  const std::vector<float> bias_values = {
+      -1.0F, -0.75F, -0.5F, -0.25F, -0.125F, -0.0625F, 0.0F, 0.0625F,
+      0.125F, 0.25F, 0.5F, 0.75F, 1.0F, 1.25F, 1.5F, 2.0F};
+  dif::runtime::TensorMap bindings = {
+      {1, float_tensor(DType::F16, {4, 256}, input_values)},
+      {2, float_tensor(DType::F16, {16, 256},
+                       std::vector<float>(16U * 256U, 0.0F))},
+      {3, float_tensor(DType::F16, {16}, bias_values)},
+  };
+  dif::runtime::RunOptions ordinary_options;
+  ordinary_options.warmups = 0U;
+  ordinary_options.iterations = 1U;
+  const auto ordinary =
+      dif::runtime::make_cpu_executor()->run(program, bindings,
+                                               ordinary_options);
+
+  const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("dif-convrot-f16-test-" + std::to_string(nonce));
+  std::filesystem::create_directories(directory);
+  const auto cache_path = directory / "convrot.safetensors";
+  std::array<std::uint32_t, 20> identity{};
+  identity[0] = 0x31525643U;
+  identity[1] = 1U;
+  identity[2] = 256U;
+  identity[3] = 1U;
+  const auto fingerprint = dif::ir::fingerprint(program);
+  for (std::size_t word = 0U; word < 8U; ++word)
+    identity[4U + word] =
+        static_cast<std::uint32_t>(fingerprint[word * 4U]) |
+        (static_cast<std::uint32_t>(fingerprint[word * 4U + 1U]) << 8U) |
+        (static_cast<std::uint32_t>(fingerprint[word * 4U + 2U]) << 16U) |
+        (static_cast<std::uint32_t>(fingerprint[word * 4U + 3U]) << 24U);
+  const std::vector<std::int8_t> quantized(16U * 256U, 0);
+  const std::vector<float> scales(16U, 1.0F);
+  dif::weights::SafeTensorWriter writer(
+      cache_path,
+      {{"__meta__.convrot_int8", DType::I32, {20}},
+       {"linear.2.weight", DType::I8, {16, 256}},
+       {"linear.2.scale", DType::F32, {16}}});
+  writer.append(
+      "__meta__.convrot_int8",
+      {reinterpret_cast<const std::uint8_t *>(identity.data()),
+       identity.size() * sizeof(std::uint32_t)});
+  writer.append(
+      "linear.2.weight",
+      {reinterpret_cast<const std::uint8_t *>(quantized.data()),
+       quantized.size() * sizeof(std::int8_t)});
+  writer.append(
+      "linear.2.scale",
+      {reinterpret_cast<const std::uint8_t *>(scales.data()),
+       scales.size() * sizeof(float)});
+  (void)writer.finish();
+
+  for (const auto resident : {false, true}) {
+    dif::runtime::RunOptions options;
+    options.warmups = 0U;
+    options.iterations = 1U;
+    options.minimum_free_bytes = 0U;
+    options.convrot_int8_checkpoint = cache_path;
+    options.convrot_int8_resident = resident;
+    options.streamed_release_mapped_pages_per_copy = false;
+    const auto candidate =
+        dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    expect(candidate.outputs.at(4U).bytes == ordinary.outputs.at(4U).bytes &&
+               candidate.convrot_int8_linears.size() == 1U &&
+               candidate.convrot_int8_linears.front().implementation ==
+                   "generic_diffir_linear_cutlass_scaled_f16",
+           resident
+               ? "resident F16 biased ConvRot INT8 fuses bias and matches semantics"
+               : "streamed F16 biased ConvRot INT8 fuses bias and matches semantics");
+  }
+  std::filesystem::remove_all(directory);
+#endif
+}
+
 void test_compiler_and_cuda_reshape_alias_plan() {
   using namespace dif::ir;
   Program program;
@@ -3752,7 +4147,80 @@ void test_png_rgb8_writer_contract() {
              bytes[39] == 'A' && bytes[40] == 'T' && bytes[67] == 'I' &&
              bytes[68] == 'E' && bytes[69] == 'N' && bytes[70] == 'D',
          "PNG writer emits deterministic IDAT and terminal IEND chunks");
+  const auto decoded = dif::read_png_rgb8(path);
+  expect(decoded.width == 2U && decoded.height == 1U &&
+             std::equal(rgb.begin(), rgb.end(), decoded.pixels.begin()),
+         "native PNG reader round-trips deterministic RGB8 pixels");
   std::filesystem::remove(path);
+}
+
+void test_qwen3vl_vision_and_multimodal_frontend_contract() {
+  using namespace dif::frontend;
+  using namespace dif::ir;
+  const auto vision = build_qwen3vl_vision_program(1U, 2U, 2U);
+  verify(vision.program);
+  expect(vision.bindings.size() == 350U &&
+             vision.linear_operations == 117U &&
+             vision.attention_operations == 27U &&
+             vision.deepstack_output_ids.size() == 3U &&
+             vision.embeds_output_id != 0U,
+         "Qwen3-VL vision frontend exposes the released 27-block shared-op contract");
+  for (const auto &operation : vision.program.operations)
+    expect(operation.opcode != Opcode::H3AdaLNSelect &&
+               operation.opcode != Opcode::H3DeinterleaveQkv &&
+               operation.opcode != Opcode::H3DeinterleaveQkvWeight,
+           "Qwen3-VL vision frontend uses shared operations, not H3 denoiser semantics");
+
+  Qwen3VlConditionerConfig conditioner_config;
+  conditioner_config.executed_layers = 3U;
+  conditioner_config.vision_token_count = 4U;
+  const auto conditioner =
+      build_qwen3vl_conditioner_program(12U, conditioner_config);
+  verify(conditioner.program);
+  expect(conditioner.vision_embeddings_input_id != 0U &&
+             conditioner.vision_destination_map_input_id != 0U &&
+             conditioner.visual_positions_input_id != 0U &&
+             conditioner.vision_deepstack_input_ids.size() == 3U,
+         "Qwen3-VL conditioner exposes generic vision splice and deepstack inputs");
+  std::uint64_t indexed_updates = 0U;
+  for (const auto &operation : conditioner.program.operations)
+    indexed_updates += operation.opcode == Opcode::IndexedUpdateRows ? 1U : 0U;
+  expect(indexed_updates == 4U,
+         "Qwen3-VL conditioner replaces embeddings once and injects three deepstack taps");
+
+  dif::RgbImage image;
+  image.width = 256U;
+  image.height = 256U;
+  image.pixels.assign(256U * 256U * 3U, 255U);
+  const auto patches = qwen3vl_vision_image_patch_rows(image);
+  expect(patches.dtype == DType::BF16 &&
+             patches.dims == std::vector<std::uint64_t>({256U, 1536U}),
+         "Qwen3-VL image preprocessing emits merged-order BF16 patch rows");
+  const auto *patch_bits =
+      reinterpret_cast<const std::uint16_t *>(patches.data());
+  expect(patch_bits[0] == dif::runtime::float_to_bf16(1.0F) &&
+             patch_bits[256U] == patch_bits[0] &&
+             patch_bits[512U] == patch_bits[0],
+         "Qwen3-VL still-image preprocessing duplicates temporal planes and preserves channels");
+
+  dif::runtime::Tensor table{DType::BF16, {48U * 48U, 1152U}, {}};
+  table.bytes.assign(static_cast<std::size_t>(table.element_count()) * 2U, 0U);
+  auto *table_bits = reinterpret_cast<std::uint16_t *>(table.mutable_data());
+  for (std::uint64_t row = 0U; row < 48U * 48U; ++row)
+    table_bits[row * 1152U] =
+        dif::runtime::float_to_bf16(static_cast<float>(row));
+  const auto positions =
+      qwen3vl_vision_position_embeddings(table, 1U, 48U, 48U);
+  const auto *position_bits =
+      reinterpret_cast<const std::uint16_t *>(positions.data());
+  const std::array<std::uint64_t, 5> expected_rows{0U, 1U, 48U, 49U, 2U};
+  for (std::size_t output = 0U; output < expected_rows.size(); ++output)
+    expect(position_bits[output * 1152U] ==
+               dif::runtime::float_to_bf16(
+                   static_cast<float>(expected_rows[output])),
+           "Qwen3-VL learned positions use creator merge-block order");
+  std::cout << "GATE qwen3vl_vision blocks=27 weights=350 attentions=27"
+               " deepstack=3 multimodal_updates=4\n";
 }
 
 int main() {
@@ -3772,14 +4240,17 @@ int main() {
   test_new_primitives_cuda_parity();
   test_vae_normalization_primitives();
   test_generic_image_vae_primitives();
+  test_group_norm_and_reflect_padding_primitives();
   test_krea2_qwen_image_vae_frontend_contract();
   test_h3_video_vae_frontend_contract();
+  test_h3_video_encoder_frontend_contract();
   test_training_autodiff_optimizer_and_checkpoint();
   test_mixed_precision_bf16_training_step();
   test_rectified_flow_training_vertical();
   test_backend_neutral_diffusion_preprocessing();
   test_backend_neutral_flow_scheduler();
   test_h3_conditioning_layout();
+  test_h3_creator_noise_and_packing();
   test_h3_latent_handoff();
   test_h3_media_handoff();
   test_prepared_execution_reuses_constants();
@@ -3789,6 +4260,7 @@ int main() {
   test_audio_bigvgan_frontend_contract();
   test_wav_pcm16_writer_contract();
   test_png_rgb8_writer_contract();
+  test_qwen3vl_vision_and_multimodal_frontend_contract();
   test_attention_implementation_identity();
   test_h3_bf16_lowering_preserves_source_reduction_identity();
   test_h3_long_sequence_transformer_declares_backend_attention();
@@ -3800,6 +4272,7 @@ int main() {
   test_memory_plan_omits_backend_replaced_constants();
   test_compiler_streamed_residency_plan();
   test_cuda_lazy_resident_upload();
+  test_cuda_f16_biased_convrot_int8();
   test_compiler_and_cuda_reshape_alias_plan();
   test_weight_bundle_roundtrip();
   test_safetensors_streaming_writer();

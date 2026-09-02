@@ -26,6 +26,7 @@
 #include "dif/weights/bundle.hpp"
 #include "dif/weights/safetensors.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -33,6 +34,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -48,17 +50,25 @@ struct Options {
   fs::path bundle;
   fs::path ids;
   fs::path inputs;
+  fs::path vision_inputs;
+  fs::path vision_outputs;
   fs::path output;
   fs::path report;
   fs::path cache_directory;
+  fs::path convrot_int8_checkpoint;
+  fs::path sealed_bundle;
   std::string backend{"cuda"};
   std::uint64_t sequence{};
   std::uint64_t layers{50};
   std::uint64_t attention{2};
+  std::uint64_t vision_tokens{};
   std::uint64_t minimum_free_mib{4096};
+  std::uint64_t streamed_stage_threads{1};
   bool krea2{};
   bool profile_pipeline{};
   bool resident_streamed{};
+  bool convrot_int8_weight_only_quality{};
+  std::uint32_t convrot_int8_linear_count{};
 };
 
 void usage() {
@@ -66,13 +76,23 @@ void usage() {
       << "usage: difcondition program --checkpoint DIR --sequence N --output "
          "FILE.difir [--layers N] [--attention 1|2] [--krea2]\n"
          "       difcondition bundle --checkpoint DIR --program FILE.difir "
-         "--output FILE.difbind\n"
+         "--output FILE.difbind [--sealed-bundle FILE.difbind]\n"
          "       difcondition run --program FILE.difir --bundle FILE.difbind "
          "--ids FILE.diftensor --output FILE.diftensor [--backend cuda|cpu] "
+         "[--cache-dir DIR] [--min-free-mib N] "
+         "[--convrot-int8-checkpoint FILE] [--convrot-int8-linear-count N] "
+         "[--convrot-int8-weight-only-quality] "
+         "[--streamed-stage-threads N]\n"
+         "       difcondition run --program FILE.difir --bundle FILE.difbind "
+         "--vision-inputs PRESENTATION.safetensors --vision-outputs "
+         "VISION.safetensors --vision-tokens N --output FILE.diftensor "
          "[--cache-dir DIR] [--min-free-mib N]\n"
          "       difcondition run --krea2 --program FILE.difir --bundle "
          "FILE.difbind --inputs creator.safetensors --output "
-         "native.safetensors [--cache-dir DIR] [--min-free-mib N]\n";
+         "native.safetensors [--cache-dir DIR] [--min-free-mib N] "
+         "[--convrot-int8-checkpoint FILE] [--convrot-int8-linear-count N] "
+         "[--convrot-int8-weight-only-quality] "
+         "[--streamed-stage-threads N]\n";
 }
 
 std::uint64_t number(const std::string &text, const char *label) {
@@ -108,6 +128,10 @@ Options parse(int argc, char **argv) {
       options.ids = value("--ids");
     else if (option == "--inputs")
       options.inputs = value("--inputs");
+    else if (option == "--vision-inputs")
+      options.vision_inputs = value("--vision-inputs");
+    else if (option == "--vision-outputs")
+      options.vision_outputs = value("--vision-outputs");
     else if (option == "--output")
       options.output = value("--output");
     else if (option == "--report")
@@ -116,14 +140,30 @@ Options parse(int argc, char **argv) {
       options.backend = value("--backend");
     else if (option == "--cache-dir")
       options.cache_directory = value("--cache-dir");
+    else if (option == "--convrot-int8-checkpoint")
+      options.convrot_int8_checkpoint =
+          value("--convrot-int8-checkpoint");
+    else if (option == "--sealed-bundle")
+      options.sealed_bundle = value("--sealed-bundle");
+    else if (option == "--convrot-int8-weight-only-quality")
+      options.convrot_int8_weight_only_quality = true;
+    else if (option == "--convrot-int8-linear-count")
+      options.convrot_int8_linear_count = static_cast<std::uint32_t>(
+          number(value("--convrot-int8-linear-count"),
+                 "ConvRot INT8 Linear count"));
     else if (option == "--sequence")
       options.sequence = number(value("--sequence"), "sequence");
     else if (option == "--layers")
       options.layers = number(value("--layers"), "layers");
     else if (option == "--attention")
       options.attention = number(value("--attention"), "attention");
+    else if (option == "--vision-tokens")
+      options.vision_tokens = number(value("--vision-tokens"), "vision tokens");
     else if (option == "--min-free-mib")
       options.minimum_free_mib = number(value("--min-free-mib"), "min free MiB");
+    else if (option == "--streamed-stage-threads")
+      options.streamed_stage_threads =
+          number(value("--streamed-stage-threads"), "streamed stage threads");
     else if (option == "--krea2")
       options.krea2 = true;
     else if (option == "--profile-pipeline")
@@ -144,7 +184,17 @@ dif::frontend::Qwen3VlConditionerConfig config_for(const Options &options) {
   dif::frontend::Qwen3VlConditionerConfig config;
   config.executed_layers = options.layers;
   config.attention_implementation = options.attention;
+  config.vision_token_count = options.vision_tokens;
   return config;
+}
+
+std::uint64_t program_sequence(const dif::ir::Program &program) {
+  for (const auto &tensor : program.tensors)
+    if (tensor.has_role(dif::ir::TensorRole::Input) &&
+        tensor.dtype == dif::ir::DType::I32 && tensor.dims.size() == 1U)
+      return tensor.dims[0];
+  dif::fail("conditioner program has no one-dimensional token-id input");
+  return 0U;
 }
 
 void command_program(const Options &options) {
@@ -168,6 +218,7 @@ void command_program(const Options &options) {
             << " input_id=" << build.token_ids_input_id
             << " output_id=" << build.conditioning_output_id
             << " outputs=" << build.conditioning_output_ids.size()
+            << " vision_tokens=" << options.vision_tokens
             << " family=" << (options.krea2 ? "krea2" : "h3") << "\n";
 }
 
@@ -185,13 +236,7 @@ void command_bundle(const Options &options) {
   dif::ir::verify(program);
 
   // Rebuild the frontend description to recover tensor-id -> weight-name.
-  std::uint64_t sequence = 0U;
-  for (const auto &tensor : program.tensors)
-    if ((tensor.roles & static_cast<std::uint32_t>(dif::ir::TensorRole::Input)) !=
-        0U)
-      sequence = tensor.dims.at(0);
-  if (sequence == 0U)
-    dif::fail("conditioner program has no token-id input");
+  const auto sequence = program_sequence(program);
   std::uint64_t layers = 0U;
   for (const auto &operation : program.operations)
     if (operation.opcode == dif::ir::Opcode::Attention)
@@ -208,10 +253,17 @@ void command_bundle(const Options &options) {
                               : options.checkpoint / "text_encoder" /
                                     "model.safetensors.index.json";
   const auto index = dif::weights::read_safetensors_index(index_path);
+  const auto index_fingerprint = dif::sha256_file(index_path);
+  std::optional<dif::weights::WeightBundle> sealed;
+  if (!options.sealed_bundle.empty()) {
+    sealed = dif::weights::read_weight_bundle(options.sealed_bundle);
+    if (sealed->index_fingerprint != index_fingerprint)
+      dif::fail("sealed conditioner bundle targets a different checkpoint index");
+  }
 
   dif::weights::WeightBundle bundle;
   bundle.program_fingerprint = dif::ir::fingerprint(program);
-  bundle.index_fingerprint = dif::sha256_file(index_path);
+  bundle.index_fingerprint = index_fingerprint;
   std::map<fs::path, std::uint32_t> shard_indices;
   std::map<fs::path, dif::weights::SafeTensorFile> shard_files;
   for (const auto &binding : build.bindings) {
@@ -224,8 +276,26 @@ void command_bundle(const Options &options) {
     auto known = shard_indices.find(shard_path);
     if (known == shard_indices.end()) {
       const auto shard_index = static_cast<std::uint32_t>(bundle.shards.size());
-      bundle.shards.push_back({shard_path, fs::file_size(shard_path),
-                               dif::sha256_file(shard_path)});
+      const auto shard_size = fs::file_size(shard_path);
+      auto digest = dif::Sha256Digest{};
+      if (sealed) {
+        const auto receipt = std::find_if(
+            sealed->shards.begin(), sealed->shards.end(),
+            [&](const dif::weights::BundleShard &candidate) {
+              return fs::absolute(candidate.path).lexically_normal() ==
+                     shard_path;
+            });
+        if (receipt == sealed->shards.end())
+          dif::fail("sealed conditioner bundle has no receipt for " +
+                    shard_path.string());
+        if (receipt->file_size != shard_size)
+          dif::fail("sealed conditioner shard size changed for " +
+                    shard_path.string());
+        digest = receipt->digest;
+      } else {
+        digest = dif::sha256_file(shard_path);
+      }
+      bundle.shards.push_back({shard_path, shard_size, digest});
       shard_files.emplace(shard_path,
                           dif::weights::read_safetensors(shard_path));
       known = shard_indices.emplace(shard_path, shard_index).first;
@@ -249,10 +319,18 @@ void command_bundle(const Options &options) {
 
 void command_run(const Options &options) {
   if (options.program.empty() || options.bundle.empty() ||
-      (options.krea2 ? options.inputs.empty() : options.ids.empty()) ||
+      (options.krea2
+           ? options.inputs.empty()
+           : (options.vision_tokens != 0U
+                  ? (options.vision_inputs.empty() ||
+                     options.vision_outputs.empty())
+                  : options.ids.empty())) ||
       options.output.empty())
     dif::fail("difcondition run requires --program, --bundle, --output and "
               "either --ids or Krea 2 --inputs");
+  if (options.convrot_int8_weight_only_quality &&
+      options.convrot_int8_checkpoint.empty())
+    dif::fail("ConvRot weight-only quality requires a ConvRot checkpoint");
   if (fs::exists(options.output))
     dif::fail("refusing to overwrite " + options.output.string());
   const auto program = dif::ir::read_file(options.program);
@@ -264,12 +342,7 @@ void command_run(const Options &options) {
   // Rotary positions and inverse frequencies are compiler-derived constants,
   // not checkpoint tensors: rebuild the frontend description (fingerprint-
   // checked) and supply them alongside the bundle's weights.
-  std::uint64_t sequence = 0U;
-  for (const auto &tensor : program.tensors)
-    if ((tensor.roles & static_cast<std::uint32_t>(dif::ir::TensorRole::Input)) !=
-            0U &&
-        tensor.dtype == dif::ir::DType::I32 && tensor.dims.size() == 1U)
-      sequence = tensor.dims[0];
+  const auto sequence = program_sequence(program);
   std::uint64_t layers = 0U;
   for (const auto &operation : program.operations)
     if (operation.opcode == dif::ir::Opcode::Attention)
@@ -299,6 +372,32 @@ void command_run(const Options &options) {
     inputs.insert_or_assign(build.position_ids_input_id,
                             dif::weights::map_safetensor(fixture,
                                                         "position_ids"));
+  } else if (options.vision_tokens != 0U) {
+    const auto presentation =
+        dif::weights::read_safetensors(options.vision_inputs);
+    const auto vision = dif::weights::read_safetensors(options.vision_outputs);
+    auto ids = dif::weights::map_safetensor(presentation, "input_ids");
+    if (ids.dtype != dif::ir::DType::I32 || ids.dims.size() != 1U ||
+        ids.dims[0] != sequence)
+      dif::fail("multimodal H3 input_ids must be I32 [S]");
+    inputs.insert_or_assign(build.token_ids_input_id, std::move(ids));
+    inputs.insert_or_assign(
+        build.vision_destination_map_input_id,
+        dif::weights::map_safetensor(presentation,
+                                     "vision_destination_map"));
+    inputs.insert_or_assign(
+        build.visual_positions_input_id,
+        dif::weights::map_safetensor(presentation, "visual_positions"));
+    inputs.insert_or_assign(
+        build.vision_embeddings_input_id,
+        dif::weights::map_safetensor(vision, "vision_embeds"));
+    for (std::size_t index = 0U;
+         index < build.vision_deepstack_input_ids.size(); ++index)
+      inputs.insert_or_assign(
+          build.vision_deepstack_input_ids[index],
+          dif::weights::map_safetensor(vision,
+                                       "deepstack_" + std::to_string(index)));
+    token_count = sequence;
   } else {
     const auto ids = dif::runtime::read_tensor(options.ids);
     if (ids.dtype != dif::ir::DType::I32 || ids.dims.size() != 1U ||
@@ -314,6 +413,12 @@ void command_run(const Options &options) {
   run_options.cache_directory = options.cache_directory;
   run_options.minimum_free_bytes = options.minimum_free_mib * 1024ULL * 1024ULL;
   run_options.profile_pipeline = options.profile_pipeline;
+  run_options.convrot_int8_checkpoint = options.convrot_int8_checkpoint;
+  run_options.convrot_int8_linear_count = options.convrot_int8_linear_count;
+  run_options.convrot_int8_weight_only_quality =
+      options.convrot_int8_weight_only_quality;
+  run_options.streamed_stage_threads =
+      static_cast<std::uint32_t>(options.streamed_stage_threads);
   if (options.resident_streamed) {
     for (const auto &tensor : program.tensors)
       if (tensor.has_role(dif::ir::TensorRole::Constant) &&

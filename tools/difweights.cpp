@@ -1,6 +1,7 @@
 #include "dif/ir/codec.hpp"
 #include "dif/ir/ir.hpp"
 #include "dif/frontend/h3_vae.hpp"
+#include "dif/frontend/h3_video_encoder.hpp"
 #include "dif/frontend/krea2.hpp"
 #include "dif/frontend/krea2_vae.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -346,6 +347,34 @@ dif::weights::WeightBundle materialize_h3_video_vae_bundle(
       dif::fail("H3 video VAE derived shard lost " + binding.name);
     bundle.bindings.push_back(
         {binding.tensor_id, 0U, binding.name, entry->dtype, entry->dims,
+         entry->file_offset, entry->byte_count});
+  }
+  dif::weights::verify_weight_bundle(bundle, build.program, false);
+  return bundle;
+}
+
+dif::weights::WeightBundle make_h3_video_encoder_bundle(
+    const std::filesystem::path &source_path,
+    const dif::frontend::H3VideoEncoderBuild &build) {
+  const auto source = dif::weights::read_safetensors(source_path);
+  dif::weights::WeightBundle bundle;
+  bundle.program_fingerprint = dif::ir::fingerprint(build.program);
+  const auto digest = dif::sha256_file(source_path);
+  bundle.index_fingerprint = digest;
+  bundle.shards.push_back(
+      {std::filesystem::absolute(source_path).lexically_normal(),
+       source.file_size, digest});
+  for (const auto &binding : build.weights) {
+    const auto *description = build.program.tensor(binding.tensor);
+    const auto *entry = source.find(binding.source_name);
+    if (!description || !description->has_role(dif::ir::TensorRole::Constant) ||
+        !entry || entry->dtype != description->dtype ||
+        entry->dims != description->dims ||
+        entry->byte_count != description->byte_count())
+      dif::fail("H3 video encoder checkpoint disagrees with DiffIR: " +
+                binding.source_name);
+    bundle.bindings.push_back(
+        {binding.tensor, 0U, binding.source_name, entry->dtype, entry->dims,
          entry->file_offset, entry->byte_count});
   }
   dif::weights::verify_weight_bundle(bundle, build.program, false);
@@ -849,6 +878,7 @@ void usage() {
                "       difweights make-krea2-text-bf16-bundle SOURCE.safetensors PROGRAM.difir DERIVED.safetensors OUT.difbind\n"
                "       difweights make-krea2-vae-bf16-bundle SOURCE.safetensors PROGRAM.difir DERIVED.safetensors OUT.difbind\n"
                "       difweights make-h3-video-vae-bundle SOURCE.safetensors PROGRAM.difir OUT.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
+               "       difweights make-h3-video-encoder-bundle SOURCE.safetensors PROGRAM.difir OUT.difbind FRAMES HEIGHT WIDTH resident|streamed\n"
                "       difweights seal-h3-video-vae-bundle DERIVED.safetensors SOURCE.safetensors PROGRAM.difir OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights reuse-h3-video-vae-bundle SEALED.difbind PROGRAM.difir GEOMETRY.safetensors OUT.difbind LATENT_T LATENT_H LATENT_W LAYERS resident|streamed generated|cudnn\n"
                "       difweights rebind-program SEALED.difbind PROGRAM.difir OUT.difbind\n"
@@ -1065,6 +1095,32 @@ int main(int argc, char **argv) {
       dif::weights::write_weight_bundle(bundle, argv[5]);
       std::cout << "H3_VIDEO_VAE_BUNDLE path=" << argv[5]
                 << " shard=" << argv[4]
+                << " program="
+                << dif::hex_digest(bundle.program_fingerprint)
+                << " source=" << dif::hex_digest(bundle.index_fingerprint)
+                << " bindings=" << bundle.bindings.size() << "\n";
+      return 0;
+    }
+    if (command == "make-h3-video-encoder-bundle" && argc == 9) {
+      if (std::filesystem::exists(argv[4]))
+        dif::fail("refusing to overwrite H3 video encoder bundle");
+      const std::string residency = argv[8];
+      if (residency != "resident" && residency != "streamed")
+        dif::fail("H3 video encoder residency must be resident or streamed");
+      dif::frontend::H3VideoEncoderConfig config;
+      config.frames = std::stoull(argv[5]);
+      config.height = std::stoull(argv[6]);
+      config.width = std::stoull(argv[7]);
+      config.streamed_constants = residency == "streamed";
+      config.capture_boundaries = false;
+      const auto build = dif::frontend::make_h3_video_encoder(config);
+      const auto program = dif::ir::read_file(argv[3]);
+      if (dif::ir::fingerprint(program) !=
+          dif::ir::fingerprint(build.program))
+        dif::fail("H3 video encoder program does not match requested geometry");
+      const auto bundle = make_h3_video_encoder_bundle(argv[2], build);
+      dif::weights::write_weight_bundle(bundle, argv[4]);
+      std::cout << "H3_VIDEO_ENCODER_BUNDLE path=" << argv[4]
                 << " program="
                 << dif::hex_digest(bundle.program_fingerprint)
                 << " source=" << dif::hex_digest(bundle.index_fingerprint)

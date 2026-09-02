@@ -31,6 +31,7 @@ namespace {
 
 struct Options {
   std::string backend{"cuda"};
+  std::string sampler{"euler"};
   std::filesystem::path backend_plugin;
   std::filesystem::path denoiser_program;
   std::filesystem::path denoiser_bundle;
@@ -43,6 +44,7 @@ struct Options {
   std::filesystem::path video_sigmas;
   std::filesystem::path audio_sigmas;
   std::filesystem::path output_latent;
+  std::filesystem::path output_video_rows;
   std::filesystem::path output_audio;
   std::filesystem::path output_audio_latent;
   std::filesystem::path output_handoff;
@@ -53,12 +55,19 @@ struct Options {
   std::filesystem::path cache_directory;
   std::filesystem::path h3_w8a8_cache;
   std::filesystem::path h3_convrot_int8_checkpoint;
+  std::filesystem::path h3_groupwise_cache;
   std::filesystem::path h3_ck_attention_dso;
   std::filesystem::path h3_modulation_cache;
   std::filesystem::path h3_modulation_source_index;
   std::uint32_t h3_w8a8_resident_layers{
       std::numeric_limits<std::uint32_t>::max()};
   std::uint32_t h3_convrot_int8_resident_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  std::uint32_t h3_convrot_int8_attention_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  std::uint32_t h3_convrot_int8_mlp_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  std::uint32_t h3_groupwise_layers{
       std::numeric_limits<std::uint32_t>::max()};
   std::uint32_t h3_int8_mlp_chunk_rows{1024U};
   std::uint32_t h3_int8_attention_first_layer{};
@@ -70,10 +79,14 @@ struct Options {
   bool h3_int8_cublaslt_tune{false};
   bool h3_int8_cutlass_scaled_fc1{false};
   bool h3_int8_cutlass_scaled_all{false};
+  std::uint32_t h3_int8_convrot_scale_chunk{};
+  bool h3_int8_convrot_global_activation_scale{false};
+  bool h3_convrot_bf16_audio_rows{false};
   bool h3_int8_compact_adaln{false};
   bool h3_cache_text_refiner{false};
   std::uint32_t cudnn_attention_heuristic{};
   std::uint32_t h3_modulation_steps{};
+  std::uint32_t h3_modulation_first_step{};
   std::uint64_t all_text_tokens{};
   std::uint64_t latent_frames{};
   std::uint64_t latent_height{};
@@ -82,6 +95,7 @@ struct Options {
   std::uint64_t patch_height{2U};
   std::uint64_t patch_width{2U};
   std::uint32_t schedule_points{};
+  std::uint32_t simple_evaluations{};
   std::uint32_t maximum_evaluations{};
   std::vector<dif::frontend::H3KeyframeAnchor> keyframes;
   std::vector<dif::frontend::H3ReferenceGeometry> references;
@@ -112,7 +126,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors --h3-convrot-int8-resident-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
+      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -225,6 +239,8 @@ Options parse(int argc, char **argv) {
     };
     if (option == "--backend")
       options.backend = value("--backend");
+    else if (option == "--sampler")
+      options.sampler = value("--sampler");
     else if (option == "--backend-plugin")
       options.backend_plugin = value("--backend-plugin");
     else if (option == "--denoiser-program")
@@ -256,6 +272,14 @@ Options parse(int argc, char **argv) {
         dif::fail("schedule points exceed U32 range");
       options.schedule_points = static_cast<std::uint32_t>(points);
     }
+    else if (option == "--simple-steps") {
+      const auto evaluations =
+          number(value("--simple-steps"), "simple scheduler steps");
+      if (evaluations > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("simple scheduler steps exceed U32 range");
+      options.simple_evaluations =
+          static_cast<std::uint32_t>(evaluations);
+    }
     else if (option == "--latent-t")
       options.latent_frames = number(value("--latent-t"), "latent frames");
     else if (option == "--latent-h")
@@ -275,6 +299,8 @@ Options parse(int argc, char **argv) {
           reference_geometry(value("--reference-geometry")));
     else if (option == "--output-latent")
       options.output_latent = value("--output-latent");
+    else if (option == "--output-video-rows")
+      options.output_video_rows = value("--output-video-rows");
     else if (option == "--output-audio")
       options.output_audio = value("--output-audio");
     else if (option == "--output-audio-latent")
@@ -286,6 +312,15 @@ Options parse(int argc, char **argv) {
     else if (option == "--h3-convrot-int8-checkpoint")
       options.h3_convrot_int8_checkpoint =
           value("--h3-convrot-int8-checkpoint");
+    else if (option == "--h3-groupwise-cache")
+      options.h3_groupwise_cache = value("--h3-groupwise-cache");
+    else if (option == "--h3-groupwise-layers") {
+      const auto layers = number(value("--h3-groupwise-layers"),
+                                 "H3 groupwise layers");
+      if (layers == 0U || layers > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 groupwise layer count must be nonzero U32");
+      options.h3_groupwise_layers = static_cast<std::uint32_t>(layers);
+    }
     else if (option == "--h3-w8a8-resident-layers") {
       const auto layers =
           number(value("--h3-w8a8-resident-layers"), "resident layers");
@@ -299,6 +334,32 @@ Options parse(int argc, char **argv) {
       if (layers > std::numeric_limits<std::uint32_t>::max())
         dif::fail("H3 ConvRot INT8 resident layer count exceeds U32 range");
       options.h3_convrot_int8_resident_layers =
+          static_cast<std::uint32_t>(layers);
+    }
+    else if (option == "--h3-convrot-int8-layers") {
+      const auto layers = number(value("--h3-convrot-int8-layers"),
+                                 "ConvRot INT8 layers");
+      if (layers == 0U || layers > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 ConvRot INT8 layer count must be nonzero U32");
+      options.h3_convrot_int8_attention_layers =
+          static_cast<std::uint32_t>(layers);
+      options.h3_convrot_int8_mlp_layers =
+          static_cast<std::uint32_t>(layers);
+    }
+    else if (option == "--h3-convrot-int8-attention-layers") {
+      const auto layers = number(value("--h3-convrot-int8-attention-layers"),
+                                 "ConvRot INT8 attention layers");
+      if (layers > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 ConvRot INT8 attention layer count exceeds U32");
+      options.h3_convrot_int8_attention_layers =
+          static_cast<std::uint32_t>(layers);
+    }
+    else if (option == "--h3-convrot-int8-mlp-layers") {
+      const auto layers = number(value("--h3-convrot-int8-mlp-layers"),
+                                 "ConvRot INT8 MLP layers");
+      if (layers > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 ConvRot INT8 MLP layer count exceeds U32");
+      options.h3_convrot_int8_mlp_layers =
           static_cast<std::uint32_t>(layers);
     }
     else if (option == "--h3-int8-mlp-chunk-rows") {
@@ -324,6 +385,18 @@ Options parse(int argc, char **argv) {
       options.h3_int8_cutlass_scaled_fc1 = true;
     else if (option == "--h3-int8-cutlass-scaled-all")
       options.h3_int8_cutlass_scaled_all = true;
+    else if (option == "--h3-int8-convrot-scale-chunk") {
+      const auto columns = number(value("--h3-int8-convrot-scale-chunk"),
+                                  "H3 ConvRot scale chunk");
+      if (columns < 256U || columns > 2048U || columns % 256U != 0U)
+        dif::fail("H3 ConvRot scale chunk must be a multiple of 256 in [256,2048]");
+      options.h3_int8_convrot_scale_chunk =
+          static_cast<std::uint32_t>(columns);
+    }
+    else if (option == "--h3-int8-convrot-global-activation-scale")
+      options.h3_int8_convrot_global_activation_scale = true;
+    else if (option == "--h3-convrot-bf16-audio-rows")
+      options.h3_convrot_bf16_audio_rows = true;
     else if (option == "--h3-int8-compact-adaln")
       options.h3_int8_compact_adaln = true;
     else if (option == "--h3-cache-text-refiner")
@@ -377,6 +450,13 @@ Options parse(int argc, char **argv) {
       if (steps > std::numeric_limits<std::uint32_t>::max())
         dif::fail("H3 modulation step count exceeds U32 range");
       options.h3_modulation_steps = static_cast<std::uint32_t>(steps);
+    }
+    else if (option == "--h3-modulation-first-step") {
+      const auto step = number(value("--h3-modulation-first-step"),
+                               "H3 modulation first step");
+      if (step > std::numeric_limits<std::uint32_t>::max())
+        dif::fail("H3 modulation first step exceeds U32 range");
+      options.h3_modulation_first_step = static_cast<std::uint32_t>(step);
     }
     else if (option == "--output-raw")
       options.output_raw = value("--output-raw");
@@ -452,21 +532,50 @@ Options parse(int argc, char **argv) {
   }
   if (options.text_tags.empty() == (options.all_text_tokens == 0U))
     dif::fail("select either --text-tags or --all-text-tokens");
+  if (options.sampler != "euler" && options.sampler != "res_multistep")
+    dif::fail("sampler must be euler or res_multistep");
   if (options.h3_modulation_cache.empty() !=
       options.h3_modulation_source_index.empty())
     dif::fail("H3 modulation cache and source index must be supplied together");
-  if (!options.h3_w8a8_cache.empty() &&
-      !options.h3_convrot_int8_checkpoint.empty())
-    dif::fail("select at most one H3 direct INT8 precision route");
+  if (options.h3_modulation_cache.empty() &&
+      options.h3_modulation_first_step != 0U)
+    dif::fail("H3 modulation first step requires a modulation cache");
+  const auto precision_routes =
+      static_cast<unsigned>(!options.h3_w8a8_cache.empty()) +
+      static_cast<unsigned>(!options.h3_convrot_int8_checkpoint.empty()) +
+      static_cast<unsigned>(!options.h3_groupwise_cache.empty());
+  if (precision_routes > 1U)
+    dif::fail("select at most one H3 INT8 precision route");
+  if (options.h3_groupwise_cache.empty() &&
+      options.h3_groupwise_layers != std::numeric_limits<std::uint32_t>::max())
+    dif::fail("H3 groupwise layer count requires a groupwise cache");
+  if (options.h3_convrot_int8_checkpoint.empty() &&
+      (options.h3_convrot_int8_attention_layers !=
+           std::numeric_limits<std::uint32_t>::max() ||
+       options.h3_convrot_int8_mlp_layers !=
+           std::numeric_limits<std::uint32_t>::max()))
+    dif::fail("H3 ConvRot INT8 layer count requires a ConvRot checkpoint");
+  if (!options.h3_convrot_int8_checkpoint.empty() &&
+      options.h3_convrot_int8_attention_layers == 0U &&
+      options.h3_convrot_int8_mlp_layers == 0U)
+    dif::fail("H3 ConvRot INT8 requires at least one admitted projection chain");
+  if (options.h3_convrot_bf16_audio_rows &&
+      options.h3_convrot_int8_checkpoint.empty())
+    dif::fail("H3 BF16 audio-row correction requires a ConvRot checkpoint");
   if (!options.keyframes.empty() && !options.references.empty())
     dif::fail("FL2VA keyframes and Ref2VA references are mutually exclusive");
   const auto supplied_schedule = !options.video_sigmas.empty() ||
                                  !options.audio_sigmas.empty();
-  if ((options.schedule_points != 0U) == supplied_schedule ||
+  const auto schedule_sources =
+      static_cast<unsigned>(options.schedule_points != 0U) +
+      static_cast<unsigned>(options.simple_evaluations != 0U) +
+      static_cast<unsigned>(supplied_schedule);
+  if (schedule_sources != 1U ||
       (supplied_schedule && (options.video_sigmas.empty() ||
                              options.audio_sigmas.empty())) ||
-      (options.schedule_points != 0U && options.schedule_points < 2U))
-    dif::fail("select either --schedule-points >= 2 or both sigma files");
+      (options.schedule_points != 0U && options.schedule_points < 2U) ||
+      options.simple_evaluations > 1000U)
+    dif::fail("select exactly one of --simple-steps 1..1000, --schedule-points >= 2, or both sigma files");
   if (!options.denoise_only &&
       (options.vae_program.empty() || options.vae_bundle.empty() ||
        options.output_raw.empty() || options.output_decoded.empty())) {
@@ -478,6 +587,7 @@ Options parse(int argc, char **argv) {
       options.patch_height == 0U || options.patch_width == 0U)
     dif::fail("H3 inference geometry must be positive");
   for (const auto *path : {&options.output_latent, &options.output_audio,
+                           &options.output_video_rows,
                            &options.output_audio_latent,
                            &options.output_handoff, &options.output_raw,
                            &options.output_decoded}) {
@@ -655,7 +765,12 @@ int main(int argc, char **argv) {
     auto audio = dif::runtime::read_tensor(options.audio);
     std::vector<float> video_sigmas;
     std::vector<float> audio_sigmas;
-    if (options.schedule_points != 0U) {
+    if (options.simple_evaluations != 0U) {
+      auto schedule = dif::sampling::make_h3_simple_av_schedule(
+          options.simple_evaluations);
+      video_sigmas = std::move(schedule.video_sigmas);
+      audio_sigmas = std::move(schedule.audio_sigmas);
+    } else if (options.schedule_points != 0U) {
       video_sigmas = dif::sampling::make_exponential_shifted_schedule(
                          options.schedule_points, 12.0F)
                          .sigmas;
@@ -745,8 +860,14 @@ int main(int argc, char **argv) {
         options.h3_w8a8_resident_layers;
     denoiser_run_options.h3_convrot_int8_checkpoint =
         options.h3_convrot_int8_checkpoint;
+    denoiser_run_options.h3_convrot_int8_attention_layers =
+        options.h3_convrot_int8_attention_layers;
+    denoiser_run_options.h3_convrot_int8_mlp_layers =
+        options.h3_convrot_int8_mlp_layers;
     denoiser_run_options.h3_convrot_int8_resident_layers =
         options.h3_convrot_int8_resident_layers;
+    denoiser_run_options.h3_groupwise_cache = options.h3_groupwise_cache;
+    denoiser_run_options.h3_groupwise_layers = options.h3_groupwise_layers;
     denoiser_run_options.h3_int8_mlp_chunk_rows =
         options.h3_int8_mlp_chunk_rows;
     denoiser_run_options.h3_int8_cublaslt = options.h3_int8_cublaslt;
@@ -758,6 +879,20 @@ int main(int argc, char **argv) {
         options.h3_int8_cutlass_scaled_fc1;
     denoiser_run_options.h3_int8_cutlass_scaled_all =
         options.h3_int8_cutlass_scaled_all;
+    denoiser_run_options.h3_int8_convrot_scale_chunk =
+        options.h3_int8_convrot_scale_chunk;
+    denoiser_run_options.h3_int8_convrot_global_activation_scale =
+        options.h3_int8_convrot_global_activation_scale;
+    if (options.h3_convrot_bf16_audio_rows) {
+      denoiser_run_options.h3_convrot_bf16_correction_rows.reserve(
+          layout.audio_indices.size());
+      for (const auto row : layout.audio_indices) {
+        if (row < 0)
+          dif::fail("H3 audio correction row is negative");
+        denoiser_run_options.h3_convrot_bf16_correction_rows.push_back(
+            static_cast<std::uint32_t>(row));
+      }
+    }
     denoiser_run_options.h3_int8_compact_adaln =
         options.h3_int8_compact_adaln;
     denoiser_run_options.resident_streamed_constants =
@@ -772,9 +907,10 @@ int main(int argc, char **argv) {
     denoiser_run_options.h3_modulation_cache = options.h3_modulation_cache;
     denoiser_run_options.h3_modulation_source_index =
         options.h3_modulation_source_index;
-    denoiser_run_options.h3_modulation_steps =
-        options.h3_modulation_steps != 0U ? options.h3_modulation_steps
-                                         : options.schedule_points;
+    if (!options.h3_modulation_cache.empty())
+      denoiser_run_options.h3_modulation_steps =
+          options.h3_modulation_steps != 0U ? options.h3_modulation_steps
+                                           : options.schedule_points;
     double denoiser_prepare_ms = 0.0;
     double denoiser_kernel_ms = 0.0;
     double denoiser_bundle_map_ms = 0.0;
@@ -783,6 +919,11 @@ int main(int argc, char **argv) {
     double denoiser_gpu_layout_ms = 0.0;
     double denoiser_gpu_dequant_ms = 0.0;
     dif::runtime::PipelineProfile denoiser_profile;
+    std::unordered_map<std::uint32_t, double> denoiser_operation_ms;
+    std::unordered_map<std::uint32_t, double> denoiser_operation_cold_ms;
+    std::unordered_map<std::uint32_t, double> denoiser_operation_hot_ms;
+    std::unordered_map<std::uint32_t, dif::ir::Opcode>
+        denoiser_operation_opcodes;
     std::uint64_t denoiser_resident = 0U;
     std::uint64_t denoiser_free_before = 0U;
     std::uint64_t denoiser_free_after = 0U;
@@ -790,6 +931,7 @@ int main(int argc, char **argv) {
     std::size_t h3_w8a8_attention_count = 0U;
     std::size_t h3_w8a8_resident_mlp_count = 0U;
     std::size_t h3_w8a8_resident_attention_count = 0U;
+    std::size_t h3_groupwise_count = 0U;
     std::size_t h3_ck_attention_count = 0U;
     std::size_t h3_modulation_cache_count = 0U;
     std::uint32_t repeated_invariant_operation_count = 0U;
@@ -837,6 +979,8 @@ int main(int argc, char **argv) {
       auto prepared = backend->prepare(program, inputs, denoiser_run_options);
       denoiser_prepare_ms = prepared->preparation_milliseconds();
       denoiser_resident = prepared->resident_bytes();
+      dif::sampling::H3ResMultistepState video_res_multistep;
+      dif::sampling::H3ResMultistepState audio_res_multistep;
       for (std::size_t step = 0U; step < evaluations; ++step) {
         const auto video_timestep = 1.0F - video_sigmas[step];
         const auto audio_timestep = 1.0F - audio_sigmas[step];
@@ -858,9 +1002,14 @@ int main(int argc, char **argv) {
           plan.timesteps.push_back(plan.timesteps.back());
         validate(program, 4U, f32_tensor({plan.timesteps.size()}, plan.timesteps),
                  "timestep plan");
-        inputs.insert_or_assign(
-            1U, video);
-        inputs.insert_or_assign(2U, audio);
+        inputs.insert_or_assign(1U, video);
+        auto audio_model_input = audio;
+        if (options.sampler == "res_multistep")
+          dif::sampling::h3_av_audio_carry_to_model_input(
+              audio_model_input.f32(), audio.f32(), audio.dims[1],
+              layout.num_condition_audio_rows, video_sigmas[step],
+              audio_sigmas[step]);
+        inputs.insert_or_assign(2U, audio_model_input);
         inputs.insert_or_assign(
             4U, f32_tensor({plan.timesteps.size()}, plan.timesteps));
         inputs.insert_or_assign(
@@ -894,7 +1043,11 @@ int main(int argc, char **argv) {
           }
         }
         denoiser_step_layout_ms += elapsed_milliseconds(step_layout_start);
+        if (step > std::numeric_limits<std::uint32_t>::max() -
+                       options.h3_modulation_first_step)
+          dif::fail("H3 modulation slice exceeds U32 range");
         denoiser_run_options.h3_modulation_slice =
+            options.h3_modulation_first_step +
             static_cast<std::uint32_t>(step);
         auto result = prepared->run(inputs, denoiser_run_options);
         for (const auto tensor_id : options.capture_denoiser_tensors) {
@@ -920,6 +1073,7 @@ int main(int argc, char **argv) {
                             result.h3_w8a8_attentions.end(),
                             [](const auto &plan) { return plan.resident; }));
           h3_ck_attention_count = result.h3_ck_attentions.size();
+          h3_groupwise_count = result.h3_groupwise_int8.size();
           if (!result.h3_ck_attentions.empty())
             attention_class = result.h3_ck_attentions.front().classification;
           h3_modulation_cache_count = result.h3_modulation_caches.size();
@@ -927,11 +1081,30 @@ int main(int argc, char **argv) {
               result.repeated_invariant_operation_count;
           repeated_invariant_persistent_bytes =
               result.repeated_invariant_persistent_bytes;
-          if ((!options.h3_w8a8_cache.empty() ||
-               !options.h3_convrot_int8_checkpoint.empty()) &&
+          if (!options.h3_w8a8_cache.empty() &&
               (h3_w8a8_mlp_count == 0U ||
                h3_w8a8_attention_count == 0U))
             dif::fail("requested H3 direct INT8 checkpoint did not cover both projection and MLP chains");
+          if (!options.h3_convrot_int8_checkpoint.empty()) {
+            const auto expected_attention =
+                options.h3_convrot_int8_attention_layers;
+            const auto expected_mlp = options.h3_convrot_int8_mlp_layers;
+            if ((expected_attention == 0U && h3_w8a8_attention_count != 0U) ||
+                (expected_attention != 0U &&
+                 h3_w8a8_attention_count == 0U) ||
+                (expected_attention !=
+                     std::numeric_limits<std::uint32_t>::max() &&
+                 h3_w8a8_attention_count != expected_attention) ||
+                (expected_mlp == 0U && h3_w8a8_mlp_count != 0U) ||
+                (expected_mlp != 0U && h3_w8a8_mlp_count == 0U) ||
+                (expected_mlp !=
+                     std::numeric_limits<std::uint32_t>::max() &&
+                 h3_w8a8_mlp_count != expected_mlp))
+              dif::fail("requested H3 ConvRot projection-chain count was not admitted exactly");
+          }
+          if (!options.h3_groupwise_cache.empty() &&
+              h3_groupwise_count == 0U)
+            dif::fail("requested H3 groupwise cache was not admitted");
           if (!options.h3_ck_attention_dso.empty() &&
               h3_ck_attention_count == 0U)
             dif::fail("requested H3 CK attention DSO was not admitted");
@@ -981,6 +1154,15 @@ int main(int argc, char **argv) {
               operation_sum(result.operation_timings, is_layout_operation);
           denoiser_gpu_dequant_ms +=
               operation_sum(result.operation_timings, is_dequant_operation);
+          for (const auto &timing : result.operation_timings) {
+            denoiser_operation_ms[timing.operation_id] +=
+                timing.mean_milliseconds;
+            (step == 0U ? denoiser_operation_cold_ms
+                        : denoiser_operation_hot_ms)[timing.operation_id] +=
+                timing.mean_milliseconds;
+            denoiser_operation_opcodes.emplace(timing.operation_id,
+                                                timing.opcode);
+          }
         }
         const auto scheduler_start = std::chrono::steady_clock::now();
         const auto &video_velocity = result.outputs.at(video_output);
@@ -990,14 +1172,27 @@ int main(int argc, char **argv) {
             audio_velocity.dtype != dif::ir::DType::F32 ||
             audio_velocity.dims != audio.dims)
           dif::fail("H3 denoiser output shape does not match scheduler state");
-        dif::sampling::h3_euler_step_in_place(
-            video.f32(), video_velocity.f32(), video.dims[1],
-            layout.num_condition_video_rows, video_timestep,
-            video_sigmas[step], video_sigmas[step + 1U]);
-        dif::sampling::h3_euler_step_in_place(
-            audio.f32(), audio_velocity.f32(), audio.dims[1],
-            layout.num_condition_audio_rows, audio_timestep,
-            audio_sigmas[step], audio_sigmas[step + 1U]);
+        if (options.sampler == "res_multistep") {
+          dif::sampling::h3_res_multistep_step_in_place(
+              video.f32(), video_velocity.f32(), video.dims[1],
+              layout.num_condition_video_rows, video_timestep,
+              video_sigmas[step], video_sigmas[step + 1U],
+              video_res_multistep);
+          dif::sampling::h3_res_multistep_av_audio_step_in_place(
+              audio.f32(), audio_model_input.f32(), audio_velocity.f32(),
+              audio.dims[1], layout.num_condition_audio_rows,
+              video_sigmas[step], audio_sigmas[step],
+              video_sigmas[step + 1U], 4.0F, audio_res_multistep);
+        } else {
+          dif::sampling::h3_euler_step_in_place(
+              video.f32(), video_velocity.f32(), video.dims[1],
+              layout.num_condition_video_rows, video_timestep,
+              video_sigmas[step], video_sigmas[step + 1U]);
+          dif::sampling::h3_euler_step_in_place(
+              audio.f32(), audio_velocity.f32(), audio.dims[1],
+              layout.num_condition_audio_rows, audio_timestep,
+              audio_sigmas[step], audio_sigmas[step + 1U]);
+        }
         scheduler_update_ms += elapsed_milliseconds(scheduler_start);
         std::cout << "H3_STEP index=" << step
                   << " video_t=" << video_timestep
@@ -1007,6 +1202,10 @@ int main(int argc, char **argv) {
                   << (result.repeated_invariant_cache_hit ? "hit" : "miss")
                   << "\n";
       }
+      if (options.sampler == "res_multistep")
+        dif::sampling::h3_av_audio_carry_to_physical_in_place(
+            audio.f32(), audio.dims[1], layout.num_condition_audio_rows,
+            video_sigmas[evaluations], audio_sigmas[evaluations], 4.0F);
     }
     const auto denoiser_wall_ms =
         std::chrono::duration<double, std::milli>(
@@ -1023,6 +1222,8 @@ int main(int argc, char **argv) {
     const auto unpatchify_ms = elapsed_milliseconds(unpatchify_start);
     const auto denoiser_output_io_start = std::chrono::steady_clock::now();
     dif::runtime::write_tensor(latent, options.output_latent);
+    if (!options.output_video_rows.empty())
+      dif::runtime::write_tensor(video, options.output_video_rows);
     dif::runtime::write_tensor(audio, options.output_audio);
     if (!options.output_audio_latent.empty())
       dif::runtime::write_tensor(audio_latent, options.output_audio_latent);
@@ -1035,6 +1236,34 @@ int main(int argc, char **argv) {
     if (options.denoise_only) {
       const auto command_wall_ms = elapsed_milliseconds(command_wall_start);
       if (options.profile_pipeline) {
+        std::vector<std::pair<std::uint32_t, double>> ranked_operations(
+            denoiser_operation_ms.begin(), denoiser_operation_ms.end());
+        std::sort(ranked_operations.begin(), ranked_operations.end(),
+                  [&](const auto &left, const auto &right) {
+                    if (evaluations > 1U)
+                      return denoiser_operation_hot_ms[left.first] >
+                             denoiser_operation_hot_ms[right.first];
+                    return left.second > right.second;
+                  });
+        const auto reported_operations =
+            std::min<std::size_t>(20U, ranked_operations.size());
+        for (std::size_t index = 0U; index < reported_operations; ++index) {
+          const auto [operation, milliseconds] = ranked_operations[index];
+          std::cout << "H3_PROFILE_OP rank=" << index + 1U
+                    << " operation=" << operation
+                    << " opcode="
+                    << dif::ir::opcode_name(
+                           denoiser_operation_opcodes.at(operation))
+                    << " total_ms=" << std::fixed << std::setprecision(3)
+                    << milliseconds
+                    << " cold_ms=" << denoiser_operation_cold_ms[operation]
+                    << " hot_mean_ms="
+                    << (evaluations > 1U
+                            ? denoiser_operation_hot_ms[operation] /
+                                  static_cast<double>(evaluations - 1U)
+                            : 0.0)
+                    << '\n';
+        }
         const auto denoiser_other_gpu_ms = std::max(
             0.0, denoiser_profile.operation_kernel_milliseconds -
                      denoiser_profile.attention_kernel_milliseconds -
@@ -1090,21 +1319,25 @@ int main(int argc, char **argv) {
                 << (!options.references.empty()
                         ? "ref2va"
                         : (options.keyframes.empty() ? "t2va" : "fl2va"))
+                << " sampler=" << options.sampler
                 << " sequence=" << layout.sequence_length
                 << " attention_class=" << attention_class
                 << " projection_class="
-                << (h3_w8a8_mlp_count == 0U &&
-                            h3_w8a8_attention_count == 0U
-                        ? "exact_checkpoint_dtype"
-                        : (!options.h3_convrot_int8_checkpoint.empty()
-                               ? "approximate_native_h256_convrot_int8_gate"
-                               : "approximate_w8a8_established_h3_gate"))
+                << (!options.h3_groupwise_cache.empty()
+                        ? "approximate_groupwise_int8_quality_gate"
+                        : (h3_w8a8_mlp_count == 0U &&
+                                   h3_w8a8_attention_count == 0U
+                               ? "exact_checkpoint_dtype"
+                               : (!options.h3_convrot_int8_checkpoint.empty()
+                                      ? "approximate_native_h256_convrot_int8_gate"
+                                      : "approximate_w8a8_established_h3_gate")))
                 << " h3_w8a8_mlps=" << h3_w8a8_mlp_count
                 << " h3_w8a8_attentions=" << h3_w8a8_attention_count
                 << " h3_w8a8_resident_mlps="
                 << h3_w8a8_resident_mlp_count
                 << " h3_w8a8_resident_attentions="
                 << h3_w8a8_resident_attention_count
+                << " h3_groupwise_blocks=" << h3_groupwise_count
                 << " h3_ck_attentions=" << h3_ck_attention_count
                 << " h3_modulation_caches=" << h3_modulation_cache_count
                 << " repeated_invariant_ops="

@@ -40,6 +40,13 @@ struct Qwen3VlConditionerConfig {
   std::uint64_t output_sequence_length{0};
   bool use_attention_mask{false};
   bool dynamic_position_ids{false};
+
+  // Optional multimodal row-splice contract. The vision tower remains a
+  // separate prepared DiffIR program; its merged rows replace image-pad token
+  // embeddings before layer 0, and its deep-stack rows are added immediately
+  // after the listed decoder layers. Zero preserves the text-only program.
+  std::uint64_t vision_token_count{0};
+  std::vector<std::uint64_t> deepstack_language_layers{0U, 1U, 2U};
 };
 
 // One checkpoint tensor the program consumes. `name` is the literal
@@ -61,6 +68,10 @@ struct Qwen3VlConditionerBuild {
   std::uint32_t token_ids_input_id{};
   std::uint32_t attention_mask_input_id{};
   std::uint32_t position_ids_input_id{};
+  std::uint32_t vision_embeddings_input_id{};
+  std::uint32_t vision_destination_map_input_id{};
+  std::uint32_t visual_positions_input_id{};
+  std::vector<std::uint32_t> vision_deepstack_input_ids;
   std::uint32_t conditioning_output_id{};
   std::vector<std::uint32_t> conditioning_output_ids;
   std::uint64_t linear_operations{};

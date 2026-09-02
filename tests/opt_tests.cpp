@@ -988,9 +988,11 @@ void test_search_scales_to_a_full_h3_denoiser() {
          "the fifty-block winner never costs more memory than the baseline");
 
   // The memory-policy vocabulary is what moves a constant-dominated working
-  // set. On this backend streaming is free, so the search takes it; a backend
-  // that charges streaming bandwidth would see the latency constraint push
-  // back, which is exactly the trade the search exists to measure.
+  // set. The deterministic test clock assigns the same latency to residency
+  // roles because the portable CPU backend does not model transfer cost. This
+  // keeps the memory-policy assertion independent of host scheduling noise; a
+  // real backend that charges streaming bandwidth still sees the latency
+  // constraint push back.
   auto policy = proving_options(50U);
   policy.max_depth = 1U;
   policy.beam_width = 1U;
@@ -999,7 +1001,9 @@ void test_search_scales_to_a_full_h3_denoiser() {
   policy.discovery.schedule = false;
   policy.discovery.numeric = false;
   policy.discovery.memory = true;
-  const auto residency = opt::optimize(base, *executor, gate, policy, nullptr);
+  ScriptedLatencyExecutor residency_executor;
+  const auto residency =
+      opt::optimize(base, residency_executor, gate, policy, nullptr);
   report(residency, "h3_denoiser_50_layer_memory_policy");
   const auto &winner = residency.candidates[residency.winner];
   expect(residency.improved && winner.numerics.max_absolute_error == 0.0,

@@ -1,4 +1,4 @@
-// difh3noise — native port of serenitymojo/ops/random.mojo randn().
+// difh3noise — source-faithful H3 sampler-noise generation.
 //
 // Reproduces the Serenity sampler's deterministic initial-noise stream
 // byte-exactly: Rust rand 0.8.5 StdRng semantics (seed_from_u64 -> PCG32-
@@ -12,8 +12,10 @@
 // (exact u64/u32 integer math) and passed to the kernel.
 
 #include "dif/runtime/tensor.hpp"
+#include "dif/frontend/h3_latents.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
+#include "dif/support/torch_cpu_rng.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -34,15 +36,28 @@ struct Arguments {
   long long rows = -1;
   long long cols = -1;
   unsigned long long seed = 0;
+  unsigned long long skip_normal_values = 0;
   bool seed_set = false;
+  std::string rng{"serenity"};
+  std::string layout{"flat"};
+  long long latent_frames = -1;
+  long long latent_height = -1;
+  long long latent_width = -1;
+  long long audio_latents = -1;
   std::filesystem::path output;
   std::filesystem::path verify_against;
 };
 
 [[noreturn]] void usage_error(const std::string &message) {
   std::cerr << "difh3noise: " << message << "\n"
-            << "usage: difh3noise --rows N --cols N --seed U64 "
-               "--output FILE.diftensor [--verify-against FILE.diftensor]\n";
+            << "usage: difh3noise --seed U64 "
+               "--output FILE.diftensor [--rng serenity|torch-cpu] "
+               "[--layout flat|h3-video|h3-audio] "
+               "[--rows N --cols N] "
+               "[--latent-frames N --latent-height N --latent-width N] "
+               "[--audio-latents N] "
+               "[--skip-normal-values N] "
+               "[--verify-against FILE.diftensor]\n";
   std::exit(2);
 }
 
@@ -240,36 +255,109 @@ int main(int argc, char **argv) {
         arguments.seed_set = true;
       } else if (option == "--output")
         arguments.output = value("--output");
+      else if (option == "--rng")
+        arguments.rng = value("--rng");
+      else if (option == "--layout")
+        arguments.layout = value("--layout");
+      else if (option == "--latent-frames")
+        arguments.latent_frames = std::stoll(value("--latent-frames"));
+      else if (option == "--latent-height")
+        arguments.latent_height = std::stoll(value("--latent-height"));
+      else if (option == "--latent-width")
+        arguments.latent_width = std::stoll(value("--latent-width"));
+      else if (option == "--audio-latents")
+        arguments.audio_latents = std::stoll(value("--audio-latents"));
+      else if (option == "--skip-normal-values")
+        arguments.skip_normal_values =
+            std::stoull(value("--skip-normal-values"));
       else if (option == "--verify-against")
         arguments.verify_against = value("--verify-against");
       else
         usage_error("unknown option " + option);
     }
-    if (arguments.rows <= 0 || arguments.cols <= 0 || !arguments.seed_set ||
-        arguments.output.empty())
-      usage_error("--rows, --cols, --seed, and --output are required");
+    if (!arguments.seed_set || arguments.output.empty())
+      usage_error("--seed and --output are required");
+    if (arguments.rng != "serenity" && arguments.rng != "torch-cpu")
+      usage_error("--rng must be serenity or torch-cpu");
+    if (arguments.layout != "flat" && arguments.layout != "h3-video" &&
+        arguments.layout != "h3-audio")
+      usage_error("--layout must be flat, h3-video, or h3-audio");
+    if (arguments.layout == "flat" &&
+        (arguments.rows <= 0 || arguments.cols <= 0))
+      usage_error("flat layout requires --rows and --cols");
+    if (arguments.layout == "h3-video" &&
+        (arguments.latent_frames <= 0 || arguments.latent_height <= 0 ||
+         arguments.latent_width <= 0 || arguments.latent_height % 2 != 0 ||
+         arguments.latent_width % 2 != 0))
+      usage_error("h3-video requires positive T and even H/W latent geometry");
+    if (arguments.layout == "h3-audio" && arguments.audio_latents <= 0)
+      usage_error("h3-audio requires --audio-latents");
+    if (arguments.rng == "serenity" && arguments.skip_normal_values != 0U)
+      usage_error("--skip-normal-values is only valid with --rng torch-cpu");
+    if (arguments.rng == "serenity" && arguments.layout != "flat")
+      usage_error("H3 source packing is only valid with --rng torch-cpu");
 
+    long long count = arguments.rows * arguments.cols;
+    if (arguments.layout == "h3-video")
+      count = 24LL * arguments.latent_frames * arguments.latent_height *
+              arguments.latent_width;
+    else if (arguments.layout == "h3-audio")
+      count = 32LL * 2LL * arguments.audio_latents;
+    std::vector<float> values;
+    if (arguments.rng == "torch-cpu") {
+      dif::TorchCpuMt19937 generator(arguments.seed);
+      if (arguments.skip_normal_values != 0U)
+        (void)dif::torch_cpu_normal(
+            generator,
+            static_cast<std::size_t>(arguments.skip_normal_values));
+      values =
+          dif::torch_cpu_normal(generator, static_cast<std::size_t>(count));
+    } else {
 #if DIF_HAS_CUDA
-    const auto count = arguments.rows * arguments.cols;
-    const auto values = generate_cuda(count, arguments.seed);
+      values = generate_cuda(count, arguments.seed);
 #else
-    dif::fail("this build has no CUDA support");
+      dif::fail("Serenity noise requires a CUDA build");
 #endif
+    }
 
-#if DIF_HAS_CUDA
-    dif::runtime::Tensor tensor{
-        dif::ir::DType::F32,
-        {static_cast<std::uint64_t>(arguments.rows),
-         static_cast<std::uint64_t>(arguments.cols)},
-        {}};
-    tensor.bytes.resize(static_cast<std::size_t>(count) * 4U);
-    std::memcpy(tensor.bytes.data(), values.data(), tensor.bytes.size());
+    dif::runtime::Tensor tensor;
+    if (arguments.layout == "h3-video") {
+      dif::runtime::Tensor raw{
+          dif::ir::DType::F32,
+          {1U, 24U, static_cast<std::uint64_t>(arguments.latent_frames),
+           static_cast<std::uint64_t>(arguments.latent_height),
+           static_cast<std::uint64_t>(arguments.latent_width)},
+          {}};
+      raw.bytes.resize(static_cast<std::size_t>(count) * sizeof(float));
+      std::memcpy(raw.bytes.data(), values.data(), raw.bytes.size());
+      tensor = dif::frontend::pack_h3_video_latent(raw);
+    } else if (arguments.layout == "h3-audio") {
+      dif::runtime::Tensor raw{
+          dif::ir::DType::F32,
+          {1U, 32U, 2U,
+           static_cast<std::uint64_t>(arguments.audio_latents)},
+          {}};
+      raw.bytes.resize(static_cast<std::size_t>(count) * sizeof(float));
+      std::memcpy(raw.bytes.data(), values.data(), raw.bytes.size());
+      tensor = dif::frontend::pack_h3_audio_latent(raw);
+    } else {
+      tensor = dif::runtime::Tensor{
+          dif::ir::DType::F32,
+          {static_cast<std::uint64_t>(arguments.rows),
+           static_cast<std::uint64_t>(arguments.cols)},
+          {}};
+      tensor.bytes.resize(static_cast<std::size_t>(count) * sizeof(float));
+      std::memcpy(tensor.bytes.data(), values.data(), tensor.bytes.size());
+    }
     dif::runtime::write_tensor(tensor, arguments.output);
     const auto payload_sha = dif::hex_digest(
         dif::sha256({tensor.bytes.data(), tensor.bytes.size()}));
     std::cout << "NOISE_WRITTEN " << arguments.output.string()
-              << " rows=" << arguments.rows << " cols=" << arguments.cols
-              << " seed=" << arguments.seed << " payload_sha256=" << payload_sha
+              << " rows=" << tensor.dims[0] << " cols=" << tensor.dims[1]
+              << " seed=" << arguments.seed << " rng=" << arguments.rng
+              << " layout=" << arguments.layout
+              << " skip_normal_values=" << arguments.skip_normal_values
+              << " payload_sha256=" << payload_sha
               << "\n";
 
     if (!arguments.verify_against.empty()) {
@@ -281,12 +369,12 @@ int main(int argc, char **argv) {
           reinterpret_cast<const std::uint32_t *>(tensor.bytes.data());
       const auto *theirs =
           reinterpret_cast<const std::uint32_t *>(recorded.data());
-      for (std::int64_t i = 0; i < count; ++i)
+      for (std::uint64_t i = 0; i < tensor.element_count(); ++i)
         mismatched += ours[i] != theirs[i];
       const auto recorded_payload_sha = dif::hex_digest(dif::sha256(
           {recorded.data(), static_cast<std::size_t>(recorded.byte_size())}));
       std::cout << "NOISE_VERIFY mismatched_elements=" << mismatched << "/"
-                << count << "\n";
+                << tensor.element_count() << "\n";
       std::cout << "NOISE_VERIFY recorded_payload_sha256="
                 << recorded_payload_sha << "\n";
       if (mismatched == 0 && payload_sha == recorded_payload_sha)
@@ -294,7 +382,6 @@ int main(int argc, char **argv) {
       return mismatched == 0 && payload_sha == recorded_payload_sha ? 0 : 3;
     }
     return 0;
-#endif
   } catch (const std::exception &error) {
     std::cerr << "difh3noise: " << error.what() << "\n";
     return 1;

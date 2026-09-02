@@ -1,14 +1,25 @@
 #pragma once
 
 #include "dif/opt/rewrite.hpp"
+#include "dif/target/profile.hpp"
 #include "dif/opt/transform.hpp"
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace dif::opt {
+
+struct PlanCompatibility {
+  std::string compiler_revision;
+  std::string target_fingerprint;
+  std::string runtime_budget_class;
+  std::string precision_policy;
+  std::uint64_t minimum_usable_device_bytes{};
+  std::uint64_t required_workspace_bytes{};
+};
 
 // The reproducible description of one optimized program. A plan plus the base
 // program and its bindings is sufficient to rebuild the winning candidate
@@ -23,6 +34,10 @@ struct OptimizationPlan {
   std::string candidate_program_fingerprint;
   std::string candidate_fingerprint;
   std::vector<Transform> transforms;
+  // Present only after a measured plan is bound to an admitted execution
+  // environment. A target-bound plan cannot be replayed through the legacy
+  // environment-free overload.
+  std::optional<PlanCompatibility> compatibility;
 };
 
 std::string serialize_plan(const OptimizationPlan &plan);
@@ -31,12 +46,26 @@ void write_plan(const OptimizationPlan &plan,
                 const std::filesystem::path &path);
 OptimizationPlan read_plan(const std::filesystem::path &path);
 
+void bind_plan_compatibility(
+    OptimizationPlan &plan, const target::TargetProfile &profile,
+    const target::RuntimeBudget &budget, std::string precision_policy,
+    std::uint64_t minimum_usable_device_bytes,
+    std::uint64_t required_workspace_bytes);
+void validate_plan_compatibility(
+    const OptimizationPlan &plan, const target::TargetProfile &profile,
+    const target::RuntimeBudget &budget, std::string_view precision_policy);
+std::string plan_fingerprint(const OptimizationPlan &plan);
+
 // Rebuilds the planned candidate from a base context. Fails when the base does
 // not match the fingerprint the plan was recorded against, when a transform is
 // no longer legal, or when the rebuilt candidate does not reproduce the
 // recorded candidate fingerprint.
 RewriteContext replay(const OptimizationPlan &plan,
                       const RewriteContext &base);
+RewriteContext replay(const OptimizationPlan &plan, const RewriteContext &base,
+                      const target::TargetProfile &profile,
+                      const target::RuntimeBudget &budget,
+                      std::string_view precision_policy);
 
 // Applies the transformation *strategy* from a measured plan to another
 // program by clearing every recorded operation/tensor scope before each apply.
