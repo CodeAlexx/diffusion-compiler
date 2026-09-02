@@ -331,11 +331,15 @@ AutodiffResult differentiate(const ir::Program &forward,
     case ir::Opcode::SwiGlu: {
       const auto grad_input =
           add_tensor(*result.program.tensor(operation.inputs[0]));
+      std::vector<ir::Attribute> attributes{ir::Attribute::boolean(
+          ir::AttrKey::GateFirst,
+          operation.boolean(ir::AttrKey::GateFirst, false))};
+      if (operation.find(ir::AttrKey::Start))
+        attributes.push_back(ir::Attribute::u64(
+            ir::AttrKey::Start, operation.u64(ir::AttrKey::Start, 0U)));
       add_operation(ir::Opcode::SwiGluBackward,
                     {grad_output, operation.inputs[0]}, {grad_input},
-                    {ir::Attribute::boolean(
-                        ir::AttrKey::GateFirst,
-                        operation.boolean(ir::AttrKey::GateFirst, false))});
+                    std::move(attributes));
       accumulate(operation.inputs[0], grad_input);
       break;
     }

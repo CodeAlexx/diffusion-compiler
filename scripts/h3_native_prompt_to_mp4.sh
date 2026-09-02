@@ -85,6 +85,7 @@ fi
 
 # 7. mux (ffmpeg is the declared native boundary)
 "$BUILD/difh3media" --video "$OUT/video-decoded.diftensor" --audio-wav "$OUT/audio.wav" \
-  --output-dir "$OUT/media" --input-fps 24 --encoder h264_nvenc
+  --output-dir "$OUT/media" --input-fps 24 \
+  --encoder "${H3_MEDIA_ENCODER:-libx264}"
 
 echo "NATIVE_PROMPT_TO_MP4 done: $OUT/media/video.mp4"

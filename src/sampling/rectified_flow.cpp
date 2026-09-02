@@ -90,6 +90,62 @@ H3AVSigmaSchedule make_h3_simple_av_schedule(std::uint32_t evaluations) {
   return schedule;
 }
 
+double flux2_empirical_mu(std::uint64_t image_sequence_length,
+                          std::uint32_t steps) {
+  if (steps == 0U)
+    fail("FLUX.2 schedule requires at least one step");
+  const auto sequence = static_cast<double>(image_sequence_length);
+  if (image_sequence_length > 4300U) {
+    volatile double scaled = 0.00016927 * sequence;
+    volatile double result = scaled + 0.45666666;
+    return result;
+  }
+  volatile double m200_scaled = 0.00016927 * sequence;
+  volatile double m200 = m200_scaled + 0.45666666;
+  volatile double m10_scaled = 8.73809524e-05 * sequence;
+  volatile double m10 = m10_scaled + 1.89833333;
+  volatile double difference = m200 - m10;
+  volatile double slope = difference / 190.0;
+  volatile double intercept_term = 200.0 * slope;
+  volatile double intercept = m200 - intercept_term;
+  volatile double step_term = static_cast<double>(steps) * slope;
+  volatile double result = step_term + intercept;
+  return result;
+}
+
+std::vector<float> make_flux2_klein_schedule(
+    std::uint32_t steps, std::uint64_t image_sequence_length) {
+  if (steps == 0U)
+    fail("FLUX.2 schedule requires at least one step");
+  const auto points = steps + 1U;
+  if (points == 0U)
+    fail("FLUX.2 schedule point count overflow");
+  const auto mu = flux2_empirical_mu(image_sequence_length, steps);
+  const auto exponential = static_cast<float>(std::exp(mu));
+  std::vector<float> result;
+  result.reserve(points);
+  const auto step = -1.0F / static_cast<float>(steps);
+  const auto halfway = points / 2U;
+  for (std::uint32_t index = 0; index < points; ++index) {
+    const auto base = index < halfway
+                          ? std::fma(step, static_cast<float>(index), 1.0F)
+                          : std::fma(-step,
+                                     static_cast<float>(points - index - 1U),
+                                     0.0F);
+    volatile float reciprocal = 1.0F / base;
+    volatile float odds = reciprocal - 1.0F;
+    volatile float denominator = exponential + odds;
+    // torch's CPU true_divide path evaluates this scalar/tensor form as a
+    // float reciprocal followed by a float multiply.
+    volatile float denominator_reciprocal = 1.0F / denominator;
+    volatile float shifted = exponential * denominator_reciprocal;
+    result.push_back(static_cast<float>(shifted));
+  }
+  if (result.front() != 1.0F || result.back() != 0.0F)
+    fail("FLUX.2 schedule lost an endpoint");
+  return result;
+}
+
 void h3_euler_step_in_place(std::span<float> sample,
                             std::span<const float> model_output,
                             std::uint64_t row_width,

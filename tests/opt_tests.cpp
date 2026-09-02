@@ -997,6 +997,12 @@ void test_search_scales_to_a_full_h3_denoiser() {
   policy.max_depth = 1U;
   policy.beam_width = 1U;
   policy.iterations = 3U;
+  // This arm proves that memory-policy discovery can select the exact,
+  // dramatically smaller plan. CPU timing is not its subject, and short
+  // full-denoiser runs can drift beyond the production default's 5% latency
+  // guard on a busy workstation. Keep a bounded guard while preventing that
+  // unrelated timing jitter from hiding the memory-policy result.
+  policy.latency_regression_tolerance = 1.25;
   policy.discovery.structural = false;
   policy.discovery.schedule = false;
   policy.discovery.numeric = false;

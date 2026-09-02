@@ -15,6 +15,14 @@ bool pinned_numeric_semantics(const ir::Operation &op) {
   case ir::Opcode::DequantizeInt5:
   case ir::Opcode::RotaryPosition:
   case ir::Opcode::Gelu:
+  case ir::Opcode::QuantizeInt8Rows:
+  case ir::Opcode::LinearInt8Scaled:
+  case ir::Opcode::QuantizeFp8Rows:
+  case ir::Opcode::LinearFp8Scaled:
+  case ir::Opcode::QuantizeFp8Blocks32:
+  case ir::Opcode::LinearFp8BlockScaled:
+  case ir::Opcode::DequantizeInt8Blocks:
+  case ir::Opcode::LinearInt8WeightScaled:
     return true;
   default:
     break;
@@ -75,6 +83,7 @@ bool dtype_uniform(ir::Opcode opcode) {
   case ir::Opcode::BiasAdd:
   case ir::Opcode::AffineLastDim:
   case ir::Opcode::LayerNorm:
+  case ir::Opcode::LayerNormModulate:
   case ir::Opcode::Clamp:
   case ir::Opcode::QkNormPartialRope:
   case ir::Opcode::Conv2d:

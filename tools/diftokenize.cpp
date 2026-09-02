@@ -1,14 +1,14 @@
 // diftokenize: native prompt -> token-id tool for the Qwen-family byte-level
 // BPE tokenizer shipped with a checkpoint's processor/ directory.
 //
-// Reproduces `transformers` Qwen2TokenizerFast with add_special_tokens=False
-// (tokenizer.json + tokenizer_config.json additional_special_tokens; no chat
-// template). Reports the id count, the SHA-256 of the comma-joined decimal
-// id sequence, and can emit the ids as text and as an I32 .diftensor.
+// Reproduces `transformers` Qwen2TokenizerFast with add_special_tokens=False.
+// Model chat policy stays in its frontend: --flux2-inputs-out applies the
+// exact FLUX.2 single-user Qwen3 template and 512-token creator padding.
 //
 // --battery mode reads a JSON array of strings and prints a JSON array of
 // id arrays — used by the oracle-parity harness.
 
+#include "dif/frontend/flux2_prompt.hpp"
 #include "dif/ir/ir.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
@@ -40,6 +40,7 @@ namespace {
             << "  --prompt-file <path> | --prompt <text> | --battery <json>\n"
             << "  [--strip-trailing-newline] [--ids-out <path>]\n"
             << "  [--diftensor-out <path>] [--krea2-inputs-out <path>] "
+               "[--flux2-inputs-out <path>] "
                "[--quiet]\n";
   std::exit(2);
 }
@@ -98,6 +99,7 @@ int main(int argc, char **argv) {
     fs::path ids_out;
     fs::path diftensor_out;
     fs::path krea2_inputs_out;
+    fs::path flux2_inputs_out;
     std::string prompt_text;
     bool have_prompt_text = false;
     bool strip_trailing_newline = false;
@@ -129,6 +131,8 @@ int main(int argc, char **argv) {
         diftensor_out = value("--diftensor-out");
       else if (option == "--krea2-inputs-out")
         krea2_inputs_out = value("--krea2-inputs-out");
+      else if (option == "--flux2-inputs-out")
+        flux2_inputs_out = value("--flux2-inputs-out");
       else if (option == "--strip-trailing-newline")
         strip_trailing_newline = true;
       else if (option == "--quiet")
@@ -171,7 +175,41 @@ int main(int argc, char **argv) {
       while (!prompt.empty() && prompt.back() == '\n')
         prompt.pop_back();
 
-    const std::vector<std::int32_t> ids = tokenizer.encode(prompt);
+    if (!krea2_inputs_out.empty() && !flux2_inputs_out.empty())
+      usage_error("--krea2-inputs-out conflicts with --flux2-inputs-out");
+
+    std::vector<std::int32_t> ids = tokenizer.encode(prompt);
+    std::size_t valid_tokens = ids.size();
+
+    if (!flux2_inputs_out.empty()) {
+      const auto flux2 =
+          dif::frontend::make_flux2_qwen_prompt_inputs(tokenizer, prompt);
+      ids = flux2.input_ids;
+      valid_tokens = flux2.valid_tokens;
+      std::vector<float> positions(ids.size());
+      for (std::size_t index = 0U; index < positions.size(); ++index)
+        positions[index] = static_cast<float>(index);
+      std::vector<dif::weights::SafeTensorWriteSpec> specs{
+          {"input_ids", dif::ir::DType::I32, {1U, ids.size()}},
+          {"attention_mask", dif::ir::DType::Bool,
+           {1U, flux2.attention_mask.size()}},
+          {"position_ids", dif::ir::DType::F32, {positions.size(), 1U}},
+      };
+      dif::weights::SafeTensorWriter writer(flux2_inputs_out,
+                                             std::move(specs));
+      writer.append(
+          "input_ids",
+          {reinterpret_cast<const std::uint8_t *>(ids.data()),
+           ids.size() * sizeof(std::int32_t)});
+      writer.append("attention_mask",
+                    {flux2.attention_mask.data(),
+                     flux2.attention_mask.size()});
+      writer.append(
+          "position_ids",
+          {reinterpret_cast<const std::uint8_t *>(positions.data()),
+           positions.size() * sizeof(float)});
+      (void)writer.finish();
+    }
 
     if (!krea2_inputs_out.empty()) {
       constexpr std::string_view krea_prefix =
@@ -237,6 +275,7 @@ int main(int argc, char **argv) {
     if (!quiet) {
       std::cout << "{\n  \"prompt_bytes\": " << prompt.size()
                 << ",\n  \"token_count\": " << ids.size()
+                << ",\n  \"valid_token_count\": " << valid_tokens
                 << ",\n  \"ids_sha256\": ";
       write_json_escaped_ascii(std::cout, ids_sha256_hex(ids));
       std::cout << ",\n  \"id_space\": " << tokenizer.id_space()

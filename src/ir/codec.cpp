@@ -132,6 +132,8 @@ std::size_t dtype_size(DType dtype) {
   case DType::I32:
     return 4;
   case DType::Bool:
+  case DType::FP8E4M3:
+  case DType::FP8E8M0:
     return 1;
   case DType::BF16:
   case DType::F16:
@@ -156,6 +158,10 @@ std::string_view dtype_name(DType dtype) {
     return "i32";
   case DType::Bool:
     return "bool";
+  case DType::FP8E4M3:
+    return "fp8_e4m3";
+  case DType::FP8E8M0:
+    return "fp8_e8m0";
   }
   return "invalid";
 }
@@ -294,6 +300,24 @@ std::string_view opcode_name(Opcode opcode) {
     return "group_norm";
   case Opcode::PadReflect:
     return "pad_reflect";
+  case Opcode::QuantizeInt8Rows:
+    return "quantize_int8_rows";
+  case Opcode::LinearInt8Scaled:
+    return "linear_int8_scaled";
+  case Opcode::QuantizeFp8Rows:
+    return "quantize_fp8_rows";
+  case Opcode::LinearFp8Scaled:
+    return "linear_fp8_scaled";
+  case Opcode::QuantizeFp8Blocks32:
+    return "quantize_fp8_blocks32";
+  case Opcode::LinearFp8BlockScaled:
+    return "linear_fp8_block_scaled";
+  case Opcode::DequantizeInt8Blocks:
+    return "dequantize_int8_blocks";
+  case Opcode::LinearInt8WeightScaled:
+    return "linear_int8_weight_scaled";
+  case Opcode::LayerNormModulate:
+    return "layer_norm_modulate";
   }
   return "invalid";
 }

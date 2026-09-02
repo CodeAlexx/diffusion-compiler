@@ -1022,6 +1022,16 @@ void test_backend_neutral_flow_scheduler() {
                   0x00000000U}),
          "H3 simple AV schedule is byte-exact to ComfyUI's 1000-point table and mapped audio shift");
 
+  const auto flux2_schedule =
+      dif::sampling::make_flux2_klein_schedule(4U, 4096U);
+  expect(flux2_schedule ==
+             floats_from_bits({0x3f800000U, 0x3f77a67bU, 0x3f687c1eU,
+                               0x3f446737U, 0x00000000U}),
+         "FLUX.2 generalized-time schedule is byte-exact to creator F32");
+  expect(std::abs(dif::sampling::flux2_empirical_mu(4096U, 50U) -
+                  2.0233511571292637) < 1.0e-15,
+         "FLUX.2 empirical mu matches creator double arithmetic");
+
   auto trajectory = floats_from_bits(
       {0x00000000U, 0x3de3166fU, 0x3e61aff2U, 0x3ea78611U,
        0x3edc233eU, 0x3f0704b2U, 0x3f1e4d7cU, 0x3f33a279U});
@@ -1478,6 +1488,7 @@ void test_krea2_rotary_layout_mask_and_broadcast_oracle() {
       {18, DType::BF16, TensorRole::Input, {2, 1, 3}},
       {19, DType::BF16, TensorRole::Input, {2, 2, 3}},
       {20, DType::BF16, TensorRole::Output, {2, 3, 3}},
+      {21, DType::BF16, TensorRole::Output, {1, 1, 4, 4}},
   };
   program.operations = {
       {1, Opcode::RotaryFrequency, {1, 2, 3, 4}, {5, 6},
@@ -1500,6 +1511,8 @@ void test_krea2_rotary_layout_mask_and_broadcast_oracle() {
         Attribute::u64(AttrKey::Permutation2, 1U)}},
       {9, Opcode::Concat, {18, 19}, {20},
        {Attribute::u64(AttrKey::Axis, 1U)}},
+      {10, Opcode::BooleanMaskToBias, {9}, {21},
+       {Attribute::boolean(AttrKey::MaskQueries, false)}},
   };
   dif::runtime::TensorMap bindings;
   bindings.emplace(1, f32_tensor(
@@ -1563,6 +1576,11 @@ void test_krea2_rotary_layout_mask_and_broadcast_oracle() {
   expect(bias[0] == 0.0F && std::isinf(bias[2]) && bias[2] < 0.0F &&
              bias[3] == 0.0F && std::isinf(bias[8]) && bias[15] == 0.0F,
          "Krea 2 vector validity mask expands across a padding gap");
+  const auto key_only_bias = float_values(cpu.outputs.at(21));
+  expect(key_only_bias[8] == 0.0F && key_only_bias[9] == 0.0F &&
+             std::isinf(key_only_bias[10]) && key_only_bias[10] < 0.0F &&
+             key_only_bias[11] == 0.0F,
+         "key-only padding leaves invalid query rows observable");
   expect(float_values(cpu.outputs.at(12)) ==
              std::vector<float>({0, 1, 2, 3}) &&
              float_values(cpu.outputs.at(14)) ==
@@ -1588,7 +1606,8 @@ void test_krea2_rotary_layout_mask_and_broadcast_oracle() {
              cuda.outputs.at(13).bytes == cpu.outputs.at(13).bytes &&
              cuda.outputs.at(14).bytes == cpu.outputs.at(14).bytes &&
              cuda.outputs.at(17).bytes == cpu.outputs.at(17).bytes &&
-             cuda.outputs.at(20).bytes == cpu.outputs.at(20).bytes,
+             cuda.outputs.at(20).bytes == cpu.outputs.at(20).bytes &&
+             cuda.outputs.at(21).bytes == cpu.outputs.at(21).bytes,
          "CUDA mask and layout operations are bit-exact to CPU semantics");
 }
 
@@ -2722,10 +2741,15 @@ void test_attention_implementation_identity() {
 
   const auto generated = make_program(DType::BF16, 1U);
   const auto cudnn = make_program(DType::BF16, 2U);
+  const auto materialized_f32 = make_program(DType::F32, 3U);
   dif::ir::verify(generated);
   dif::ir::verify(cudnn);
+  dif::ir::verify(materialized_f32);
   expect(dif::ir::fingerprint(generated) != dif::ir::fingerprint(cudnn),
          "attention implementation changes candidate fingerprint");
+  expect(dif::ir::fingerprint(cudnn) !=
+             dif::ir::fingerprint(materialized_f32),
+         "materialized f32 attention has a distinct candidate identity");
 
   bool rejected = false;
   try {
@@ -2733,7 +2757,7 @@ void test_attention_implementation_identity() {
   } catch (const dif::Error &) {
     rejected = true;
   }
-  expect(rejected, "verifier rejects unknown attention implementation");
+  expect(rejected, "verifier restricts materialized attention to f32");
 
   rejected = false;
   try {
@@ -2742,6 +2766,14 @@ void test_attention_implementation_identity() {
     rejected = true;
   }
   expect(rejected, "verifier rejects f32 cuDNN attention candidate");
+
+  rejected = false;
+  try {
+    dif::ir::verify(make_program(DType::F32, 4U));
+  } catch (const dif::Error &) {
+    rejected = true;
+  }
+  expect(rejected, "verifier rejects unknown attention implementation");
 }
 
 void test_h3_bf16_lowering_preserves_source_reduction_identity() {
@@ -4223,6 +4255,421 @@ void test_qwen3vl_vision_and_multimodal_frontend_contract() {
                " deepstack=3 multimodal_updates=4\n";
 }
 
+void test_generic_scaled_int8_linear() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1U, DType::BF16, TensorRole::Input, {2U, 16U}},
+      {2U, DType::I8, TensorRole::Internal, {2U, 16U}},
+      {3U, DType::F32, TensorRole::Internal, {2U}},
+      {4U, DType::I8, TensorRole::Constant, {16U, 16U}},
+      {5U, DType::F32, TensorRole::Constant, {16U}},
+      {6U, DType::BF16, TensorRole::Output, {2U, 16U}},
+  };
+  program.operations = {
+      {1U, Opcode::QuantizeInt8Rows, {1U}, {2U, 3U},
+       {Attribute::u64(AttrKey::BlockSize, 256U),
+        Attribute::f64(AttrKey::Scale, 0.98)}},
+      {2U, Opcode::LinearInt8Scaled, {2U, 4U, 3U, 5U}, {6U}, {}},
+  };
+  dif::ir::verify(program);
+
+  dif::runtime::Tensor weight{DType::I8, {16U, 16U}, {}};
+  weight.bytes.resize(256U);
+  auto *weight_values =
+      reinterpret_cast<std::int8_t *>(weight.mutable_data());
+  for (std::size_t index = 0U; index < 256U; ++index)
+    weight_values[index] = static_cast<std::int8_t>(
+        static_cast<int>(index % 13U) - 6);
+  weight.validate();
+  std::vector<float> input_values(32U);
+  for (std::size_t index = 0U; index < input_values.size(); ++index)
+    input_values[index] = static_cast<float>(static_cast<int>(index % 11U) - 5) /
+                          2.0F;
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1U,
+                   float_tensor(DType::BF16, {2U, 16U}, input_values));
+  bindings.emplace(4U, weight);
+  bindings.emplace(5U, f32_tensor({16U}, std::vector<float>(16U, 0.25F)));
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  const auto cpu_values = float_values(cpu.outputs.at(6U));
+  expect(std::all_of(cpu_values.begin(), cpu_values.end(),
+                     [](float value) { return std::isfinite(value); }),
+         "generic scaled INT8 Linear CPU output is finite");
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  const auto cuda_values = float_values(cuda.outputs.at(6U));
+  expect(cuda_values == cpu_values,
+         "generic scaled INT8 Linear CUDA matches the integer CPU oracle");
+}
+
+void test_generic_int8_weight_linear() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1U, DType::BF16, TensorRole::Input, {2U, 16U}},
+      {2U, DType::I8, TensorRole::Constant, {16U, 16U}},
+      {3U, DType::F32, TensorRole::Constant, {16U}},
+      {4U, DType::BF16, TensorRole::Output, {2U, 16U}},
+  };
+  program.operations = {{1U, Opcode::LinearInt8WeightScaled,
+                         {1U, 2U, 3U}, {4U}, {}}};
+  dif::ir::verify(program);
+
+  dif::runtime::Tensor weight{DType::I8, {16U, 16U}, {}};
+  weight.bytes.resize(256U);
+  auto *weight_values =
+      reinterpret_cast<std::int8_t *>(weight.mutable_data());
+  for (std::size_t index = 0U; index < 256U; ++index)
+    weight_values[index] = static_cast<std::int8_t>(
+        static_cast<int>(index % 13U) - 6);
+  weight.validate();
+  std::vector<float> input_values(32U);
+  for (std::size_t index = 0U; index < input_values.size(); ++index)
+    input_values[index] = static_cast<float>(static_cast<int>(index % 11U) - 5) /
+                          2.0F;
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1U,
+                   float_tensor(DType::BF16, {2U, 16U}, input_values));
+  bindings.emplace(2U, weight);
+  bindings.emplace(3U, f32_tensor({16U}, std::vector<float>(16U, 0.25F)));
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cuda.outputs.at(4U).bytes == cpu.outputs.at(4U).bytes,
+         "generic mixed BF16/INT8 weight Linear CUDA matches its CPU oracle");
+}
+
+void test_generic_scaled_fp8_linear() {
+  using namespace dif::ir;
+  expect(dif::runtime::float_to_fp8_e4m3(0.0F) == 0x00U &&
+             dif::runtime::float_to_fp8_e4m3(1.0F) == 0x38U &&
+             dif::runtime::float_to_fp8_e4m3(-1.0F) == 0xb8U &&
+             dif::runtime::float_to_fp8_e4m3(448.0F) == 0x7eU &&
+             dif::runtime::float_to_fp8_e4m3(1.0F / 512.0F) == 0x01U,
+         "FP8 E4M3 scalar encoding pins zero, unit, maximum, and subnormal");
+  expect(dif::runtime::fp8_e4m3_to_float(0x38U) == 1.0F &&
+             dif::runtime::fp8_e4m3_to_float(0xb8U) == -1.0F &&
+             dif::runtime::fp8_e4m3_to_float(0x7eU) == 448.0F,
+         "FP8 E4M3 scalar decoding pins unit and maximum values");
+
+  Program program;
+  program.tensors = {
+      {1U, DType::BF16, TensorRole::Input, {16U, 16U}},
+      {2U, DType::FP8E4M3, TensorRole::Output, {16U, 16U}},
+      {3U, DType::F32, TensorRole::Output, {16U}},
+      {4U, DType::FP8E4M3, TensorRole::Constant, {16U, 16U}},
+      {5U, DType::F32, TensorRole::Constant, {16U}},
+      {6U, DType::BF16, TensorRole::Output, {16U, 16U}},
+  };
+  program.operations = {
+      {1U, Opcode::QuantizeFp8Rows, {1U}, {2U, 3U},
+       {Attribute::u64(AttrKey::BlockSize, 256U)}},
+      {2U, Opcode::LinearFp8Scaled, {2U, 4U, 3U, 5U}, {6U}, {}},
+  };
+  dif::ir::verify(program);
+
+  std::vector<float> input_values(256U);
+  for (std::size_t index = 0U; index < input_values.size(); ++index)
+    input_values[index] =
+        static_cast<float>(static_cast<int>(index % 29U) - 14) /
+        static_cast<float>((index % 5U) + 1U);
+  dif::runtime::Tensor weight{DType::FP8E4M3, {16U, 16U}, {}};
+  weight.bytes.resize(256U);
+  std::vector<float> column_scales(16U);
+  for (std::size_t row = 0U; row < 16U; ++row) {
+    std::array<float, 16U> values{};
+    float maximum = 0.0F;
+    for (std::size_t column = 0U; column < 16U; ++column) {
+      values[column] =
+          static_cast<float>(static_cast<int>((row * 7U + column) % 19U) - 9) /
+          static_cast<float>((column % 3U) + 1U);
+      maximum = std::max(maximum, std::fabs(values[column]));
+    }
+    const auto scale = std::max(maximum / 448.0F, 1.0e-30F);
+    column_scales[row] = scale;
+    for (std::size_t column = 0U; column < 16U; ++column)
+      weight.mutable_data()[row * 16U + column] =
+          dif::runtime::float_to_fp8_e4m3(values[column] / scale);
+  }
+  weight.validate();
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1U,
+                   float_tensor(DType::BF16, {16U, 16U}, input_values));
+  bindings.emplace(4U, weight);
+  bindings.emplace(5U, f32_tensor({16U}, column_scales));
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  const auto cpu_values = float_values(cpu.outputs.at(6U));
+  expect(std::all_of(cpu_values.begin(), cpu_values.end(),
+                     [](float value) { return std::isfinite(value); }),
+         "generic scaled FP8 Linear CPU output is finite");
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cuda.outputs.at(2U).bytes == cpu.outputs.at(2U).bytes &&
+             cuda.outputs.at(3U).bytes == cpu.outputs.at(3U).bytes,
+         "generic FP8 row quantization CUDA matches the CPU contract exactly");
+  const auto cuda_values = float_values(cuda.outputs.at(6U));
+  float maximum_absolute_error = 0.0F;
+  for (std::size_t index = 0U; index < cpu_values.size(); ++index)
+    maximum_absolute_error =
+        std::max(maximum_absolute_error,
+                 std::fabs(cuda_values[index] - cpu_values[index]));
+  expect(maximum_absolute_error <= 0.25F,
+         "generic scaled FP8 Linear CUDA stays within its BF16 boundary");
+}
+
+void test_generic_mxfp8_linear() {
+  using namespace dif::ir;
+  expect(dif::runtime::float_to_fp8_e8m0_round_up(1.0F) == 127U &&
+             dif::runtime::float_to_fp8_e8m0_round_up(0.5F) == 126U &&
+             dif::runtime::float_to_fp8_e8m0_round_up(1.1F) == 128U &&
+             dif::runtime::fp8_e8m0_to_float(128U) == 2.0F,
+         "FP8 E8M0 uses positive-infinity exponent rounding");
+  constexpr std::uint64_t rows = 128U;
+  constexpr std::uint64_t inner = 128U;
+  constexpr std::uint64_t columns = 128U;
+  constexpr std::uint64_t scale_blocks = inner / 32U;
+  Program program;
+  program.tensors = {
+      {1U, DType::BF16, TensorRole::Input, {rows, inner}},
+      {2U, DType::FP8E4M3, TensorRole::Output, {rows, inner}},
+      {3U, DType::FP8E8M0, TensorRole::Output, {rows, scale_blocks}},
+      {4U, DType::FP8E4M3, TensorRole::Constant, {columns, inner}},
+      {5U, DType::FP8E8M0, TensorRole::Constant,
+       {columns, scale_blocks}},
+      {6U, DType::BF16, TensorRole::Output, {rows, columns}},
+  };
+  program.operations = {
+      {1U, Opcode::QuantizeFp8Blocks32, {1U}, {2U, 3U},
+       {Attribute::u64(AttrKey::BlockSize, 256U)}},
+      {2U, Opcode::LinearFp8BlockScaled, {2U, 4U, 3U, 5U}, {6U}, {}},
+  };
+  dif::ir::verify(program);
+  const auto scale_offset = [](std::uint64_t outer, std::uint64_t block) {
+    const auto within = (outer % 32U) * 16U +
+                        ((outer % 128U) / 32U) * 4U + block % 4U;
+    return (block / 4U) * 4U * 128U + within;
+  };
+  std::vector<float> input_values(rows * inner);
+  for (std::size_t index = 0U; index < input_values.size(); ++index)
+    input_values[index] =
+        static_cast<float>(static_cast<int>(index % 31U) - 15) / 32.0F;
+  dif::runtime::Tensor weight{DType::FP8E4M3, {columns, inner}, {}};
+  weight.bytes.resize(columns * inner);
+  dif::runtime::Tensor scales{DType::FP8E8M0,
+                              {columns, scale_blocks}, {}};
+  scales.bytes.resize(columns * scale_blocks, 0U);
+  for (std::uint64_t row = 0U; row < columns; ++row) {
+    for (std::uint64_t block = 0U; block < scale_blocks; ++block) {
+      float maximum = 0.0F;
+      std::array<float, 32U> values{};
+      for (std::uint64_t lane = 0U; lane < 32U; ++lane) {
+        values[lane] = static_cast<float>(
+            static_cast<int>((row * 13U + block * 5U + lane) % 29U) - 14) /
+                       64.0F;
+        maximum = std::max(maximum, std::fabs(values[lane]));
+      }
+      const auto encoded_scale =
+          dif::runtime::float_to_fp8_e8m0_round_up(maximum / 448.0F);
+      scales.mutable_data()[scale_offset(row, block)] = encoded_scale;
+      const auto scale = dif::runtime::fp8_e8m0_to_float(encoded_scale);
+      for (std::uint64_t lane = 0U; lane < 32U; ++lane)
+        weight.mutable_data()[row * inner + block * 32U + lane] =
+            dif::runtime::float_to_fp8_e4m3(values[lane] / scale);
+    }
+  }
+  weight.validate();
+  scales.validate();
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1U, float_tensor(DType::BF16, {rows, inner}, input_values));
+  bindings.emplace(4U, weight);
+  bindings.emplace(5U, scales);
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cuda.outputs.at(2U).bytes == cpu.outputs.at(2U).bytes &&
+             cuda.outputs.at(3U).bytes == cpu.outputs.at(3U).bytes,
+         "MXFP8 block quantization CUDA matches the CPU tiled-scale contract");
+  const auto cpu_values = float_values(cpu.outputs.at(6U));
+  const auto cuda_values = float_values(cuda.outputs.at(6U));
+  float maximum_absolute_error = 0.0F;
+  for (std::size_t index = 0U; index < cpu_values.size(); ++index)
+    maximum_absolute_error =
+        std::max(maximum_absolute_error,
+                 std::fabs(cuda_values[index] - cpu_values[index]));
+  expect(maximum_absolute_error <= 0.25F,
+         "MXFP8 cuBLASLt output stays within its BF16 accumulation boundary");
+}
+
+void test_generic_int8_block_dequantization() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1U, DType::I8, TensorRole::Constant, {2U, 64U}},
+      {2U, DType::F32, TensorRole::Constant, {2U, 2U}},
+      {3U, DType::BF16, TensorRole::Output, {2U, 64U}},
+  };
+  program.operations = {
+      {1U, Opcode::DequantizeInt8Blocks, {1U, 2U}, {3U},
+       {Attribute::u64(AttrKey::BlockSize, 32U)}},
+  };
+  dif::ir::verify(program);
+  dif::runtime::Tensor weight{DType::I8, {2U, 64U}, {}};
+  weight.bytes.resize(128U);
+  auto *values = reinterpret_cast<std::int8_t *>(weight.mutable_data());
+  for (std::size_t index = 0U; index < 128U; ++index)
+    values[index] = static_cast<std::int8_t>(
+        static_cast<int>(index % 31U) - 15);
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1U, std::move(weight));
+  bindings.emplace(2U, f32_tensor({2U, 2U}, {0.25F, 0.5F, 1.0F, 2.0F}));
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto cpu =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto cuda =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  expect(cuda.outputs.at(3U).bytes == cpu.outputs.at(3U).bytes,
+         "generic groupwise INT8 weight dequantization matches exactly");
+}
+
+void test_h256_convrot_row_quantization() {
+  using namespace dif::ir;
+  std::vector<float> values(512U);
+  for (std::size_t index = 0U; index < values.size(); ++index)
+    values[index] = static_cast<float>(static_cast<int>(index % 37U) - 18) /
+                    static_cast<float>((index % 5U) + 1U);
+  for (const auto implementation : {Int8RowQuantization::H256ConvRot,
+                                    Int8RowQuantization::H256SignedConvRot,
+                                    Int8RowQuantization::H256F32ConvRot,
+                                    Int8RowQuantization::H256F32SignedConvRot}) {
+    const auto dynamic_clip =
+        implementation == Int8RowQuantization::H256F32ConvRot ||
+        implementation == Int8RowQuantization::H256F32SignedConvRot;
+    Program program;
+    program.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {2U, 256U}},
+        {2U, DType::I8, TensorRole::Output, {2U, 256U}},
+        {3U, DType::F32, TensorRole::Output, {2U}},
+        {4U, DType::I8, TensorRole::Output, {2U, 256U}},
+        {5U, DType::F32, TensorRole::Output, {2U}},
+    };
+    if (dynamic_clip)
+      program.tensors.push_back(
+          {6U, DType::F32, TensorRole::Input, {1U}});
+    program.operations = {{
+        1U,
+        Opcode::QuantizeInt8Rows,
+        dynamic_clip ? std::vector<std::uint32_t>{1U, 6U}
+                     : std::vector<std::uint32_t>{1U},
+        {2U, 3U, 4U, 5U},
+        {Attribute::u64(AttrKey::BlockSize, 256U),
+         Attribute::u64(AttrKey::Implementation,
+                        static_cast<std::uint64_t>(implementation))},
+    }};
+    dif::ir::verify(program);
+    dif::runtime::TensorMap bindings;
+    bindings.emplace(1U, float_tensor(DType::BF16, {2U, 256U}, values));
+    if (dynamic_clip)
+      bindings.emplace(6U, f32_tensor({1U}, {0.9995F}));
+    dif::runtime::RunOptions options;
+    options.warmups = 0U;
+    options.iterations = 1U;
+    options.minimum_free_bytes = 0U;
+    const auto cpu =
+        dif::runtime::make_cpu_executor()->run(program, bindings, options);
+    if (!dif::runtime::cuda_available())
+      continue;
+    const auto cuda =
+        dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    expect(cuda.outputs.at(2U).bytes == cpu.outputs.at(2U).bytes,
+           "H256 ConvRot primary codes match the CPU contract exactly");
+    expect(cuda.outputs.at(3U).bytes == cpu.outputs.at(3U).bytes,
+           "H256 ConvRot primary scales match the CPU contract exactly");
+    expect(cuda.outputs.at(4U).bytes == cpu.outputs.at(4U).bytes,
+           "H256 ConvRot residual codes match the CPU contract exactly");
+    expect(cuda.outputs.at(5U).bytes == cpu.outputs.at(5U).bytes,
+           "H256 ConvRot residual scales match the CPU contract exactly");
+  }
+}
+
+void test_h4096_convrot_row_quantization() {
+  using namespace dif::ir;
+  for (const auto implementation : {
+           Int8RowQuantization::H4096SignedConvRot,
+           Int8RowQuantization::H4096F32SignedConvRot}) {
+    constexpr auto width = 4096U;
+    std::vector<float> values(width);
+    for (std::size_t index = 0U; index < values.size(); ++index)
+      values[index] =
+          static_cast<float>(static_cast<int>(index % 53U) - 26) /
+          static_cast<float>((index % 7U) + 1U);
+    Program program;
+    program.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {1U, width}},
+        {2U, DType::I8, TensorRole::Output, {1U, width}},
+        {3U, DType::F32, TensorRole::Output, {1U}},
+    };
+    program.operations = {{
+        1U,
+        Opcode::QuantizeInt8Rows,
+        {1U},
+        {2U, 3U},
+        {Attribute::u64(AttrKey::BlockSize, 256U),
+         Attribute::u64(AttrKey::Implementation,
+                        static_cast<std::uint64_t>(implementation))},
+    }};
+    dif::ir::verify(program);
+    dif::runtime::TensorMap bindings;
+    bindings.emplace(1U, float_tensor(DType::BF16, {1U, width}, values));
+    dif::runtime::RunOptions options;
+    options.warmups = 0U;
+    options.iterations = 1U;
+    options.minimum_free_bytes = 0U;
+    const auto cpu =
+        dif::runtime::make_cpu_executor()->run(program, bindings, options);
+    if (!dif::runtime::cuda_available())
+      continue;
+    const auto cuda =
+        dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    expect(cuda.outputs.at(2U).bytes == cpu.outputs.at(2U).bytes &&
+               cuda.outputs.at(3U).bytes == cpu.outputs.at(3U).bytes,
+           "H4096 ConvRot row quantization CUDA matches the CPU contract exactly");
+  }
+}
+
 int main() {
   test_sha256();
   test_json_parser();
@@ -4261,6 +4708,13 @@ int main() {
   test_wav_pcm16_writer_contract();
   test_png_rgb8_writer_contract();
   test_qwen3vl_vision_and_multimodal_frontend_contract();
+  test_generic_scaled_int8_linear();
+  test_generic_int8_weight_linear();
+  test_generic_scaled_fp8_linear();
+  test_generic_mxfp8_linear();
+  test_generic_int8_block_dequantization();
+  test_h256_convrot_row_quantization();
+  test_h4096_convrot_row_quantization();
   test_attention_implementation_identity();
   test_h3_bf16_lowering_preserves_source_reduction_identity();
   test_h3_long_sequence_transformer_declares_backend_attention();

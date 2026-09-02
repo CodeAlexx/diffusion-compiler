@@ -247,6 +247,14 @@ struct RunOptions {
   // identical either way; only host paging behavior changes. Any non-default
   // choice must enter difopt candidate identity.
   bool streamed_release_mapped_pages_per_copy{true};
+  // Keep mapped streamed-weight pages populated across repeated run() calls
+  // on the same PreparedExecution. This is the host-resident checkpoint mode
+  // for iterative samplers: the file mapping and its page tables are reused
+  // for every denoise step instead of being discarded at copy or run end.
+  // It is mutually exclusive with release-per-copy and increases host RSS by
+  // up to the streamed checkpoint payload. Default OFF preserves historical
+  // behavior; enabling it is an explicit whole-system plan choice.
+  bool streamed_keep_mapped_pages_between_runs{false};
   // Pinned staging ring for streamed constants and how many operations
   // ahead the overlapped scheduler prefetches. Defaults (2 buffers,
   // depth 1) are the historical double-buffer policy, byte-for-byte.

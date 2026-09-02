@@ -2,6 +2,7 @@
 
 #include "dif/support/error.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -96,6 +97,68 @@ float f16_to_float(std::uint16_t value) {
     bits = sign | ((exponent + 112U) << 23U) | (mantissa << 13U);
   }
   return std::bit_cast<float>(bits);
+}
+
+float fp8_e4m3_to_float(std::uint8_t value) {
+  const auto sign = (value & 0x80U) != 0U ? -1.0F : 1.0F;
+  const auto exponent = static_cast<unsigned>((value >> 3U) & 0x0fU);
+  const auto mantissa = static_cast<unsigned>(value & 0x07U);
+  if (exponent == 0U)
+    return sign * std::ldexp(static_cast<float>(mantissa), -9);
+  if (exponent == 0x0fU && mantissa == 0x07U)
+    return std::numeric_limits<float>::quiet_NaN();
+  return sign * std::ldexp(1.0F + static_cast<float>(mantissa) / 8.0F,
+                           static_cast<int>(exponent) - 7);
+}
+
+std::uint8_t float_to_fp8_e4m3(float value) {
+  if (std::isnan(value))
+    return 0x7fU;
+  const auto sign = std::signbit(value) ? 0x80U : 0U;
+  const auto magnitude = std::fabs(value);
+  if (magnitude == 0.0F)
+    return static_cast<std::uint8_t>(sign);
+  if (!std::isfinite(magnitude) || magnitude >= 448.0F)
+    return static_cast<std::uint8_t>(sign | 0x7eU);
+  if (magnitude < 0.015625F) {
+    const auto mantissa = static_cast<unsigned>(
+        std::nearbyint(std::ldexp(magnitude, 9)));
+    if (mantissa >= 8U)
+      return static_cast<std::uint8_t>(sign | 0x08U);
+    return static_cast<std::uint8_t>(sign | mantissa);
+  }
+  int binary_exponent{};
+  const auto fraction = std::frexp(magnitude, &binary_exponent);
+  auto exponent = binary_exponent - 1 + 7;
+  auto mantissa = static_cast<unsigned>(
+      std::nearbyint((fraction * 2.0F - 1.0F) * 8.0F));
+  if (mantissa == 8U) {
+    mantissa = 0U;
+    ++exponent;
+  }
+  if (exponent > 15 || (exponent == 15 && mantissa >= 7U))
+    return static_cast<std::uint8_t>(sign | 0x7eU);
+  return static_cast<std::uint8_t>(sign |
+                                   (static_cast<unsigned>(exponent) << 3U) |
+                                   mantissa);
+}
+
+std::uint8_t float_to_fp8_e8m0_round_up(float value) {
+  if (std::isnan(value))
+    return 0xffU;
+  const auto magnitude = std::fabs(value);
+  if (magnitude == 0.0F)
+    return 0U;
+  if (!std::isfinite(magnitude))
+    return 0xfeU;
+  const auto exponent = static_cast<int>(std::ceil(std::log2(magnitude)));
+  return static_cast<std::uint8_t>(std::clamp(exponent, -127, 127) + 127);
+}
+
+float fp8_e8m0_to_float(std::uint8_t value) {
+  if (value == 0xffU)
+    return std::numeric_limits<float>::quiet_NaN();
+  return std::ldexp(1.0F, static_cast<int>(value) - 127);
 }
 
 float load_float(const Tensor &tensor, std::uint64_t index) {

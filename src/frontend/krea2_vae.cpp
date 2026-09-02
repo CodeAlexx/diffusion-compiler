@@ -157,7 +157,9 @@ private:
                      const std::string &prefix,
                      Krea2VaeWeightTransform transform) {
     using namespace ir;
-    const auto &input_desc = description(input);
+    // Builder helpers append tensor descriptors, so keep a value copy rather
+    // than a reference that vector growth can invalidate.
+    const auto input_desc = description(input);
     if (transform == Krea2VaeWeightTransform::Conv3dLastTemporalSlice) {
       const auto weight = checkpoint(
           prefix + ".weight",
@@ -284,7 +286,7 @@ private:
 
   std::uint32_t attention(std::uint32_t input, const std::string &prefix) {
     using namespace ir;
-    const auto &input_desc = description(input);
+    const auto input_desc = description(input);
     const auto channels = input_desc.dims[1];
     const auto height = input_desc.dims[2];
     const auto width = input_desc.dims[3];
@@ -344,7 +346,7 @@ private:
   std::uint32_t upsample(std::uint32_t input,
                          const std::string &conv_prefix) {
     using namespace ir;
-    const auto &input_desc = description(input);
+    const auto input_desc = description(input);
     const auto expanded = tensor(
         DType::BF16, TensorRole::Internal,
         {input_desc.dims[0], input_desc.dims[1], 2U * input_desc.dims[2],

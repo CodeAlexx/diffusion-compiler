@@ -632,6 +632,329 @@ void emit_cast(std::ostringstream &out, const ir::Program &program,
       << count << "ULL)" << store << "(y,i," << load << "(x,i));}\n";
 }
 
+void emit_quantize_int8_rows(std::ostringstream &out,
+                             const ir::Program &program,
+                             const ir::Operation &op) {
+  const auto *quantized = program.tensor(op.outputs[0]);
+  const auto columns = quantized->dims.back();
+  const auto rows = quantized->element_count() / columns;
+  const auto dynamic_clip =
+      program.tensor(op.inputs.back())->dtype == ir::DType::F32;
+  const auto data_input_count =
+      op.inputs.size() - static_cast<std::size_t>(dynamic_clip);
+  const auto input_parameters = [&] {
+    std::string result;
+    for (std::size_t index = 0U; index < data_input_count; ++index)
+      result += "const dif_bf16* x" + std::to_string(index) + ",";
+    if (dynamic_clip)
+      result += "const dif_f32* clip_ratio,";
+    return result;
+  }();
+  const auto load_input = [&] {
+    std::string result;
+    std::uint64_t prefix = 0U;
+    for (std::size_t index = 0U; index < data_input_count; ++index) {
+      const auto width = program.tensor(op.inputs[index])->dims.back();
+      const auto load = "dif_load_bf16(x" + std::to_string(index) +
+                        ",row*" + std::to_string(width) + "ULL+column-" +
+                        std::to_string(prefix) + "ULL)";
+      if (index + 1U == data_input_count) {
+        result += load;
+      } else {
+        result += "(column<" + std::to_string(prefix + width) + "ULL?" +
+                  load + ":";
+      }
+      prefix += width;
+    }
+    result.append(data_input_count - 1U, ')');
+    return result;
+  }();
+  const auto residual2 = op.outputs.size() == 4U;
+  const auto implementation = static_cast<ir::Int8RowQuantization>(
+      op.u64(ir::AttrKey::Implementation,
+             static_cast<std::uint64_t>(
+                 ir::Int8RowQuantization::Direct)));
+  const auto clip_ratio = op.f64(ir::AttrKey::Scale, 1.0);
+  std::ostringstream clip_ratio_literal;
+  clip_ratio_literal << std::scientific << std::setprecision(9)
+                     << static_cast<float>(clip_ratio);
+  const auto clip_ratio_source =
+      dynamic_clip ? std::string{"dif_load_f32(clip_ratio,0ULL)"}
+                   : clip_ratio_literal.str() + "f";
+  if (implementation == ir::Int8RowQuantization::H256ConvRot ||
+      implementation == ir::Int8RowQuantization::H256F32ConvRot ||
+      implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H256SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot) {
+    const auto f32_convrot =
+        implementation == ir::Int8RowQuantization::H256F32ConvRot ||
+        implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
+        implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+    const auto signed_rotation =
+        implementation == ir::Int8RowQuantization::H256SignedConvRot ||
+        implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
+        implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
+        implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+    auto rotation_group =
+        (implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
+         implementation == ir::Int8RowQuantization::H4096F32SignedConvRot)
+            ? 4096U
+            : 256U;
+    const auto signed_rotation_source =
+        signed_rotation
+            ? "unsigned h=(unsigned)column+" +
+                  std::to_string(0x9e3779b9U) +
+                  "U;h=(h^(h>>16))*0x7feb352dU;h=(h^(h>>15))*"
+                  "0x846ca68bU;h^=h>>16;value=(h&1U)?-value:value;"
+            : std::string{};
+    auto rotation_stages = 0U;
+    for (auto width = rotation_group; width > 1U; width /= 4U)
+      ++rotation_stages;
+    out << "extern \"C\" __global__ void " << function_name(op)
+        << "(" << input_parameters << "signed char* q,float* scales"
+        << (residual2 ? ",signed char* q2,float* scales2" : "")
+        << "){"
+           "extern __shared__ float values[];__shared__ float maximums[256];"
+           "unsigned long long row=blockIdx.x;unsigned tid=threadIdx.x;if(row>="
+        << rows
+        << "ULL)return;unsigned long long base=row*" << columns
+        << "ULL;for(unsigned long long column=tid;column<" << columns
+        << "ULL;column+=256ULL){float value=" << load_input << ";"
+        << signed_rotation_source
+        << "values[column]=value;}"
+           "__syncthreads();for(unsigned stage=0U;stage<"
+        << rotation_stages
+        << "U;++stage){unsigned stride=1U<<(2U*stage);"
+           "for(unsigned long long tuple=tid;tuple<"
+        << columns
+        << "ULL/4ULL;tuple+=256ULL){unsigned long long group=(tuple/"
+        << rotation_group / 4U << "ULL)*" << rotation_group
+        << "ULL;unsigned lane=(unsigned)(tuple%" << rotation_group / 4U
+        << "ULL);unsigned offset=(lane%stride)+"
+           "(lane/stride)*(4U*stride);unsigned long long i=group+offset;"
+           "float x0=values[i],x1=values[i+stride],x2=values[i+2U*stride],"
+           "x3=values[i+3U*stride];values[i]=0.5f*(x0+x1+x2-x3);"
+           "values[i+stride]=0.5f*(x0+x1-x2+x3);"
+           "values[i+2U*stride]=0.5f*(x0-x1+x2+x3);"
+           "values[i+3U*stride]=0.5f*(-x0+x1+x2+x3);}__syncthreads();}"
+           "float maximum=0.0f;for(unsigned long long column=tid;column<"
+        << columns
+        << "ULL;column+=256ULL)maximum=fmaxf(maximum,fabsf(values[column]));"
+           "maximums[tid]=maximum;__syncthreads();for(unsigned active=128U;"
+           "active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf("
+           "maximums[tid],maximums[tid+active]);__syncthreads();}float scale="
+           "fmaxf(maximums[0]*"
+        << clip_ratio_source
+        << "/127.0f,1.0e-30f);float scale_bf16=dif_round_bf16(scale);"
+           "if(tid==0U)scales[row]="
+        << (signed_rotation && !f32_convrot ? "scale_bf16;" : "scale;")
+        << "__syncthreads();"
+           "for(unsigned long long column=tid;column<"
+        << columns
+        << "ULL;column+=256ULL){"
+        << (f32_convrot
+                ? "float value=values[column];float divided=value/scale;"
+                  "int encoded=(int)nearbyintf(divided);encoded=encoded>127?"
+                  "127:(encoded<-127?-127:encoded);"
+                : "float value=dif_round_bf16(values[column]);float divided="
+                  "dif_round_bf16(value/scale_bf16);int encoded=(int)"
+                  "nearbyintf(divided);encoded=encoded>127?127:(encoded<-128?"
+                  "-128:encoded);")
+        << "q[base+column]=(signed char)encoded;}"
+        << (residual2
+                ? "__syncthreads();float stored_scale=scales[row];float "
+                  "residual_maximum=0.0f;for(unsigned long long column=tid;"
+                  "column<" + std::to_string(columns) +
+                  "ULL;column+=256ULL){float value=" +
+                  std::string(f32_convrot ? "values[column]"
+                                          : "dif_round_bf16(values[column])") +
+                  ";float residual=fmaf(-(float)q[base+column],"
+                  "stored_scale,value);residual_maximum=fmaxf(residual_maximum,"
+                  "fabsf(residual));}maximums[tid]=residual_maximum;"
+                  "__syncthreads();for(unsigned active=128U;active>0U;"
+                  "active>>=1U){if(tid<active)maximums[tid]=fmaxf(maximums["
+                  "tid],maximums[tid+active]);__syncthreads();}float scale2="
+                  "fmaxf(maximums[0]/127.0f,1.0e-30f);float scale2_bf16="
+                  "dif_round_bf16(scale2);if(tid==0U)scales2[row]=" +
+                  std::string(signed_rotation && !f32_convrot
+                                  ? "scale2_bf16;"
+                                  : "scale2;") +
+                  "__syncthreads();float stored_scale2=scales2[row];for("
+                  "unsigned long long column=tid;column<" +
+                  std::to_string(columns) +
+                  "ULL;column+=256ULL){float value=" +
+                  std::string(f32_convrot ? "values[column]"
+                                          : "dif_round_bf16(values[column])") +
+                  ";float residual=" +
+                  std::string(f32_convrot
+                                  ? "fmaf(-(float)q[base+column],stored_scale,value)"
+                                  : "dif_round_bf16(fmaf(-(float)q[base+column],stored_scale,value))") +
+                  ";float divided=" +
+                  std::string(f32_convrot
+                                  ? "residual/scale2"
+                                  : "dif_round_bf16(residual/scale2_bf16)") +
+                  ";int encoded=(int)nearbyintf(divided);encoded=encoded>127?"
+                  "127:(encoded<" +
+                  std::string(f32_convrot ? "-127?-127:" : "-128?-128:") +
+                  "encoded);q2[base+column]=(signed char)encoded;}"
+                : "")
+        << "}\n";
+    return;
+  }
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(" << input_parameters << "signed char* q,float* scales"
+      << (residual2 ? ",signed char* q2,float* scales2" : "")
+      << "){"
+         "__shared__ float maximums[256];unsigned long long row=blockIdx.x;"
+         "unsigned tid=threadIdx.x;if(row>="
+      << rows
+      << "ULL)return;unsigned long long base=row*" << columns
+      << "ULL;float maximum=0.0f;for(unsigned long long column=tid;column<"
+      << columns
+      << "ULL;column+=256ULL){float value=fabsf(" << load_input << ");"
+         "maximum=fmaxf(maximum,value);}maximums[tid]=maximum;__syncthreads();"
+         "for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)"
+         "maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);"
+         "__syncthreads();}float scale=fmaxf(maximums[0]*"
+      << clip_ratio_source
+      << "/127.0f,1.0e-30f);"
+         "if(tid==0U)scales[row]=scale;for(unsigned long long column=tid;column<"
+      << columns
+      << "ULL;column+=256ULL){int value=(int)rintf(" << load_input
+      << "/scale);value=value>127?127:(value<-127?-127:value);"
+         "q[base+column]=(signed char)value;}"
+      << (residual2
+              ? "__syncthreads();float residual_maximum=0.0f;for(unsigned "
+                "long long column=tid;column<" + std::to_string(columns) +
+                "ULL;column+=256ULL){float residual=fmaf(-(float)q[base+"
+                "column],scale," + load_input + ");residual_maximum=fmaxf("
+                "residual_maximum,fabsf(residual));}maximums[tid]="
+                "residual_maximum;__syncthreads();for(unsigned active=128U;"
+                "active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf("
+                "maximums[tid],maximums[tid+active]);__syncthreads();}float "
+                "scale2=fmaxf(maximums[0]/127.0f,1.0e-30f);if(tid==0U)"
+                "scales2[row]=scale2;__syncthreads();for(unsigned long long "
+                "column=tid;column<" + std::to_string(columns) +
+                "ULL;column+=256ULL){float residual=fmaf(-(float)q[base+"
+                "column],scale," + load_input + ");int value=(int)rintf("
+                "residual/scale2);value=value>127?127:(value<-127?-127:"
+                "value);q2[base+column]=(signed char)value;}"
+              : "")
+      << "}\n";
+}
+
+void emit_dequantize_int8_blocks(std::ostringstream &out,
+                                 const ir::Program &program,
+                                 const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *scales = program.tensor(op.inputs[1]);
+  const auto count = input->element_count();
+  const auto columns = input->dims[1];
+  const auto scale_columns = scales->dims[1];
+  const auto block = op.u64(ir::AttrKey::BlockSize, 0U);
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const signed char* x,const float* scales,dif_bf16* y){"
+         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
+         "threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << columns
+      << "ULL;unsigned long long column=i%" << columns
+      << "ULL;dif_store_bf16(y,i,(float)x[i]*scales[row*"
+      << scale_columns << "ULL+column/" << block << "ULL]);}}\n";
+}
+
+void emit_quantize_fp8_rows(std::ostringstream &out,
+                            const ir::Program &program,
+                            const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto columns = input->dims.back();
+  const auto rows = input->element_count() / columns;
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_bf16* x,unsigned char* q,float* scales){"
+         "__shared__ float maximums[256];unsigned long long row=blockIdx.x;"
+         "unsigned tid=threadIdx.x;if(row>="
+      << rows
+      << "ULL)return;unsigned long long base=row*" << columns
+      << "ULL;float maximum=0.0f;for(unsigned long long column=tid;column<"
+      << columns
+      << "ULL;column+=256ULL){maximum=fmaxf(maximum,fabsf(dif_load_bf16(x,"
+         "base+column)));}maximums[tid]=maximum;__syncthreads();"
+         "for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)"
+         "maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);"
+         "__syncthreads();}float scale=fmaxf(maximums[0]/448.0f,1.0e-30f);"
+         "if(tid==0U)scales[row]=scale;for(unsigned long long column=tid;"
+         "column<"
+      << columns
+      << "ULL;column+=256ULL){float value=dif_load_bf16(x,base+column)/scale;"
+         "unsigned short pair;asm(\"{cvt.rn.satfinite.e4m3x2.f32 %0, %2, "
+         "%1;}\\n\":\"=h\"(pair):\"f\"(value),\"f\"(0.0f));"
+         "q[base+column]=(unsigned char)pair;}}\n";
+}
+
+void emit_linear_fp8_output_scale(std::ostringstream &out,
+                                  const ir::Program &program,
+                                  const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *weight = program.tensor(op.inputs[1]);
+  const auto rows = input->element_count() / input->dims.back();
+  const auto columns = weight->dims.front();
+  const auto count = rows * columns;
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const unsigned char* x,const unsigned char* w,const float* rs,"
+         "const float* cs,dif_bf16* y){unsigned long long i="
+         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
+      << count << "ULL){unsigned long long row=i/" << columns
+      << "ULL;unsigned long long column=i%" << columns
+      << "ULL;dif_store_bf16(y,i,dif_load_bf16(y,i)*rs[row]*cs[column]);}}\n";
+}
+
+void emit_quantize_fp8_blocks32(std::ostringstream &out,
+                                const ir::Program &program,
+                                const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *scales = program.tensor(op.outputs[1]);
+  const auto columns = input->dims.back();
+  const auto rows = input->element_count() / columns;
+  const auto blocks = (columns + 31U) / 32U;
+  const auto scale_inner_dimension = scales->dims.at(1);
+  out << "extern \"C\" __global__ void " << function_name(op)
+      << "(const dif_bf16* x,unsigned char* q,unsigned char* scales){"
+         "unsigned long long row=blockIdx.x;unsigned tid=threadIdx.x;"
+         "if(row>="
+      << rows
+      << "ULL)return;unsigned lane=tid&31U;unsigned warp=tid>>5U;"
+         "for(unsigned long long block=warp;block<"
+      << blocks
+      << "ULL;block+=8ULL){unsigned long long column=block*32ULL+lane;"
+         "float value=column<"
+      << columns
+      << "ULL?dif_load_bf16(x,row*" << columns
+      << "ULL+column):0.0f;float maximum=fabsf(value);"
+         "for(unsigned offset=16U;offset>0U;offset>>=1U)"
+         "maximum=fmaxf(maximum,__shfl_down_sync(0xffffffffU,maximum,offset));"
+         "maximum=__shfl_sync(0xffffffffU,maximum,0U);float target=maximum/448.0f;"
+         "unsigned bits=__float_as_uint(target)&0x7fffffffU;"
+         "unsigned exponent=bits>>23U;unsigned mantissa=bits&0x7fffffU;"
+         "unsigned encoded=(bits==0U)?0U:((exponent==0U)?"
+         "(mantissa>0x400000U?1U:0U):exponent+(mantissa!=0U));"
+         "unsigned char encoded_scale=(unsigned char)(encoded>254U?254U:encoded);"
+         "float scale=ldexpf(1.0f,(int)encoded_scale-127);"
+         "if(lane==0U){unsigned long long tile_outer=row/128ULL;"
+         "unsigned long long tile_inner=(block/4ULL)*4ULL;"
+         "unsigned long long within=(row%32ULL)*16ULL+"
+         "((row%128ULL)/32ULL)*4ULL+block%4ULL;"
+         "unsigned long long scale_offset=(tile_inner+tile_outer*"
+      << scale_inner_dimension
+      << "ULL)*128ULL+within;scales[scale_offset]=encoded_scale;}"
+         "if(column<"
+      << columns
+      << "ULL){float divided=value/scale;unsigned short pair;"
+         "asm(\"{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}\\n\":"
+         "\"=h\"(pair):\"f\"(divided),\"f\"(0.0f));"
+         "q[row*"
+      << columns << "ULL+column]=(unsigned char)pair;}}}\n";
+}
+
 void emit_elementwise(std::ostringstream &out, const ir::Program &program,
                       const ir::Operation &op, const char *expression) {
   const auto count = program.tensor(op.outputs[0])->element_count();
@@ -818,14 +1141,14 @@ void emit_rotary_frequency(std::ostringstream &out,
       << "ULL,token=(i/" << pairs << "ULL)%" << sequence
       << "ULL,batch=i/(" << pairs << "ULL*" << sequence
       << "ULL);int axis=pair_axes[pair],component=pair_indices[pair],"
-         "axis_dim=axis_dims[axis];double scale=(2.0*(double)component)/"
-         "(double)axis_dim;double omega=1.0/pow("
+         "axis_dim=axis_dims[axis];float scale=(2.0f*(float)component)/"
+         "(float)axis_dim;float omega=1.0f/powf((float)("
       << op.f64(ir::AttrKey::Theta, 10000.0) << "*"
       << op.f64(ir::AttrKey::Ntk, 1.0)
-      << ",scale);double angle=(double)dif_load_f32(positions,(batch*"
+      << "),scale);float angle=dif_load_f32(positions,(batch*"
       << sequence << "ULL+token)*" << axes
       << "ULL+(unsigned long long)axis)*omega;dif_store_f32(cosine,i,"
-         "(float)cos(angle));dif_store_f32(sine,i,(float)sin(angle));}}\n"
+         "cosf(angle));dif_store_f32(sine,i,sinf(angle));}}\n"
       << std::defaultfloat;
 }
 
@@ -878,6 +1201,7 @@ void emit_boolean_mask_to_bias(std::ostringstream &out,
   const auto *output = program.tensor(op.outputs[0]);
   const auto sequence = output->dims[2];
   const bool vector_mask = mask->dims.size() == 2U;
+  const bool mask_queries = op.boolean(ir::AttrKey::MaskQueries, true);
   out << "extern \"C\" __global__ void " << function_name(op)
       << "(const unsigned char* mask," << typed_scalar(output->dtype)
       << "* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
@@ -886,9 +1210,11 @@ void emit_boolean_mask_to_bias(std::ostringstream &out,
       << sequence << "ULL,query=(i/" << sequence << "ULL)%" << sequence
       << "ULL,batch=i/(" << sequence << "ULL*" << sequence
       << "ULL);bool valid=";
-  if (vector_mask)
-    out << "mask[batch*" << sequence << "ULL+query]&&mask[batch*" << sequence
-        << "ULL+key]";
+  if (vector_mask) {
+    if (mask_queries)
+      out << "mask[batch*" << sequence << "ULL+query]&&";
+    out << "mask[batch*" << sequence << "ULL+key]";
+  }
   else
     out << "mask[(batch*" << sequence << "ULL+query)*" << sequence
         << "ULL+key]";
@@ -1358,6 +1684,30 @@ void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
                         << static_cast<float>(weight_offset);
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
   const auto reduction_tile = op.u64(ir::AttrKey::ReductionTileSize, 0U);
+  if (op.u64(ir::AttrKey::Implementation, 1U) == 2U) {
+    out << std::setprecision(17) << "extern \"C\" __global__ void "
+        << function_name(op)
+        << "(const dif_scalar* x,const dif_scalar* weight,dif_scalar* y){"
+           "extern __shared__ float reduction[];unsigned long long row="
+           "blockIdx.x;if(row>="
+        << rows
+        << "ULL)return;unsigned tid=threadIdx.x;float sigma2=0.0f;if(tid<32U){"
+           "unsigned long long base=row*128ULL+(unsigned long long)tid;float "
+           "v0=dif_load(x,base),v1=dif_load(x,base+32ULL),v2=dif_load(x,base+"
+           "64ULL),v3=dif_load(x,base+96ULL),s0,s1,s2,s3;asm volatile("
+           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s0):\"f\"(v0));asm volatile("
+           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s1):\"f\"(v1));asm volatile("
+           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s2):\"f\"(v2));asm volatile("
+           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s3):\"f\"(v3));sigma2=((s0+"
+           "s1)+s2)+s3;for(unsigned offset=1U;offset<32U;offset<<=1U)sigma2="
+           "sigma2+__shfl_down_sync(0xffffffffU,sigma2,offset);}if(tid==0U)"
+           "reduction[0]=sigma2*0.0078125f;__syncthreads();float inverse=rsqrtf("
+           "reduction[0]+"
+        << static_cast<float>(epsilon)
+        << "f);if(tid<128U){unsigned long long index=row*128ULL+tid;dif_store("
+           "y,index,dif_load(weight,tid)*(inverse*dif_load(x,index)));}}\n";
+    return;
+  }
   const auto triton_blocked_reduction =
       block == 512U && columns == block * 12U && reduction_tile == 8192U;
   const auto triton_chunked_reduction =
@@ -1490,6 +1840,75 @@ void emit_layer_norm(std::ostringstream &out, const ir::Program &program,
   const auto columns = input->dims.back();
   const auto rows = input->element_count() / columns;
   const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
+  const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  if (input->dtype == ir::DType::BF16 && columns % 4U == 0U &&
+      block == 128U) {
+    const auto suffix = std::to_string(op.id);
+    out << std::setprecision(17)
+        << "struct dif_welford_" << suffix
+        << "{float mean;float sigma2;float count;};\n"
+        << "extern \"C\" __device__ __forceinline__ dif_welford_" << suffix
+        << " dif_welford_online_" << suffix
+        << "(float value,dif_welford_" << suffix
+        << " current){float delta=value-current.mean;float count=current.count+"
+           "1.0f;float mean=current.mean+delta*(1.0f/count);return {mean,"
+           "current.sigma2+delta*(value-mean),count};}\n"
+        << "extern \"C\" __device__ __forceinline__ dif_welford_" << suffix
+        << " dif_welford_combine_" << suffix << "(dif_welford_" << suffix
+        << " data_b,dif_welford_" << suffix
+        << " data_a){float delta=data_b.mean-data_a.mean;float count="
+           "data_a.count+data_b.count;if(count>0.0f){float coefficient="
+           "1.0f/count;float n_a=data_a.count*coefficient;float n_b="
+           "data_b.count*coefficient;return {n_a*data_a.mean+n_b*data_b.mean,"
+           "data_a.sigma2+data_b.sigma2+delta*delta*data_a.count*n_b,count};}"
+           "return {0.0f,0.0f,0.0f};}\n"
+        << "extern \"C\" __global__ void " << function_name(op)
+        << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* "
+           "bias,dif_scalar* y){extern __shared__ float reduction[];unsigned "
+           "long long row=blockIdx.x;if(row>="
+        << rows
+        << "ULL)return;unsigned tid=threadIdx.x,lane=tid&31U,warp=tid>>5U;"
+           "dif_welford_"
+        << suffix
+        << " state={0.0f,0.0f,0.0f};for(unsigned long long pack=tid;pack<"
+        << columns / 4U
+        << "ULL;pack+=128ULL){unsigned long long base=row*" << columns
+        << "ULL+pack*4ULL;state=dif_welford_online_" << suffix
+        << "(dif_load(x,base),state);state=dif_welford_online_" << suffix
+        << "(dif_load(x,base+1ULL),state);state=dif_welford_online_" << suffix
+        << "(dif_load(x,base+2ULL),state);state=dif_welford_online_" << suffix
+        << "(dif_load(x,base+3ULL),state);}for(int offset=16;offset>0;offset>>=1)"
+           "{dif_welford_"
+        << suffix
+        << " other={__shfl_down_sync(0xffffffffU,state.mean,offset),"
+           "__shfl_down_sync(0xffffffffU,state.sigma2,offset),"
+           "__shfl_down_sync(0xffffffffU,state.count,offset)};state="
+           "dif_welford_combine_"
+        << suffix
+        << "(state,other);}float* meansigma=reduction;float* counts=reduction+"
+           "4U;for(unsigned offset=2U;offset>0U;offset>>=1U){if(lane==0U&&"
+           "warp>=offset&&warp<2U*offset){unsigned target=warp-offset;"
+           "meansigma[2U*target]=state.mean;meansigma[2U*target+1U]="
+           "state.sigma2;counts[target]=state.count;}__syncthreads();if(lane=="
+           "0U&&warp<offset){dif_welford_"
+        << suffix
+        << " other={meansigma[2U*warp],meansigma[2U*warp+1U],counts[warp]};"
+           "state=dif_welford_combine_"
+        << suffix
+        << "(state,other);}__syncthreads();}if(tid==0U){meansigma[0]=state.mean;"
+           "meansigma[1]=state.sigma2/"
+        << columns
+        << ".0f;}__syncthreads();float mean=meansigma[0];float inverse=rsqrtf("
+           "meansigma[1]+"
+        << static_cast<float>(epsilon)
+        << "f);for(unsigned long long pack=tid;pack<" << columns / 4U
+        << "ULL;pack+=128ULL){unsigned long long base=row*" << columns
+        << "ULL+pack*4ULL;for(unsigned inner=0U;inner<4U;++inner){"
+           "unsigned long long index=base+inner;float normalized=inverse*("
+           "dif_load(x,index)-mean);dif_store(y,index,dif_load(weight,pack*"
+           "4ULL+inner)*normalized+dif_load(bias,pack*4ULL+inner));}}}\n";
+    return;
+  }
   out << std::setprecision(17) << "extern \"C\" __global__ void "
       << function_name(op)
       << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* bias,"
@@ -1515,6 +1934,130 @@ void emit_layer_norm(std::ostringstream &out, const ir::Program &program,
       << "ULL;col+=blockDim.x){unsigned long long i=row*" << columns
       << "ULL+col;dif_store(y,i,(dif_load(x,i)-mean)*inv*dif_load(weight,col)+"
          "dif_load(bias,col));}}\n";
+}
+
+void emit_layer_norm_modulate(std::ostringstream &out,
+                              const ir::Program &program,
+                              const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto *scale = program.tensor(op.inputs[3]);
+  const auto columns = input->dims.back();
+  const auto rows = input->element_count() / columns;
+  const auto modulation_rows = scale->element_count() / columns;
+  const auto rows_per_modulation = rows / modulation_rows;
+  const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
+  const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  if (input->dtype == ir::DType::BF16 && columns % 4U == 0U &&
+      block == 128U) {
+    const auto suffix = std::to_string(op.id);
+    out << std::setprecision(17)
+        << "struct dif_welford_mod_" << suffix
+        << "{float mean;float sigma2;float count;};\n"
+        << "extern \"C\" __device__ __forceinline__ dif_welford_mod_"
+        << suffix << " dif_welford_mod_online_" << suffix
+        << "(float value,dif_welford_mod_" << suffix
+        << " current){float delta=value-current.mean;float count=current.count+"
+           "1.0f;float mean=current.mean+delta*(1.0f/count);return {mean,"
+           "current.sigma2+delta*(value-mean),count};}\n"
+        << "extern \"C\" __device__ __forceinline__ dif_welford_mod_"
+        << suffix << " dif_welford_mod_combine_" << suffix
+        << "(dif_welford_mod_" << suffix << " data_b,dif_welford_mod_"
+        << suffix
+        << " data_a){float delta=data_b.mean-data_a.mean;float count="
+           "data_a.count+data_b.count;if(count>0.0f){float coefficient="
+           "1.0f/count;float n_a=data_a.count*coefficient;float n_b="
+           "data_b.count*coefficient;return {n_a*data_a.mean+n_b*data_b.mean,"
+           "data_a.sigma2+data_b.sigma2+delta*delta*data_a.count*n_b,count};}"
+           "return {0.0f,0.0f,0.0f};}\n"
+        << "extern \"C\" __global__ void " << function_name(op)
+        << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* "
+           "bias,const dif_scalar* scale,const dif_scalar* shift,dif_scalar* "
+           "y){extern __shared__ float reduction[];unsigned long long row="
+           "blockIdx.x;if(row>="
+        << rows
+        << "ULL)return;unsigned tid=threadIdx.x,lane=tid&31U,warp=tid>>5U;"
+           "dif_welford_mod_"
+        << suffix
+        << " state={0.0f,0.0f,0.0f};for(unsigned long long pack=tid;pack<"
+        << columns / 4U
+        << "ULL;pack+=128ULL){unsigned long long base=row*" << columns
+        << "ULL+pack*4ULL;state=dif_welford_mod_online_" << suffix
+        << "(dif_load(x,base),state);state=dif_welford_mod_online_" << suffix
+        << "(dif_load(x,base+1ULL),state);state=dif_welford_mod_online_"
+        << suffix
+        << "(dif_load(x,base+2ULL),state);state=dif_welford_mod_online_"
+        << suffix
+        << "(dif_load(x,base+3ULL),state);}for(int offset=16;offset>0;"
+           "offset>>=1){dif_welford_mod_"
+        << suffix
+        << " other={__shfl_down_sync(0xffffffffU,state.mean,offset),"
+           "__shfl_down_sync(0xffffffffU,state.sigma2,offset),"
+           "__shfl_down_sync(0xffffffffU,state.count,offset)};state="
+           "dif_welford_mod_combine_"
+        << suffix
+        << "(state,other);}float* meansigma=reduction;float* counts=reduction+"
+           "4U;for(unsigned offset=2U;offset>0U;offset>>=1U){if(lane==0U&&"
+           "warp>=offset&&warp<2U*offset){unsigned target=warp-offset;"
+           "meansigma[2U*target]=state.mean;meansigma[2U*target+1U]="
+           "state.sigma2;counts[target]=state.count;}__syncthreads();if(lane=="
+           "0U&&warp<offset){dif_welford_mod_"
+        << suffix
+        << " other={meansigma[2U*warp],meansigma[2U*warp+1U],counts[warp]};"
+           "state=dif_welford_mod_combine_"
+        << suffix
+        << "(state,other);}__syncthreads();}if(tid==0U){meansigma[0]=state.mean;"
+           "meansigma[1]=state.sigma2/"
+        << columns
+        << ".0f;}__syncthreads();float mean=meansigma[0];float inverse=rsqrtf("
+           "meansigma[1]+"
+        << static_cast<float>(epsilon)
+        << "f);unsigned long long modulation_row=row/" << rows_per_modulation
+        << "ULL;for(unsigned long long pack=tid;pack<" << columns / 4U
+        << "ULL;pack+=128ULL){unsigned long long base=row*" << columns
+        << "ULL+pack*4ULL;for(unsigned inner=0U;inner<4U;++inner){unsigned long "
+           "long column=pack*4ULL+inner,index=base+inner,modulation_index="
+           "modulation_row*"
+        << columns
+        << "ULL+column;float normalized=inverse*(dif_load(x,index)-mean);"
+           "normalized=dif_round(dif_load(weight,column)*normalized+"
+           "dif_load(bias,column));float one_plus_scale=dif_round(1.0f+"
+           "dif_load(scale,modulation_index));float scaled=dif_round("
+           "normalized*one_plus_scale);dif_store(y,index,scaled+dif_load("
+           "shift,modulation_index));}}}\n";
+    return;
+  }
+  out << std::setprecision(17) << "extern \"C\" __global__ void "
+      << function_name(op)
+      << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* "
+         "bias,const dif_scalar* scale,const dif_scalar* shift,dif_scalar* "
+         "y){extern __shared__ float reduction[];unsigned long long row="
+         "blockIdx.x;if(row>="
+      << rows
+      << "ULL)return;float local=0.0f;for(unsigned long long col=threadIdx.x;"
+         "col<"
+      << columns
+      << "ULL;col+=blockDim.x)local+=dif_load(x,row*" << columns
+      << "ULL+col);reduction[threadIdx.x]=local;__syncthreads();for(unsigned "
+         "stride=blockDim.x/2;stride>0;stride>>=1){if(threadIdx.x<stride)"
+         "reduction[threadIdx.x]+=reduction[threadIdx.x+stride];"
+         "__syncthreads();}float mean=reduction[0]/"
+      << columns
+      << ".0f;local=0.0f;for(unsigned long long col=threadIdx.x;col<"
+      << columns
+      << "ULL;col+=blockDim.x){float centered=dif_load(x,row*" << columns
+      << "ULL+col)-mean;local+=centered*centered;}reduction[threadIdx.x]=local;"
+         "__syncthreads();for(unsigned stride=blockDim.x/2;stride>0;stride>>=1)"
+         "{if(threadIdx.x<stride)reduction[threadIdx.x]+=reduction[threadIdx.x+"
+         "stride];__syncthreads();}float inv=rsqrtf(reduction[0]/"
+      << columns << ".0f+" << static_cast<float>(epsilon)
+      << "f);unsigned long long modulation_row=row/" << rows_per_modulation
+      << "ULL;for(unsigned long long col=threadIdx.x;col<" << columns
+      << "ULL;col+=blockDim.x){unsigned long long i=row*" << columns
+      << "ULL+col,mi=modulation_row*" << columns
+      << "ULL+col;float normalized=dif_round((dif_load(x,i)-mean)*inv*"
+         "dif_load(weight,col)+dif_load(bias,col));float one_plus_scale="
+         "dif_round(1.0f+dif_load(scale,mi));float scaled=dif_round(normalized*"
+         "one_plus_scale);dif_store(y,i,scaled+dif_load(shift,mi));}}\n";
 }
 
 void emit_rms_norm_modulate(std::ostringstream &out, const ir::Program &program,
@@ -1734,15 +2277,17 @@ void emit_swiglu(std::ostringstream &out, const ir::Program &program,
                  const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto width = program.tensor(op.outputs[0])->dims.back();
+  const auto input_width = program.tensor(op.inputs[0])->dims.back();
+  const auto start = op.u64(ir::AttrKey::Start, 0U);
   const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
   out << "extern \"C\" __global__ void " << function_name(op)
       << "(const dif_scalar* x, dif_scalar* y) {\n"
       << "  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;\n"
       << "  if(i<" << count << "ULL){ unsigned long long row=i/" << width
-      << "ULL, col=i%" << width << "ULL; float value=dif_load(x,row*" << width * 2U
-      << "ULL+" << (gate_first ? width : 0U)
-      << "ULL+col); float gate=dif_load(x,row*" << width * 2U << "ULL+"
-      << (gate_first ? 0U : width)
+      << "ULL, col=i%" << width << "ULL; float value=dif_load(x,row*" << input_width
+      << "ULL+" << start + (gate_first ? width : 0U)
+      << "ULL+col); float gate=dif_load(x,row*" << input_width << "ULL+"
+      << start + (gate_first ? 0U : width)
       << "ULL+col); float activated=dif_round(dif_silu(gate));"
          "dif_store(y,i,value*activated);}\n}\n";
 }
@@ -1908,26 +2453,89 @@ void emit_dequantize_int5(std::ostringstream &out,
 
 void emit_residual_gate(std::ostringstream &out, const ir::Program &program,
                         const ir::Operation &op) {
-  const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto *output = program.tensor(op.outputs[0]);
+  const auto *gate = program.tensor(op.inputs[2]);
+  const auto count = output->element_count();
+  const auto width = output->dims.back();
+  const auto rows = count / width;
+  const auto gate_rows = gate->element_count() / width;
+  const auto rows_per_gate = rows / gate_rows;
   out << "extern \"C\" __global__ void " << function_name(op)
       << "(const dif_scalar* residual, const dif_scalar* branch, const dif_scalar* gate, dif_scalar* y) {\n"
       << "  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
          " if(i<"
       << count
-      << "ULL) dif_store(y,i,dif_load(residual,i)+"
-         "dif_round(dif_load(gate,i)*dif_load(branch,i)));\n}\n";
+      << "ULL){unsigned long long row=i/" << width
+      << "ULL,gate_index=(row/" << rows_per_gate << "ULL)*" << width
+      << "ULL+i%" << width
+      << "ULL;dif_store(y,i,dif_load(residual,i)+"
+         "dif_round(dif_load(gate,gate_index)*dif_load(branch,i)));}\n}\n";
 }
 
 void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
                        const ir::Operation &op) {
   const auto &shape = program.tensor(op.inputs[0])->dims;
-  const auto sequence = shape[0];
-  const auto heads = shape[1];
-  const auto dim = shape[2];
+  const auto heads = shape[shape.size() - 2U];
+  const auto dim = shape.back();
+  const auto sequence =
+      program.tensor(op.inputs[0])->element_count() / (heads * dim);
+  const auto input_sequence =
+      shape.size() == 4U ? shape[1] : shape[0];
+  const auto &table_shape = program.tensor(op.inputs[2])->dims;
+  const auto table_sequence =
+      table_shape.size() == 3U ? table_shape[1] : table_shape[0];
+  const auto table_start = op.u64(ir::AttrKey::Start, 0U);
   const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
   const auto half = rotary / 2U;
-  const auto table_width = program.tensor(op.inputs[2])->dims[1];
+  const auto table_width = program.tensor(op.inputs[2])->dims.back();
   const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
+  const auto implementation = op.u64(ir::AttrKey::Implementation, 1U);
+  const auto rotary_layout = static_cast<ir::RotaryLayout>(op.u64(
+      ir::AttrKey::RotaryLayout,
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit)));
+  if (implementation == 2U && rotary_layout == ir::RotaryLayout::Interleaved &&
+      program.tensor(op.inputs[0])->dtype == ir::DType::BF16 && dim == 128U &&
+      program.tensor(op.inputs[2])->dtype == ir::DType::F32 &&
+      table_width * 2U == rotary) {
+    out << std::setprecision(17)
+        << "extern \"C\" __global__ void " << function_name(op)
+        << "(const dif_bf16* x,const dif_bf16* weight,const dif_f32* cosv,"
+           "const dif_f32* sinv,dif_bf16* y){extern __shared__ float "
+           "reduction[];unsigned long long row=blockIdx.x;unsigned tid="
+           "threadIdx.x;if(row>="
+        << sequence * heads
+        << "ULL)return;unsigned long long base=row*128ULL;float sigma2=0.0f;"
+           "if(tid<32U){unsigned long long lane_base=base+(unsigned long long)tid;"
+           "float v0=dif_load_bf16(x,lane_base),v1=dif_load_bf16(x,lane_base+32ULL),"
+           "v2=dif_load_bf16(x,lane_base+64ULL),v3=dif_load_bf16(x,lane_base+96ULL),"
+           "s0,s1,s2,s3;asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s0):\"f\"(v0));"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s1):\"f\"(v1));"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s2):\"f\"(v2));"
+           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s3):\"f\"(v3));"
+           "sigma2=((s0+s1)+s2)+s3;for(unsigned offset=1U;offset<32U;offset<<=1U)"
+           "sigma2=sigma2+__shfl_down_sync(0xffffffffU,sigma2,offset);}if(tid==0U)"
+           "reduction[0]=sigma2*0.0078125f;__syncthreads();float inv=rsqrtf("
+           "reduction[0]+"
+        << static_cast<float>(epsilon)
+        << "f);if(tid<128U){unsigned pair=tid/2U,even=pair*2U;float e="
+           "dif_round_bf16(dif_load_bf16(x,base+even)*inv);e=dif_round_bf16("
+           "e*dif_load_bf16(weight,even));float o=dif_round_bf16(dif_load_bf16("
+           "x,base+even+1U)*inv);o=dif_round_bf16(o*dif_load_bf16(weight,even+1U));"
+           "unsigned long long token=row/"
+        << heads << "ULL,table_token=(token/" << input_sequence << "ULL)*"
+        << table_sequence << "ULL+" << table_start << "ULL+token%"
+        << input_sequence << "ULL,table=table_token*" << table_width
+        << "ULL+pair;float c=dif_load_f32(cosv,table),s=dif_load_f32(sinv,table),"
+           "first,second,result;if(tid&1U){asm volatile(\"mul.rn.f32 %0,%1,%2;\":"
+           "\"=f\"(first):\"f\"(e),\"f\"(s));asm volatile(\"mul.rn.f32 %0,%1,%2;\":"
+           "\"=f\"(second):\"f\"(o),\"f\"(c));asm volatile(\"add.rn.f32 %0,%1,%2;\":"
+           "\"=f\"(result):\"f\"(first),\"f\"(second));}else{asm volatile("
+           "\"mul.rn.f32 %0,%1,%2;\":\"=f\"(first):\"f\"(e),\"f\"(c));"
+           "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(second):\"f\"(o),"
+           "\"f\"(s));asm volatile(\"sub.rn.f32 %0,%1,%2;\":\"=f\"(result):"
+           "\"f\"(first),\"f\"(second));}dif_store_bf16(y,base+tid,result);}}\n";
+    return;
+  }
   if (program.tensor(op.inputs[0])->dtype == ir::DType::BF16 && dim == 128U &&
       table_width == rotary) {
     // Port of Serenity's accepted MiniMax-H3 fused Q/K RMSNorm + partial-RoPE
@@ -1946,7 +2554,10 @@ void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
            "if(tid<active)reduction[tid]=__fadd_rn(reduction[tid],reduction[tid+active]);__syncthreads();}"
            "float inv=rsqrtf(__fadd_rn(__fdiv_rn(reduction[0],128.0f),"
         << static_cast<float>(epsilon)
-        << "f));unsigned long long token=row/" << heads << "ULL;if(tid<"
+        << "f));unsigned long long token=row/" << heads
+        << "ULL,table_token=(token/" << input_sequence << "ULL)*"
+        << table_sequence << "ULL+" << table_start << "ULL+token%"
+        << input_sequence << "ULL;if(tid<"
         << half
         << "U){unsigned lane=tid;float value0=dif_load(x,base+lane);"
            "float value1=dif_load(x,base+lane+"
@@ -1954,7 +2565,7 @@ void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
         << "ULL);float norm0=dif_round(value0*inv*dif_load(weight,lane));"
            "float norm1=dif_round(value1*inv*dif_load(weight,lane+"
         << half
-        << "ULL));unsigned long long table=token*" << table_width
+        << "ULL));unsigned long long table=table_token*" << table_width
         << "ULL;float result0=norm0*dif_load(cosv,table+lane)-norm1*dif_load(sinv,table+lane);"
            "float result1=norm1*dif_load(cosv,table+lane+"
         << half
@@ -2162,20 +2773,25 @@ void emit_swiglu_backward(std::ostringstream &out, const ir::Program &program,
   const auto *grad_output = program.tensor(op.inputs[0]);
   const auto width = grad_output->dims.back();
   const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto input_width = program.tensor(op.inputs[1])->dims.back();
+  const auto start = op.u64(ir::AttrKey::Start, 0U);
   const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
   // Thread i owns one element of the packed [.., 2W] input gradient; the
   // value half receives silu(gate)*g, the gate half dsilu(gate)*value*g.
   out << "extern \"C\" __global__ void " << function_name(op)
       << "(const dif_scalar* grad_output,const dif_scalar* x,dif_scalar* grad_input){"
          "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << width * 2U
-      << "ULL,col=i%" << width * 2U << "ULL,cw=col<" << width
-      << "ULL?col:col-" << width << "ULL,base=row*" << width * 2U
+      << count << "ULL){unsigned long long row=i/" << input_width
+      << "ULL,col=i%" << input_width << "ULL;if(col<" << start
+      << "ULL||col>=" << start + width * 2U
+      << "ULL){dif_store(grad_input,i,0.0f);return;}unsigned long long lane=col-"
+      << start << "ULL,cw=lane<" << width << "ULL?lane:lane-" << width
+      << "ULL,base=row*" << input_width << "ULL+" << start
       << "ULL;float value=dif_load(x,base+" << (gate_first ? width : 0U)
       << "ULL+cw);float gate=dif_load(x,base+" << (gate_first ? 0U : width)
       << "ULL+cw);float sigmoid=1.0f/(1.0f+expf(-gate));"
          "float upstream=dif_load(grad_output,row*"
-      << width << "ULL+cw);int is_value_slot=col"
+      << width << "ULL+cw);int is_value_slot=lane"
       << (gate_first ? ">=" : "<") << width
       << "ULL;float gradient=is_value_slot?gate*sigmoid*upstream:"
          "sigmoid*(1.0f+gate*(1.0f-sigmoid))*value*upstream;"
@@ -2522,6 +3138,8 @@ bool elementwise_identity_slot(ir::Opcode opcode, std::size_t input_slot) {
     return false;
   if (opcode == ir::Opcode::BiasAdd)
     return input_slot == 0U;
+  if (opcode == ir::Opcode::ResidualGate && input_slot == 2U)
+    return false;
   return true;
 }
 
@@ -2842,17 +3460,30 @@ struct ElementwiseFusionEmitter {
     case ir::Opcode::ResidualGate: {
       const auto residual = value(op.inputs[0], index);
       const auto branch = value(op.inputs[1], index);
-      const auto gate = value(op.inputs[2], index);
+      const auto *gate_description = program.tensor(op.inputs[2]);
+      auto gate_index = index;
+      if (gate_description->element_count() != output->element_count()) {
+        const auto width = output->dims.back();
+        const auto rows = output->element_count() / width;
+        const auto gate_rows = gate_description->element_count() / width;
+        gate_index = "((" + index + ")/" + std::to_string(width) +
+                     "ULL/" + std::to_string(rows / gate_rows) + "ULL)*" +
+                     std::to_string(width) + "ULL+(" + index + ")%" +
+                     std::to_string(width) + "ULL";
+      }
+      const auto gate = value(op.inputs[2], gate_index);
       return residual + "+" + std::string(typed_round(output->dtype)) + "(" +
              gate + "*" + branch + ")";
     }
     case ir::Opcode::SwiGlu: {
       const auto width = output->dims.back();
+      const auto input_width = program.tensor(op.inputs[0])->dims.back();
+      const auto start = op.u64(ir::AttrKey::Start, 0U);
       const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
       const auto [row, column] = row_column(op, index, width);
       const auto lane = [&](std::uint64_t offset) {
-        return row + "*" + std::to_string(width * 2U) + "ULL+" +
-               std::to_string(offset) + "ULL+" + column;
+        return row + "*" + std::to_string(input_width) + "ULL+" +
+               std::to_string(start + offset) + "ULL+" + column;
       };
       const auto value_lane =
           value(op.inputs[0], lane(gate_first ? width : 0U));
@@ -2900,6 +3531,8 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
     if (tensor.dtype != ir::DType::F32 && tensor.dtype != ir::DType::BF16 &&
         tensor.dtype != ir::DType::F16 &&
         tensor.dtype != ir::DType::I32 && tensor.dtype != ir::DType::I8 &&
+        tensor.dtype != ir::DType::FP8E4M3 &&
+        tensor.dtype != ir::DType::FP8E8M0 &&
         tensor.dtype != ir::DType::Bool)
       fail("CUDA source emitter admits mixed f32/bf16/f16 plus i32 indices "
            "and packed i8/bool constants");
@@ -2941,10 +3574,14 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       }
       continue;
     }
-    if (op.opcode == ir::Opcode::Barrier || op.opcode == ir::Opcode::Conv2d ||
+    if (op.opcode == ir::Opcode::Barrier ||
+        op.opcode == ir::Opcode::LinearInt8Scaled ||
+        op.opcode == ir::Opcode::LinearInt8WeightScaled ||
+        op.opcode == ir::Opcode::LinearFp8BlockScaled ||
+        op.opcode == ir::Opcode::Conv2d ||
         op.opcode == ir::Opcode::Conv3d ||
         (op.opcode == ir::Opcode::Attention &&
-         op.u64(ir::AttrKey::Implementation, 1U) == 2U))
+         op.u64(ir::AttrKey::Implementation, 1U) != 1U))
       continue;
     if (const auto region = elementwise_regions.find(op.id);
         region != elementwise_regions.end()) {
@@ -2981,6 +3618,26 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
     }
     if (op.opcode == ir::Opcode::BooleanMaskToBias) {
       emit_boolean_mask_to_bias(source, program, op);
+      continue;
+    }
+    if (op.opcode == ir::Opcode::QuantizeInt8Rows) {
+      emit_quantize_int8_rows(source, program, op);
+      continue;
+    }
+    if (op.opcode == ir::Opcode::DequantizeInt8Blocks) {
+      emit_dequantize_int8_blocks(source, program, op);
+      continue;
+    }
+    if (op.opcode == ir::Opcode::QuantizeFp8Rows) {
+      emit_quantize_fp8_rows(source, program, op);
+      continue;
+    }
+    if (op.opcode == ir::Opcode::LinearFp8Scaled) {
+      emit_linear_fp8_output_scale(source, program, op);
+      continue;
+    }
+    if (op.opcode == ir::Opcode::QuantizeFp8Blocks32) {
+      emit_quantize_fp8_blocks32(source, program, op);
       continue;
     }
     begin_float_operation(source, operation_float_dtype(program, op));
@@ -3021,6 +3678,9 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::LayerNorm:
       emit_layer_norm(source, program, op);
+      break;
+    case ir::Opcode::LayerNormModulate:
+      emit_layer_norm_modulate(source, program, op);
       break;
     case ir::Opcode::Clamp:
       emit_clamp(source, program, op);
@@ -3171,6 +3831,15 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::SnakeBeta:
       emit_snake_beta(source, program, op);
+      break;
+    case ir::Opcode::QuantizeInt8Rows:
+    case ir::Opcode::LinearInt8Scaled:
+    case ir::Opcode::QuantizeFp8Rows:
+    case ir::Opcode::LinearFp8Scaled:
+    case ir::Opcode::QuantizeFp8Blocks32:
+    case ir::Opcode::LinearFp8BlockScaled:
+    case ir::Opcode::DequantizeInt8Blocks:
+    case ir::Opcode::LinearInt8WeightScaled:
       break;
     }
     end_float_operation(source);

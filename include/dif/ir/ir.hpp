@@ -20,6 +20,8 @@ enum class DType : std::uint32_t {
   I8 = 4,
   I32 = 5,
   Bool = 6,
+  FP8E4M3 = 7,
+  FP8E8M0 = 8,
 };
 
 enum TensorRole : std::uint32_t {
@@ -118,6 +120,50 @@ enum class Opcode : std::uint32_t {
   // extent must be smaller than the corresponding source dimension, matching
   // the common framework reflect-padding contract.
   PadReflect = 66,
+  // Dynamic symmetric per-row quantization. One or more BF16 inputs are
+  // logically concatenated on their last axis; an optional final F32 scalar
+  // input supplies the runtime clipping ratio. The first output is I8 with
+  // that combined shape and the second is the F32 dequantization scale for
+  // every flattened row. An optional third/fourth output pair carries a second I8
+  // code and F32 row scale for the residual left by the first code. This
+  // keeps higher-fidelity activation quantization reusable and explicit
+  // without coupling it to a model family. Zero rows use the smallest
+  // positive guarded scale. The Implementation attribute selects the
+  // explicit row transform/rounding contract; it is never inferred from a
+  // model family.
+  QuantizeInt8Rows = 67,
+  // Unbiased scaled INT8 matrix multiplication with an explicit numerical
+  // contract:
+  //   BF16 Y[m,n] = BF16(I32(X[m,k] * W[n,k]^T) * xs[m] * ws[n]).
+  // Quantization policy is deliberately separate from this reusable math.
+  LinearInt8Scaled = 68,
+  // Dynamic symmetric per-row E4M3 quantization. The first output retains the
+  // input shape in FP8; the second is one F32 dequantization scale per row.
+  QuantizeFp8Rows = 69,
+  // FP8 E4M3 matrix multiplication with F32 accumulation, a BF16 raw GEMM
+  // boundary, explicit F32 row/column dequantization scales, and BF16 output.
+  LinearFp8Scaled = 70,
+  // Blackwell MXFP8 quantization: E4M3 values with one positive UE8M0
+  // dequantization scale per 32 adjacent K values. Scale storage uses the
+  // cuBLASLt 128x4 tiled layout and pads the outer dimension to 128.
+  QuantizeFp8Blocks32 = 71,
+  // Unbiased MXFP8 matrix multiplication with F32 accumulation and BF16
+  // output. A/B scale tensors carry the explicit tiled UE8M0 block scales.
+  LinearFp8BlockScaled = 72,
+  // Dequantize row-major signed INT8 weights with one F32 scale per adjacent
+  // K block into BF16. The block size is explicit and model agnostic; this is
+  // a storage/runtime primitive, not an approximate activation contract.
+  DequantizeInt8Blocks = 73,
+  // Mixed-input weight-only matrix multiplication. Activations remain BF16,
+  // signed INT8 weights carry one F32 dequantization scale per output row,
+  // accumulation is F32, and the explicit output storage boundary is BF16:
+  //   BF16 Y[m,n] = BF16(F32(X[m,k] * I8(W[n,k])^T) * scale[n]).
+  LinearInt8WeightScaled = 74,
+  // Layer normalization followed by creator-style adaptive scale/shift with
+  // explicit storage-dtype boundaries after normalization, scale addition,
+  // multiplication, and shift addition. Scale/shift carry one or more rows
+  // which broadcast over contiguous groups of input rows.
+  LayerNormModulate = 75,
 };
 
 enum class AttrKey : std::uint32_t {
@@ -203,6 +249,10 @@ enum class AttrKey : std::uint32_t {
   DilationT = 70,
   PadFront = 71,
   PadBack = 72,
+  // BooleanMaskToBias vector-mask policy. True (the v1 default) masks both
+  // invalid query and key rows; false masks keys only, matching causal language
+  // model padding where padded query states remain observable.
+  MaskQueries = 73,
 };
 
 // Gelu carries an explicit approximation because exact-erf and tanh GELU are
@@ -215,6 +265,26 @@ enum class LinearBiasMode : std::uint64_t { Epilogue = 1, Addmm = 2 };
 enum class ModulationLayout : std::uint64_t {
   ExplicitScaleShift = 1,
   SharedVectorDelta = 2,
+};
+
+// QuantizeInt8Rows keeps low-precision policy explicit in DiffIR. Direct is
+// ordinary dynamic symmetric row quantization. H256ConvRot applies the
+// normalized H4^4 orthogonal transform independently to each 256-wide group
+// before quantization, with BF16 value/scale/division boundaries. The F32
+// variants retain F32 transform, scale, and division arithmetic and use the
+// ordinary symmetric [-127,127] code range. The signed
+// variants first apply a fixed Rademacher diagonal, which remains a generic
+// orthogonal transform. H4096SignedConvRot extends the normalized Kronecker
+// transform to independent 4096-wide groups. A matching transform on Linear
+// weights preserves the unquantized dot product.
+enum class Int8RowQuantization : std::uint64_t {
+  Direct = 1,
+  H256ConvRot = 2,
+  H256SignedConvRot = 3,
+  H4096SignedConvRot = 4,
+  H256F32ConvRot = 5,
+  H256F32SignedConvRot = 6,
+  H4096F32SignedConvRot = 7,
 };
 
 // RotaryApply names the channel pairing explicitly.  Interleaved rotates

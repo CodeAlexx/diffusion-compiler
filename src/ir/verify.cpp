@@ -14,7 +14,8 @@ namespace {
 
 bool valid_dtype(DType dtype) {
   return dtype == DType::F32 || dtype == DType::BF16 || dtype == DType::F16 ||
-         dtype == DType::I8 || dtype == DType::I32 || dtype == DType::Bool;
+         dtype == DType::I8 || dtype == DType::I32 || dtype == DType::Bool ||
+         dtype == DType::FP8E4M3 || dtype == DType::FP8E8M0;
 }
 
 bool supported_float(DType dtype) {
@@ -22,11 +23,11 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::PadReflect;
+  return opcode >= Opcode::Add && opcode <= Opcode::LayerNormModulate;
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::PadBack;
+  return key >= AttrKey::Epsilon && key <= AttrKey::MaskQueries;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -43,7 +44,9 @@ void expect_counts(const Operation &op, std::size_t inputs, std::size_t outputs)
 void same_shape_dtype(const TensorDesc &a, const TensorDesc &b,
                       const Operation &op) {
   if (a.dtype != b.dtype || a.dims != b.dims)
-    fail("DiffIR op " + std::to_string(op.id) + " requires equal shape/dtype");
+    fail("DiffIR op " + std::to_string(op.id) + " (" +
+         std::string(opcode_name(op.opcode)) +
+         ") requires equal shape/dtype");
 }
 
 // Training kernels accumulate in F32 unconditionally (the flame dtype
@@ -235,6 +238,7 @@ void verify_operation(const Program &program, const Operation &op) {
         out.dims[3] != (vector_mask ? mask.dims[1] : mask.dims[2]) ||
         (matrix_mask && mask.dims[1] != mask.dims[2]))
       fail("boolean_mask_to_bias requires bool [B,L] or [B,L,L] and float [B,1,L,L]");
+    (void)op.boolean(AttrKey::MaskQueries, true);
     return;
   }
 
@@ -494,6 +498,15 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto block = op.u64(AttrKey::BlockSize, 256U);
     if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
       fail("rms_norm block size must be a power of two in [32,1024]");
+    const auto implementation = op.u64(AttrKey::Implementation, 1U);
+    if (implementation != 1U && implementation != 2U)
+      fail("rms_norm implementation must be 1 (generated) or 2 (vectorized "
+           "Welford)");
+    if (implementation == 2U &&
+        (input.dtype != DType::BF16 || input.dims.back() != 128U ||
+         block != 128U))
+      fail("vectorized Welford rms_norm requires bf16 width 128 and block "
+           "size 128");
     const auto reduction_tile = op.u64(AttrKey::ReductionTileSize, 0U);
     if (reduction_tile != 0U && reduction_tile != 2048U &&
         reduction_tile != 8192U)
@@ -829,10 +842,14 @@ void verify_operation(const Program &program, const Operation &op) {
     if (!supported_float(input.dtype) || out.dtype != input.dtype ||
         input.dims.size() != out.dims.size() || input.dims.empty())
       fail("swiglu semantics require compatible f32, bf16, or f16 tensors");
-    auto expected = out.dims;
-    expected.back() *= 2U;
-    if (input.dims != expected)
-      fail("swiglu input final dimension must be twice output final dimension");
+    for (std::size_t axis = 0U; axis + 1U < input.dims.size(); ++axis)
+      if (input.dims[axis] != out.dims[axis])
+        fail("swiglu input and output prefix dimensions must match");
+    const auto start = op.u64(AttrKey::Start, 0U);
+    if (out.dims.back() >
+            (std::numeric_limits<std::uint64_t>::max() - start) / 2U ||
+        start + out.dims.back() * 2U > input.dims.back())
+      fail("swiglu packed window is outside the input final dimension");
     return;
   }
 
@@ -843,10 +860,44 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &gate = tensor_or_fail(program, op.inputs[2], op);
     const auto &out = tensor_or_fail(program, op.outputs[0], op);
     same_shape_dtype(residual, branch, op);
-    same_shape_dtype(residual, gate, op);
     same_shape_dtype(residual, out, op);
-    if (!supported_float(residual.dtype))
-      fail("residual_gate semantics admit f32, bf16, or f16");
+    if (!supported_float(residual.dtype) || residual.dims.empty() ||
+        gate.dtype != residual.dtype || gate.dims.empty() ||
+        gate.dims.back() != residual.dims.back())
+      fail("residual_gate requires compatible floating residual/branch/output "
+           "and gate rows with the same final dimension");
+    const auto rows = residual.element_count() / residual.dims.back();
+    const auto gate_rows = gate.element_count() / gate.dims.back();
+    if (gate_rows == 0U || rows % gate_rows != 0U)
+      fail("residual_gate gate rows must divide residual rows");
+    return;
+  }
+
+  if (op.opcode == Opcode::LayerNormModulate) {
+    expect_counts(op, 5U, 1U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &bias = tensor_or_fail(program, op.inputs[2], op);
+    const auto &scale = tensor_or_fail(program, op.inputs[3], op);
+    const auto &shift = tensor_or_fail(program, op.inputs[4], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        weight.dtype != input.dtype || bias.dtype != input.dtype ||
+        weight.dims != std::vector<std::uint64_t>{input.dims.back()} ||
+        bias.dims != weight.dims || scale.dtype != input.dtype ||
+        shift.dtype != input.dtype || scale.dims != shift.dims ||
+        scale.dims.empty() || scale.dims.back() != input.dims.back())
+      fail("layer_norm_modulate requires floating x/out, [hidden] weight/bias, "
+           "and compatible scale/shift rows");
+    const auto input_rows = input.element_count() / input.dims.back();
+    const auto modulation_rows = scale.element_count() / scale.dims.back();
+    if (modulation_rows == 0U || input_rows % modulation_rows != 0U)
+      fail("layer_norm_modulate scale/shift rows must divide input rows");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U ||
+        !(op.f64(AttrKey::Epsilon, 1.0e-5) > 0.0))
+      fail("layer_norm_modulate has invalid normalization geometry");
     return;
   }
 
@@ -894,6 +945,261 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::QuantizeInt8Rows) {
+    if (op.inputs.empty() ||
+        (op.outputs.size() != 2U && op.outputs.size() != 4U))
+      fail("quantize_int8_rows expects BF16 inputs and either two or four "
+           "outputs");
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &quantized = tensor_or_fail(program, op.outputs[0], op);
+    const auto &scales = tensor_or_fail(program, op.outputs[1], op);
+    const auto &last_input = tensor_or_fail(program, op.inputs.back(), op);
+    const auto dynamic_clip = last_input.dtype == DType::F32;
+    const auto data_input_count =
+        op.inputs.size() - static_cast<std::size_t>(dynamic_clip);
+    if (data_input_count == 0U ||
+        (dynamic_clip && last_input.dims != std::vector<std::uint64_t>{1U}))
+      fail("quantize_int8_rows runtime clipping input must be one F32 scalar "
+           "after at least one BF16 data input");
+    std::uint64_t combined_width = 0U;
+    const auto rows = input.element_count() / input.dims.back();
+    for (std::size_t index = 0U; index < data_input_count; ++index) {
+      const auto input_id = op.inputs[index];
+      const auto &part = tensor_or_fail(program, input_id, op);
+      if (part.dtype != DType::BF16 || part.dims.empty() ||
+          part.element_count() / part.dims.back() != rows)
+        fail("quantize_int8_rows inputs must be compatible BF16 tensors");
+      if (combined_width > std::numeric_limits<std::uint64_t>::max() -
+                               part.dims.back())
+        fail("quantize_int8_rows combined width overflow");
+      combined_width += part.dims.back();
+    }
+    if (input.dtype != DType::BF16 || input.dims.empty() ||
+        quantized.dtype != DType::I8 || quantized.dims.empty() ||
+        quantized.dims.back() != combined_width ||
+        quantized.element_count() / combined_width != rows ||
+        scales.dtype != DType::F32 || scales.dims.size() != 1U ||
+        scales.dims[0] != quantized.element_count() / combined_width)
+      fail("quantize_int8_rows requires BF16 inputs, combined-shape I8 output, "
+           "and one F32 scale per flattened row");
+    if (op.outputs.size() == 4U) {
+      const auto &residual = tensor_or_fail(program, op.outputs[2], op);
+      const auto &residual_scales = tensor_or_fail(program, op.outputs[3], op);
+      if (residual.dtype != DType::I8 || residual.dims != quantized.dims ||
+          residual_scales.dtype != DType::F32 ||
+          residual_scales.dims != scales.dims)
+        fail("four-output quantize_int8_rows requires an equal-shape I8 "
+             "residual and one F32 residual scale per flattened row");
+    }
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block != 256U)
+      fail("quantize_int8_rows currently requires BlockSize=256");
+    const auto clip_ratio = op.f64(AttrKey::Scale, 1.0);
+    if (!(clip_ratio > 0.0) || clip_ratio > 1.0)
+      fail("quantize_int8_rows Scale range multiplier must be in (0,1]");
+    const auto implementation = static_cast<Int8RowQuantization>(
+        op.u64(AttrKey::Implementation,
+               static_cast<std::uint64_t>(Int8RowQuantization::Direct)));
+    if (implementation != Int8RowQuantization::Direct &&
+        implementation != Int8RowQuantization::H256ConvRot &&
+        implementation != Int8RowQuantization::H256SignedConvRot &&
+        implementation != Int8RowQuantization::H4096SignedConvRot &&
+        implementation != Int8RowQuantization::H256F32ConvRot &&
+        implementation != Int8RowQuantization::H256F32SignedConvRot &&
+        implementation != Int8RowQuantization::H4096F32SignedConvRot)
+      fail("quantize_int8_rows implementation must be direct, H256 ConvRot, "
+           "H256 F32 ConvRot, H256 signed ConvRot, H256 F32 signed ConvRot, "
+           "H4096 signed ConvRot, or H4096 F32 signed ConvRot");
+    if ((implementation == Int8RowQuantization::H256ConvRot ||
+         implementation == Int8RowQuantization::H256F32ConvRot ||
+         implementation == Int8RowQuantization::H256SignedConvRot ||
+         implementation == Int8RowQuantization::H256F32SignedConvRot) &&
+        combined_width % 256U != 0U)
+      fail("H256 ConvRot row quantization requires a last dimension divisible "
+           "by 256");
+    if ((implementation == Int8RowQuantization::H4096SignedConvRot ||
+         implementation == Int8RowQuantization::H4096F32SignedConvRot) &&
+        combined_width % 4096U != 0U)
+      fail("H4096 ConvRot row quantization requires a last dimension "
+           "divisible by 4096");
+    return;
+  }
+
+  if (op.opcode == Opcode::LinearInt8Scaled) {
+    expect_counts(op, 4U, 1U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &row_scales = tensor_or_fail(program, op.inputs[2], op);
+    const auto &column_scales = tensor_or_fail(program, op.inputs[3], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (input.dtype != DType::I8 || weight.dtype != DType::I8 ||
+        row_scales.dtype != DType::F32 ||
+        column_scales.dtype != DType::F32 || out.dtype != DType::BF16 ||
+        input.dims.empty() || weight.dims.size() != 2U || out.dims.empty())
+      fail("linear_int8_scaled requires I8 input/weight, F32 scales, and "
+           "BF16 output");
+    const auto rows = input.element_count() / input.dims.back();
+    const auto inner = input.dims.back();
+    const auto columns = weight.dims[0];
+    if (weight.dims[1] != inner || row_scales.dims !=
+            std::vector<std::uint64_t>{rows} ||
+        column_scales.dims != std::vector<std::uint64_t>{columns} ||
+        out.element_count() != rows * columns ||
+        out.dims.back() != columns)
+      fail("linear_int8_scaled shapes must flatten as [M,K] x [N,K] with "
+           "row [M], column [N], and BF16 [M,N]");
+    if (!weight.has_role(TensorRole::Constant) ||
+        !column_scales.has_role(TensorRole::Constant))
+      fail("linear_int8_scaled weight and column scales must be constants");
+    return;
+  }
+
+  if (op.opcode == Opcode::LinearInt8WeightScaled) {
+    expect_counts(op, 3U, 1U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &scales = tensor_or_fail(program, op.inputs[2], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (input.dtype != DType::BF16 || weight.dtype != DType::I8 ||
+        scales.dtype != DType::F32 || out.dtype != DType::BF16 ||
+        input.dims.empty() || weight.dims.size() != 2U || out.dims.empty())
+      fail("linear_int8_weight_scaled requires BF16 input/output, rank-2 I8 "
+           "weight, and F32 scales");
+    const auto rows = input.element_count() / input.dims.back();
+    const auto inner = input.dims.back();
+    const auto columns = weight.dims[0];
+    if (weight.dims[1] != inner ||
+        scales.dims != std::vector<std::uint64_t>{columns} ||
+        out.element_count() != rows * columns || out.dims.back() != columns)
+      fail("linear_int8_weight_scaled shapes must flatten as [M,K] x [N,K] "
+           "with scale [N] and BF16 [M,N]");
+    if (!weight.has_role(TensorRole::Constant) ||
+        !scales.has_role(TensorRole::Constant))
+      fail("linear_int8_weight_scaled weight and scales must be constants");
+    return;
+  }
+
+  if (op.opcode == Opcode::QuantizeFp8Rows) {
+    expect_counts(op, 1U, 2U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &quantized = tensor_or_fail(program, op.outputs[0], op);
+    const auto &scales = tensor_or_fail(program, op.outputs[1], op);
+    if (input.dtype != DType::BF16 || input.dims.empty() ||
+        quantized.dtype != DType::FP8E4M3 || quantized.dims != input.dims ||
+        scales.dtype != DType::F32 ||
+        scales.dims != std::vector<std::uint64_t>{
+                           input.element_count() / input.dims.back()})
+      fail("quantize_fp8_rows requires BF16 input, equal-shape FP8 E4M3 "
+           "output, and one F32 scale per flattened row");
+    return;
+  }
+
+  if (op.opcode == Opcode::LinearFp8Scaled) {
+    expect_counts(op, 4U, 1U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &row_scales = tensor_or_fail(program, op.inputs[2], op);
+    const auto &column_scales = tensor_or_fail(program, op.inputs[3], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (input.dtype != DType::FP8E4M3 ||
+        weight.dtype != DType::FP8E4M3 ||
+        row_scales.dtype != DType::F32 ||
+        column_scales.dtype != DType::F32 || out.dtype != DType::BF16 ||
+        input.dims.empty() || weight.dims.size() != 2U || out.dims.empty())
+      fail("linear_fp8_scaled requires FP8 E4M3 input/weight, F32 scales, "
+           "and BF16 output");
+    const auto rows = input.element_count() / input.dims.back();
+    const auto inner = input.dims.back();
+    const auto columns = weight.dims[0];
+    if (weight.dims[1] != inner ||
+        row_scales.dims != std::vector<std::uint64_t>{rows} ||
+        column_scales.dims != std::vector<std::uint64_t>{columns} ||
+        out.element_count() != rows * columns || out.dims.back() != columns)
+      fail("linear_fp8_scaled shapes must flatten as [M,K] x [N,K] with "
+           "row [M], column [N], and BF16 [M,N]");
+    if (!weight.has_role(TensorRole::Constant) ||
+        !column_scales.has_role(TensorRole::Constant))
+      fail("linear_fp8_scaled weight and column scales must be constants");
+    return;
+  }
+
+  if (op.opcode == Opcode::QuantizeFp8Blocks32) {
+    expect_counts(op, 1U, 2U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &quantized = tensor_or_fail(program, op.outputs[0], op);
+    const auto &scales = tensor_or_fail(program, op.outputs[1], op);
+    if (input.dtype != DType::BF16 || input.dims.empty() ||
+        quantized.dtype != DType::FP8E4M3 || quantized.dims != input.dims ||
+        scales.dtype != DType::FP8E8M0)
+      fail("quantize_fp8_blocks32 requires BF16 input, equal-shape FP8 E4M3 "
+           "output, and tiled FP8 E8M0 scales");
+    const auto rows = input.element_count() / input.dims.back();
+    const auto padded_rows = ((rows + 127U) / 128U) * 128U;
+    const auto blocks = (input.dims.back() + 31U) / 32U;
+    const auto padded_blocks = ((blocks + 3U) / 4U) * 4U;
+    if (scales.dims !=
+        std::vector<std::uint64_t>{padded_rows, padded_blocks})
+      fail("quantize_fp8_blocks32 scale storage must pad outer rows to 128 "
+           "and K/32 blocks to 4");
+    return;
+  }
+
+  if (op.opcode == Opcode::LinearFp8BlockScaled) {
+    expect_counts(op, 4U, 1U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &input_scales = tensor_or_fail(program, op.inputs[2], op);
+    const auto &weight_scales = tensor_or_fail(program, op.inputs[3], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    if (input.dtype != DType::FP8E4M3 ||
+        weight.dtype != DType::FP8E4M3 ||
+        input_scales.dtype != DType::FP8E8M0 ||
+        weight_scales.dtype != DType::FP8E8M0 ||
+        out.dtype != DType::BF16 || input.dims.empty() ||
+        weight.dims.size() != 2U || out.dims.empty())
+      fail("linear_fp8_block_scaled requires FP8 E4M3 input/weight, tiled "
+           "FP8 E8M0 scales, and BF16 output");
+    const auto rows = input.element_count() / input.dims.back();
+    const auto inner = input.dims.back();
+    const auto columns = weight.dims[0];
+    const auto padded_blocks = (((inner + 31U) / 32U + 3U) / 4U) * 4U;
+    const auto input_padded_rows = ((rows + 127U) / 128U) * 128U;
+    const auto weight_padded_rows = ((columns + 127U) / 128U) * 128U;
+    if (weight.dims[1] != inner ||
+        input_scales.dims !=
+            std::vector<std::uint64_t>{input_padded_rows, padded_blocks} ||
+        weight_scales.dims !=
+            std::vector<std::uint64_t>{weight_padded_rows, padded_blocks} ||
+        out.element_count() != rows * columns || out.dims.back() != columns)
+      fail("linear_fp8_block_scaled shapes must flatten as [M,K] x [N,K] "
+           "with tiled/padded block scales and BF16 [M,N]");
+    if (!weight.has_role(TensorRole::Constant) ||
+        !weight_scales.has_role(TensorRole::Constant))
+      fail("linear_fp8_block_scaled weight and scales must be constants");
+    return;
+  }
+
+  if (op.opcode == Opcode::DequantizeInt8Blocks) {
+    expect_counts(op, 2U, 1U);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &scales = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const auto block = op.u64(AttrKey::BlockSize, 0U);
+    if (input.dtype != DType::I8 || input.dims.size() != 2U ||
+        scales.dtype != DType::F32 || scales.dims.size() != 2U ||
+        out.dtype != DType::BF16 || out.dims != input.dims || block == 0U ||
+        (block & (block - 1U)) != 0U || block > 256U ||
+        scales.dims != std::vector<std::uint64_t>{
+                           input.dims[0], (input.dims[1] + block - 1U) / block})
+      fail("dequantize_int8_blocks requires rank-2 I8 input, rank-2 F32 "
+           "block scales, equal-shape BF16 output, and a power-of-two block "
+           "size no larger than 256");
+    if (!input.has_role(TensorRole::Constant) ||
+        !scales.has_role(TensorRole::Constant))
+      fail("dequantize_int8_blocks input and scales must be constants");
+    return;
+  }
+
   if (op.opcode == Opcode::QkNormPartialRope) {
     expect_counts(op, 4, 1);
     const auto &input = tensor_or_fail(program, op.inputs[0], op);
@@ -902,18 +1208,37 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &sin = tensor_or_fail(program, op.inputs[3], op);
     const auto &out = tensor_or_fail(program, op.outputs[0], op);
     same_shape_dtype(input, out, op);
-    if (!supported_float(input.dtype) || input.dims.size() != 3 ||
+    const bool compatible_table_rank =
+        input.dims.size() == 4U
+            ? cos.dims.size() == 3U
+            : (cos.dims.size() == 2U ||
+               (cos.dims.size() == 3U && cos.dims[0] == 1U));
+    if (!supported_float(input.dtype) ||
+        (input.dims.size() != 3U && input.dims.size() != 4U) ||
         weight.dtype != input.dtype || weight.dims.size() != 1 ||
-        cos.dtype != input.dtype || sin.dtype != input.dtype || cos.dims != sin.dims ||
-        cos.dims.size() != 2)
-      fail("qk_norm_partial_rope requires input [S,H,D], weight [D], cos/sin [S,R]");
-    const auto heads = op.u64(AttrKey::Heads, input.dims[1]);
-    const auto head_dim = op.u64(AttrKey::HeadDim, input.dims[2]);
-    const auto rotary = op.u64(AttrKey::RotaryDim, cos.dims[1] * 2U);
-    if (heads != input.dims[1] || head_dim != input.dims[2] ||
-        weight.dims[0] != head_dim || cos.dims[0] != input.dims[0] ||
+        (cos.dtype != input.dtype && cos.dtype != DType::F32) ||
+        sin.dtype != cos.dtype || cos.dims != sin.dims ||
+        !compatible_table_rank)
+      fail("qk_norm_partial_rope requires [S,H,D] or [B,S,H,D], weight "
+           "[D], and compatible cos/sin tables");
+    const auto head_axis = input.dims.size() - 2U;
+    const auto heads = op.u64(AttrKey::Heads, input.dims[head_axis]);
+    const auto head_dim = op.u64(AttrKey::HeadDim, input.dims.back());
+    const auto table_width = cos.dims.back();
+    const auto rotary = op.u64(AttrKey::RotaryDim, table_width * 2U);
+    const auto input_batch = input.dims.size() == 4U ? input.dims[0] : 1U;
+    const auto input_sequence =
+        input.dims.size() == 4U ? input.dims[1] : input.dims[0];
+    const auto table_batch = cos.dims.size() == 3U ? cos.dims[0] : 1U;
+    const auto table_sequence =
+        cos.dims.size() == 3U ? cos.dims[1] : cos.dims[0];
+    const auto table_start = op.u64(AttrKey::Start, 0U);
+    if (heads != input.dims[head_axis] || head_dim != input.dims.back() ||
+        weight.dims[0] != head_dim || table_batch != input_batch ||
+        table_start > table_sequence ||
+        input_sequence > table_sequence - table_start ||
         rotary == 0 || rotary > head_dim || (rotary % 2U) != 0U ||
-        (cos.dims[1] != rotary && cos.dims[1] * 2U != rotary))
+        (table_width != rotary && table_width * 2U != rotary))
       fail("qk_norm_partial_rope shape attributes are inconsistent");
     const auto block = op.u64(AttrKey::BlockSize, 256U);
     if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
@@ -958,8 +1283,10 @@ void verify_operation(const Program &program, const Operation &op) {
         fail("attention additive bias must be [B,1,S,S] in the query dtype");
     }
     const auto implementation = op.u64(AttrKey::Implementation, 1U);
-    if (implementation != 1U && implementation != 2U)
-      fail("attention implementation must be 1 (generated) or 2 (cuDNN)");
+    if (implementation != 1U && implementation != 2U &&
+        implementation != 3U && implementation != 4U)
+      fail("attention implementation must be 1 (generated), 2 (cuDNN), or "
+           "3 (materialized f32), or 4 (native FlashAttention)");
     if (implementation == 2U && q.dtype != DType::BF16 &&
         q.dtype != DType::F16)
       fail("cuDNN attention implementation requires bf16 or f16");
@@ -968,6 +1295,19 @@ void verify_operation(const Program &program, const Operation &op) {
       fail("generated attention currently admits unbatched attention without additive bias; use cuDNN for batched/masked semantics");
     if (implementation == 1U && q.dims[sequence_axis] > 4096U)
       fail("naive exact attention is admitted only for S<=4096; use a backend implementation");
+    if (implementation == 3U &&
+        (q.dtype != DType::F32 || q.dims.size() != 3U ||
+         q.dims[head_axis] != 1U || kv_heads != 1U ||
+         op.inputs.size() != 3U || op.boolean(AttrKey::Causal, false)))
+      fail("materialized f32 attention requires noncausal unbatched "
+           "f32 [S,1,D] q/k/v without additive bias");
+    if (implementation == 4U &&
+        (q.dtype != DType::BF16 ||
+         (q.dims.size() != 3U && q.dims.size() != 4U) ||
+         q.dims.back() != 128U || op.inputs.size() != 3U ||
+         op.boolean(AttrKey::Causal, false)))
+      fail("native FlashAttention requires noncausal bf16 [S,H,128] or "
+           "[B,S,H,128] q/k/v without additive bias");
     const auto block = op.u64(AttrKey::BlockSize, 64U);
     if (block < 32U || block > 256U || (block & (block - 1U)) != 0U)
       fail("initial fused attention requires a power-of-two block in [32,256]");
@@ -1185,11 +1525,14 @@ void verify_operation(const Program &program, const Operation &op) {
         input.dims.empty() ||
         grad_output.dims.size() != input.dims.size())
       fail("swiglu_backward requires uniform float tensors");
-    auto expected = grad_output.dims;
-    expected.back() *= 2U;
-    if (input.dims != expected)
-      fail("swiglu_backward input final dimension must be twice the "
-           "grad_output final dimension");
+    for (std::size_t axis = 0U; axis + 1U < input.dims.size(); ++axis)
+      if (input.dims[axis] != grad_output.dims[axis])
+        fail("swiglu_backward input and output prefix dimensions must match");
+    const auto start = op.u64(AttrKey::Start, 0U);
+    if (grad_output.dims.back() >
+            (std::numeric_limits<std::uint64_t>::max() - start) / 2U ||
+        start + grad_output.dims.back() * 2U > input.dims.back())
+      fail("swiglu_backward packed window is outside the input final dimension");
     return;
   }
 

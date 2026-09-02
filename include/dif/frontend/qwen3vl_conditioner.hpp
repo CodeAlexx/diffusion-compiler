@@ -40,6 +40,7 @@ struct Qwen3VlConditionerConfig {
   std::uint64_t output_sequence_length{0};
   bool use_attention_mask{false};
   bool dynamic_position_ids{false};
+  bool mask_padding_queries{true};
 
   // Optional multimodal row-splice contract. The vision tower remains a
   // separate prepared DiffIR program; its merged rows replace image-pad token
@@ -47,6 +48,19 @@ struct Qwen3VlConditionerConfig {
   // after the listed decoder layers. Zero preserves the text-only program.
   std::uint64_t vision_token_count{0};
   std::vector<std::uint64_t> deepstack_language_layers{0U, 1U, 2U};
+
+  // Literal checkpoint prefix for the shared Qwen decoder topology. Qwen3-VL
+  // text towers live under model.language_model.; ordinary Qwen3 CausalLM
+  // checkpoints live under model. The model frontend chooses the name while
+  // the DiffIR and executor stay shared.
+  std::string checkpoint_prefix{"model.language_model."};
+
+  // Optionally concatenate selected raw hidden states across their final
+  // dimension inside DiffIR. Individual taps remain outputs for parity.
+  bool concatenate_selected_hidden_states{false};
+
+  // Parity-only observability. This changes tensor roles, not computation.
+  bool capture_first_layer_boundaries{false};
 };
 
 // One checkpoint tensor the program consumes. `name` is the literal
@@ -74,6 +88,7 @@ struct Qwen3VlConditionerBuild {
   std::vector<std::uint32_t> vision_deepstack_input_ids;
   std::uint32_t conditioning_output_id{};
   std::vector<std::uint32_t> conditioning_output_ids;
+  std::vector<std::pair<std::string, std::uint32_t>> first_layer_boundaries;
   std::uint64_t linear_operations{};
   std::uint64_t attention_operations{};
 };

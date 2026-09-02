@@ -404,6 +404,110 @@ typename Int8F16ScaledDeviceGemm::Arguments int8_scaled_f16_arguments(
       static_cast<int>(k), 0, 0);
 }
 
+// Weight-only mixed-input path. CUTLASS upcasts the narrow signed operand in
+// the mainloop and executes BF16 tensor-core MMA with FP32 accumulation. The
+// per-output-channel weight scale is fused into the output visitor.
+using Int8WeightElementA = cutlass::bfloat16_t;
+using Int8WeightElementB = std::int8_t;
+using Int8WeightOutput = cutlass::bfloat16_t;
+using Int8WeightAccumulator = float;
+using Int8WeightCompute = float;
+using Int8WeightLayoutA = cutlass::layout::RowMajor;
+using Int8WeightLayoutB = cutlass::layout::ColumnMajor;
+using Int8WeightLayoutC = cutlass::layout::RowMajor;
+using Int8WeightThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+using Int8WeightWarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
+using Int8WeightInstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+constexpr int kInt8WeightAlignmentA = 8;
+constexpr int kInt8WeightAlignmentB = 16;
+constexpr int kInt8WeightOutputAlignment = 8;
+constexpr int kInt8WeightStages = 3;
+constexpr int kInt8WeightEpilogueStages = 1;
+
+using Int8WeightOutputThreadMap =
+    cutlass::epilogue::threadblock::OutputTileThreadLayout<
+        Int8WeightThreadblockShape, Int8WeightWarpShape, Int8WeightOutput,
+        kInt8WeightOutputAlignment, kInt8WeightEpilogueStages>;
+using Int8WeightAccum = cutlass::epilogue::threadblock::VisitorAccFetch;
+using Int8WeightColumnScale =
+    cutlass::epilogue::threadblock::VisitorRowBroadcast<
+        Int8WeightOutputThreadMap, float,
+        cute::Stride<cute::_0, cute::_1, std::int64_t>>;
+using Int8WeightMul = cutlass::epilogue::threadblock::VisitorCompute<
+    cutlass::multiplies, Int8WeightOutput, float,
+    cutlass::FloatRoundStyle::round_to_nearest>;
+using Int8WeightScaled = cutlass::epilogue::threadblock::Sm80EVT<
+    Int8WeightMul, Int8WeightAccum, Int8WeightColumnScale>;
+using Int8WeightStore = cutlass::epilogue::threadblock::VisitorAuxStore<
+    Int8WeightOutputThreadMap, Int8WeightOutput,
+    cutlass::FloatRoundStyle::round_to_nearest,
+    cute::Stride<std::int64_t, cute::_1, std::int64_t>>;
+using Int8WeightEpilogue = cutlass::epilogue::threadblock::Sm80EVT<
+    Int8WeightStore, Int8WeightScaled>;
+using Int8WeightDefinition =
+    cutlass::gemm::kernel::DefaultGemmWithVisitor<
+        Int8WeightElementA, Int8WeightLayoutA,
+        cutlass::ComplexTransform::kNone, kInt8WeightAlignmentA,
+        Int8WeightElementB, Int8WeightLayoutB,
+        cutlass::ComplexTransform::kNone, kInt8WeightAlignmentB,
+        Int8WeightOutput, Int8WeightLayoutC, kInt8WeightOutputAlignment,
+        Int8WeightAccumulator, Int8WeightCompute,
+        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        Int8WeightThreadblockShape, Int8WeightWarpShape,
+        Int8WeightInstructionShape, Int8WeightEpilogue,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        kInt8WeightStages, cutlass::arch::OpMultiplyAddMixedInputUpcast,
+        kInt8WeightEpilogueStages>;
+using Int8WeightKernelBase = typename Int8WeightDefinition::GemmKernel;
+struct Int8WeightKernel : Int8WeightKernelBase {
+  using Mma = typename Int8WeightDefinition::GemmBase::Mma;
+  using Epilogue = typename Int8WeightDefinition::Epilogue;
+  using EpilogueOutputOp = typename Epilogue::OutputOp;
+  using Operator = typename Mma::Operator;
+  using WarpShape = typename Mma::Operator::Shape;
+  using InstructionShape = typename Mma::Policy::Operator::InstructionShape;
+  static constexpr auto kTransformA = cutlass::ComplexTransform::kNone;
+  static constexpr auto kTransformB = cutlass::ComplexTransform::kNone;
+  static constexpr int kAlignmentA = kInt8WeightAlignmentA;
+  static constexpr int kAlignmentB = kInt8WeightAlignmentB;
+  static constexpr int kAlignmentC = kInt8WeightOutputAlignment;
+  static constexpr int kThreadCount = 32 * Mma::WarpCount::kCount;
+
+  static cutlass::Status can_implement(Arguments const &arguments) {
+    const auto &problem = arguments.problem_size;
+    if ((problem.k() % kAlignmentA) != 0 ||
+        (problem.k() % kAlignmentB) != 0 ||
+        (problem.n() % kAlignmentC) != 0)
+      return cutlass::Status::kErrorMisalignedOperand;
+    return cutlass::Status::kSuccess;
+  }
+};
+using Int8WeightDeviceGemm =
+    cutlass::gemm::device::GemmUniversalAdapter<Int8WeightKernel>;
+
+typename Int8WeightDeviceGemm::Arguments int8_weight_arguments(
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    std::uintptr_t input, std::uintptr_t weight,
+    std::uintptr_t column_scale, std::uintptr_t output) {
+  using namespace cute;
+  typename Int8WeightEpilogue::Arguments callbacks{
+      {{},
+       {reinterpret_cast<const float *>(column_scale), 0.0F,
+        {_0{}, _1{}, static_cast<std::int64_t>(n)}},
+       {}},
+      {reinterpret_cast<Int8WeightOutput *>(output),
+       {static_cast<std::int64_t>(n), _1{},
+        static_cast<std::int64_t>(m) * n}}};
+  return typename Int8WeightDeviceGemm::Arguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k)}, 1,
+      callbacks, reinterpret_cast<const Int8WeightElementA *>(input),
+      reinterpret_cast<const Int8WeightElementB *>(weight), nullptr, nullptr,
+      static_cast<std::int64_t>(m) * k,
+      static_cast<std::int64_t>(n) * k, 0, 0, static_cast<int>(k),
+      static_cast<int>(k), 0, 0);
+}
+
 } // namespace
 
 struct CutlassGemmHandle {
@@ -433,6 +537,16 @@ struct CutlassInt8ScaledF16GemmHandle {
   std::uintptr_t bias{};
   std::uintptr_t output{};
   Int8F16ScaledDeviceGemm gemm;
+};
+struct CutlassInt8WeightGemmHandle {
+  std::uint32_t m{};
+  std::uint32_t n{};
+  std::uint32_t k{};
+  std::uintptr_t input{};
+  std::uintptr_t weight{};
+  std::uintptr_t column_scale{};
+  std::uintptr_t output{};
+  Int8WeightDeviceGemm gemm;
 };
 
 const char *cutlass_gemm_schedule_name(std::uint32_t schedule) {
@@ -748,6 +862,80 @@ bool launch_cutlass_int8_scaled_f16_gemm(
 
 void destroy_cutlass_int8_scaled_f16_gemm(
     CutlassInt8ScaledF16GemmHandle *handle) {
+  delete handle;
+}
+CutlassInt8WeightGemmHandle *create_cutlass_int8_weight_gemm(
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    std::uintptr_t input, std::uintptr_t weight,
+    std::uintptr_t column_scale, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity) {
+  auto handle = std::make_unique<CutlassInt8WeightGemmHandle>();
+  handle->m = m;
+  handle->n = n;
+  handle->k = k;
+  handle->input = input;
+  handle->weight = weight;
+  handle->column_scale = column_scale;
+  handle->output = output;
+  auto arguments = int8_weight_arguments(
+      m, n, k, input, weight, column_scale, output);
+  auto status = Int8WeightDeviceGemm::can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) {
+    set_error(error, error_capacity,
+              std::string("CUTLASS INT8 weight can_implement failed: ") +
+                  cutlassGetStatusString(status));
+    return nullptr;
+  }
+  if (Int8WeightDeviceGemm::get_workspace_size(arguments) != 0U) {
+    set_error(error, error_capacity,
+              "CUTLASS INT8 weight GEMM unexpectedly requires workspace");
+    return nullptr;
+  }
+  status = handle->gemm.initialize(
+      arguments, nullptr, reinterpret_cast<cudaStream_t>(stream));
+  if (status != cutlass::Status::kSuccess) {
+    set_error(error, error_capacity,
+              std::string("CUTLASS INT8 weight initialize failed: ") +
+                  cutlassGetStatusString(status));
+    return nullptr;
+  }
+  return handle.release();
+}
+
+bool launch_cutlass_int8_weight_gemm(
+    CutlassInt8WeightGemmHandle *handle, std::uintptr_t input,
+    std::uintptr_t weight, std::uintptr_t column_scale,
+    std::uintptr_t output, std::uintptr_t stream, char *error,
+    std::size_t error_capacity) {
+  if (!handle) {
+    set_error(error, error_capacity, "null CUTLASS INT8 weight GEMM handle");
+    return false;
+  }
+  auto status = cutlass::Status::kSuccess;
+  if (input != handle->input || weight != handle->weight ||
+      column_scale != handle->column_scale || output != handle->output) {
+    auto arguments = int8_weight_arguments(
+        handle->m, handle->n, handle->k, input, weight, column_scale, output);
+    status = handle->gemm.update(arguments);
+    if (status == cutlass::Status::kSuccess) {
+      handle->input = input;
+      handle->weight = weight;
+      handle->column_scale = column_scale;
+      handle->output = output;
+    }
+  }
+  if (status == cutlass::Status::kSuccess)
+    status = handle->gemm.run(reinterpret_cast<cudaStream_t>(stream));
+  if (status == cutlass::Status::kSuccess)
+    return true;
+  set_error(error, error_capacity,
+            std::string("CUTLASS INT8 weight launch failed: ") +
+                cutlassGetStatusString(status));
+  return false;
+}
+
+void destroy_cutlass_int8_weight_gemm(
+    CutlassInt8WeightGemmHandle *handle) {
   delete handle;
 }
 

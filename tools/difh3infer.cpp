@@ -907,10 +907,12 @@ int main(int argc, char **argv) {
     denoiser_run_options.h3_modulation_cache = options.h3_modulation_cache;
     denoiser_run_options.h3_modulation_source_index =
         options.h3_modulation_source_index;
-    if (!options.h3_modulation_cache.empty())
-      denoiser_run_options.h3_modulation_steps =
-          options.h3_modulation_steps != 0U ? options.h3_modulation_steps
-                                           : options.schedule_points;
+    denoiser_run_options.h3_modulation_steps =
+        options.h3_modulation_cache.empty()
+            ? 0U
+            : (options.h3_modulation_steps != 0U
+                   ? options.h3_modulation_steps
+                   : options.schedule_points);
     double denoiser_prepare_ms = 0.0;
     double denoiser_kernel_ms = 0.0;
     double denoiser_bundle_map_ms = 0.0;

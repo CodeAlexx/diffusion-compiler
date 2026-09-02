@@ -43,136 +43,35 @@ in this repository.
 - MiniMax-H3 as the first production-scale video/audio proving frontend.
 - Krea 2 as model family number two, reusing the same verifier, planner,
   executor, allocator, attention implementation, and NVIDIA backend.
+- FLUX.2 [klein] Base 9B as a fully native prompt-to-PNG frontend on RTX 5080,
+  reusing the same DiffIR, prepared executor, residency planner, quantization
+  semantics, cuBLASLt/cuDNN backend, VAE primitives, and PNG path.
 
-H3 and Krea-specific tensor packing, block ordering, checkpoint names,
-conditioning policy, and scheduler rules stay in their frontends. Generic
-operations stay in DiffIR and the shared runtime; there is no Krea-specific
-executor or second tensor framework.
+Model-specific tensor packing, block ordering, checkpoint names, conditioning
+policy, and scheduler rules stay in their frontends. Generic operations stay
+in DiffIR and the shared runtime; there is no model-specific executor or
+second tensor framework.
 
-## Krea 2 Turbo BF16 benchmark
 
-The frozen baseline uses the official Krea 2 Turbo checkpoint and creator
-recipe on one RTX 3090 Ti:
+## Performance
 
-- 1024x1024 output, 4096 image tokens, 512 text tokens
-- 28 MMDiT blocks, width 6144, 48 query heads, 12 KV heads
-- BF16 production math
-- 8 Euler steps, CFG disabled, `mu=1.15`
-- identical checkpoint, prompt, seed, initial latent, schedule, and conditioning
-  boundary for the compared denoisers
+The main benchmark summary stays compact here. See
+[PERFORMANCE.md](PERFORMANCE.md) for the speed charts, frozen workloads,
+quality gates, stage timings, memory data, and comparator disclosures.
 
-The frozen pre-optimization native path, the first admitted whole-system plan,
-and the strict ComfyUI/PyTorch eager-mode development comparator measured:
+| Model and product boundary | GPU | Native C++ | Matched baseline | Result |
+|---|---|---:|---:|---:|
+| FLUX.2 [klein] Base 9B, prompt to PNG | RTX 5080 | **52.809 s** | 99.242 s ComfyUI | **1.879x faster** |
+| Krea 2 Turbo, prompt to PNG | RTX 3090 Ti | **26.58 s** | 59.14 s framework | **2.225x faster** |
+| MiniMax-H3 FL2VA, prompt to MP4 | RTX 3090 Ti | **78.88 s** | 81.095 s ComfyUI | **1.028x faster** |
 
-| Measurement | Native frozen | Native admitted plan | ComfyUI/PyTorch BF16 |
-|---|---:|---:|---:|
-| One-time denoiser preparation | 1.227 s | 1.224–1.230 s | included in cold first step |
-| Cold first denoise step | 4.332 s | 3.565–3.599 s | 28.287 s |
-| Hot denoise step median | 4.309 s | 2.249–2.258 s | 2.000 s |
-| Complete 8-step denoise | 34.477 s | 19.364–19.379 s | 42.316 s |
-| Preparation + 8-step denoise | 35.703 s | 20.594–20.602 s | 42.316 s |
-| Peak NVML GPU use / host RSS | not captured together | 23,364 MiB / 26,771,764 KiB | 25.487 GB / 27.028 GB |
+FLUX.2 saves 46.433 seconds (46.788%) on the frozen 1024x1024, 50-step
+workload and passes the unchanged numerical and visual gates. It meets the
+approved near-55-second target; it is not labeled 2x.
 
-Across two accepted repetitions, the admitted native plan is **2.054x faster**
-including its explicit preparation, and its denoise loop is **2.184x faster**.
-The warmed ComfyUI iteration remains about **1.12x faster** than the admitted
-native hot iteration; the native end-to-end advantage comes from retaining its
-small setup boundary and populating compiler-selected resident weights once
-during the first semantic evaluation instead of paying the framework's large
-cold step.
-
-The admitted plan keeps 22.072 GB of reusable weights resident, streams 2.775
-GB, selects residency largest-first under an explicit 22,000 MiB plan budget,
-aliases immutable reshapes, and uses four bounded host staging participants.
-Krea modulation now uses the shared `AffineLastDim` semantic instead of
-materializing redundant full-sequence broadcasts. All eight recorded states
-and the final latent remain bit-identical to the frozen creator trajectory; no
-quality or numerical threshold changed. This is the first 2x checkpoint, not
-the final optimization target. No complete prompt-to-image speed ratio is
-claimed by this denoiser-only table.
-
-A separate literal-prompt-to-PNG validation measured every external stage with
-fresh processes and a warm operating-system page cache:
-
-| External stage | Native C++ | Creator / ComfyUI / PyTorch BF16 |
-|---|---:|---:|
-| Tokenizer + Qwen3-VL | 2.28 s | 9.05 s |
-| TextFusion | 1.29 s | 7.52 s |
-| Prepared 8-step denoise | 19.54 s | 34.26 s |
-| Qwen-Image VAE + PNG | 3.43 s | 8.31 s |
-| **Literal prompt to PNG** | **26.58 s** | **59.14 s** |
-
-That is a measured **2.225x complete-chain speedup** on the RTX 3090 Ti. The
-native run recorded zero filesystem input, so this is explicitly a warm-page-
-cache result, not a cold-disk claim. A cold-filesystem native diagnostic took
-55.58 s, dominated by 27.42 s of Qwen weight page-in; it is preserved as a
-separate I/O result rather than folded into the admitted number. The validated
-native denoiser remained bit-identical to the creator trajectory, the VAE gate
-passed at cosine `0.99999339` and relative L2 `0.00363512` after clamping, and
-the inspected PNG retained SHA-256
-`eea79ee7d84a703235481b0e1859ca087fa20d40304aa0243d9929da8333fbfd`.
-
-The framework comparator is ordinary ComfyUI/PyTorch eager execution. It does
-not use `torch.compile` or Inductor kernel fusion; that would be a separate
-matched benchmark.
-
-The strict comparator uses the creator's padding mask and the same
-post-TextFusion conditioning boundary. Its final latent versus the exact
-creator/native trajectory measured cosine `0.997472`, relative L2 `0.070970`,
-and zero nonfinite values. The stock ComfyUI Krea frontend was also measured,
-but it omits that creator mask at the main blocks in the checked revision and
-therefore is retained only as a product-speed observation, not a numerical
-parity arm. No threshold was relaxed to admit it.
-
-Qwen-Image VAE decode through the native runtime measured 0.977 s after a
-separate 4.519 s one-time plan build. Against the creator decode, the native
-PNG measured 56.81 dB PSNR and 0.999073 SSIM and passed visual inspection.
-
-The original numbers remain the frozen pre-optimization baseline. Successor
-plans continue to use the same prompt, seed, BF16 quality class, scheduler,
-and output gate.
-
-## MiniMax-H3 FL2VA prompt-to-MP4 checkpoint
-
-The current H3 product path executes literal FL2VA inputs through native
-presentation, Qwen3-VL vision/text conditioning, both keyframe encodes, seven
-denoiser evaluations, video/audio decode, and a saved H.264/AAC MP4. It uses
-native ConvRot INT8 projections and the project-owned CK INT8 attention DSO in
-the Compiler only; SerenityFlow and ComfyUI are unchanged. This is an
-approximate INT8 route, distinct from the exact BF16/cuDNN route.
-
-The matched contract is one RTX 3090 Ti at 300 W, two keyframes, 832x480,
-124 delivered frames at 24 fps, 207 audio latents, 1,256 conditioner tokens,
-packed sequence length 16,880, and seven `res_multistep`/`simple` evaluations.
-The performance ratio uses only complete literal-prompt-to-saved-MP4 wall time.
-
-| Complete-wall measurement | Time |
-|---|---:|
-| Fastest valid matched stock ComfyUI ConvRot INT8 baseline | 81.0952614400303 s |
-| Strict 2x Compiler ceiling | <40.54763072001515 s |
-| Fastest valid Compiler ConvRot INT8 + CK result | 78.88 s |
-
-The Compiler is currently **1.028083943x faster** than that baseline, a 2.732%
-wall-time reduction, but it is **38.33236928 s above** the strict 2x ceiling.
-It still needs a 48.596% reduction from its current best time. No 2x result is
-claimed.
-
-Diagnostic stage walls for the 78.88 s result were 0.23 s presentation, 1.10 s
-vision, 4.84/4.93 s concurrent keyframe encodes, 7.45 s conditioning, 55.47 s
-denoise, 5.70/13.61 s concurrent audio/video decode, and 0.48 s mux. These
-overlap and must not be summed or used instead of the complete wall.
-
-The saved MP4 is 832x480 H.264 with 124 frames at 24 fps plus 32 kHz stereo AAC
-and passed direct visual inspection for coherent subject and camera motion. Its
-SHA-256 is
-`cfb0c6b8110ff2dda9a0a240e57b5a16476cff0b3c5c41872f131e2ebc21e64f`.
-Decoded video/audio numerical parity to the stock competitor is not fully
-accepted, so the result remains an approximate quality checkpoint as well as a
-rejected 2x performance result.
-
-An exact-output QKV/RMSNorm/RoPE fusion improved isolated hot denoiser
-evaluations but regressed complete wall to 84.49 s warm and 92.05 s cold; it
-was removed. Stage-level wins do not override the complete-wall decision.
+The H3 result saves 2.215 seconds (2.732%) on the complete seven-evaluation
+FL2VA chain. Decoded parity is not fully accepted and the result remains far
+from the 2x ceiling, so no H3 2x or final-quality claim is made.
 
 ## Hardware target and observability foundation
 
@@ -319,10 +218,19 @@ CMake-supported build tool. CUDA Toolkit and cuDNN enable the NVIDIA backend.
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DDIF_ENABLE_CUDA=ON \
-  -DDIF_ENABLE_CUDNN=ON
+  -DDIF_ENABLE_CUDNN=ON \
+  -DDIF_CUDA_ARCHITECTURES=native
 cmake --build build -j2
 ctest --test-dir build --output-on-failure -j1
 ```
+
+`DIF_CUDA_ARCHITECTURES` defaults to `native`. Set it explicitly when building
+for another deployment target; for example, Blackwell RTX 50-series uses
+`-DDIF_CUDA_ARCHITECTURES=120` with a toolkit that supports SM 120.
+
+H3 media output defaults to portable `libx264`. Set `--encoder h264_nvenc`
+(or `H3_MEDIA_ENCODER=h264_nvenc` in the replay script) only when the selected
+FFmpeg build exposes that encoder.
 
 For a CPU-only development build:
 
@@ -360,10 +268,13 @@ Core tools include:
 - `difschedule` for authenticated flow schedules.
 - `difopt` and `diftune` for gated plan search and backend candidate tests.
 - `diftrain` for compiled forward/backward, optimizer state, and resume.
-- `difh3layout`, `difh3vision`, `difh3encode`, `difh3state`, `difh3infer`,
-  `difh3media`, and `difvaedecode` for the H3 proving path.
+- `diftokenize`, `difcondition`, `difh3layout`, `difh3convrot`, `difmodcache`,
+  `difh3vision`, `difh3encode`, `difh3state`, `difh3infer`, `difvaedecode`,
+  `difaudiodecode`, and `difh3media` for the H3 proving path.
 - `difkrea2block`, `difkrea2denoise`, `difkrea2sample`, and `difkrea2vae` for
   the Krea 2 source-faithful gates and native image path.
+- `difflux2block` and `difflux2sample` for FLUX.2 source-faithful block gates
+  and the complete native prompt-to-PNG path.
 
 Run a tool without arguments for its current usage. Binary `.difir`,
 `.diftensor`, `.difbind`, and `.diftrain` files are canonical; CLI text is an

@@ -8,6 +8,7 @@ namespace dif::runtime {
 struct CutlassGemmHandle;
 struct CutlassInt8ScaledGemmHandle;
 struct CutlassInt8ScaledF16GemmHandle;
+struct CutlassInt8WeightGemmHandle;
 
 struct CutlassGemmResources {
   const char *name{};
@@ -78,5 +79,23 @@ bool launch_cutlass_int8_scaled_f16_gemm(
 
 void destroy_cutlass_int8_scaled_f16_gemm(
     CutlassInt8ScaledF16GemmHandle *handle);
+
+// Prepared mixed-input GEMM that keeps activations in BF16 and weights in
+// signed INT8. One static F32 scale per output channel is applied in the
+// epilogue, so the compressed weight never needs a BF16 materialization:
+//   BF16 D[m,n] = BF16(F32(A[m,k] * I8(W[n,k])^T) * scale[n]).
+CutlassInt8WeightGemmHandle *create_cutlass_int8_weight_gemm(
+    std::uint32_t m, std::uint32_t n, std::uint32_t k,
+    std::uintptr_t input, std::uintptr_t weight,
+    std::uintptr_t column_scale, std::uintptr_t output,
+    std::uintptr_t stream, char *error, std::size_t error_capacity);
+
+bool launch_cutlass_int8_weight_gemm(
+    CutlassInt8WeightGemmHandle *handle, std::uintptr_t input,
+    std::uintptr_t weight, std::uintptr_t column_scale,
+    std::uintptr_t output, std::uintptr_t stream, char *error,
+    std::size_t error_capacity);
+
+void destroy_cutlass_int8_weight_gemm(CutlassInt8WeightGemmHandle *handle);
 
 } // namespace dif::runtime

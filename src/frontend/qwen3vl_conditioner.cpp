@@ -73,8 +73,10 @@ struct Builder {
   }
 };
 
-std::string layer_prefix(std::uint64_t layer) {
-  return "model.language_model.layers." + std::to_string(layer) + ".";
+std::string layer_prefix(std::string_view checkpoint_prefix,
+                         std::uint64_t layer) {
+  return std::string(checkpoint_prefix) + "layers." +
+         std::to_string(layer) + ".";
 }
 
 } // namespace
@@ -103,6 +105,8 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     fail("masked qwen3-vl attention requires the exact cuDNN implementation");
   if (config.dynamic_position_ids != config.use_attention_mask)
     fail("qwen3-vl dynamic position ids and attention masking must be enabled together");
+  if (config.checkpoint_prefix.empty())
+    fail("qwen3-vl checkpoint prefix must not be empty");
   for (const auto hidden_state : config.selected_hidden_states)
     if (hidden_state == 0U || hidden_state > config.executed_layers)
       fail("selected qwen3-vl hidden state is outside the executed layer range");
@@ -164,7 +168,9 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
         {1U, sequence});
     attention_bias_id = builder.internal({1U, 1U, sequence, sequence});
     builder.operation(Opcode::BooleanMaskToBias,
-                      {build.attention_mask_input_id}, {attention_bias_id});
+                      {build.attention_mask_input_id}, {attention_bias_id},
+                      {Attribute::boolean(AttrKey::MaskQueries,
+                                          config.mask_padding_queries)});
   }
 
   // ---- rotary tables ------------------------------------------------------
@@ -199,7 +205,8 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
 
   // ---- embedding ----------------------------------------------------------
   const auto embedding_id = builder.streamed(
-      "model.language_model.embed_tokens.weight", {config.vocabulary, hidden});
+      config.checkpoint_prefix + "embed_tokens.weight",
+      {config.vocabulary, hidden});
   auto residual_id = builder.internal({sequence, hidden});
   builder.operation(Opcode::GatherRows, {embedding_id, build.token_ids_input_id},
                     {residual_id});
@@ -212,6 +219,28 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     residual_id = spliced;
   }
 
+  const auto capture = [&](std::uint64_t layer, std::string name,
+                           std::uint32_t tensor_id) {
+    if (layer != 0U || !config.capture_first_layer_boundaries)
+      return;
+    const auto tensor = std::find_if(
+        build.program.tensors.begin(), build.program.tensors.end(),
+        [&](const auto &candidate) { return candidate.id == tensor_id; });
+    if (tensor == build.program.tensors.end())
+      fail("qwen3-vl boundary capture lost its tensor");
+    tensor->roles |= static_cast<std::uint32_t>(TensorRole::Output);
+    build.first_layer_boundaries.emplace_back(std::move(name), tensor_id);
+  };
+  if (config.capture_first_layer_boundaries) {
+    const auto tensor = std::find_if(
+        build.program.tensors.begin(), build.program.tensors.end(),
+        [&](const auto &candidate) { return candidate.id == residual_id; });
+    if (tensor == build.program.tensors.end())
+      fail("qwen3-vl embedding capture lost its tensor");
+    tensor->roles |= static_cast<std::uint32_t>(TensorRole::Output);
+    build.first_layer_boundaries.emplace_back("embedding", residual_id);
+  }
+
   const auto rms_attributes = [&](void) {
     return std::vector<Attribute>{
         Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)};
@@ -219,7 +248,7 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
 
   // ---- layers 0 .. executed_layers-1 --------------------------------------
   for (std::uint64_t layer = 0U; layer < config.executed_layers; ++layer) {
-    const auto prefix = layer_prefix(layer);
+    const auto prefix = layer_prefix(config.checkpoint_prefix, layer);
 
     // Attention block.
     const auto input_norm_weight_id =
@@ -227,6 +256,7 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     const auto normed_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::RmsNorm, {residual_id, input_norm_weight_id},
                       {normed_id}, rms_attributes());
+    capture(layer, "input_norm", normed_id);
 
     // Linear flattens trailing output dims, so the projections write the
     // head-split shapes their consumers need without any reshape opcode.
@@ -234,14 +264,17 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
         builder.streamed(prefix + "self_attn.q_proj.weight", {query_width, hidden});
     const auto query_id = builder.internal({sequence, heads, head_dim});
     builder.operation(Opcode::Linear, {normed_id, query_weight_id}, {query_id});
+    capture(layer, "q_proj", query_id);
     const auto key_weight_id =
         builder.streamed(prefix + "self_attn.k_proj.weight", {kv_width, hidden});
     const auto key_id = builder.internal({sequence, kv_heads, head_dim});
     builder.operation(Opcode::Linear, {normed_id, key_weight_id}, {key_id});
+    capture(layer, "k_proj", key_id);
     const auto value_weight_id =
         builder.streamed(prefix + "self_attn.v_proj.weight", {kv_width, hidden});
     const auto value_id = builder.internal({sequence, kv_heads, head_dim});
     builder.operation(Opcode::Linear, {normed_id, value_weight_id}, {value_id});
+    capture(layer, "v_proj", value_id);
     build.linear_operations += 3U;
 
     // Qwen3 per-head QK RMSNorm followed by full-width rotate-half RoPE:
@@ -258,6 +291,7 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
          Attribute::u64(AttrKey::HeadDim, head_dim),
          Attribute::u64(AttrKey::RotaryDim, head_dim),
          Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)});
+    capture(layer, "rotated_q", rotated_query_id);
     const auto key_norm_weight_id =
         builder.streamed(prefix + "self_attn.k_norm.weight", {head_dim});
     const auto rotated_key_id = builder.internal({sequence, kv_heads, head_dim});
@@ -268,6 +302,7 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
          Attribute::u64(AttrKey::HeadDim, head_dim),
          Attribute::u64(AttrKey::RotaryDim, head_dim),
          Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)});
+    capture(layer, "rotated_k", rotated_key_id);
 
     // Causal grouped-query attention: K/V keep their 8 heads and the KvHeads
     // attribute maps query head h to kv head h/(H/KvHeads) — no materialized
@@ -305,16 +340,19 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
                                         config.attention_implementation)});
     }
     build.attention_operations += 1U;
+    capture(layer, "attention", attention_id);
 
     const auto output_weight_id =
         builder.streamed(prefix + "self_attn.o_proj.weight", {hidden, query_width});
     const auto projected_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::Linear, {attention_id, output_weight_id},
                       {projected_id});
+    capture(layer, "attention_projected", projected_id);
     build.linear_operations += 1U;
     const auto attention_residual_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::Add, {residual_id, projected_id},
                       {attention_residual_id});
+    capture(layer, "attention_residual", attention_residual_id);
     residual_id = attention_residual_id;
 
     // Feed-forward block. gate_proj and up_proj are separate checkpoint
@@ -327,26 +365,33 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     const auto post_normed_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::RmsNorm, {residual_id, post_norm_weight_id},
                       {post_normed_id}, rms_attributes());
+    capture(layer, "post_attention_norm", post_normed_id);
     const auto gate_weight_id =
         builder.streamed(prefix + "mlp.gate_proj.weight", {intermediate, hidden});
     const auto gate_id = builder.internal({sequence, intermediate});
     builder.operation(Opcode::Linear, {post_normed_id, gate_weight_id},
                       {gate_id});
+    capture(layer, "mlp_gate", gate_id);
     const auto up_weight_id =
         builder.streamed(prefix + "mlp.up_proj.weight", {intermediate, hidden});
     const auto up_id = builder.internal({sequence, intermediate});
     builder.operation(Opcode::Linear, {post_normed_id, up_weight_id}, {up_id});
+    capture(layer, "mlp_up", up_id);
     const auto activated_id = builder.internal({sequence, intermediate});
     builder.operation(Opcode::SiLU, {gate_id}, {activated_id});
+    capture(layer, "mlp_gate_activated", activated_id);
     const auto gated_id = builder.internal({sequence, intermediate});
     builder.operation(Opcode::Multiply, {activated_id, up_id}, {gated_id});
+    capture(layer, "mlp_gated", gated_id);
     const auto down_weight_id =
         builder.streamed(prefix + "mlp.down_proj.weight", {hidden, intermediate});
     const auto down_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::Linear, {gated_id, down_weight_id}, {down_id});
+    capture(layer, "mlp_down", down_id);
     build.linear_operations += 3U;
     const auto layer_output_id = builder.internal({sequence, hidden});
     builder.operation(Opcode::Add, {residual_id, down_id}, {layer_output_id});
+    capture(layer, "layer_output", layer_output_id);
     residual_id = layer_output_id;
 
     if (config.vision_token_count != 0U) {
@@ -400,6 +445,15 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
         tensor.roles = static_cast<std::uint32_t>(TensorRole::Output);
     build.conditioning_output_id = residual_id;
     build.conditioning_output_ids.push_back(residual_id);
+  } else if (config.concatenate_selected_hidden_states) {
+    const auto concatenated = builder.add_tensor(
+        DType::BF16, static_cast<std::uint32_t>(TensorRole::Output),
+        {config.output_sequence_length,
+         hidden * build.conditioning_output_ids.size()});
+    builder.operation(
+        Opcode::Concat, build.conditioning_output_ids, {concatenated},
+        {Attribute::u64(AttrKey::Axis, 1U)});
+    build.conditioning_output_id = concatenated;
   } else {
     build.conditioning_output_id = build.conditioning_output_ids.back();
   }

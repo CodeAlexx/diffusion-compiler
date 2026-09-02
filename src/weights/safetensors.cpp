@@ -60,6 +60,10 @@ std::optional<ir::DType> dtype(std::string_view name) {
     return ir::DType::I32;
   if (name == "BOOL")
     return ir::DType::Bool;
+  if (name == "F8_E4M3")
+    return ir::DType::FP8E4M3;
+  if (name == "F8_E8M0")
+    return ir::DType::FP8E8M0;
   return std::nullopt;
 }
 
@@ -94,6 +98,10 @@ std::string safetensors_dtype_name(ir::DType value) {
     return "I32";
   case ir::DType::Bool:
     return "BOOL";
+  case ir::DType::FP8E4M3:
+    return "F8_E4M3";
+  case ir::DType::FP8E8M0:
+    return "F8_E8M0";
   }
   fail("cannot write unknown SafeTensors dtype");
 }
@@ -271,7 +279,11 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
     const auto parsed_dtype = dtype(dtype_name);
     for (const auto &dimension : shape_value->array())
       entry.dims.push_back(unsigned_number(dimension, "shape"));
-    if (entry.dims.empty() || entry.dims.size() > ir::kMaxRank)
+    // SafeTensors permits rank-zero scalar buffers (for example PyTorch's
+    // num_batches_tracked). Keep them in the file inventory so an otherwise
+    // valid creator checkpoint remains mappable; runtime Tensor values still
+    // require rank >= 1 and fail closed if a caller tries to bind a scalar.
+    if (entry.dims.size() > ir::kMaxRank)
       fail("invalid SafeTensors tensor rank: " + name);
     const auto relative_begin =
         unsigned_number(offset_value->array()[0], "data offset");
@@ -297,7 +309,10 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
     if (parsed_dtype) {
       entry.dtype = *parsed_dtype;
       output.tensors.emplace(name, std::move(entry));
-    } else if (name.starts_with("__meta__.")) {
+    } else if (name.starts_with("__meta__.") || entry.dims.empty()) {
+      // Creator checkpoints commonly carry unsupported scalar bookkeeping
+      // buffers (not executable weights), such as an I64 BatchNorm counter.
+      // Preserve their metadata/range while keeping them unbindable.
       output.metadata_tensors.emplace(
           name, SafeTensorMetadataEntry{name, dtype_name, entry.dims,
                                         entry.file_offset, entry.byte_count});

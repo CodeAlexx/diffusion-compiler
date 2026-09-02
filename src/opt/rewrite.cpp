@@ -1149,20 +1149,22 @@ void apply_fuse_qkv_projection(const Transform &transform,
     const auto *projection =
         find_operation(context.program, site.projections[0]);
     const auto projection_attributes = projection->attributes;
-    const auto *activation = context.program.tensor(site.activation);
-    const auto *result = context.program.tensor(site.results[0]);
+    // Preserve descriptions by value before appending to program.tensors;
+    // vector growth invalidates pointers returned by Program::tensor().
+    const auto activation = *context.program.tensor(site.activation);
+    const auto result = *context.program.tensor(site.results[0]);
     const auto packed_id = fresh_tensor_id(context.program);
     context.program.tensors.push_back(
-        {packed_id, activation->dtype, ir::TensorRole::Internal,
-         {activation->dims[0], 3U * result->dims[1] * result->dims[2]}});
+        {packed_id, activation.dtype, ir::TensorRole::Internal,
+         {activation.dims[0], 3U * result.dims[1] * result.dims[2]}});
     auto operation_id = fresh_operation_id(context.program);
     ir::Operation packed_projection{operation_id++, ir::Opcode::Linear,
                                     {site.activation, site.packed_weight},
                                     {packed_id},
                                     projection_attributes};
     std::vector<ir::Attribute> deinterleave_attributes = {
-        ir::Attribute::u64(ir::AttrKey::Heads, result->dims[1]),
-        ir::Attribute::u64(ir::AttrKey::HeadDim, result->dims[2])};
+        ir::Attribute::u64(ir::AttrKey::Heads, result.dims[1]),
+        ir::Attribute::u64(ir::AttrKey::HeadDim, result.dims[2])};
     if (const auto *block = split_operation.find(ir::AttrKey::BlockSize))
       deinterleave_attributes.push_back(*block);
     ir::Operation deinterleave{
@@ -1188,7 +1190,9 @@ void apply_split_qkv_projection(const Transform &transform,
       fail("split_qkv_projection is not legal at operation " +
            std::to_string(id));
     const auto results = deinterleave->outputs;
-    const auto *weight = context.program.tensor(site.packed_weight);
+    // Preserve the description by value: appending component tensors may
+    // reallocate program.tensors and invalidate pointers into that vector.
+    const auto weight = *context.program.tensor(site.packed_weight);
     const auto *projection =
         find_operation(context.program, site.projection_operation);
     const auto projection_attributes = projection->attributes;
@@ -1197,9 +1201,9 @@ void apply_split_qkv_projection(const Transform &transform,
     for (std::size_t component = 0; component < 3U; ++component) {
       component_weights[component] = fresh_tensor_id(context.program);
       context.program.tensors.push_back({component_weights[component],
-                                         weight->dtype,
+                                         weight.dtype,
                                          ir::TensorRole::Internal,
-                                         {inner, weight->dims[1]}});
+                                         {inner, weight.dims[1]}});
     }
     auto operation_id = fresh_operation_id(context.program);
     std::vector<ir::Operation> replacement;

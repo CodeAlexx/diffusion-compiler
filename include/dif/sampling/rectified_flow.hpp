@@ -29,6 +29,13 @@ ShiftedSigmaSchedule make_exponential_shifted_schedule(std::uint32_t points,
 // table.
 H3AVSigmaSchedule make_h3_simple_av_schedule(std::uint32_t evaluations);
 
+// Creator-faithful FLUX.2 [klein] generalized-time schedule. The returned
+// vector has steps+1 descending F32 values including 1 and terminal 0.
+double flux2_empirical_mu(std::uint64_t image_sequence_length,
+                          std::uint32_t steps);
+std::vector<float> make_flux2_klein_schedule(
+    std::uint32_t steps, std::uint64_t image_sequence_length);
+
 // Source-faithful MiniMax-H3 data-ward Euler update. The denoised estimate
 // deliberately recovers sigma from the rounded timestep while the blend ratio
 // uses the sigma grid, and every arithmetic boundary is rounded to F32.

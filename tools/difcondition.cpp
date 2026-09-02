@@ -1,9 +1,8 @@
-// difcondition — native MiniMax-H3 text conditioning.
+// difcondition — native shared-Qwen diffusion text conditioning.
 //
-// Builds the Qwen3-VL text-tower conditioner as one DiffIR program, binds it
-// straight to the checkpoint's own text_encoder shards (no derived copy, no
-// Python loader), executes it, and writes the [S, hidden] BF16 conditioning
-// the H3 denoiser consumes.
+// Builds a Qwen3/Qwen3-VL conditioner as one DiffIR program, binds it straight
+// to the checkpoint shards (no Python loader), executes it, and writes the raw
+// hidden-state conditioning the selected model frontend consumes.
 //
 //   difcondition program  --checkpoint DIR --sequence N --output P.difir
 //                         [--layers N] [--attention 1|2]
@@ -17,6 +16,7 @@
 
 #include "dif/frontend/qwen3vl_conditioner.hpp"
 #include "dif/frontend/krea2.hpp"
+#include "dif/frontend/flux2.hpp"
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/runtime/executor.hpp"
@@ -59,12 +59,14 @@ struct Options {
   fs::path sealed_bundle;
   std::string backend{"cuda"};
   std::uint64_t sequence{};
-  std::uint64_t layers{50};
+  std::uint64_t layers{};
   std::uint64_t attention{2};
   std::uint64_t vision_tokens{};
   std::uint64_t minimum_free_mib{4096};
   std::uint64_t streamed_stage_threads{1};
   bool krea2{};
+  bool flux2{};
+  bool capture_first_layer{};
   bool profile_pipeline{};
   bool resident_streamed{};
   bool convrot_int8_weight_only_quality{};
@@ -93,6 +95,9 @@ void usage() {
          "[--convrot-int8-checkpoint FILE] [--convrot-int8-linear-count N] "
          "[--convrot-int8-weight-only-quality] "
          "[--streamed-stage-threads N]\n";
+  std::cerr
+      << "       add --flux2 for the FLUX.2 [klein] 9B Qwen3-8B frontend; "
+         "use --inputs from diftokenize --flux2-inputs-out\n";
 }
 
 std::uint64_t number(const std::string &text, const char *label) {
@@ -166,6 +171,10 @@ Options parse(int argc, char **argv) {
           number(value("--streamed-stage-threads"), "streamed stage threads");
     else if (option == "--krea2")
       options.krea2 = true;
+    else if (option == "--flux2")
+      options.flux2 = true;
+    else if (option == "--capture-first-layer")
+      options.capture_first_layer = true;
     else if (option == "--profile-pipeline")
       options.profile_pipeline = true;
     else if (option == "--resident-streamed")
@@ -175,14 +184,33 @@ Options parse(int argc, char **argv) {
       dif::fail("unknown option: " + option);
     }
   }
+  if (options.krea2 && options.flux2)
+    dif::fail("--krea2 and --flux2 are mutually exclusive");
   return options;
 }
 
-dif::frontend::Qwen3VlConditionerConfig config_for(const Options &options) {
-  if (options.krea2)
-    return dif::frontend::make_krea2_conditioner_config();
+dif::frontend::Qwen3VlConditionerConfig
+config_for(const Options &options, std::uint64_t reconstructed_layers = 0U) {
+  const auto requested_layers = reconstructed_layers != 0U
+                                    ? reconstructed_layers
+                                    : options.layers;
+  if (options.flux2) {
+    auto config = dif::frontend::make_flux2_klein_9b_conditioner_config(
+        requested_layers == 0U ? 27U : requested_layers);
+    config.attention_implementation = options.attention;
+    config.capture_first_layer_boundaries = options.capture_first_layer;
+    return config;
+  }
+  if (options.krea2) {
+    auto config = dif::frontend::make_krea2_conditioner_config();
+    if (requested_layers != 0U)
+      config.executed_layers = requested_layers;
+    config.attention_implementation = options.attention;
+    return config;
+  }
   dif::frontend::Qwen3VlConditionerConfig config;
-  config.executed_layers = options.layers;
+  if (requested_layers != 0U)
+    config.executed_layers = requested_layers;
   config.attention_implementation = options.attention;
   config.vision_token_count = options.vision_tokens;
   return config;
@@ -210,7 +238,8 @@ void command_program(const Options &options) {
   dif::ir::write_file(build.program, options.output);
   std::cout << "CONDITIONER_PROGRAM path=" << options.output.string()
             << " fingerprint=" << dif::hex_digest(dif::ir::fingerprint(build.program))
-            << " sequence=" << options.sequence << " layers=" << options.layers
+            << " sequence=" << options.sequence
+            << " layers=" << build.attention_operations
             << " operations=" << build.program.operations.size()
             << " linears=" << build.linear_operations
             << " attentions=" << build.attention_operations
@@ -219,7 +248,9 @@ void command_program(const Options &options) {
             << " output_id=" << build.conditioning_output_id
             << " outputs=" << build.conditioning_output_ids.size()
             << " vision_tokens=" << options.vision_tokens
-            << " family=" << (options.krea2 ? "krea2" : "h3") << "\n";
+            << " family="
+            << (options.flux2 ? "flux2" : options.krea2 ? "krea2" : "h3")
+            << "\n";
 }
 
 // Bind every streamed weight straight to the shard that already holds it:
@@ -241,8 +272,7 @@ void command_bundle(const Options &options) {
   for (const auto &operation : program.operations)
     if (operation.opcode == dif::ir::Opcode::Attention)
       ++layers;
-  auto config = config_for(options);
-  config.executed_layers = layers;
+  auto config = config_for(options, layers);
   const auto build =
       dif::frontend::build_qwen3vl_conditioner_program(sequence, config);
   if (dif::ir::fingerprint(build.program) != dif::ir::fingerprint(program))
@@ -318,16 +348,18 @@ void command_bundle(const Options &options) {
 }
 
 void command_run(const Options &options) {
-  if (options.program.empty() || options.bundle.empty() ||
-      (options.krea2
-           ? options.inputs.empty()
-           : (options.vision_tokens != 0U
-                  ? (options.vision_inputs.empty() ||
-                     options.vision_outputs.empty())
-                  : options.ids.empty())) ||
+  const bool structured_inputs = options.krea2 || options.flux2;
+  const bool missing_inputs =
+      structured_inputs
+          ? options.inputs.empty()
+          : (options.vision_tokens != 0U
+                 ? (options.vision_inputs.empty() ||
+                    options.vision_outputs.empty())
+                 : options.ids.empty());
+  if (options.program.empty() || options.bundle.empty() || missing_inputs ||
       options.output.empty())
     dif::fail("difcondition run requires --program, --bundle, --output and "
-              "either --ids or Krea 2 --inputs");
+              "either --ids, vision inputs, or structured --inputs");
   if (options.convrot_int8_weight_only_quality &&
       options.convrot_int8_checkpoint.empty())
     dif::fail("ConvRot weight-only quality requires a ConvRot checkpoint");
@@ -347,8 +379,7 @@ void command_run(const Options &options) {
   for (const auto &operation : program.operations)
     if (operation.opcode == dif::ir::Opcode::Attention)
       ++layers;
-  auto config = config_for(options);
-  config.executed_layers = layers;
+  auto config = config_for(options, layers);
   auto build =
       dif::frontend::build_qwen3vl_conditioner_program(sequence, config);
   if (dif::ir::fingerprint(build.program) != dif::ir::fingerprint(program))
@@ -357,12 +388,12 @@ void command_run(const Options &options) {
     inputs.insert_or_assign(generated.first, std::move(generated.second));
 
   std::uint64_t token_count = sequence;
-  if (options.krea2) {
+  if (structured_inputs) {
     const auto fixture = dif::weights::read_safetensors(options.inputs);
     auto ids = dif::weights::map_safetensor(fixture, "input_ids");
     if (ids.dtype != dif::ir::DType::I32 ||
         ids.element_count() != sequence)
-      dif::fail("Krea 2 input_ids must be I32 with the program sequence count");
+      dif::fail("conditioner input_ids must be I32 with the program sequence count");
     ids.dims = {sequence};
     ids.validate();
     inputs.insert_or_assign(build.token_ids_input_id, std::move(ids));
@@ -434,8 +465,16 @@ void command_run(const Options &options) {
                         std::chrono::steady_clock::now() - start)
                         .count();
   const auto &conditioning = result.outputs.at(build.conditioning_output_id);
-  if (options.krea2) {
+  if (options.krea2 || options.flux2) {
     std::vector<dif::weights::SafeTensorWriteSpec> specs;
+    if (options.flux2) {
+      specs.push_back(
+          {"conditioning", conditioning.dtype, conditioning.dims});
+      for (const auto &[name, tensor_id] : build.first_layer_boundaries) {
+        const auto &tensor = result.outputs.at(tensor_id);
+        specs.push_back({"boundary_" + name, tensor.dtype, tensor.dims});
+      }
+    }
     for (std::size_t index = 0; index < build.conditioning_output_ids.size();
          ++index) {
       const auto &tensor = result.outputs.at(build.conditioning_output_ids[index]);
@@ -444,6 +483,17 @@ void command_run(const Options &options) {
                        tensor.dtype, tensor.dims});
     }
     dif::weights::SafeTensorWriter writer(options.output, std::move(specs));
+    if (options.flux2)
+      writer.append("conditioning",
+                    std::span<const std::uint8_t>(conditioning.data(),
+                                                  conditioning.byte_size()));
+    if (options.flux2)
+      for (const auto &[name, tensor_id] : build.first_layer_boundaries) {
+        const auto &tensor = result.outputs.at(tensor_id);
+        writer.append("boundary_" + name,
+                      std::span<const std::uint8_t>(tensor.data(),
+                                                    tensor.byte_size()));
+      }
     for (std::size_t index = 0; index < build.conditioning_output_ids.size();
          ++index) {
       const auto &tensor = result.outputs.at(build.conditioning_output_ids[index]);

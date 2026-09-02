@@ -12,6 +12,9 @@
 #include "dif/runtime/cutlass_gemm.hpp"
 #include "dif/runtime/device_probe.hpp"
 #endif
+#if DIF_HAS_FLASH_ATTENTION
+#include "dif/runtime/flash_attention.hpp"
+#endif
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/telemetry/trace_sink.hpp"
@@ -681,6 +684,107 @@ private:
   void *pointer_{};
   std::size_t bytes_{};
 };
+
+// Exact backend lowering for large unbatched F32 attention.  DiffIR keeps one
+// Attention semantic; implementation 3 is only an execution-plan choice for
+// shapes that the generated S<=4096 kernel and cuDNN BF16/F16 paths cannot
+// admit.  Scores are intentionally materialized so no approximate/online
+// attention math is introduced at the source-faithful parity gate.
+struct MaterializedF32AttentionPlan {
+  std::uint32_t operation{};
+  int sequence{};
+  int head_dim{};
+  float scale{};
+
+  std::uint64_t score_bytes() const {
+    return static_cast<std::uint64_t>(sequence) *
+           static_cast<std::uint64_t>(sequence) * sizeof(float);
+  }
+
+  void execute(const ir::Operation &op, const DeviceBuffers &buffers,
+               cublasHandle_t cublas, CUfunction softmax,
+               CUdeviceptr scores, CUstream stream) const {
+    constexpr float zero = 0.0F;
+    constexpr float one = 1.0F;
+    const auto query = buffers.at(op.inputs.at(0));
+    const auto key = buffers.at(op.inputs.at(1));
+    const auto value = buffers.at(op.inputs.at(2));
+    const auto output = buffers.at(op.outputs.at(0));
+
+    // DiffIR tensors are row-major [S,D].  cuBLAS sees those same bytes as
+    // column-major [D,S], so C_col = K_row * Q_row^T stores
+    // C_col == scores_row^T without a transpose materialization.
+    check(counted_cublas_gemm_ex(
+              cublas, CUBLAS_OP_T, CUBLAS_OP_N, sequence, sequence,
+              head_dim, &scale, reinterpret_cast<const void *>(key),
+              CUDA_R_32F, head_dim,
+              reinterpret_cast<const void *>(query), CUDA_R_32F, head_dim,
+              &zero, reinterpret_cast<void *>(scores), CUDA_R_32F, sequence,
+              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+          "cuBLAS materialized F32 attention QK");
+
+    auto rows = sequence;
+    auto columns = sequence;
+    std::array<void *, 3> softmax_arguments = {&scores, &rows, &columns};
+    check(counted_launch_kernel(
+              softmax, static_cast<unsigned>(sequence), 1U, 1U, 256U, 1U,
+              1U, 256U * sizeof(float), stream, softmax_arguments.data(),
+              nullptr),
+          "cuLaunchKernel materialized F32 attention softmax");
+
+    // O_row^T = V_row^T * P_row^T, again requiring no layout conversion.
+    check(counted_cublas_gemm_ex(
+              cublas, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, sequence, sequence,
+              &one, reinterpret_cast<const void *>(value), CUDA_R_32F,
+              head_dim, reinterpret_cast<const void *>(scores), CUDA_R_32F,
+              sequence, &zero, reinterpret_cast<void *>(output), CUDA_R_32F,
+              head_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+          "cuBLAS materialized F32 attention PV");
+  }
+};
+
+std::string materialized_f32_attention_source(bool enabled) {
+  if (!enabled)
+    return {};
+  return R"CUDA(
+extern "C" __global__ void dif_materialized_f32_attention_softmax(
+    float* scores, int rows, int columns) {
+  const int row = (int)blockIdx.x;
+  const int lane = (int)threadIdx.x;
+  if (row >= rows) return;
+  extern __shared__ float shared[];
+  float maximum = -3.402823466e+38F;
+  const unsigned long long offset =
+      (unsigned long long)row * (unsigned long long)columns;
+  for (int column = lane; column < columns; column += (int)blockDim.x)
+    maximum = fmaxf(maximum, scores[offset + (unsigned long long)column]);
+  shared[lane] = maximum;
+  __syncthreads();
+  for (int stride = (int)blockDim.x / 2; stride != 0; stride >>= 1) {
+    if (lane < stride)
+      shared[lane] = fmaxf(shared[lane], shared[lane + stride]);
+    __syncthreads();
+  }
+  maximum = shared[0];
+  float sum = 0.0F;
+  for (int column = lane; column < columns; column += (int)blockDim.x) {
+    const float probability =
+        expf(scores[offset + (unsigned long long)column] - maximum);
+    scores[offset + (unsigned long long)column] = probability;
+    sum += probability;
+  }
+  shared[lane] = sum;
+  __syncthreads();
+  for (int stride = (int)blockDim.x / 2; stride != 0; stride >>= 1) {
+    if (lane < stride) shared[lane] += shared[lane + stride];
+    __syncthreads();
+  }
+  const float inverse_sum = 1.0F / shared[0];
+  for (int column = lane; column < columns; column += (int)blockDim.x)
+    scores[offset + (unsigned long long)column] *= inverse_sum;
+}
+)CUDA";
+}
 
 #if DIF_HAS_CUDNN
 struct CudnnAttentionKey {
@@ -1667,10 +1771,289 @@ private:
   std::unordered_set<H3Int8GemmKey, H3Int8GemmKeyHash> tuned_;
 };
 
+class Fp8ScaledLinearPlan {
+public:
+  Fp8ScaledLinearPlan(const ir::Program &program, const ir::Operation &op,
+                      cublasLtHandle_t handle, std::size_t workspace_bytes)
+      : workspace_bytes_(workspace_bytes) {
+    const auto *input = program.tensor(op.inputs.at(0));
+    const auto *weight = program.tensor(op.inputs.at(1));
+    const auto *output = program.tensor(op.outputs.at(0));
+    if (!input || !weight || !output || input->dims.empty() ||
+        weight->dims.size() != 2U)
+      fail("invalid scaled FP8 Linear descriptors");
+    const auto rows64 = input->element_count() / input->dims.back();
+    const auto inner64 = input->dims.back();
+    const auto columns64 = weight->dims.front();
+    if (rows64 > static_cast<std::uint64_t>(
+                     std::numeric_limits<std::int64_t>::max()) ||
+        inner64 > static_cast<std::uint64_t>(
+                      std::numeric_limits<std::int64_t>::max()) ||
+        columns64 > static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max()))
+      fail("scaled FP8 Linear shape is not representable by cuBLASLt");
+    const auto rows = static_cast<std::int64_t>(rows64);
+    const auto inner = static_cast<std::int64_t>(inner64);
+    const auto columns = static_cast<std::int64_t>(columns64);
+    try {
+      check(cublasLtMatmulDescCreate(&operation_, CUBLAS_COMPUTE_32F,
+                                     CUDA_R_32F),
+            "cublasLtMatmulDescCreate scaled FP8");
+      constexpr cublasOperation_t transpose_weight = CUBLAS_OP_T;
+      check(cublasLtMatmulDescSetAttribute(
+                operation_, CUBLASLT_MATMUL_DESC_TRANSB, &transpose_weight,
+                sizeof(transpose_weight)),
+            "cublasLtMatmulDescSetAttribute scaled FP8 trans B");
+      check(cublasLtMatrixLayoutCreate(&input_, CUDA_R_8F_E4M3, rows, inner,
+                                       inner),
+            "cublasLtMatrixLayoutCreate scaled FP8 input");
+      check(cublasLtMatrixLayoutCreate(&weight_, CUDA_R_8F_E4M3, columns,
+                                       inner, inner),
+            "cublasLtMatrixLayoutCreate scaled FP8 weight");
+      check(cublasLtMatrixLayoutCreate(&output_, CUDA_R_16BF, rows, columns,
+                                       columns),
+            "cublasLtMatrixLayoutCreate scaled FP8 output");
+      constexpr cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+      for (auto layout : {input_, weight_, output_})
+        check(cublasLtMatrixLayoutSetAttribute(
+                  layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+                  sizeof(row_major)),
+              "cublasLtMatrixLayoutSetAttribute scaled FP8 row major");
+      cublasLtMatmulPreference_t preference{};
+      check(cublasLtMatmulPreferenceCreate(&preference),
+            "cublasLtMatmulPreferenceCreate scaled FP8");
+      try {
+        check(cublasLtMatmulPreferenceSetAttribute(
+                  preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                  &workspace_bytes_, sizeof(workspace_bytes_)),
+              "cublasLtMatmulPreferenceSetAttribute scaled FP8 workspace");
+        constexpr int requested = 32;
+        std::array<cublasLtMatmulHeuristicResult_t, requested> candidates{};
+        int returned = 0;
+        check(cublasLtMatmulAlgoGetHeuristic(
+                  handle, operation_, input_, weight_, output_, output_,
+                  preference, requested, candidates.data(), &returned),
+              "cublasLtMatmulAlgoGetHeuristic scaled FP8");
+        if (returned == 0)
+          fail("cuBLASLt found no admitted scaled FP8 Linear algorithm");
+        heuristic_ = candidates.front();
+      } catch (...) {
+        (void)cublasLtMatmulPreferenceDestroy(preference);
+        throw;
+      }
+      check(cublasLtMatmulPreferenceDestroy(preference),
+            "cublasLtMatmulPreferenceDestroy scaled FP8");
+    } catch (...) {
+      destroy();
+      throw;
+    }
+  }
+
+  ~Fp8ScaledLinearPlan() { destroy(); }
+
+  Fp8ScaledLinearPlan(const Fp8ScaledLinearPlan &) = delete;
+  Fp8ScaledLinearPlan &operator=(const Fp8ScaledLinearPlan &) = delete;
+
+  void launch(const ir::Operation &op, const DeviceBuffers &buffers,
+              cublasLtHandle_t handle, const Workspace &workspace,
+              CUstream stream) const {
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    count_cublaslt_matmul();
+    check(cublasLtMatmul(
+              handle, operation_, &alpha,
+              reinterpret_cast<const void *>(buffers.at(op.inputs.at(0))),
+              input_,
+              reinterpret_cast<const void *>(buffers.at(op.inputs.at(1))),
+              weight_, &beta,
+              reinterpret_cast<const void *>(buffers.at(op.outputs.at(0))),
+              output_,
+              reinterpret_cast<void *>(buffers.at(op.outputs.at(0))), output_,
+              &heuristic_.algo, workspace.data(),
+              std::min(workspace.size(), workspace_bytes_),
+              reinterpret_cast<cudaStream_t>(stream)),
+          "cublasLtMatmul scaled FP8 Linear");
+  }
+
+private:
+  void destroy() {
+    if (output_)
+      (void)cublasLtMatrixLayoutDestroy(output_);
+    if (weight_)
+      (void)cublasLtMatrixLayoutDestroy(weight_);
+    if (input_)
+      (void)cublasLtMatrixLayoutDestroy(input_);
+    if (operation_)
+      (void)cublasLtMatmulDescDestroy(operation_);
+    output_ = nullptr;
+    weight_ = nullptr;
+    input_ = nullptr;
+    operation_ = nullptr;
+  }
+
+  std::size_t workspace_bytes_{};
+  cublasLtMatmulDesc_t operation_{};
+  cublasLtMatrixLayout_t input_{};
+  cublasLtMatrixLayout_t weight_{};
+  cublasLtMatrixLayout_t output_{};
+  cublasLtMatmulHeuristicResult_t heuristic_{};
+};
+
+class Fp8BlockScaledLinearPlan {
+public:
+  Fp8BlockScaledLinearPlan(const ir::Program &program,
+                           const ir::Operation &op,
+                           const DeviceBuffers &buffers,
+                           cublasLtHandle_t handle,
+                           std::size_t workspace_bytes)
+      : workspace_bytes_(workspace_bytes) {
+    const auto *input = program.tensor(op.inputs.at(0));
+    const auto *weight = program.tensor(op.inputs.at(1));
+    const auto *output = program.tensor(op.outputs.at(0));
+    if (!input || !weight || !output || input->dims.empty() ||
+        weight->dims.size() != 2U)
+      fail("invalid MXFP8 Linear descriptors");
+    const auto rows = static_cast<std::int64_t>(
+        input->element_count() / input->dims.back());
+    const auto inner = static_cast<std::int64_t>(input->dims.back());
+    const auto columns = static_cast<std::int64_t>(weight->dims.front());
+    try {
+      check(cublasLtMatmulDescCreate(&operation_, CUBLAS_COMPUTE_32F,
+                                     CUDA_R_32F),
+            "cublasLtMatmulDescCreate MXFP8");
+      constexpr cublasOperation_t transpose_weight = CUBLAS_OP_T;
+      check(cublasLtMatmulDescSetAttribute(
+                operation_, CUBLASLT_MATMUL_DESC_TRANSB, &transpose_weight,
+                sizeof(transpose_weight)),
+            "cublasLtMatmulDescSetAttribute MXFP8 trans B");
+      constexpr cublasLtMatmulMatrixScale_t block_scale =
+          CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+      check(cublasLtMatmulDescSetAttribute(
+                operation_, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &block_scale,
+                sizeof(block_scale)),
+            "cublasLtMatmulDescSetAttribute MXFP8 A scale mode");
+      check(cublasLtMatmulDescSetAttribute(
+                operation_, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &block_scale,
+                sizeof(block_scale)),
+            "cublasLtMatmulDescSetAttribute MXFP8 B scale mode");
+      const auto *input_scales =
+          reinterpret_cast<const void *>(buffers.at(op.inputs.at(2)));
+      const auto *weight_scales =
+          reinterpret_cast<const void *>(buffers.at(op.inputs.at(3)));
+      check(cublasLtMatmulDescSetAttribute(
+                operation_, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                &input_scales, sizeof(input_scales)),
+            "cublasLtMatmulDescSetAttribute MXFP8 A scale pointer");
+      check(cublasLtMatmulDescSetAttribute(
+                operation_, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                &weight_scales, sizeof(weight_scales)),
+            "cublasLtMatmulDescSetAttribute MXFP8 B scale pointer");
+      check(cublasLtMatrixLayoutCreate(&input_, CUDA_R_8F_E4M3, rows, inner,
+                                       inner),
+            "cublasLtMatrixLayoutCreate MXFP8 input");
+      check(cublasLtMatrixLayoutCreate(&weight_, CUDA_R_8F_E4M3, columns,
+                                       inner, inner),
+            "cublasLtMatrixLayoutCreate MXFP8 weight");
+      check(cublasLtMatrixLayoutCreate(&output_, CUDA_R_16BF, rows, columns,
+                                       columns),
+            "cublasLtMatrixLayoutCreate MXFP8 output");
+      constexpr cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+      for (auto layout : {input_, weight_, output_})
+        check(cublasLtMatrixLayoutSetAttribute(
+                  layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+                  sizeof(row_major)),
+              "cublasLtMatrixLayoutSetAttribute MXFP8 row major");
+      cublasLtMatmulPreference_t preference{};
+      check(cublasLtMatmulPreferenceCreate(&preference),
+            "cublasLtMatmulPreferenceCreate MXFP8");
+      try {
+        check(cublasLtMatmulPreferenceSetAttribute(
+                  preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                  &workspace_bytes_, sizeof(workspace_bytes_)),
+              "cublasLtMatmulPreferenceSetAttribute MXFP8 workspace");
+        constexpr int requested = 32;
+        std::array<cublasLtMatmulHeuristicResult_t, requested> candidates{};
+        int returned = 0;
+        check(cublasLtMatmulAlgoGetHeuristic(
+                  handle, operation_, input_, weight_, output_, output_,
+                  preference, requested, candidates.data(), &returned),
+              "cublasLtMatmulAlgoGetHeuristic MXFP8");
+        if (returned == 0)
+          fail("cuBLASLt found no admitted MXFP8 Linear algorithm");
+        heuristic_ = candidates.front();
+      } catch (...) {
+        (void)cublasLtMatmulPreferenceDestroy(preference);
+        throw;
+      }
+      check(cublasLtMatmulPreferenceDestroy(preference),
+            "cublasLtMatmulPreferenceDestroy MXFP8");
+    } catch (...) {
+      destroy();
+      throw;
+    }
+  }
+
+  ~Fp8BlockScaledLinearPlan() { destroy(); }
+
+  Fp8BlockScaledLinearPlan(const Fp8BlockScaledLinearPlan &) = delete;
+  Fp8BlockScaledLinearPlan &
+  operator=(const Fp8BlockScaledLinearPlan &) = delete;
+
+  void launch(const ir::Operation &op, const DeviceBuffers &buffers,
+              cublasLtHandle_t handle, const Workspace &workspace,
+              CUstream stream) const {
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    count_cublaslt_matmul();
+    check(cublasLtMatmul(
+              handle, operation_, &alpha,
+              reinterpret_cast<const void *>(buffers.at(op.inputs.at(0))),
+              input_,
+              reinterpret_cast<const void *>(buffers.at(op.inputs.at(1))),
+              weight_, &beta,
+              reinterpret_cast<const void *>(buffers.at(op.outputs.at(0))),
+              output_,
+              reinterpret_cast<void *>(buffers.at(op.outputs.at(0))), output_,
+              &heuristic_.algo, workspace.data(),
+              std::min(workspace.size(), workspace_bytes_),
+              reinterpret_cast<cudaStream_t>(stream)),
+          "cublasLtMatmul MXFP8 Linear");
+  }
+
+private:
+  void destroy() {
+    if (output_)
+      (void)cublasLtMatrixLayoutDestroy(output_);
+    if (weight_)
+      (void)cublasLtMatrixLayoutDestroy(weight_);
+    if (input_)
+      (void)cublasLtMatrixLayoutDestroy(input_);
+    if (operation_)
+      (void)cublasLtMatmulDescDestroy(operation_);
+    output_ = nullptr;
+    weight_ = nullptr;
+    input_ = nullptr;
+    operation_ = nullptr;
+  }
+
+  std::size_t workspace_bytes_{};
+  cublasLtMatmulDesc_t operation_{};
+  cublasLtMatrixLayout_t input_{};
+  cublasLtMatrixLayout_t weight_{};
+  cublasLtMatrixLayout_t output_{};
+  cublasLtMatmulHeuristicResult_t heuristic_{};
+};
+
 #if DIF_HAS_CUTLASS
 struct CutlassInt8ScaledGemmDeleter {
   void operator()(CutlassInt8ScaledGemmHandle *handle) const {
     destroy_cutlass_int8_scaled_gemm(handle);
+  }
+};
+
+struct CutlassInt8WeightGemmDeleter {
+  void operator()(CutlassInt8WeightGemmHandle *handle) const {
+    destroy_cutlass_int8_weight_gemm(handle);
   }
 };
 
@@ -1892,6 +2275,117 @@ private:
                      std::unique_ptr<Int8ScaledF16GemmPlan>,
                      Int8ScaledF16GemmKeyHash>
       plans_;
+};
+
+class Int8ScaledLinearPlan {
+public:
+  Int8ScaledLinearPlan(const ir::Program &program, const ir::Operation &op,
+                       const DeviceBuffers &buffers, CUstream stream)
+      : operation_id_(op.id) {
+    const auto *input = program.tensor(op.inputs.at(0));
+    const auto *weight = program.tensor(op.inputs.at(1));
+    if (!input || !weight)
+      fail("scaled INT8 Linear plan references a missing tensor");
+    const auto rows = input->element_count() / input->dims.back();
+    const auto columns = weight->dims.front();
+    const auto inner = input->dims.back();
+    if (rows > std::numeric_limits<std::uint32_t>::max() ||
+        columns > std::numeric_limits<std::uint32_t>::max() ||
+        inner > std::numeric_limits<std::uint32_t>::max())
+      fail("scaled INT8 Linear shape exceeds the CUTLASS primitive ABI");
+    std::array<char, 512> error{};
+    handle_.reset(create_cutlass_int8_scaled_gemm(
+        static_cast<std::uint32_t>(rows),
+        static_cast<std::uint32_t>(columns),
+        static_cast<std::uint32_t>(inner),
+        static_cast<std::uintptr_t>(buffers.at(op.inputs.at(0))),
+        static_cast<std::uintptr_t>(buffers.at(op.inputs.at(1))),
+        static_cast<std::uintptr_t>(buffers.at(op.inputs.at(2))),
+        static_cast<std::uintptr_t>(buffers.at(op.inputs.at(3))),
+        static_cast<std::uintptr_t>(buffers.at(op.outputs.at(0))),
+        reinterpret_cast<std::uintptr_t>(stream), error.data(), error.size()));
+    if (!handle_)
+      fail(std::string("CUTLASS scaled INT8 Linear plan creation failed: ") +
+           error.data());
+  }
+
+  void launch(const ir::Operation &op, const DeviceBuffers &buffers,
+              CUstream stream) const {
+    std::array<char, 512> error{};
+    count_cutlass_launch();
+    if (!launch_cutlass_int8_scaled_gemm(
+            handle_.get(),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(0))),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(1))),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(2))),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(3))),
+            static_cast<std::uintptr_t>(buffers.at(op.outputs.at(0))),
+            reinterpret_cast<std::uintptr_t>(stream), error.data(),
+            error.size()))
+      fail(std::string("CUTLASS scaled INT8 Linear launch failed: ") +
+           error.data());
+  }
+
+  std::uint32_t operation_id() const { return operation_id_; }
+
+private:
+  std::uint32_t operation_id_{};
+  std::unique_ptr<CutlassInt8ScaledGemmHandle,
+                  CutlassInt8ScaledGemmDeleter>
+      handle_;
+};
+
+class Int8WeightLinearPlan {
+public:
+  Int8WeightLinearPlan(const ir::Program &program, const ir::Operation &op,
+                       const DeviceBuffers &buffers, CUstream stream)
+      : operation_id_(op.id) {
+    const auto *input = program.tensor(op.inputs.at(0));
+    const auto *weight = program.tensor(op.inputs.at(1));
+    if (!input || !weight)
+      fail("INT8 weight Linear plan references a missing tensor");
+    const auto rows = input->element_count() / input->dims.back();
+    const auto columns = weight->dims.front();
+    const auto inner = input->dims.back();
+    if (rows > std::numeric_limits<std::uint32_t>::max() ||
+        columns > std::numeric_limits<std::uint32_t>::max() ||
+        inner > std::numeric_limits<std::uint32_t>::max())
+      fail("INT8 weight Linear shape exceeds the CUTLASS primitive ABI");
+    std::array<char, 512> error{};
+    handle_.reset(create_cutlass_int8_weight_gemm(
+        static_cast<std::uint32_t>(rows),
+        static_cast<std::uint32_t>(columns),
+        static_cast<std::uint32_t>(inner),
+        static_cast<std::uintptr_t>(buffers.at(op.inputs.at(0))),
+        static_cast<std::uintptr_t>(buffers.at(op.inputs.at(1))),
+        static_cast<std::uintptr_t>(buffers.at(op.inputs.at(2))),
+        static_cast<std::uintptr_t>(buffers.at(op.outputs.at(0))),
+        reinterpret_cast<std::uintptr_t>(stream), error.data(), error.size()));
+    if (!handle_)
+      fail(std::string("CUTLASS INT8 weight Linear plan creation failed: ") +
+           error.data());
+  }
+
+  void launch(const ir::Operation &op, const DeviceBuffers &buffers,
+              CUstream stream) const {
+    std::array<char, 512> error{};
+    count_cutlass_launch();
+    if (!launch_cutlass_int8_weight_gemm(
+            handle_.get(),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(0))),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(1))),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(2))),
+            static_cast<std::uintptr_t>(buffers.at(op.outputs.at(0))),
+            reinterpret_cast<std::uintptr_t>(stream), error.data(),
+            error.size()))
+      fail(std::string("CUTLASS INT8 weight Linear launch failed: ") +
+           error.data());
+  }
+
+private:
+  std::uint32_t operation_id_{};
+  std::unique_ptr<CutlassInt8WeightGemmHandle, CutlassInt8WeightGemmDeleter>
+      handle_;
 };
 
 class CutlassLinearPlan {
@@ -6427,22 +6921,26 @@ std::string compile_ptx(const std::string &source, int major, int minor,
   return ptx;
 }
 
-void validate_inputs(const ir::Program &program, const TensorMap &inputs) {
+void validate_inputs(const ir::Program &program, const TensorMap &inputs,
+                     const TensorMap &constants) {
+  const auto &bound = [&](std::uint32_t id) -> const Tensor & {
+    if (const auto found = inputs.find(id); found != inputs.end())
+      return found->second;
+    return constants.at(id);
+  };
   for (const auto &desc : program.tensors) {
     if (!desc.has_role(ir::TensorRole::Input) &&
         !desc.has_role(ir::TensorRole::Constant))
       continue;
-    const auto it = inputs.find(desc.id);
-    if (it == inputs.end())
-      fail("missing input tensor " + std::to_string(desc.id));
-    it->second.validate();
-    if (it->second.dtype != desc.dtype || it->second.dims != desc.dims)
+    const auto &tensor = bound(desc.id);
+    tensor.validate();
+    if (tensor.dtype != desc.dtype || tensor.dims != desc.dims)
       fail("bound tensor shape/dtype mismatch for id " + std::to_string(desc.id));
   }
   for (const auto &op : program.operations) {
     if (op.opcode == ir::Opcode::H3AdaLNSelect) {
       const auto &projected = *program.tensor(op.inputs[0]);
-      const auto &indices = inputs.at(op.inputs[1]);
+      const auto &indices = bound(op.inputs[1]);
       const auto table_rows = projected.dims[0] * 3U;
       for (std::uint64_t row = 0; row < indices.element_count(); ++row) {
         std::int32_t value = 0;
@@ -6452,7 +6950,7 @@ void validate_inputs(const ir::Program &program, const TensorMap &inputs) {
       }
     } else if (op.opcode == ir::Opcode::SelectRowChunks) {
       const auto rows = program.tensor(op.inputs[0])->dims[0];
-      const auto &indices = inputs.at(op.inputs[1]);
+      const auto &indices = bound(op.inputs[1]);
       for (std::uint64_t row = 0; row < indices.element_count(); ++row) {
         std::int32_t value = 0;
         std::memcpy(&value, indices.data() + row * sizeof(value), sizeof(value));
@@ -6461,7 +6959,7 @@ void validate_inputs(const ir::Program &program, const TensorMap &inputs) {
       }
     } else if (op.opcode == ir::Opcode::GatherRows) {
       const auto rows = program.tensor(op.inputs[0])->dims[0];
-      const auto &indices = inputs.at(op.inputs[1]);
+      const auto &indices = bound(op.inputs[1]);
       for (std::uint64_t row = 0; row < indices.element_count(); ++row) {
         std::int32_t value = 0;
         std::memcpy(&value, indices.data() + row * sizeof(value), sizeof(value));
@@ -6470,7 +6968,7 @@ void validate_inputs(const ir::Program &program, const TensorMap &inputs) {
       }
     } else if (op.opcode == ir::Opcode::IndexedUpdateRows) {
       const auto update_rows = program.tensor(op.inputs[1])->dims[0];
-      const auto &map = inputs.at(op.inputs[2]);
+      const auto &map = bound(op.inputs[2]);
       for (std::uint64_t row = 0; row < map.element_count(); ++row) {
         std::int32_t value = 0;
         std::memcpy(&value, map.data() + row * sizeof(value), sizeof(value));
@@ -6994,18 +7492,46 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     shared = static_cast<unsigned>(8U * flattened_rows * sizeof(float));
   } else if (op.opcode == ir::Opcode::RmsNormModulate ||
              op.opcode == ir::Opcode::RmsNorm ||
-             op.opcode == ir::Opcode::LayerNorm) {
+             op.opcode == ir::Opcode::LayerNorm ||
+             op.opcode == ir::Opcode::LayerNormModulate) {
     const auto *input = program.tensor(op.inputs[0]);
     grid = static_cast<unsigned>(input->element_count() / input->dims.back());
     shared = block * sizeof(float);
+  } else if (op.opcode == ir::Opcode::QuantizeInt8Rows) {
+    const auto *quantized = program.tensor(op.outputs[0]);
+    grid = static_cast<unsigned>(quantized->element_count() /
+                                 quantized->dims.back());
+    block = 256U;
+    const auto implementation = static_cast<ir::Int8RowQuantization>(op.u64(
+        ir::AttrKey::Implementation,
+        static_cast<std::uint64_t>(ir::Int8RowQuantization::Direct)));
+    if (implementation == ir::Int8RowQuantization::H256ConvRot ||
+        implementation == ir::Int8RowQuantization::H256F32ConvRot ||
+        implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
+        implementation == ir::Int8RowQuantization::H256SignedConvRot ||
+        implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
+        implementation == ir::Int8RowQuantization::H4096F32SignedConvRot)
+      shared = static_cast<unsigned>(quantized->dims.back() * sizeof(float));
+  } else if (op.opcode == ir::Opcode::QuantizeFp8Rows) {
+    const auto *input = program.tensor(op.inputs[0]);
+    grid = static_cast<unsigned>(input->element_count() / input->dims.back());
+    block = 256U;
+  } else if (op.opcode == ir::Opcode::QuantizeFp8Blocks32) {
+    const auto *input = program.tensor(op.inputs[0]);
+    grid = static_cast<unsigned>(input->element_count() / input->dims.back());
+    block = 256U;
   } else if (op.opcode == ir::Opcode::QkNormPartialRope) {
     const auto &dims = program.tensor(op.inputs[0])->dims;
     const auto *table = program.tensor(op.inputs[2]);
     if (program.tensor(op.inputs[0])->dtype == ir::DType::BF16 &&
-        dims[2] == 128U &&
-        table->dims[1] == op.u64(ir::AttrKey::RotaryDim, dims[2]))
+        dims.back() == 128U &&
+        (table->dims.back() ==
+             op.u64(ir::AttrKey::RotaryDim, dims.back()) ||
+         table->dims.back() * 2U ==
+             op.u64(ir::AttrKey::RotaryDim, dims.back())))
       block = 128U;
-    grid = static_cast<unsigned>(dims[0] * dims[1]);
+    grid = static_cast<unsigned>(program.tensor(op.inputs[0])->element_count() /
+                                 dims.back());
     shared = block * sizeof(float);
   } else if (op.opcode == ir::Opcode::ChannelRmsNorm) {
     const auto *input = program.tensor(op.inputs[0]);
@@ -7222,6 +7748,62 @@ public:
     const auto minor = static_cast<int>(target_profile_.compute_minor);
     device_name_ = target_profile_.product_name;
     free_bytes_before_ = runtime_budget_.free_device_memory_bytes;
+
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::Attention ||
+          operation.u64(ir::AttrKey::Implementation, 1U) != 3U)
+        continue;
+      const auto *query = program_.tensor(operation.inputs.at(0));
+      if (!query || query->dims.size() != 3U || query->dims.at(1) != 1U)
+        fail("materialized F32 attention found an invalid verified query");
+      if (query->dims.at(0) >
+              static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+          query->dims.at(2) >
+              static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+        fail("materialized F32 attention shape exceeds cuBLAS integer limits");
+      MaterializedF32AttentionPlan plan{
+          operation.id,
+          static_cast<int>(query->dims.at(0)),
+          static_cast<int>(query->dims.at(2)),
+          static_cast<float>(operation.f64(
+              ir::AttrKey::AttentionScale,
+              1.0 / std::sqrt(static_cast<double>(query->dims.at(2))))),
+      };
+      if (!(plan.scale > 0.0F))
+        fail("materialized F32 attention scale must be positive");
+      materialized_f32_attention_score_bytes_ = std::max(
+          materialized_f32_attention_score_bytes_, plan.score_bytes());
+      materialized_f32_attention_plans_.emplace(operation.id, plan);
+    }
+    flash_attention_workspace_bytes_ = 0U;
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::Attention ||
+          operation.u64(ir::AttrKey::Implementation, 1U) != 4U)
+        continue;
+#if DIF_HAS_FLASH_ATTENTION
+      const auto *query = program_.tensor(operation.inputs.at(0));
+      if (!query ||
+          (query->dims.size() != 3U && query->dims.size() != 4U))
+        fail("native FlashAttention found an invalid verified query");
+      const auto batched = query->dims.size() == 4U;
+      const auto batch = batched ? query->dims.at(0) : 1U;
+      const auto sequence = query->dims.at(batched ? 1U : 0U);
+      const auto heads = query->dims.at(batched ? 2U : 1U);
+      if (batch > std::numeric_limits<std::uint64_t>::max() / heads ||
+          batch * heads > std::numeric_limits<std::uint64_t>::max() /
+                              sequence ||
+          batch * heads * sequence >
+              std::numeric_limits<std::uint64_t>::max() / sizeof(float))
+        fail("native FlashAttention workspace size overflow");
+      flash_attention_workspace_bytes_ = std::max(
+          flash_attention_workspace_bytes_,
+          batch * heads * sequence * sizeof(float));
+#else
+      fail("DiffIR requests native FlashAttention but this CUDA backend was "
+           "built without it");
+#endif
+    }
+
     fused_linear_swiglu_plans_ =
         find_fused_linear_swiglu_plans(program_, options, major);
     absorbed_linear_bias_plans_ =
@@ -7519,6 +8101,8 @@ public:
         has_h3_convrot || !convrot_int8_linear_plans_.empty();
     generated.source += h3_convrot_source(has_convrot);
     generated.source += h3_groupwise_source(!h3_groupwise_plans_.empty());
+    generated.source += materialized_f32_attention_source(
+        !materialized_f32_attention_plans_.empty());
     std::unordered_set<std::uint32_t> fused_linear_operations;
     std::unordered_set<std::uint32_t> excluded_tensors;
     std::unordered_set<std::uint32_t> replaced_constant_tensors;
@@ -7645,6 +8229,9 @@ public:
                  !fused_linear_operations.contains(op.id);
         });
     workspace_bytes_ = contains_linear ? linear_workspace_bytes : 0U;
+    workspace_bytes_ = std::max<std::size_t>(
+        workspace_bytes_,
+        static_cast<std::size_t>(flash_attention_workspace_bytes_));
     if (options.h3_int8_cublaslt) {
       if (h3_w8a8_mlp_plans_.empty() &&
           h3_w8a8_attention_plans_.empty())
@@ -7928,7 +8515,11 @@ public:
             std::numeric_limits<std::uint64_t>::max() -
                 parallel_workspace_bytes_ ||
         tensor_bytes + workspace_bytes_ + parallel_workspace_bytes_ >
-            std::numeric_limits<std::uint64_t>::max() - cudnn_workspace_bytes_)
+            std::numeric_limits<std::uint64_t>::max() - cudnn_workspace_bytes_ ||
+        tensor_bytes + workspace_bytes_ + parallel_workspace_bytes_ +
+                cudnn_workspace_bytes_ >
+            std::numeric_limits<std::uint64_t>::max() -
+                materialized_f32_attention_score_bytes_)
       fail("DiffIR allocation plus backend workspace overflow");
     auto h3_w8a8_weight_bytes = std::uint64_t{0U};
     auto h3_w8a8_scratch_bytes = std::uint64_t{0U};
@@ -8058,7 +8649,8 @@ public:
     }
     const auto base_required = tensor_bytes + workspace_bytes_ +
                                parallel_workspace_bytes_ +
-                               cudnn_workspace_bytes_;
+                               cudnn_workspace_bytes_ +
+                               materialized_f32_attention_score_bytes_;
     if (base_required > std::numeric_limits<std::uint64_t>::max() -
                             ck_attention_scratch_bytes_)
       fail("DiffIR allocation plus H3 CK scratch overflow");
@@ -8107,6 +8699,8 @@ public:
                 << " parallel_linear_workspace_bytes="
                 << parallel_workspace_bytes_
                 << " attention_workspace_bytes=" << cudnn_workspace_bytes_
+                << " materialized_f32_attention_score_bytes="
+                << materialized_f32_attention_score_bytes_
                 << " ck_attention_scratch_bytes="
                 << ck_attention_scratch_bytes_
                 << " h3_w8a8_weight_bytes=" << h3_w8a8_weight_bytes
@@ -8175,11 +8769,42 @@ public:
     const auto ptx = compile_ptx(generated.source, major, minor,
                                  options.cache_directory, source_hash_);
     module_ = std::make_unique<Module>(ptx);
+    if (!materialized_f32_attention_plans_.empty())
+      check(cuModuleGetFunction(
+                &materialized_f32_attention_softmax_, module_->get(),
+                "dif_materialized_f32_attention_softmax"),
+            "cuModuleGetFunction materialized F32 attention softmax");
     for (const auto &[operation, entrypoint] : generated.entrypoints) {
       CUfunction function{};
       check(cuModuleGetFunction(&function, module_->get(), entrypoint.c_str()),
             "cuModuleGetFunction");
       functions_.emplace(operation, function);
+    }
+    for (const auto &operation : program_.operations) {
+      const auto implementation = static_cast<ir::Int8RowQuantization>(
+          operation.u64(ir::AttrKey::Implementation,
+                        static_cast<std::uint64_t>(
+                            ir::Int8RowQuantization::Direct)));
+      if (operation.opcode != ir::Opcode::QuantizeInt8Rows ||
+          (implementation != ir::Int8RowQuantization::H256ConvRot &&
+           implementation != ir::Int8RowQuantization::H256F32ConvRot &&
+           implementation != ir::Int8RowQuantization::H256F32SignedConvRot &&
+           implementation != ir::Int8RowQuantization::H256SignedConvRot &&
+           implementation != ir::Int8RowQuantization::H4096SignedConvRot &&
+           implementation != ir::Int8RowQuantization::H4096F32SignedConvRot))
+        continue;
+      const auto found = functions_.find(operation.id);
+      const auto *quantized = program_.tensor(operation.outputs.front());
+      if (found == functions_.end() || !quantized)
+        fail("H256 ConvRot quantization kernel was not compiled");
+      const auto shared_bytes = quantized->dims.back() * sizeof(float);
+      if (shared_bytes > static_cast<std::uint64_t>(
+                             std::numeric_limits<int>::max()))
+        fail("H256 ConvRot dynamic shared-memory request overflows CUDA int");
+      check(cuFuncSetAttribute(
+                found->second, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                static_cast<int>(shared_bytes)),
+            "cuFuncSetAttribute H256 ConvRot dynamic shared memory");
     }
     for (auto &fusion : fused_linear_swiglu_plans_)
       check(cuModuleGetFunction(&fusion.function, module_->get(),
@@ -8395,6 +9020,9 @@ public:
     }
     cudnn_workspace_ =
         std::make_unique<Workspace>(cudnn_workspace_bytes_, arena_.get());
+    materialized_f32_attention_scores_ = std::make_unique<Workspace>(
+        static_cast<std::size_t>(materialized_f32_attention_score_bytes_),
+        arena_.get());
     h3_w8a8_scratch_storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(h3_w8a8_scratch_bytes), arena_.get());
     if (h3_convrot_bf16_correction_) {
@@ -8825,7 +9453,37 @@ public:
                 << " isolated=" << isolated_plan_count
                 << "\n";
     }
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::LinearFp8Scaled)
+        continue;
+      fp8_scaled_linear_plans_.emplace(
+          operation.id, std::make_unique<Fp8ScaledLinearPlan>(
+                            program_, operation, context_.cublas_lt(),
+                            workspace_bytes_));
+    }
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::LinearFp8BlockScaled)
+        continue;
+      fp8_block_scaled_linear_plans_.emplace(
+          operation.id, std::make_unique<Fp8BlockScaledLinearPlan>(
+                            program_, operation, buffers_, context_.cublas_lt(),
+                            workspace_bytes_));
+    }
 #if DIF_HAS_CUTLASS
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::LinearInt8Scaled)
+        continue;
+      int8_scaled_linear_plans_.emplace(
+          operation.id, std::make_unique<Int8ScaledLinearPlan>(
+                            program_, operation, buffers_, context_.stream()));
+    }
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::LinearInt8WeightScaled)
+        continue;
+      int8_weight_linear_plans_.emplace(
+          operation.id, std::make_unique<Int8WeightLinearPlan>(
+                            program_, operation, buffers_, context_.stream()));
+    }
     std::unordered_set<std::uint32_t> cutlass_operations;
     for (const auto &choice : options.cutlass_linear_operations) {
       if (!cutlass_operations.insert(choice.operation_id).second)
@@ -8848,6 +9506,15 @@ public:
               context_.stream()));
     }
 #else
+    if (std::any_of(program_.operations.begin(), program_.operations.end(),
+                    [](const ir::Operation &operation) {
+                      return operation.opcode ==
+                                 ir::Opcode::LinearInt8Scaled ||
+                             operation.opcode ==
+                                 ir::Opcode::LinearInt8WeightScaled;
+                    }))
+      fail("INT8 Linear requested but the backend was built without "
+           "CUTLASS");
     if (!options.cutlass_linear_operations.empty())
       fail("CUTLASS Linear requested but the backend was built without CUTLASS");
 #endif
@@ -9177,6 +9844,9 @@ public:
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
     if (options.iterations == 0)
       fail("run iterations must be nonzero");
+    if (options.streamed_keep_mapped_pages_between_runs &&
+        options.streamed_release_mapped_pages_per_copy)
+      fail("streamed mapped pages cannot be kept between runs and released per copy");
     if (options.lazy_resident_upload != lazy_resident_upload_)
       fail("lazy resident upload is fixed when the plan is prepared");
     auto requested_captures = options.capture_intermediate_tensors;
@@ -9199,16 +9869,27 @@ public:
         options.streamed_release_mapped_pages_per_copy);
     if (options.streamed_prefetch_depth != streamed_prefetch_depth_)
       fail("streamed prefetch depth is fixed when the plan is prepared");
-    TensorMap bindings = constants_;
+    // Constants were fully validated and frozen into constants_ during
+    // preparation. Re-copying that map here is cheap only for mmap-backed
+    // tensors; an owned packed/quantized checkpoint would deep-copy every
+    // byte on every denoise step. The run path needs host tensors only for
+    // dynamic inputs, while streamed and resident constants are consumed
+    // directly from constants_ by their prepared upload plans.
+    TensorMap bindings;
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Input))
         continue;
       const auto found = inputs.find(desc.id);
       if (found == inputs.end())
         fail("missing CUDA dynamic input tensor " + std::to_string(desc.id));
-      bindings.insert_or_assign(desc.id, found->second);
+      found->second.validate();
+      if (found->second.dtype != desc.dtype ||
+          found->second.dims != desc.dims)
+        fail("CUDA dynamic input shape/dtype mismatch for id " +
+             std::to_string(desc.id));
+      bindings.emplace(desc.id, found->second);
     }
-    validate_inputs(program_, bindings);
+    validate_inputs(program_, bindings, constants_);
     auto repeated_cache_ready = repeated_invariant_valid_;
     if (repeated_cache_ready) {
       for (const auto input_id : repeated_invariant_input_tensors_) {
@@ -9599,7 +10280,24 @@ public:
                fused != fused_launch_inputs_.end())
         launch(program_, op, functions_.at(op.id), buffers_, context_.stream(),
                &fused->second);
+      else if (const auto scaled = fp8_scaled_linear_plans_.find(op.id);
+               scaled != fp8_scaled_linear_plans_.end()) {
+        scaled->second->launch(op, buffers_, context_.cublas_lt(), *workspace_,
+                               context_.stream());
+        launch(program_, op, functions_.at(op.id), buffers_,
+               context_.stream());
+      }
+      else if (const auto scaled = fp8_block_scaled_linear_plans_.find(op.id);
+               scaled != fp8_block_scaled_linear_plans_.end())
+        scaled->second->launch(op, buffers_, context_.cublas_lt(), *workspace_,
+                               context_.stream());
 #if DIF_HAS_CUTLASS
+      else if (const auto scaled = int8_scaled_linear_plans_.find(op.id);
+               scaled != int8_scaled_linear_plans_.end())
+        scaled->second->launch(op, buffers_, context_.stream());
+      else if (const auto weight_only = int8_weight_linear_plans_.find(op.id);
+               weight_only != int8_weight_linear_plans_.end())
+        weight_only->second->launch(op, buffers_, context_.stream());
       else if (const auto cutlass = cutlass_linear_plans_.find(op.id);
                cutlass != cutlass_linear_plans_.end()) {
         count_cutlass_launch();
@@ -9623,7 +10321,42 @@ public:
         count_ck_attention_dispatch();
         h3_ck_attention_plans_.at(op.id)->execute(op, buffers_,
                                                   context_.stream());
+      } else if (op.opcode == ir::Opcode::Attention &&
+                 op.u64(ir::AttrKey::Implementation, 1U) == 3U) {
+        materialized_f32_attention_plans_.at(op.id).execute(
+            op, buffers_, context_.cublas(),
+            materialized_f32_attention_softmax_,
+            materialized_f32_attention_scores_->pointer(), context_.stream());
       }
+#if DIF_HAS_FLASH_ATTENTION
+      else if (op.opcode == ir::Opcode::Attention &&
+               op.u64(ir::AttrKey::Implementation, 1U) == 4U) {
+        const auto *query = program_.tensor(op.inputs.at(0));
+        const auto batched = query->dims.size() == 4U;
+        const auto batch = static_cast<std::uint32_t>(
+            batched ? query->dims.at(0) : 1U);
+        const auto sequence = static_cast<std::uint32_t>(
+            query->dims.at(batched ? 1U : 0U));
+        const auto heads = static_cast<std::uint32_t>(
+            query->dims.at(batched ? 2U : 1U));
+        const auto head_dimension =
+            static_cast<std::uint32_t>(query->dims.back());
+        const auto key_value_heads = static_cast<std::uint32_t>(
+            op.u64(ir::AttrKey::KvHeads, heads));
+        const auto scale = static_cast<float>(op.f64(
+            ir::AttrKey::AttentionScale,
+            1.0 / std::sqrt(static_cast<double>(head_dimension))));
+        if (const auto *error = flash_attention_bf16_forward(
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2))),
+                static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+                reinterpret_cast<std::uintptr_t>(workspace_->data()), batch,
+                sequence, heads, key_value_heads, head_dimension, scale,
+                reinterpret_cast<std::uintptr_t>(context_.stream())))
+          fail(std::string("native FlashAttention execution failed: ") + error);
+      }
+#endif
 #if DIF_HAS_CUDNN
       else if (op.opcode == ir::Opcode::Conv2d) {
         count_cudnn_convolution_dispatch();
@@ -10270,7 +11003,8 @@ public:
     std::size_t total = 0;
     check(cuMemGetInfo(&free_after, &total), "cuMemGetInfo after");
     result.free_bytes_after = free_after;
-    if (!options.streamed_release_mapped_pages_per_copy)
+    if (!options.streamed_release_mapped_pages_per_copy &&
+        !options.streamed_keep_mapped_pages_between_runs)
       streamed_prefetcher_->release_mapped_pages();
     result.preparation_telemetry = preparation_telemetry_;
     result.run_telemetry = run_telemetry;
@@ -10318,9 +11052,17 @@ public:
     auto result = std::string("cuda-nvrtc");
     if (!linear_plans_.empty())
       result += "-cublaslt";
+    if (!fp8_scaled_linear_plans_.empty())
+      result += "-scaled-fp8";
+    if (!fp8_block_scaled_linear_plans_.empty())
+      result += "-mxfp8";
 #if DIF_HAS_CUTLASS
     if (!cutlass_linear_plans_.empty())
       result += "-cutlass";
+    if (!int8_scaled_linear_plans_.empty())
+      result += "-scaled-int8";
+    if (!int8_weight_linear_plans_.empty())
+      result += "-int8-weight";
 #endif
     if (!fused_linear_swiglu_plans_.empty())
       result += "-wmma-swiglu";
@@ -10387,6 +11129,10 @@ public:
       else if (cudnn_attention_heuristic_ == 2U)
         result += "-heur-fallback";
     }
+    if (!materialized_f32_attention_plans_.empty())
+      result += "-materialized-f32-attention";
+    if (flash_attention_workspace_bytes_ != 0U)
+      result += "-native-flash-attention";
     return result;
   }
   double preparation_milliseconds() const override {
@@ -10412,6 +11158,7 @@ private:
   std::unique_ptr<Event> parallel_start_event_;
   std::vector<std::unique_ptr<Event>> parallel_done_events_;
   std::unique_ptr<Workspace> cudnn_workspace_;
+  std::unique_ptr<Workspace> materialized_f32_attention_scores_;
   std::unique_ptr<Workspace> h3_w8a8_scratch_storage_;
   std::unique_ptr<Workspace> h3_w8a8_tail_weight_storage_;
   std::unique_ptr<PinnedHostWorkspace> h3_w8a8_tail_stage_;
@@ -10442,12 +11189,21 @@ private:
   std::unordered_map<std::uint32_t, std::vector<std::uint8_t>>
       repeated_invariant_input_snapshots_;
   std::unordered_map<std::uint32_t, std::shared_ptr<LinearPlan>> linear_plans_;
+  std::unordered_map<std::uint32_t, std::unique_ptr<Fp8ScaledLinearPlan>>
+      fp8_scaled_linear_plans_;
+  std::unordered_map<std::uint32_t,
+                     std::unique_ptr<Fp8BlockScaledLinearPlan>>
+      fp8_block_scaled_linear_plans_;
   std::unordered_map<std::size_t, std::vector<std::size_t>>
       parallel_linear_groups_;
   std::unordered_set<std::size_t> parallel_linear_followups_;
 #if DIF_HAS_CUTLASS
   std::unordered_map<std::uint32_t, std::unique_ptr<CutlassLinearPlan>>
       cutlass_linear_plans_;
+  std::unordered_map<std::uint32_t, std::unique_ptr<Int8ScaledLinearPlan>>
+      int8_scaled_linear_plans_;
+  std::unordered_map<std::uint32_t, std::unique_ptr<Int8WeightLinearPlan>>
+      int8_weight_linear_plans_;
 #endif
   std::vector<LinearTuningResult> linear_tuning_results_;
   std::vector<LinearAlgorithmChoice> selected_linear_algorithms_;
@@ -10491,6 +11247,9 @@ private:
   std::shared_ptr<CkAttentionPlan> h3_ck_attention_plan_;
   std::unordered_map<std::uint32_t, std::shared_ptr<CkAttentionPlan>>
       h3_ck_attention_plans_;
+  std::unordered_map<std::uint32_t, MaterializedF32AttentionPlan>
+      materialized_f32_attention_plans_;
+  CUfunction materialized_f32_attention_softmax_{};
 #if DIF_HAS_CUDNN
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnAttentionPlan>>
       cudnn_attention_plans_;
@@ -10504,8 +11263,10 @@ private:
   target::RuntimeBudget runtime_budget_;
   std::string source_hash_;
   std::size_t workspace_bytes_{};
+  std::uint64_t flash_attention_workspace_bytes_{};
   std::uint64_t parallel_workspace_bytes_{};
   std::size_t cudnn_workspace_bytes_{};
+  std::uint64_t materialized_f32_attention_score_bytes_{};
   std::uint64_t ck_attention_scratch_bytes_{};
   std::uint64_t h3_w8a8_tail_attention_bytes_{};
   std::uint64_t h3_w8a8_tail_mlp_bytes_{};

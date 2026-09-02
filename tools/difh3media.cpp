@@ -22,7 +22,7 @@ struct Options {
   std::filesystem::path audio_wav;
   std::filesystem::path output_directory;
   std::string ffmpeg{"ffmpeg"};
-  std::string encoder{"h264_nvenc"};
+  std::string encoder{"libx264"};
   std::uint64_t input_fps{};
   std::uint64_t output_fps{};
 };
@@ -203,9 +203,15 @@ int main(int argc, char **argv) {
                                          "-b:v", "0"});
     else
       arguments.insert(arguments.end(), {"-preset", "slow", "-crf", "18"});
+    const auto media_duration_seconds =
+        std::to_string(static_cast<double>(video.frames) /
+                       static_cast<double>(options.output_fps));
     arguments.insert(arguments.end(),
-                     {"-pix_fmt", "yuv420p", "-af", "apad", "-c:a", "aac",
-                      "-shortest", "-movflags", "+faststart",
+                     {"-pix_fmt", "yuv420p", "-af",
+                      "atrim=duration=" + media_duration_seconds +
+                          ",apad=whole_dur=" + media_duration_seconds,
+                      "-c:a", "aac",
+                      "-movflags", "+faststart",
                       media_path.string()});
     run(arguments);
     const auto mux_milliseconds =

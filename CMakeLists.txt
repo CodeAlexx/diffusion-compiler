@@ -25,6 +25,10 @@ option(DIF_BUILD_TESTS "Build unit tests" ON)
 option(DIF_ENABLE_OPENCL "Build the vendor-neutral OpenCL reference backend" ON)
 set(DIF_CUDNN_ROOT "" CACHE PATH "cuDNN installation root (include/ and lib/)")
 set(DIF_CUTLASS_ROOT "" CACHE PATH "CUTLASS source root (contains include/cutlass)")
+set(DIF_FLASH_ATTENTION_ROOT "" CACHE PATH
+    "FlashAttention csrc/flash_attn root (contains src/flash.h)")
+set(DIF_CUDA_ARCHITECTURES "native" CACHE STRING
+    "CUDA architectures for compiled kernels (for example 86 or 120)")
 
 add_library(difcore
     src/build_info.cpp
@@ -47,6 +51,8 @@ add_library(difcore
   src/frontend/krea2.cpp
   src/frontend/provenance.cpp
   src/frontend/krea2_vae.cpp
+  src/frontend/flux2.cpp
+  src/frontend/flux2_vae.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
   src/frontend/lora.cpp
@@ -118,12 +124,16 @@ if(DIF_ENABLE_CUDA)
 endif()
 
 if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
+  # FindCUDAToolkit may expose multiple include directories (CUDA 13 also
+  # appends include/cccl).  The NVRTC helper expects one quoted directory;
+  # injecting the CMake list into a compile definition breaks shell quoting.
+  list(GET CUDAToolkit_INCLUDE_DIRS 0 DIF_CUDA_PRIMARY_INCLUDE_DIR)
   target_sources(difcore PRIVATE src/runtime/cuda_executor.cpp)
   target_link_libraries(difcore PRIVATE CUDA::cuda_driver CUDA::nvrtc
                                         CUDA::cublas CUDA::cublasLt)
   target_compile_definitions(
       difcore PUBLIC DIF_HAS_CUDA=1
-      PRIVATE DIF_CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}")
+      PRIVATE DIF_CUDA_INCLUDE_DIR="${DIF_CUDA_PRIMARY_INCLUDE_DIR}")
   # NVTX v3 is header-only; ranges are inert unless a tool such as Nsight
   # Systems injects an implementation at run time.
   find_path(DIF_NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h
@@ -149,12 +159,47 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
     target_include_directories(difcore SYSTEM PRIVATE "${DIF_CUTLASS_INCLUDE_DIR}")
     target_link_libraries(difcore PRIVATE CUDA::cudart)
     target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=1)
-    set_property(TARGET difcore PROPERTY CUDA_ARCHITECTURES 86)
+    set_property(TARGET difcore PROPERTY CUDA_ARCHITECTURES
+                                         "${DIF_CUDA_ARCHITECTURES}")
     set_property(TARGET difcore PROPERTY CUDA_STANDARD 17)
     set_property(TARGET difcore PROPERTY CUDA_STANDARD_REQUIRED ON)
     message(STATUS "Diffusion compiler CUTLASS GEMM: ${DIF_CUTLASS_INCLUDE_DIR}")
+    message(STATUS "Diffusion compiler CUDA architectures: ${DIF_CUDA_ARCHITECTURES}")
+
+    find_path(DIF_FLASH_ATTENTION_SOURCE_DIR
+              flash_fwd_hdim128_bf16_sm80.cu
+              HINTS "${DIF_FLASH_ATTENTION_ROOT}" ENV FLASH_ATTENTION_ROOT
+              PATH_SUFFIXES src)
+    if(DIF_FLASH_ATTENTION_SOURCE_DIR)
+      target_sources(
+          difcore PRIVATE
+          src/runtime/flash_attention.cu
+          "${DIF_FLASH_ATTENTION_SOURCE_DIR}/flash_fwd_hdim128_bf16_sm80.cu")
+      target_include_directories(
+          difcore BEFORE PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flash_attention_shim")
+      target_include_directories(
+          difcore SYSTEM PRIVATE "${DIF_FLASH_ATTENTION_SOURCE_DIR}")
+      set_source_files_properties(
+          src/runtime/flash_attention.cu
+          "${DIF_FLASH_ATTENTION_SOURCE_DIR}/flash_fwd_hdim128_bf16_sm80.cu"
+          PROPERTIES COMPILE_OPTIONS
+          "--expt-relaxed-constexpr;--expt-extended-lambda")
+      target_compile_definitions(
+          difcore PUBLIC DIF_HAS_FLASH_ATTENTION=1
+          PRIVATE FLASH_NAMESPACE=pytorch_flash
+                  FLASHATTENTION_DISABLE_ALIBI=1
+                  FLASHATTENTION_DISABLE_SOFTCAP=1
+                  UNFUSE_FMA=1)
+      message(STATUS
+              "Diffusion compiler native FlashAttention: ${DIF_FLASH_ATTENTION_SOURCE_DIR}")
+    else()
+      target_compile_definitions(difcore PUBLIC DIF_HAS_FLASH_ATTENTION=0)
+      message(STATUS "Diffusion compiler native FlashAttention: disabled")
+    endif()
   else()
-    target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=0)
+    target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=0
+                                              DIF_HAS_FLASH_ATTENTION=0)
     message(STATUS "Diffusion compiler CUTLASS GEMM: disabled")
   endif()
   if(DIF_ENABLE_CUDNN)
@@ -183,7 +228,8 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
 else()
   target_sources(difcore PRIVATE src/runtime/cuda_executor_stub.cpp)
   target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=0 DIF_HAS_CUDNN=0
-                                            DIF_HAS_CUTLASS=0)
+                                            DIF_HAS_CUTLASS=0
+                                            DIF_HAS_FLASH_ATTENTION=0)
 endif()
 
 add_executable(difc tools/difc.cpp)
@@ -311,6 +357,12 @@ endif()
 
 add_executable(difkrea2block tools/difkrea2block.cpp)
 target_link_libraries(difkrea2block PRIVATE difcore)
+
+add_executable(difflux2block tools/difflux2block.cpp)
+target_link_libraries(difflux2block PRIVATE difcore)
+
+add_executable(difflux2sample tools/difflux2sample.cpp)
+target_link_libraries(difflux2sample PRIVATE difcore)
 add_executable(difkrea2text tools/difkrea2text.cpp)
 target_link_libraries(difkrea2text PRIVATE difcore)
 add_executable(difkrea2denoise tools/difkrea2denoise.cpp)
@@ -353,6 +405,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_tests tests/dif_tests.cpp)
   target_link_libraries(dif_tests PRIVATE difcore)
   add_test(NAME dif_tests COMMAND dif_tests)
+
+  add_executable(dif_flux2_frontend_tests tests/flux2_frontend_tests.cpp)
+  target_link_libraries(dif_flux2_frontend_tests PRIVATE difcore)
+  add_test(NAME dif_flux2_frontend_tests COMMAND dif_flux2_frontend_tests)
 
   add_executable(dif_lora_tests tests/lora_tests.cpp)
   target_link_libraries(dif_lora_tests PRIVATE difcore)
@@ -469,12 +525,14 @@ endif()
 # --- native text tokenizer (w3-conditioner) ---------------------------------
 add_library(dif_text STATIC
     src/text/unicode.cpp
-    src/text/qwen_bpe_tokenizer.cpp)
+    src/text/qwen_bpe_tokenizer.cpp
+    src/text/flux2_prompt.cpp)
 target_include_directories(dif_text PUBLIC include)
 target_compile_options(
     dif_text PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>)
 target_link_libraries(dif_text PUBLIC difcore)
+target_link_libraries(difflux2sample PRIVATE dif_text)
 
 add_executable(diftokenize tools/diftokenize.cpp)
 target_link_libraries(diftokenize PRIVATE dif_text)
@@ -485,4 +543,9 @@ if(DIF_BUILD_TESTS)
   target_link_libraries(dif_tokenizer_tests PRIVATE dif_text)
   add_test(NAME dif_tokenizer_tests COMMAND dif_tokenizer_tests)
   set_tests_properties(dif_tokenizer_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(dif_flux2_prompt_tests tests/flux2_prompt_tests.cpp)
+  target_link_libraries(dif_flux2_prompt_tests PRIVATE dif_text)
+  add_test(NAME dif_flux2_prompt_tests COMMAND dif_flux2_prompt_tests)
+  set_tests_properties(dif_flux2_prompt_tests PROPERTIES SKIP_RETURN_CODE 77)
 endif()

@@ -121,6 +121,378 @@ void sigmoid(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void quantize_int8_rows(const ir::Operation &op, TensorMap &tensors) {
+  auto &quantized = tensors.at(op.outputs[0]);
+  auto &scales = tensors.at(op.outputs[1]);
+  Tensor *residual_quantized = nullptr;
+  Tensor *residual_scales = nullptr;
+  if (op.outputs.size() == 4U) {
+    residual_quantized = &tensors.at(op.outputs[2]);
+    residual_scales = &tensors.at(op.outputs[3]);
+  }
+  const auto columns = quantized.dims.back();
+  const auto rows = quantized.element_count() / columns;
+  const auto dynamic_clip =
+      tensors.at(op.inputs.back()).dtype == ir::DType::F32;
+  const auto data_input_count =
+      op.inputs.size() - static_cast<std::size_t>(dynamic_clip);
+  const auto load_input = [&](std::uint64_t row, std::uint64_t column) {
+    for (std::size_t index = 0U; index < data_input_count; ++index) {
+      const auto input_id = op.inputs[index];
+      const auto &input = tensors.at(input_id);
+      if (column < input.dims.back())
+        return load_float(input, row * input.dims.back() + column);
+      column -= input.dims.back();
+    }
+    fail("quantize_int8_rows logical input column is outside its parts");
+  };
+  auto *output = reinterpret_cast<std::int8_t *>(quantized.mutable_data());
+  auto *residual_output = residual_quantized
+                              ? reinterpret_cast<std::int8_t *>(
+                                    residual_quantized->mutable_data())
+                              : nullptr;
+  const auto implementation = static_cast<ir::Int8RowQuantization>(
+      op.u64(ir::AttrKey::Implementation,
+             static_cast<std::uint64_t>(
+                 ir::Int8RowQuantization::Direct)));
+  const auto convrot =
+      implementation == ir::Int8RowQuantization::H256ConvRot ||
+      implementation == ir::Int8RowQuantization::H256F32ConvRot ||
+      implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H256SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+  const auto f32_convrot =
+      implementation == ir::Int8RowQuantization::H256F32ConvRot ||
+      implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+  const auto signed_convrot =
+      implementation == ir::Int8RowQuantization::H256SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
+      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+  auto rotation_group =
+      (implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
+       implementation == ir::Int8RowQuantization::H4096F32SignedConvRot)
+          ? std::uint64_t{4096U}
+          : std::uint64_t{256U};
+  const auto clip_ratio = dynamic_clip
+                              ? load_float(tensors.at(op.inputs.back()), 0U)
+                              : static_cast<float>(
+                                    op.f64(ir::AttrKey::Scale, 1.0));
+  const auto rotation_sign = [](std::uint64_t column) {
+    auto hash = static_cast<std::uint32_t>(column) + 0x9e3779b9U;
+    hash = (hash ^ (hash >> 16U)) * 0x7feb352dU;
+    hash = (hash ^ (hash >> 15U)) * 0x846ca68bU;
+    hash ^= hash >> 16U;
+    return (hash & 1U) != 0U ? -1.0F : 1.0F;
+  };
+  std::vector<float> transformed;
+  if (convrot)
+    transformed.resize(static_cast<std::size_t>(columns));
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    float maximum = 0.0F;
+    const auto base = row * columns;
+    if (convrot) {
+      for (std::uint64_t column = 0U; column < columns; ++column) {
+        transformed[static_cast<std::size_t>(column)] =
+            load_input(row, column) *
+            (signed_convrot ? rotation_sign(column) : 1.0F);
+      }
+      for (const std::uint64_t stride :
+           {1U, 4U, 16U, 64U, 256U, 1024U, 4096U}) {
+        if (stride >= rotation_group)
+          break;
+        for (std::uint64_t group = 0U; group < columns;
+             group += rotation_group) {
+          for (std::uint64_t lane = 0U; lane < rotation_group / 4U;
+               ++lane) {
+            const auto index = group + (lane % stride) +
+                               (lane / stride) * (4U * stride);
+            const auto x0 = transformed[static_cast<std::size_t>(index)];
+            const auto x1 =
+                transformed[static_cast<std::size_t>(index + stride)];
+            const auto x2 =
+                transformed[static_cast<std::size_t>(index + 2U * stride)];
+            const auto x3 =
+                transformed[static_cast<std::size_t>(index + 3U * stride)];
+            transformed[static_cast<std::size_t>(index)] =
+                0.5F * (x0 + x1 + x2 - x3);
+            transformed[static_cast<std::size_t>(index + stride)] =
+                0.5F * (x0 + x1 - x2 + x3);
+            transformed[static_cast<std::size_t>(index + 2U * stride)] =
+                0.5F * (x0 - x1 + x2 + x3);
+            transformed[static_cast<std::size_t>(index + 3U * stride)] =
+                0.5F * (-x0 + x1 + x2 + x3);
+          }
+        }
+      }
+      for (const auto value : transformed)
+        maximum = std::max(maximum, std::fabs(value));
+    } else {
+      for (std::uint64_t column = 0U; column < columns; ++column)
+        maximum = std::max(maximum, std::fabs(load_input(row, column)));
+    }
+    const auto scale =
+        std::max(maximum * clip_ratio / 127.0F, 1.0e-30F);
+    const auto scale_bf16 = bf16_to_float(float_to_bf16(scale));
+    store_float(scales, row,
+                signed_convrot && !f32_convrot ? scale_bf16 : scale);
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      if (f32_convrot) {
+        const auto rounded = static_cast<int>(std::nearbyint(
+            transformed[static_cast<std::size_t>(column)] / scale));
+        output[base + column] =
+            static_cast<std::int8_t>(std::clamp(rounded, -127, 127));
+      } else if (convrot) {
+        const auto value_bf16 = bf16_to_float(float_to_bf16(
+            transformed[static_cast<std::size_t>(column)]));
+        const auto divided_bf16 =
+            bf16_to_float(float_to_bf16(value_bf16 / scale_bf16));
+        const auto rounded = static_cast<int>(std::nearbyint(divided_bf16));
+        output[base + column] =
+            static_cast<std::int8_t>(std::clamp(rounded, -128, 127));
+      } else {
+        const auto rounded = static_cast<int>(
+            std::nearbyint(load_input(row, column) / scale));
+        output[base + column] =
+            static_cast<std::int8_t>(std::clamp(rounded, -127, 127));
+      }
+    }
+    if (!residual_output)
+      continue;
+    const auto stored_scale = load_float(scales, row);
+    float residual_maximum = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto value = f32_convrot
+                             ? transformed[static_cast<std::size_t>(column)]
+                         : convrot
+                             ? bf16_to_float(float_to_bf16(
+                                   transformed[static_cast<std::size_t>(column)]))
+                             : load_input(row, column);
+      residual_maximum = std::max(
+          residual_maximum,
+          std::fabs(std::fma(-static_cast<float>(output[base + column]),
+                             stored_scale, value)));
+    }
+    const auto residual_scale =
+        std::max(residual_maximum / 127.0F, 1.0e-30F);
+    const auto residual_scale_bf16 =
+        bf16_to_float(float_to_bf16(residual_scale));
+    store_float(*residual_scales, row,
+                signed_convrot && !f32_convrot ? residual_scale_bf16
+                                               : residual_scale);
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto value = f32_convrot
+                             ? transformed[static_cast<std::size_t>(column)]
+                         : convrot
+                             ? bf16_to_float(float_to_bf16(
+                                   transformed[static_cast<std::size_t>(column)]))
+                             : load_input(row, column);
+      const auto residual =
+          std::fma(-static_cast<float>(output[base + column]), stored_scale,
+                   value);
+      const auto divided = f32_convrot
+                               ? residual / residual_scale
+                           : convrot
+                               ? bf16_to_float(float_to_bf16(
+                                     bf16_to_float(float_to_bf16(residual)) /
+                                     residual_scale_bf16))
+                               : residual / residual_scale;
+      const auto rounded = static_cast<int>(std::nearbyint(divided));
+      residual_output[base + column] = static_cast<std::int8_t>(
+          std::clamp(rounded, convrot && !f32_convrot ? -128 : -127, 127));
+    }
+  }
+}
+
+void linear_int8_scaled(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &row_scales = tensors.at(op.inputs[2]);
+  const auto &column_scales = tensors.at(op.inputs[3]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto rows = input.element_count() / input.dims.back();
+  const auto inner = input.dims.back();
+  const auto columns = weight.dims.front();
+  const auto *input_values =
+      reinterpret_cast<const std::int8_t *>(input.data());
+  const auto *weight_values =
+      reinterpret_cast<const std::int8_t *>(weight.data());
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      std::int32_t accumulator = 0;
+      for (std::uint64_t index = 0U; index < inner; ++index)
+        accumulator +=
+            static_cast<std::int32_t>(input_values[row * inner + index]) *
+            static_cast<std::int32_t>(weight_values[column * inner + index]);
+      store_float(out, row * columns + column,
+                  static_cast<float>(accumulator) *
+                      load_float(row_scales, row) *
+                      load_float(column_scales, column));
+    }
+  }
+}
+
+void linear_int8_weight_scaled(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &scales = tensors.at(op.inputs[2]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto rows = input.element_count() / input.dims.back();
+  const auto inner = input.dims.back();
+  const auto columns = weight.dims.front();
+  const auto *weight_values =
+      reinterpret_cast<const std::int8_t *>(weight.data());
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      float accumulator = 0.0F;
+      for (std::uint64_t index = 0U; index < inner; ++index)
+        accumulator += load_float(input, row * inner + index) *
+                       static_cast<float>(
+                           weight_values[column * inner + index]);
+      store_float(out, row * columns + column,
+                  accumulator * load_float(scales, column));
+    }
+  }
+}
+
+void dequantize_int8_blocks(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &scales = tensors.at(op.inputs[1]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto rows = input.dims[0];
+  const auto columns = input.dims[1];
+  const auto block = op.u64(ir::AttrKey::BlockSize, 0U);
+  const auto scale_columns = scales.dims[1];
+  const auto *values =
+      reinterpret_cast<const std::int8_t *>(input.data());
+  for (std::uint64_t row = 0U; row < rows; ++row)
+    for (std::uint64_t column = 0U; column < columns; ++column)
+      store_float(out, row * columns + column,
+                  static_cast<float>(values[row * columns + column]) *
+                      load_float(scales,
+                                 row * scale_columns + column / block));
+}
+
+void quantize_fp8_rows(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &quantized = tensors.at(op.outputs[0]);
+  auto &scales = tensors.at(op.outputs[1]);
+  const auto columns = input.dims.back();
+  const auto rows = input.element_count() / columns;
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    const auto base = row * columns;
+    float maximum = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column)
+      maximum = std::max(maximum,
+                         std::fabs(load_float(input, base + column)));
+    const auto scale = std::max(maximum / 448.0F, 1.0e-30F);
+    store_float(scales, row, scale);
+    for (std::uint64_t column = 0U; column < columns; ++column)
+      quantized.mutable_data()[base + column] =
+          float_to_fp8_e4m3(load_float(input, base + column) / scale);
+  }
+}
+
+void linear_fp8_scaled(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &row_scales = tensors.at(op.inputs[2]);
+  const auto &column_scales = tensors.at(op.inputs[3]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto rows = input.element_count() / input.dims.back();
+  const auto inner = input.dims.back();
+  const auto columns = weight.dims.front();
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      float accumulator = 0.0F;
+      for (std::uint64_t index = 0U; index < inner; ++index)
+        accumulator += fp8_e4m3_to_float(input.data()[row * inner + index]) *
+                       fp8_e4m3_to_float(
+                           weight.data()[column * inner + index]);
+      const auto raw_bf16 =
+          bf16_to_float(float_to_bf16(accumulator));
+      store_float(out, row * columns + column,
+                  raw_bf16 * load_float(row_scales, row) *
+                      load_float(column_scales, column));
+    }
+  }
+}
+
+std::uint64_t fp8_block_scale_offset(std::uint64_t outer,
+                                     std::uint64_t inner_block,
+                                     std::uint64_t scale_inner_dimension) {
+  const auto tile_outer = outer / 128U;
+  const auto tile_inner = (inner_block / 4U) * 4U;
+  const auto within = (outer % 32U) * 16U +
+                      ((outer % 128U) / 32U) * 4U + inner_block % 4U;
+  return (tile_inner + tile_outer * scale_inner_dimension) * 128U + within;
+}
+
+void quantize_fp8_blocks32(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &quantized = tensors.at(op.outputs[0]);
+  auto &scales = tensors.at(op.outputs[1]);
+  std::fill(scales.bytes.begin(), scales.bytes.end(), 0U);
+  const auto columns = input.dims.back();
+  const auto rows = input.element_count() / columns;
+  const auto blocks = (columns + 31U) / 32U;
+  const auto scale_inner_dimension = scales.dims.at(1);
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    for (std::uint64_t block = 0U; block < blocks; ++block) {
+      const auto begin = block * 32U;
+      const auto end = std::min(columns, begin + 32U);
+      float maximum = 0.0F;
+      for (auto column = begin; column < end; ++column)
+        maximum = std::max(
+            maximum, std::fabs(load_float(input, row * columns + column)));
+      const auto encoded_scale =
+          float_to_fp8_e8m0_round_up(maximum / 448.0F);
+      scales.mutable_data()[fp8_block_scale_offset(
+          row, block, scale_inner_dimension)] = encoded_scale;
+      const auto scale = fp8_e8m0_to_float(encoded_scale);
+      for (auto column = begin; column < end; ++column)
+        quantized.mutable_data()[row * columns + column] =
+            float_to_fp8_e4m3(load_float(input, row * columns + column) /
+                              scale);
+    }
+  }
+}
+
+void linear_fp8_block_scaled(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &input_scales = tensors.at(op.inputs[2]);
+  const auto &weight_scales = tensors.at(op.inputs[3]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto rows = input.element_count() / input.dims.back();
+  const auto inner = input.dims.back();
+  const auto columns = weight.dims.front();
+  const auto blocks = (inner + 31U) / 32U;
+  const auto scale_inner_dimension = input_scales.dims.at(1);
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      float accumulator = 0.0F;
+      for (std::uint64_t block = 0U; block < blocks; ++block) {
+        const auto input_scale = fp8_e8m0_to_float(input_scales.data()[
+            fp8_block_scale_offset(row, block, scale_inner_dimension)]);
+        const auto weight_scale = fp8_e8m0_to_float(weight_scales.data()[
+            fp8_block_scale_offset(column, block, scale_inner_dimension)]);
+        const auto begin = block * 32U;
+        const auto end = std::min(inner, begin + 32U);
+        float partial = 0.0F;
+        for (auto index = begin; index < end; ++index)
+          partial += fp8_e4m3_to_float(input.data()[row * inner + index]) *
+                     fp8_e4m3_to_float(
+                         weight.data()[column * inner + index]);
+        accumulator += partial * input_scale * weight_scale;
+      }
+      store_float(out, row * columns + column, accumulator);
+    }
+  }
+}
+
 void reshape(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[0]);
   auto &out = tensors.at(op.outputs[0]);
@@ -259,11 +631,13 @@ void boolean_mask_to_bias(const ir::Operation &op, TensorMap &tensors) {
   const auto batch = out.dims[0];
   const auto sequence = out.dims[2];
   const bool vector_mask = mask.dims.size() == 2U;
+  const bool mask_queries = op.boolean(ir::AttrKey::MaskQueries, true);
   for (std::uint64_t b = 0; b < batch; ++b) {
     for (std::uint64_t query = 0; query < sequence; ++query) {
       for (std::uint64_t key = 0; key < sequence; ++key) {
         const bool valid = vector_mask
-                               ? values[b * sequence + query] != 0U &&
+                               ? (!mask_queries ||
+                                  values[b * sequence + query] != 0U) &&
                                      values[b * sequence + key] != 0U
                                : values[(b * sequence + query) * sequence +
                                         key] != 0U;
@@ -729,6 +1103,48 @@ void layer_norm(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void layer_norm_modulate(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &bias = tensors.at(op.inputs[2]);
+  const auto &scale = tensors.at(op.inputs[3]);
+  const auto &shift = tensors.at(op.inputs[4]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto columns = input.dims.back();
+  const auto rows = input.element_count() / columns;
+  const auto modulation_rows = scale.element_count() / columns;
+  const auto rows_per_modulation = rows / modulation_rows;
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    float mean = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column)
+      mean += load_float(input, row * columns + column);
+    mean /= static_cast<float>(columns);
+    float variance = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto centered = load_float(input, row * columns + column) - mean;
+      variance += centered * centered;
+    }
+    const auto inverse =
+        1.0F / std::sqrt(variance / static_cast<float>(columns) + epsilon);
+    const auto modulation_row = row / rows_per_modulation;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto index = row * columns + column;
+      const auto modulation_index = modulation_row * columns + column;
+      const auto normalized = round_to_storage_dtype(
+          (load_float(input, index) - mean) * inverse *
+                  load_float(weight, column) +
+              load_float(bias, column),
+          input.dtype);
+      const auto one_plus_scale = round_to_storage_dtype(
+          1.0F + load_float(scale, modulation_index), input.dtype);
+      const auto scaled = round_to_storage_dtype(
+          normalized * one_plus_scale, input.dtype);
+      store_float(out, index, scaled + load_float(shift, modulation_index));
+    }
+  }
+}
+
 void fill(const ir::Operation &op, TensorMap &tensors) {
   auto &out = tensors.at(op.outputs[0]);
   const auto value = static_cast<float>(op.f64(ir::AttrKey::Value, 0.0));
@@ -850,11 +1266,13 @@ void swiglu(const ir::Operation &op, TensorMap &tensors) {
   const auto &input_tensor = tensors.at(op.inputs[0]);
   auto &out = tensors.at(op.outputs[0]);
   const auto width = tensors.at(op.outputs[0]).dims.back();
+  const auto input_width = input_tensor.dims.back();
+  const auto start = op.u64(ir::AttrKey::Start, 0U);
   const auto rows = out.element_count() / width;
   const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
   for (std::uint64_t row = 0; row < rows; ++row) {
     for (std::uint64_t col = 0; col < width; ++col) {
-      const auto base = row * width * 2U;
+      const auto base = row * input_width + start;
       const float value = load_float(
           input_tensor, base + (gate_first ? width : 0U) + col);
       const float gate = load_float(
@@ -1113,10 +1531,15 @@ void swiglu_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[1]);
   auto &grad_input = tensors.at(op.outputs[0]);
   const auto width = grad_output.dims.back();
+  const auto input_width = input.dims.back();
+  const auto start = op.u64(ir::AttrKey::Start, 0U);
   const auto rows = grad_output.element_count() / width;
   const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
   for (std::uint64_t row = 0U; row < rows; ++row) {
-    const auto base = row * width * 2U;
+    const auto row_base = row * input_width;
+    for (std::uint64_t column = 0U; column < input_width; ++column)
+      store_float(grad_input, row_base + column, 0.0F);
+    const auto base = row_base + start;
     for (std::uint64_t column = 0U; column < width; ++column) {
       const auto value_index = base + (gate_first ? width : 0U) + column;
       const auto gate_index = base + (gate_first ? 0U : width) + column;
@@ -1280,10 +1703,17 @@ void residual_gate(const ir::Operation &op, TensorMap &tensors) {
   const auto &branch = tensors.at(op.inputs[1]);
   const auto &gate = tensors.at(op.inputs[2]);
   auto &out = tensors.at(op.outputs[0]);
-  for (std::uint64_t i = 0; i < out.element_count(); ++i)
+  const auto width = out.dims.back();
+  const auto rows = out.element_count() / width;
+  const auto gate_rows = gate.element_count() / width;
+  const auto rows_per_gate = rows / gate_rows;
+  for (std::uint64_t i = 0; i < out.element_count(); ++i) {
+    const auto row = i / width;
+    const auto gate_index = (row / rows_per_gate) * width + i % width;
     store_float(out, i,
                 load_float(residual, i) +
-                    load_float(gate, i) * load_float(branch, i));
+                    load_float(gate, gate_index) * load_float(branch, i));
+  }
 }
 
 void linear(const ir::Operation &op, TensorMap &tensors) {
@@ -1312,14 +1742,62 @@ void qk_norm_rope(const ir::Operation &op, TensorMap &tensors) {
   const auto &cosv = tensors.at(op.inputs[2]);
   const auto &sinv = tensors.at(op.inputs[3]);
   auto &out = tensors.at(op.outputs[0]);
-  const auto sequence = input_tensor.dims[0];
-  const auto heads = input_tensor.dims[1];
-  const auto dim = input_tensor.dims[2];
+  const auto heads = input_tensor.dims[input_tensor.dims.size() - 2U];
+  const auto dim = input_tensor.dims.back();
+  const auto sequence = input_tensor.element_count() / (heads * dim);
+  const auto input_sequence = input_tensor.dims.size() == 4U
+                                  ? input_tensor.dims[1]
+                                  : input_tensor.dims[0];
+  const auto table_sequence = cosv.dims.size() == 3U ? cosv.dims[1]
+                                                      : cosv.dims[0];
+  const auto table_start = op.u64(ir::AttrKey::Start, 0U);
+  const auto table_token = [&](std::uint64_t token) {
+    return (token / input_sequence) * table_sequence + table_start +
+           token % input_sequence;
+  };
   const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
   const auto half = rotary / 2U;
-  const auto table_width = tensors.at(op.inputs[2]).dims[1];
+  const auto table_width = tensors.at(op.inputs[2]).dims.back();
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto implementation = op.u64(ir::AttrKey::Implementation, 1U);
+  const auto rotary_layout = static_cast<ir::RotaryLayout>(op.u64(
+      ir::AttrKey::RotaryLayout,
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit)));
   std::vector<float> normalized(dim);
+  if (implementation == 2U &&
+      rotary_layout == ir::RotaryLayout::Interleaved) {
+    for (std::uint64_t token = 0U; token < sequence; ++token) {
+      for (std::uint64_t head = 0U; head < heads; ++head) {
+        const auto base = (token * heads + head) * dim;
+        float sum = 0.0F;
+        for (std::uint64_t d = 0U; d < dim; ++d) {
+          const auto value = load_float(input_tensor, base + d);
+          sum += value * value;
+        }
+        const auto inverse =
+            1.0F / std::sqrt(sum / static_cast<float>(dim) + epsilon);
+        for (std::uint64_t d = 0U; d < dim; ++d) {
+          const auto rms = round_to_storage_dtype(
+              load_float(input_tensor, base + d) * inverse,
+              input_tensor.dtype);
+          normalized[d] = round_to_storage_dtype(
+              rms * load_float(weight, d), input_tensor.dtype);
+        }
+        for (std::uint64_t pair = 0U; pair < table_width; ++pair) {
+          const auto even = normalized[2U * pair];
+          const auto odd = normalized[2U * pair + 1U];
+          const auto table = table_token(token) * table_width + pair;
+          const auto c = load_float(cosv, table);
+          const auto s = load_float(sinv, table);
+          store_float(out, base + 2U * pair, even * c - odd * s);
+          store_float(out, base + 2U * pair + 1U, even * s + odd * c);
+        }
+        for (std::uint64_t d = rotary; d < dim; ++d)
+          store_float(out, base + d, normalized[d]);
+      }
+    }
+    return;
+  }
   for (std::uint64_t sequence_index = 0; sequence_index < sequence; ++sequence_index) {
     for (std::uint64_t head = 0; head < heads; ++head) {
       const auto base = (sequence_index * heads + head) * dim;
@@ -1333,9 +1811,9 @@ void qk_norm_rope(const ir::Operation &op, TensorMap &tensors) {
                         load_float(weight, d);
       for (std::uint64_t d = 0; d < half; ++d) {
         const float cosine =
-            load_float(cosv, sequence_index * table_width + d);
+            load_float(cosv, table_token(sequence_index) * table_width + d);
         const float sine =
-            load_float(sinv, sequence_index * table_width + d);
+            load_float(sinv, table_token(sequence_index) * table_width + d);
         store_float(out, base + d,
                     normalized[d] * cosine - normalized[d + half] * sine);
         const auto second_index = table_width == rotary ? d + half : d;
@@ -1343,10 +1821,12 @@ void qk_norm_rope(const ir::Operation &op, TensorMap &tensors) {
             out, base + d + half,
             normalized[d + half] *
                     load_float(cosv,
-                               sequence_index * table_width + second_index) +
+                               table_token(sequence_index) * table_width +
+                                   second_index) +
                 normalized[d] *
                     load_float(sinv,
-                               sequence_index * table_width + second_index));
+                               table_token(sequence_index) * table_width +
+                                   second_index));
       }
       for (std::uint64_t d = rotary; d < dim; ++d)
         store_float(out, base + d, normalized[d]);
@@ -2200,6 +2680,30 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
     case ir::Opcode::Sigmoid:
       sigmoid(op, tensors);
       break;
+    case ir::Opcode::QuantizeInt8Rows:
+      quantize_int8_rows(op, tensors);
+      break;
+    case ir::Opcode::LinearInt8Scaled:
+      linear_int8_scaled(op, tensors);
+      break;
+    case ir::Opcode::LinearInt8WeightScaled:
+      linear_int8_weight_scaled(op, tensors);
+      break;
+    case ir::Opcode::QuantizeFp8Rows:
+      quantize_fp8_rows(op, tensors);
+      break;
+    case ir::Opcode::LinearFp8Scaled:
+      linear_fp8_scaled(op, tensors);
+      break;
+    case ir::Opcode::QuantizeFp8Blocks32:
+      quantize_fp8_blocks32(op, tensors);
+      break;
+    case ir::Opcode::LinearFp8BlockScaled:
+      linear_fp8_block_scaled(op, tensors);
+      break;
+    case ir::Opcode::DequantizeInt8Blocks:
+      dequantize_int8_blocks(op, tensors);
+      break;
     case ir::Opcode::Reshape:
       reshape(op, tensors);
       break;
@@ -2223,6 +2727,9 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::LayerNorm:
       layer_norm(op, tensors);
+      break;
+    case ir::Opcode::LayerNormModulate:
+      layer_norm_modulate(op, tensors);
       break;
     case ir::Opcode::Clamp:
       clamp(op, tensors);

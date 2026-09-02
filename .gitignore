@@ -5,6 +5,7 @@
 /.cache/
 *.md
 !/README.md
+!/PERFORMANCE.md
 *.log
 *.safetensors
 *.ckpt
