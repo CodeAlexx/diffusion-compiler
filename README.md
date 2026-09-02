@@ -287,6 +287,29 @@ name.
   and the largest tensors. Tensor names appear only as examples; no model
   semantics are inferred from them.
 
+## Validation surfaces: difquality and difregress
+
+Phase E closes the roadmap's tool sequence.
+
+- `difquality CANDIDATE [--reference FILE] [--json]` is the generic image,
+  video, and audio gate assistant. It computes decodability and sanity
+  (constant image, silent audio), and against a reference PSNR, an 8x8-window
+  SSIM, SNR, and for MP4s ffmpeg-sampled frame and audio-track comparisons.
+  The verdict is `PASS`, `FAIL`, or `MANUAL REVIEW REQUIRED`: a numeric
+  failure or a recorded rejection fails, and `PASS` requires both numeric
+  admission (or sanity when no reference exists) and a recorded human review.
+  Scalar metrics never replace perceptual inspection.
+- `difregress run SUITE.json --tier smoke|model NAME|full [--baseline FILE]
+  [--json]` runs strict correctness checks (exit status, JSON assertions) and
+  noise-aware performance checks against recorded baselines (`difregress
+  record`). A check that cannot run on the host is `BLOCKED`, never `PASS`.
+  `perf/regress/suite.json` holds this repository's suite; its model tiers
+  wrap the difbench recipes.
+- Oracle fixtures follow one manifest protocol
+  (`scripts/oracle_fixture_manifest.py` writes it, `difbisect validate-oracle`
+  checks it) so per-model oracle scripts stay development-only while the
+  tools that consume their output stay model-neutral.
+
 ## Build and test
 
 Requirements are CMake 3.24 or newer, a C++20 compiler, and Ninja or another
@@ -330,6 +353,8 @@ Core tools include:
 - `difopt --formats` / `--formats-table`, `diftune --json`, and
   `difweights stats` for target-aware physical-format competition, tuning
   reports, and checkpoint storage statistics.
+- `difquality` and `difregress` for the final artifact gate and tiered
+  regression, plus `difbisect validate-oracle` for oracle fixture manifests.
 - `difweights`, `difcast`, `difcompare`, and `difquant` for model storage and
   numerical gates.
 - `difschedule` for authenticated flow schedules.

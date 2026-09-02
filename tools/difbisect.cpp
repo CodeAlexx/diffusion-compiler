@@ -11,6 +11,7 @@
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/json.hpp"
+#include "dif/support/sha256.hpp"
 #include "dif/telemetry/schema.hpp"
 #include "dif/telemetry/vocabulary.hpp"
 #include "dif/weights/bundle.hpp"
@@ -36,6 +37,7 @@ void usage() {
       << "usage: difbisect pairs --native FILE.safetensors --oracle FILE.safetensors\n"
          "                       --order NAME[,NAME...] [bars] [--json] [--report FILE]\n"
          "       difbisect manifest MANIFEST.json [bars] [--json] [--report FILE]\n"
+         "       difbisect validate-oracle MANIFEST.json [--json]\n"
          "       difbisect program --backend cpu|cuda --program FILE.difir\n"
          "                       [--weight-bundle FILE.difbind] [--input ID=FILE ...]\n"
          "                       --oracle FILE.safetensors --map TENSOR_ID=NAME [--map ...]\n"
@@ -678,6 +680,165 @@ int command_program(int argc, char **argv) {
 
 } // namespace
 
+// --- oracle fixture protocol ------------------------------------------------
+// Per-model oracle scripts emit a manifest beside their safetensors payload;
+// this validates the standard fields and the payload identity so a bisect
+// consumes a fixture whose provenance is stated, not assumed.
+
+int command_validate_oracle(int argc, char **argv) {
+  if (argc < 3) {
+    usage();
+    return 2;
+  }
+  const std::filesystem::path manifest_path = argv[2];
+  bool json = false;
+  for (int index = 3; index < argc; ++index)
+    if (std::string(argv[index]) == "--json")
+      json = true;
+  std::ifstream stream(manifest_path, std::ios::binary);
+  if (!stream)
+    dif::fail("cannot open oracle manifest " + manifest_path.string());
+  std::stringstream buffer;
+  buffer << stream.rdbuf();
+  const auto parsed = dif::json::parse(buffer.str());
+  auto document = dif::telemetry::make_document("oracle-fixture-report");
+  document.set("manifest", std::filesystem::absolute(manifest_path).string());
+  dif::telemetry::Array checks;
+  bool valid = true;
+  const auto record = [&](const std::string &name, bool ok, const std::string &detail) {
+    dif::telemetry::Object entry;
+    entry.set("check", name);
+    entry.set("ok", ok);
+    entry.set("detail", detail);
+    checks.push_back(std::move(entry));
+    valid = valid && ok;
+  };
+  const auto string_field = [&](const dif::json::Value &object, const char *key,
+                                const std::string &label) -> std::string {
+    const auto *value = object.find(key);
+    if (!value || !std::holds_alternative<std::string>(value->storage) ||
+        value->string().empty()) {
+      record(label, false, std::string("missing or empty '") + key + "'");
+      return {};
+    }
+    record(label, true, value->string());
+    return value->string();
+  };
+  if (!parsed.is_object()) {
+    record("manifest", false, "not a JSON object");
+  } else {
+    const auto *kind = parsed.find("kind");
+    record("kind", kind && std::holds_alternative<std::string>(kind->storage) &&
+                       kind->string() == "diffusion-compiler-oracle-fixture",
+           "kind must be diffusion-compiler-oracle-fixture");
+    const auto *version = parsed.find("version");
+    record("version", version && std::holds_alternative<double>(version->storage) &&
+                          version->number() == 1.0,
+           "version must be 1");
+    if (const auto *creator = parsed.find("creator"); creator && creator->is_object()) {
+      string_field(*creator, "repository", "creator.repository");
+      string_field(*creator, "revision", "creator.revision");
+    } else {
+      record("creator", false, "missing 'creator' object");
+    }
+    if (const auto *model = parsed.find("model"); model && model->is_object())
+      string_field(*model, "name", "model.name");
+    else
+      record("model", false, "missing 'model' object");
+    string_field(parsed, "semantic_boundary", "semantic_boundary");
+    string_field(parsed, "dtype", "dtype");
+    string_field(parsed, "fixture_version", "fixture_version");
+    if (const auto *inputs = parsed.find("inputs"); inputs && inputs->is_array()) {
+      for (const auto &input : inputs->array()) {
+        const auto *name = input.find("name");
+        const auto *sha = input.find("sha256");
+        record("input", name && sha && std::holds_alternative<std::string>(sha->storage) &&
+                            sha->string().size() == 64U,
+               name ? "input " + name->string() : "input without a name");
+      }
+    } else {
+      record("inputs", false, "missing 'inputs' array");
+    }
+    std::optional<dif::weights::SafeTensorFile> payload_file;
+    if (const auto *payload = parsed.find("payload"); payload && payload->is_object()) {
+      const auto path_text = string_field(*payload, "path", "payload.path");
+      const auto expected = string_field(*payload, "sha256", "payload.sha256");
+      if (!path_text.empty()) {
+        auto path = std::filesystem::path(path_text);
+        if (!path.is_absolute())
+          path = manifest_path.parent_path() / path;
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(path, error)) {
+          record("payload.exists", false, path.string());
+        } else {
+          record("payload.exists", true, path.string());
+          const auto actual = dif::hex_digest(dif::sha256_file(path));
+          record("payload.sha256_matches", actual == expected,
+                 actual == expected ? actual : "actual " + actual);
+          try {
+            payload_file.emplace(dif::weights::read_safetensors(path));
+          } catch (const std::exception &error) {
+            record("payload.safetensors", false, error.what());
+          }
+        }
+      }
+    } else {
+      record("payload", false, "missing 'payload' object");
+    }
+    if (const auto *boundaries = parsed.find("boundaries");
+        boundaries && boundaries->is_array() && !boundaries->array().empty()) {
+      for (const auto &boundary : boundaries->array()) {
+        const auto *name = boundary.find("name");
+        const auto *tensor = boundary.find("tensor");
+        if (!name || !tensor) {
+          record("boundary", false, "boundary without name or tensor");
+          continue;
+        }
+        if (!payload_file) {
+          record("boundary " + name->string(), false, "payload not readable");
+          continue;
+        }
+        const auto *entry = payload_file->find(tensor->string());
+        if (!entry) {
+          record("boundary " + name->string(), false,
+                 "payload has no tensor " + tensor->string());
+          continue;
+        }
+        bool shape_ok = true;
+        if (const auto *shape = boundary.find("shape"); shape && shape->is_array()) {
+          std::vector<std::uint64_t> dims;
+          for (const auto &dim : shape->array())
+            dims.push_back(static_cast<std::uint64_t>(dim.number()));
+          shape_ok = dims == entry->dims;
+        }
+        bool dtype_ok = true;
+        if (const auto *dtype = boundary.find("dtype");
+            dtype && std::holds_alternative<std::string>(dtype->storage))
+          dtype_ok = dtype->string() == dif::ir::dtype_name(entry->dtype);
+        record("boundary " + name->string(), shape_ok && dtype_ok,
+               shape_ok && dtype_ok ? "tensor " + tensor->string() + " present with declared shape and dtype"
+                                    : "declared shape or dtype differs from the payload");
+      }
+    } else {
+      record("boundaries", false, "missing or empty 'boundaries' array");
+    }
+  }
+  document.set("checks", std::move(checks));
+  document.set("valid", valid);
+  document.set("oracle", dif::telemetry::from_parsed(parsed));
+  const auto text = dif::telemetry::serialize(dif::telemetry::Value(document));
+  if (json) {
+    std::cout << text;
+  } else {
+    for (const auto &entry : document.find("checks")->array())
+      std::cout << (entry.object().find("ok")->boolean() ? "ok    " : "FAIL  ")
+                << entry.object().find("check")->string() << ": "
+                << entry.object().find("detail")->string() << "\n";
+    std::cout << "ORACLE_FIXTURE " << (valid ? "VALID" : "INVALID") << "\n";
+  }
+  return valid ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc < 2) {
@@ -685,6 +846,8 @@ int main(int argc, char **argv) {
       return 2;
     }
     const std::string command = argv[1];
+    if (command == "validate-oracle")
+      return command_validate_oracle(argc, argv);
     if (command == "pairs")
       return command_pairs(argc, argv);
     if (command == "manifest")

@@ -1,0 +1,24 @@
+{
+  "schema": {
+    "name": "diffusion-compiler-telemetry",
+    "version": 1
+  },
+  "kind": "regression-baselines",
+  "provenance": {
+    "compiler": "diffusion-compiler",
+    "version": "0.1.0",
+    "revision": "9c8412f5e53aca2159f1e2b8547cf4690c19ed0f",
+    "generated_at": "2026-09-02T18:35:52Z"
+  },
+  "suite": "diffusion-compiler",
+  "checks": {
+    "formats-table-cuda": {
+      "samples": [0.209019493, 0.21060838700000001, 0.20848472300000001],
+      "median": 0.209019493,
+      "min": 0.20848472300000001,
+      "max": 0.21060838700000001,
+      "recorded_at": "2026-09-02T18:35:52Z",
+      "revision": "9c8412f5e53aca2159f1e2b8547cf4690c19ed0f"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "kind": "diffusion-compiler-regression-suite",
+  "version": 1,
+  "name": "diffusion-compiler",
+  "variables": {
+    "REPO": "${suite_dir}/../.."
+  },
+  "checks": [
+    {"name": "target-tests", "tier": "smoke", "argv": ["${build}/dif_target_tests"]},
+    {"name": "telemetry-tests", "tier": "smoke", "argv": ["${build}/dif_telemetry_tests"]},
+    {"name": "bisect-tests", "tier": "smoke", "argv": ["${build}/dif_bisect_tests"]},
+    {"name": "format-tests", "tier": "smoke", "argv": ["${build}/dif_format_tests"]},
+    {"name": "probe-json", "tier": "smoke",
+     "argv": ["${build}/difprobe", "--json"],
+     "expect_json": {"kind": "device-probe"}},
+    {"name": "formats-table-cuda", "tier": "smoke",
+     "argv": ["${build}/difopt", "--formats-table", "--backend", "cuda", "--json"],
+     "expect_json": {"kind": "physical-formats"},
+     "performance": {"metric": "wall_seconds", "samples": 3, "tolerance": 0.25}},
+    {"name": "h3-fl2va-prompt-to-mp4", "tier": "model", "model": "h3",
+     "argv": ["${build}/difbench", "run", "${REPO}/perf/recipes/h3-fl2va-convrot-int8-ck.json",
+              "--workdir", "${workdir}", "--json", "--cooldown-seconds", "0"],
+     "blocked_exit": [2],
+     "expect_json": {"status": "completed"},
+     "performance": {"metric": "json:summary.complete_wall_seconds.minimum", "samples": 1, "tolerance": 0.05}},
+    {"name": "krea2-prompt-to-png", "tier": "model", "model": "krea2",
+     "argv": ["${build}/difbench", "run", "${REPO}/perf/recipes/krea2-turbo-bf16-1024.json",
+              "--workdir", "${workdir}", "--json", "--cooldown-seconds", "0"],
+     "blocked_exit": [2],
+     "expect_json": {"status": "completed"},
+     "performance": {"metric": "json:summary.complete_wall_seconds.minimum", "samples": 1, "tolerance": 0.05}}
+  ]
+}

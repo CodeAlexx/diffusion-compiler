@@ -82,6 +82,7 @@ add_library(difcore
     src/bench/process.cpp
     src/bench/recipe.cpp
     src/bench/report.cpp
+    src/quality/metrics.cpp
     src/tune/database.cpp
     src/training/autodiff.cpp
     src/training/checkpoint.cpp
@@ -208,6 +209,12 @@ target_link_libraries(difplan PRIVATE difcore)
 
 add_executable(difbisect tools/difbisect.cpp)
 target_link_libraries(difbisect PRIVATE difcore)
+
+add_executable(difquality tools/difquality.cpp)
+target_link_libraries(difquality PRIVATE difcore)
+
+add_executable(difregress tools/difregress.cpp)
+target_link_libraries(difregress PRIVATE difcore)
 
 add_executable(diftune tools/diftune.cpp)
 target_link_libraries(diftune PRIVATE difcore)
@@ -400,6 +407,16 @@ if(DIF_BUILD_TESTS)
       DIF_DIFOPT_PATH="$<TARGET_FILE:difopt>")
   add_dependencies(dif_telemetry_tests difbench diftrace difplan difrun difopt)
   add_test(NAME dif_telemetry_tests COMMAND dif_telemetry_tests)
+
+  add_executable(dif_quality_tests tests/quality_tests.cpp)
+  target_link_libraries(dif_quality_tests PRIVATE difcore)
+  target_compile_definitions(
+      dif_quality_tests PRIVATE
+      DIF_DIFQUALITY_PATH="$<TARGET_FILE:difquality>"
+      DIF_DIFREGRESS_PATH="$<TARGET_FILE:difregress>"
+      DIF_DIFBISECT_PATH="$<TARGET_FILE:difbisect>")
+  add_dependencies(dif_quality_tests difquality difregress difbisect)
+  add_test(NAME dif_quality_tests COMMAND dif_quality_tests)
 
   add_executable(dif_format_tests tests/format_tests.cpp)
   target_link_libraries(dif_format_tests PRIVATE difcore)
