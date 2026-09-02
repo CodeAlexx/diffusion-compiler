@@ -228,6 +228,16 @@ struct RunOptions {
   bool trace_operations{false};
   bool overlap_streaming{true};
   bool profile_pipeline{false};
+  // Collect attributed TraceEvent records at the centralized submission
+  // sites (launches, library dispatches, copies, waits, staging) for this
+  // run. Host-side timestamps only; never alters what is submitted. The
+  // DIF_TRACE_FILE environment variable enables the same collection for any
+  // tool and appends one runtime-trace document per run() to that file.
+  bool trace_events{false};
+  // Push an NVTX range per semantic operation and per phase so Nsight
+  // Systems can correlate kernels with DiffIR operations. Requires the NVTX
+  // headers at build time; silently unavailable otherwise.
+  bool nvtx_ranges{false};
   // W1-R streamed-transport policy. Default preserves the historical
   // behavior exactly: mapped streamed constants madvise(MADV_DONTNEED)
   // their source ranges after every staging copy. This drops process page
@@ -493,6 +503,25 @@ struct PipelineProfile {
   double non_kernel_device_timeline_milliseconds{};
 };
 
+// One attributed runtime event recorded at a centralized submission site.
+// Host timestamps are milliseconds since the start of the run() (or
+// prepare()) call that produced the event; a submission that does not block
+// the host has host_end_ms equal to host_start_ms. Category names come from
+// dif/telemetry/vocabulary.hpp.
+struct TraceEvent {
+  std::string category;
+  std::string name;
+  // Semantic operation being executed when the event was submitted; zero
+  // when the event belongs to no operation (input upload, output readback,
+  // preparation).
+  std::uint32_t operation_id{};
+  std::string opcode;
+  double host_start_ms{};
+  double host_end_ms{};
+  std::uint64_t bytes{};
+  std::string stream;
+};
+
 struct RunResult {
   target::TargetProfile target_profile;
   target::RuntimeBudget runtime_budget;
@@ -531,6 +560,11 @@ struct RunResult {
   // iterations, input upload, and output readback included).
   LaunchTelemetry preparation_telemetry;
   LaunchTelemetry run_telemetry;
+  // Populated only when RunOptions::trace_events (or DIF_TRACE_FILE) is set.
+  std::vector<TraceEvent> preparation_trace_events;
+  std::vector<TraceEvent> trace_events;
+  double preparation_trace_milliseconds{};
+  double trace_milliseconds{};
 };
 
 class PreparedExecution {

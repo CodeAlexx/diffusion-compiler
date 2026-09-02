@@ -14,7 +14,12 @@
 #endif
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
+#include "dif/telemetry/trace_sink.hpp"
+#include "dif/telemetry/vocabulary.hpp"
 #include "dif/weights/safetensors.hpp"
+#if DIF_HAS_NVTX
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 #include <cuda.h>
 #include <cublasLt.h>
@@ -97,6 +102,198 @@ private:
   LaunchTelemetry *previous_;
 };
 
+// --- Attributed trace events ----------------------------------------------
+// Sibling of the launch counters. When a Tracer is active the same wrappers
+// also append a TraceEvent naming the semantic operation that submitted the
+// work, so an agent can attribute GEMM, attention, generated-kernel, copy,
+// staging, wait, and synchronization submissions to DiffIR operations.
+// Collection is host-side bookkeeping only; it never changes what is
+// submitted or in which order. NVTX ranges use the same operation scope so
+// Nsight Systems can correlate device kernels with DiffIR operations.
+bool nvtx_enabled = false;
+
+void nvtx_push(const char *name) {
+#if DIF_HAS_NVTX
+  if (nvtx_enabled)
+    nvtxRangePushA(name);
+#else
+  (void)name;
+#endif
+}
+
+void nvtx_pop() {
+#if DIF_HAS_NVTX
+  if (nvtx_enabled)
+    nvtxRangePop();
+#endif
+}
+
+bool layout_opcode(ir::Opcode opcode) {
+  switch (opcode) {
+  case ir::Opcode::Reshape:
+  case ir::Opcode::BroadcastTo:
+  case ir::Opcode::Slice:
+  case ir::Opcode::Permute:
+  case ir::Opcode::Concat:
+  case ir::Opcode::Patchify3D:
+  case ir::Opcode::Unpatchify3D:
+  case ir::Opcode::H3DeinterleaveQkv:
+  case ir::Opcode::H3DeinterleaveQkvWeight:
+  case ir::Opcode::SelectRowChunks:
+  case ir::Opcode::GatherRows:
+  case ir::Opcode::IndexedUpdateRows:
+  case ir::Opcode::PadConstant:
+  case ir::Opcode::PadReflect:
+    return true;
+  default:
+    return false;
+  }
+}
+
+struct Tracer {
+  std::vector<TraceEvent> events;
+  std::chrono::steady_clock::time_point origin{
+      std::chrono::steady_clock::now()};
+  bool in_operation{};
+  std::uint32_t operation_id{};
+  ir::Opcode opcode{};
+  // Context for submissions outside an operation or for naming a specific
+  // mechanism inside one (streamed staging, resident upload, readback).
+  const char *label{nullptr};
+
+  double now_ms() const {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - origin)
+        .count();
+  }
+
+  void record(std::string_view category, std::string_view api,
+              std::uint64_t bytes, std::string_view stream, double start_ms,
+              double end_ms) {
+    TraceEvent event;
+    if (category == telemetry::category::generated_kernel && in_operation &&
+        layout_opcode(opcode))
+      category = telemetry::category::layout;
+    event.category = std::string(category);
+    event.name = label ? std::string(label) + ":" + std::string(api)
+                       : std::string(api);
+    event.operation_id = in_operation ? operation_id : 0U;
+    if (in_operation)
+      event.opcode = std::string(ir::opcode_name(opcode));
+    event.host_start_ms = start_ms;
+    event.host_end_ms = end_ms;
+    event.bytes = bytes;
+    event.stream = std::string(stream);
+    events.push_back(std::move(event));
+  }
+};
+
+Tracer *active_tracer = nullptr;
+
+class TracerScope {
+public:
+  explicit TracerScope(Tracer &tracer) : previous_(active_tracer) {
+    active_tracer = &tracer;
+  }
+  ~TracerScope() { active_tracer = previous_; }
+  TracerScope(const TracerScope &) = delete;
+  TracerScope &operator=(const TracerScope &) = delete;
+
+private:
+  Tracer *previous_;
+};
+
+class TraceLabelScope {
+public:
+  explicit TraceLabelScope(const char *label) {
+    if (active_tracer) {
+      previous_ = active_tracer->label;
+      active_tracer->label = label;
+    }
+  }
+  ~TraceLabelScope() {
+    if (active_tracer)
+      active_tracer->label = previous_;
+  }
+  TraceLabelScope(const TraceLabelScope &) = delete;
+  TraceLabelScope &operator=(const TraceLabelScope &) = delete;
+
+private:
+  const char *previous_{nullptr};
+};
+
+// Attributes every submission inside a semantic operation to that operation
+// and records the operation's own host submission span.
+class TraceOperationScope {
+public:
+  explicit TraceOperationScope(const ir::Operation &operation)
+      : active_(active_tracer != nullptr) {
+    if (active_) {
+      previous_in_operation_ = active_tracer->in_operation;
+      previous_id_ = active_tracer->operation_id;
+      previous_opcode_ = active_tracer->opcode;
+      active_tracer->in_operation = true;
+      active_tracer->operation_id = operation.id;
+      active_tracer->opcode = operation.opcode;
+      start_ms_ = active_tracer->now_ms();
+    }
+    if (nvtx_enabled) {
+      name_ = "op" + std::to_string(operation.id) + " " +
+              std::string(ir::opcode_name(operation.opcode));
+      nvtx_push(name_.c_str());
+    }
+  }
+  ~TraceOperationScope() {
+    if (nvtx_enabled)
+      nvtx_pop();
+    if (active_) {
+      active_tracer->record(telemetry::category::operation, "submit", 0U,
+                            "compute", start_ms_, active_tracer->now_ms());
+      active_tracer->in_operation = previous_in_operation_;
+      active_tracer->operation_id = previous_id_;
+      active_tracer->opcode = previous_opcode_;
+    }
+  }
+  TraceOperationScope(const TraceOperationScope &) = delete;
+  TraceOperationScope &operator=(const TraceOperationScope &) = delete;
+
+private:
+  bool active_;
+  bool previous_in_operation_{};
+  std::uint32_t previous_id_{};
+  ir::Opcode previous_opcode_{};
+  double start_ms_{};
+  std::string name_;
+};
+
+void trace_submit(std::string_view category, std::string_view api,
+                  std::uint64_t bytes = 0U, std::string_view stream = "") {
+  if (!active_tracer)
+    return;
+  const auto now = active_tracer->now_ms();
+  active_tracer->record(category, api, bytes, stream, now, now);
+}
+
+// Records a host-blocking call as a wait spanning its actual duration.
+class TraceWaitScope {
+public:
+  explicit TraceWaitScope(std::string_view api) : api_(api) {
+    if (active_tracer)
+      start_ms_ = active_tracer->now_ms();
+  }
+  ~TraceWaitScope() {
+    if (active_tracer)
+      active_tracer->record(telemetry::category::wait, api_, 0U, "host",
+                            start_ms_, active_tracer->now_ms());
+  }
+  TraceWaitScope(const TraceWaitScope &) = delete;
+  TraceWaitScope &operator=(const TraceWaitScope &) = delete;
+
+private:
+  std::string_view api_;
+  double start_ms_{};
+};
+
 CUresult counted_launch_kernel(CUfunction function, unsigned grid_x,
                                unsigned grid_y, unsigned grid_z,
                                unsigned block_x, unsigned block_y,
@@ -105,6 +302,7 @@ CUresult counted_launch_kernel(CUfunction function, unsigned grid_x,
                                void **extra) {
   if (active_telemetry)
     ++active_telemetry->kernel_launches;
+  trace_submit(telemetry::category::generated_kernel, "cuLaunchKernel");
   return cuLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y,
                         block_z, shared_bytes, stream, parameters, extra);
 }
@@ -115,6 +313,7 @@ CUresult counted_memcpy_htod(CUdeviceptr destination, const void *source,
     ++active_telemetry->h2d_copies;
     active_telemetry->h2d_bytes += bytes;
   }
+  trace_submit(telemetry::category::h2d, "cuMemcpyHtoDAsync", bytes);
   return cuMemcpyHtoDAsync(destination, source, bytes, stream);
 }
 
@@ -124,6 +323,7 @@ CUresult counted_memcpy_dtoh(void *destination, CUdeviceptr source,
     ++active_telemetry->d2h_copies;
     active_telemetry->d2h_bytes += bytes;
   }
+  trace_submit(telemetry::category::d2h, "cuMemcpyDtoHAsync", bytes);
   return cuMemcpyDtoHAsync(destination, source, bytes, stream);
 }
 
@@ -133,12 +333,14 @@ CUresult counted_memcpy_dtod(CUdeviceptr destination, CUdeviceptr source,
     ++active_telemetry->d2d_copies;
     active_telemetry->d2d_bytes += bytes;
   }
+  trace_submit(telemetry::category::d2d, "cuMemcpyDtoDAsync", bytes);
   return cuMemcpyDtoDAsync(destination, source, bytes, stream);
 }
 
 CUresult counted_event_record(CUevent event, CUstream stream) {
   if (active_telemetry)
     ++active_telemetry->event_records;
+  trace_submit(telemetry::category::synchronization, "cuEventRecord");
   return cuEventRecord(event, stream);
 }
 
@@ -146,24 +348,28 @@ CUresult counted_stream_wait_event(CUstream stream, CUevent event,
                                    unsigned flags) {
   if (active_telemetry)
     ++active_telemetry->stream_wait_events;
+  trace_submit(telemetry::category::synchronization, "cuStreamWaitEvent");
   return cuStreamWaitEvent(stream, event, flags);
 }
 
 CUresult counted_event_synchronize(CUevent event) {
   if (active_telemetry)
     ++active_telemetry->host_event_synchronizes;
+  TraceWaitScope wait("cuEventSynchronize");
   return cuEventSynchronize(event);
 }
 
 CUresult counted_stream_synchronize(CUstream stream) {
   if (active_telemetry)
     ++active_telemetry->host_stream_synchronizes;
+  TraceWaitScope wait("cuStreamSynchronize");
   return cuStreamSynchronize(stream);
 }
 
 CUresult counted_mem_alloc(CUdeviceptr *pointer, std::size_t bytes) {
   if (active_telemetry)
     ++active_telemetry->device_mem_allocs;
+  trace_submit(telemetry::category::allocation, "cuMemAlloc", bytes);
   return cuMemAlloc(pointer, bytes);
 }
 
@@ -171,39 +377,46 @@ CUresult counted_mem_host_alloc(void **pointer, std::size_t bytes,
                                 unsigned flags) {
   if (active_telemetry)
     ++active_telemetry->pinned_mem_allocs;
+  trace_submit(telemetry::category::allocation, "cuMemHostAlloc", bytes);
   return cuMemHostAlloc(pointer, bytes, flags);
 }
 
 void count_cublaslt_matmul() {
   if (active_telemetry)
     ++active_telemetry->cublaslt_matmuls;
+  trace_submit(telemetry::category::gemm, "cublasLtMatmul");
 }
 
 void count_cudnn_attention_dispatch() {
   if (active_telemetry)
     ++active_telemetry->cudnn_attention_dispatches;
+  trace_submit(telemetry::category::attention, "cudnn-sdpa");
 }
 
 void count_cudnn_convolution_dispatch() {
   if (active_telemetry)
     ++active_telemetry->cudnn_convolution_dispatches;
+  trace_submit(telemetry::category::convolution, "cudnn-convolution");
 }
 
 void count_cutlass_launch() {
   if (active_telemetry)
     ++active_telemetry->cutlass_launches;
+  trace_submit(telemetry::category::gemm, "cutlass");
 }
 
 // One dispatch = the DSO's quantize-QK + quantize-V + attend launcher trio.
 void count_ck_attention_dispatch() {
   if (active_telemetry)
     ++active_telemetry->ck_attention_dispatches;
+  trace_submit(telemetry::category::attention, "ck-int8-dso");
 }
 
 template <typename... Arguments>
 cublasStatus_t counted_cublas_gemm_ex(Arguments &&...arguments) {
   if (active_telemetry)
     ++active_telemetry->cublas_gemms;
+  trace_submit(telemetry::category::gemm, "cublasGemmEx");
   return cublasGemmEx(std::forward<Arguments>(arguments)...);
 }
 
@@ -6558,9 +6771,11 @@ public:
     if (!has_streamed)
       return false;
     const auto host_wait_start = std::chrono::steady_clock::now();
-    if (copy_recorded_[parity])
+    if (copy_recorded_[parity]) {
+      TraceLabelScope reuse_label("streamed-staging-reuse");
       check(counted_event_synchronize(copy_done_[parity]->get()),
             "cuEventSynchronize streamed staging reuse");
+    }
     if (profiling_)
       host_wait_milliseconds_ +=
           std::chrono::duration<double, std::milli>(
@@ -6596,7 +6811,15 @@ public:
       auto *destination = static_cast<std::uint8_t *>(staging_[parity]->data()) +
                           offset;
       const auto host_stage_start = std::chrono::steady_clock::now();
+      const auto trace_stage_start =
+          active_tracer ? active_tracer->now_ms() : 0.0;
       staging_pool_.copy(destination, tensor.data(), tensor.byte_size());
+      if (active_tracer)
+        active_tracer->record(telemetry::category::staging,
+                              "streamed-constant:host-stage",
+                              tensor.byte_size(), "host", trace_stage_start,
+                              active_tracer->now_ms());
+      TraceLabelScope streamed_label("streamed-constant");
       if (profiling_) {
         host_stage_milliseconds_ +=
             std::chrono::duration<double, std::milli>(
@@ -6915,6 +7138,14 @@ public:
         context_(*context_owner_) {
     const auto preparation_start = std::chrono::steady_clock::now();
     TelemetryScope telemetry_scope(preparation_telemetry_);
+    std::optional<TracerScope> tracer_scope;
+    if (telemetry::trace_events_requested(options)) {
+      preparation_tracer_.origin = preparation_start;
+      tracer_scope.emplace(preparation_tracer_);
+    }
+    nvtx_enabled = telemetry::nvtx_ranges_requested(options);
+    TraceLabelScope preparation_label("prepare");
+    nvtx_push("dif::prepare");
     if (options.lazy_resident_upload && options.pipelined_resident_upload)
       fail("lazy and pipelined resident upload are mutually exclusive");
     if (options.cudnn_attention_heuristic > 4U)
@@ -8938,6 +9169,9 @@ public:
         std::chrono::duration<double, std::milli>(preparation_stop -
                                                   preparation_start)
             .count();
+    nvtx_pop();
+    if (tracer_scope)
+      preparation_trace_milliseconds_ = preparation_milliseconds_;
   }
 
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
@@ -8954,6 +9188,13 @@ public:
       fail("intermediate capture requires zero warmups and one iteration");
     LaunchTelemetry run_telemetry;
     TelemetryScope telemetry_scope(run_telemetry);
+    Tracer run_tracer;
+    std::optional<TracerScope> tracer_scope;
+    const bool tracing = telemetry::trace_events_requested(options);
+    if (tracing)
+      tracer_scope.emplace(run_tracer);
+    nvtx_enabled = telemetry::nvtx_ranges_requested(options);
+    nvtx_push("dif::run");
     streamed_prefetcher_->set_release_mapped_pages_per_copy(
         options.streamed_release_mapped_pages_per_copy);
     if (options.streamed_prefetch_depth != streamed_prefetch_depth_)
@@ -9247,6 +9488,7 @@ public:
     auto execute_operation = [&](const ir::Operation &op, bool profile) {
       if (skipped_operations_.contains(op.id))
         return;
+      TraceOperationScope operation_scope(op);
       const auto h3_groupwise_qkv = std::find_if(
           h3_groupwise_plans_.begin(), h3_groupwise_plans_.end(),
           [&](const H3GroupwiseBlockPlan &plan) {
@@ -10061,6 +10303,14 @@ public:
       print("prepare", preparation_telemetry_);
       print("run", run_telemetry);
     }
+    nvtx_pop();
+    if (tracing) {
+      result.trace_milliseconds = run_tracer.now_ms();
+      result.trace_events = std::move(run_tracer.events);
+      result.preparation_trace_events = preparation_tracer_.events;
+      result.preparation_trace_milliseconds = preparation_trace_milliseconds_;
+    }
+    telemetry::append_runtime_trace(result, program_, options);
     return result;
   }
 
@@ -10276,6 +10526,8 @@ private:
   std::unique_ptr<Workspace> promoted_constant_storage_;
   std::uint64_t promoted_constant_bytes_{};
   LaunchTelemetry preparation_telemetry_;
+  Tracer preparation_tracer_;
+  double preparation_trace_milliseconds_{};
   double preparation_milliseconds_{};
   double resident_upload_milliseconds_{};
   double resident_host_prefault_milliseconds_{};

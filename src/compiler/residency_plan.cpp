@@ -69,6 +69,8 @@ StreamedResidencyPlan plan_streamed_residency(
             });
 
   std::unordered_set<std::uint32_t> selected;
+  std::vector<StreamedResidencyDecision> decisions;
+  decisions.reserve(candidates.size());
   std::uint64_t resident_bytes = 0U;
   auto memory = plan_memory(program, 256U, stream_prefetch_distance, {}, {},
                             tensor_aliases, false);
@@ -96,8 +98,27 @@ StreamedResidencyPlan plan_streamed_residency(
     trial_required = checked_add(
         trial_required, trial_resident,
         "streamed residency complete required bytes overflow");
-    if (trial_required > maximum_total_bytes)
+    StreamedResidencyDecision decision;
+    decision.tensor_id = id;
+    decision.bytes = tensor->byte_count();
+    decision.first_consumer_operation = first;
+    decision.required_bytes_if_resident = trial_required;
+    decision.maximum_total_bytes = maximum_total_bytes;
+    if (trial_required > maximum_total_bytes) {
+      decision.resident = false;
+      decision.reason =
+          "admitting this constant would need " +
+          std::to_string(trial_required) + " bytes, above the " +
+          std::to_string(maximum_total_bytes) +
+          "-byte plan ceiling; it stays streamed";
+      decisions.push_back(std::move(decision));
       continue;
+    }
+    decision.resident = true;
+    decision.reason = "admitted as resident: complete plan needs " +
+                      std::to_string(trial_required) + " of " +
+                      std::to_string(maximum_total_bytes) + " bytes";
+    decisions.push_back(std::move(decision));
     selected = std::move(trial);
     resident_bytes = trial_resident;
     memory = trial_memory;
@@ -105,6 +126,10 @@ StreamedResidencyPlan plan_streamed_residency(
   }
 
   StreamedResidencyPlan result;
+  result.selection_order = order == StreamedResidencyOrder::LargestFirst
+                               ? "largest_first"
+                               : "first_consumer";
+  result.decisions = std::move(decisions);
   result.maximum_total_bytes = maximum_total_bytes;
   result.fixed_runtime_bytes = fixed_runtime_bytes;
   result.memory_plan_bytes = memory.total_bytes;

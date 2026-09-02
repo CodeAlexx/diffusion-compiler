@@ -12,6 +12,26 @@
 
 namespace dif::opt {
 
+// Recorded provenance of one compiler decision: why a tensor is resident or
+// streamed, why a candidate was selected or rejected, which precision policy
+// and target capabilities the plan requires. Decisions explain a plan and are
+// excluded from plan identity, so re-explaining never changes a fingerprint
+// and a plan with decisions replays exactly like one without them.
+struct PlanDecision {
+  // "tensor", "operation", "candidate", or "plan".
+  std::string subject;
+  // Tensor id, operation id, or candidate index; zero for the whole plan.
+  std::uint64_t subject_id{};
+  // Short verb-like outcome: "resident", "streamed", "selected", "accepted",
+  // "rejected", "required", "precision-policy".
+  std::string decision;
+  // The deciding code's own sentence. Never synthesized after the fact.
+  std::string reason;
+  // Ordered facts the decision was made from. Values are integer or decimal
+  // text (serialized as JSON numbers) or arbitrary text (serialized quoted).
+  std::vector<std::pair<std::string, std::string>> evidence;
+};
+
 struct PlanCompatibility {
   std::string compiler_revision;
   std::string target_fingerprint;
@@ -38,9 +58,12 @@ struct OptimizationPlan {
   // environment. A target-bound plan cannot be replayed through the legacy
   // environment-free overload.
   std::optional<PlanCompatibility> compatibility;
+  std::vector<PlanDecision> decisions;
 };
 
-std::string serialize_plan(const OptimizationPlan &plan);
+// include_decisions=false yields the identity form used by plan_fingerprint.
+std::string serialize_plan(const OptimizationPlan &plan,
+                           bool include_decisions = true);
 OptimizationPlan parse_plan(std::string_view text);
 void write_plan(const OptimizationPlan &plan,
                 const std::filesystem::path &path);

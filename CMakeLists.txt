@@ -71,7 +71,15 @@ add_library(difcore
     src/support/png.cpp
     src/support/torch_cpu_rng.cpp
     src/target/profile.cpp
+    src/telemetry/document.cpp
     src/telemetry/schema.cpp
+    src/telemetry/trace_sink.cpp
+    src/bench/artifact.cpp
+    src/bench/gpu_sampler.cpp
+    src/bench/host.cpp
+    src/bench/process.cpp
+    src/bench/recipe.cpp
+    src/bench/report.cpp
     src/tune/database.cpp
     src/training/autodiff.cpp
     src/training/checkpoint.cpp
@@ -113,6 +121,18 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_compile_definitions(
       difcore PUBLIC DIF_HAS_CUDA=1
       PRIVATE DIF_CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}")
+  # NVTX v3 is header-only; ranges are inert unless a tool such as Nsight
+  # Systems injects an implementation at run time.
+  find_path(DIF_NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h
+            HINTS ${CUDAToolkit_INCLUDE_DIRS})
+  if(DIF_NVTX_INCLUDE_DIR)
+    target_include_directories(difcore SYSTEM PRIVATE "${DIF_NVTX_INCLUDE_DIR}")
+    target_compile_definitions(difcore PRIVATE DIF_HAS_NVTX=1)
+    message(STATUS "Diffusion compiler NVTX ranges: ${DIF_NVTX_INCLUDE_DIR}")
+  else()
+    target_compile_definitions(difcore PRIVATE DIF_HAS_NVTX=0)
+    message(STATUS "Diffusion compiler NVTX ranges: disabled")
+  endif()
   find_path(DIF_CUTLASS_INCLUDE_DIR cutlass/cutlass.h
             HINTS "${DIF_CUTLASS_ROOT}" ENV CUTLASS_ROOT
             PATH_SUFFIXES include)
@@ -174,6 +194,15 @@ target_link_libraries(difinspect PRIVATE difcore)
 
 add_executable(difprobe tools/difprobe.cpp)
 target_link_libraries(difprobe PRIVATE difcore)
+
+add_executable(difbench tools/difbench.cpp)
+target_link_libraries(difbench PRIVATE difcore)
+
+add_executable(diftrace tools/diftrace.cpp)
+target_link_libraries(diftrace PRIVATE difcore)
+
+add_executable(difplan tools/difplan.cpp)
+target_link_libraries(difplan PRIVATE difcore)
 
 add_executable(diftune tools/diftune.cpp)
 target_link_libraries(diftune PRIVATE difcore)
@@ -354,6 +383,18 @@ if(DIF_BUILD_TESTS)
       DIF_DIFPROBE_PATH="$<TARGET_FILE:difprobe>")
   add_dependencies(dif_target_tests difprobe)
   add_test(NAME dif_target_tests COMMAND dif_target_tests)
+
+  add_executable(dif_telemetry_tests tests/telemetry_tests.cpp)
+  target_link_libraries(dif_telemetry_tests PRIVATE difcore)
+  target_compile_definitions(
+      dif_telemetry_tests PRIVATE
+      DIF_DIFBENCH_PATH="$<TARGET_FILE:difbench>"
+      DIF_DIFTRACE_PATH="$<TARGET_FILE:diftrace>"
+      DIF_DIFPLAN_PATH="$<TARGET_FILE:difplan>"
+      DIF_DIFRUN_PATH="$<TARGET_FILE:difrun>"
+      DIF_DIFOPT_PATH="$<TARGET_FILE:difopt>")
+  add_dependencies(dif_telemetry_tests difbench diftrace difplan difrun difopt)
+  add_test(NAME dif_telemetry_tests COMMAND dif_telemetry_tests)
 
   add_executable(dif_difopt_cli_tests tests/difopt_cli_tests.cpp)
   target_link_libraries(dif_difopt_cli_tests PRIVATE difcore)

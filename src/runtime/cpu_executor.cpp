@@ -1,4 +1,6 @@
 #include "dif/runtime/executor.hpp"
+#include "dif/telemetry/trace_sink.hpp"
+#include "dif/telemetry/vocabulary.hpp"
 
 #include "dif/ir/verify.hpp"
 #include "dif/runtime/scalar.hpp"
@@ -2167,8 +2169,18 @@ void snake_beta(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void execute_operation(const ir::Program &program, const ir::Operation &op,
+                       TensorMap &tensors);
+
 void execute_once(const ir::Program &program, TensorMap &tensors) {
-  for (const auto &op : program.operations) {
+  for (const auto &op : program.operations)
+    execute_operation(program, op, tensors);
+}
+
+void execute_operation(const ir::Program &program, const ir::Operation &op,
+                       TensorMap &tensors) {
+  (void)program;
+  {
     switch (op.opcode) {
     case ir::Opcode::Add:
       elementwise(op, tensors, false);
@@ -2407,10 +2419,36 @@ public:
     std::vector<double> elapsed;
     elapsed.reserve(options.iterations);
     TensorMap final_tensors;
+    const bool tracing = telemetry::trace_events_requested(options);
+    const auto trace_origin = std::chrono::steady_clock::now();
+    const auto since_origin = [&](std::chrono::steady_clock::time_point at) {
+      return std::chrono::duration<double, std::milli>(at - trace_origin)
+          .count();
+    };
+    std::vector<TraceEvent> trace_events;
     for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
       auto tensors = initialize(program_, bindings);
       const auto start = std::chrono::steady_clock::now();
-      execute_once(program_, tensors);
+      if (tracing) {
+        // The typed reference executor has no submission queue: every
+        // operation's host span is its complete execution.
+        for (const auto &op : program_.operations) {
+          const auto op_start = std::chrono::steady_clock::now();
+          execute_operation(program_, op, tensors);
+          const auto op_stop = std::chrono::steady_clock::now();
+          TraceEvent event;
+          event.category = std::string(telemetry::category::operation);
+          event.name = "execute";
+          event.operation_id = op.id;
+          event.opcode = std::string(ir::opcode_name(op.opcode));
+          event.host_start_ms = since_origin(op_start);
+          event.host_end_ms = since_origin(op_stop);
+          event.stream = "host";
+          trace_events.push_back(std::move(event));
+        }
+      } else {
+        execute_once(program_, tensors);
+      }
       const auto stop = std::chrono::steady_clock::now();
       elapsed.push_back(std::chrono::duration<double, std::milli>(stop - start).count());
       final_tensors = std::move(tensors);
@@ -2419,6 +2457,11 @@ public:
     RunResult result;
     result.backend_name = "cpu";
     result.device_name = "host";
+    if (tracing) {
+      result.trace_events = std::move(trace_events);
+      result.trace_milliseconds =
+          since_origin(std::chrono::steady_clock::now());
+    }
     result.minimum_milliseconds = *std::min_element(elapsed.begin(), elapsed.end());
     result.maximum_milliseconds = *std::max_element(elapsed.begin(), elapsed.end());
     result.mean_milliseconds =
@@ -2427,6 +2470,7 @@ public:
       if (desc.has_role(ir::TensorRole::Output))
         result.outputs.emplace(desc.id, std::move(final_tensors.at(desc.id)));
     }
+    telemetry::append_runtime_trace(result, program_, options);
     return result;
   }
 

@@ -198,6 +198,40 @@ minimum VRAM/workspace requirements. Target-bound replay fails closed when any
 required compatibility condition changes; version-1 plans remain readable as
 explicitly unbound historical plans.
 
+## Truth surfaces: difbench, diftrace, difplan
+
+Phase B adds the agent-facing measurement and explanation surfaces on top of
+the Phase A hardware layer. All three emit the same versioned
+`diffusion-compiler-telemetry` JSON: one `schema`/`kind`/`provenance` head,
+shared `hardware`, `runtime_budget`, and launch-telemetry sections, and one
+attribution vocabulary (`include/dif/telemetry/vocabulary.hpp`).
+
+- `difbench run RECIPE.json --workdir DIR [--json]` is the canonical
+  literal-prompt-to-saved-output boundary. A recipe
+  (JSON, kind `diffusion-compiler-benchmark-recipe`; see `perf/recipes/`)
+  names the fresh-process chain for one workload with `after` dependencies; difbench owns the timer, dependency-ordered process stages with
+  per-stage rusage, page-cache residency of the declared model files
+  (cold/warm/mixed), NVML peak VRAM and power under the configured cap, and
+  native PNG/MP4 verification of the saved output. Total complete wall is the
+  only acceptance metric; stage timings are diagnostics. The frozen H3 FL2VA
+  and Krea 2 Turbo chains are transcribed as `perf/recipes/*.json` and are
+  validation fixtures, not part of the tool.
+- `diftrace recipe|program|merge` attributes where total wait goes. The shared
+  runtime now records attributed events at its centralized submission sites
+  (GEMM, attention, convolution, generated kernels, H2D/D2H/D2D bytes, staging,
+  waits, synchronization, layout, allocation) with the DiffIR operation that
+  submitted them, and pushes NVTX ranges (`dif::prepare`, `dif::run`,
+  `op<id> <opcode>`) for Nsight Systems correlation. Any tool can be traced
+  without new flags: `DIF_TRACE_FILE=path` appends one `runtime-trace`
+  document per execution; `DIF_NVTX=1` enables the ranges.
+- `difplan show|diff|residency|explain tensor|op` reads `.difplan` files and
+  the decisions the compiler recorded while planning: streamed-residency
+  admission arithmetic from the residency planner, every measured candidate's
+  verdict and diagnostic from the optimizer search, and the precision policy
+  and target requirements bound by `difopt --plan`. Decisions are provenance,
+  excluded from plan identity, and never inferred after the fact: a subject
+  without a recorded decision is reported as such.
+
 ## Build and test
 
 Requirements are CMake 3.24 or newer, a C++20 compiler, and Ninja or another
@@ -232,6 +266,9 @@ Core tools include:
   execution.
 - `difprobe` for the shared hardware `TargetProfile` and current
   `RuntimeBudget`, with stable JSON output.
+- `difbench`, `diftrace`, and `difplan` for the complete prompt-to-saved-output
+  wall, attributed runtime tracing, and recorded plan decisions, all with
+  `--json`.
 - `difweights`, `difcast`, `difcompare`, and `difquant` for model storage and
   numerical gates.
 - `difschedule` for authenticated flow schedules.

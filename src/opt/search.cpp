@@ -380,6 +380,73 @@ SearchResult optimize(
       result.candidates[result.winner].program_fingerprint;
   result.plan.candidate_fingerprint =
       result.candidates[result.winner].candidate_fingerprint;
+  {
+    // Record why the winner was selected and why every other measured
+    // candidate was not, from the verdicts the gate actually returned.
+    PlanDecision summary;
+    summary.subject = "plan";
+    summary.decision = "objective";
+    summary.reason =
+        std::string("search minimized ") +
+        std::string(objective_name(result.objective)) +
+        (result.improved ? "; the winner beat the baseline by more than the "
+                           "effective margin"
+                         : "; no candidate beat the baseline by the effective "
+                           "margin, so the baseline is retained");
+    summary.evidence.emplace_back("winner_index", std::to_string(result.winner));
+    summary.evidence.emplace_back("improved", result.improved ? "true" : "false");
+    summary.evidence.emplace_back(
+        "effective_improvement_margin",
+        json_number(result.effective_improvement_margin));
+    summary.evidence.emplace_back("latency_noise_bound",
+                                  json_number(result.latency_noise_bound));
+    summary.evidence.emplace_back("baseline_drift_ratio",
+                                  json_number(result.baseline_drift_ratio));
+    summary.evidence.emplace_back("measured_candidates",
+                                  std::to_string(result.candidates.size()));
+    result.plan.decisions.push_back(std::move(summary));
+    for (const auto &record : result.candidates) {
+      PlanDecision decision;
+      decision.subject = "candidate";
+      decision.subject_id = record.index;
+      if (record.winner)
+        decision.decision = "selected";
+      else if (record.accepted)
+        decision.decision = "accepted";
+      else
+        decision.decision = "rejected";
+      decision.reason = std::string(verdict_name(record.verdict));
+      if (!record.diagnostic.empty())
+        decision.reason += ": " + record.diagnostic;
+      else if (record.winner)
+        decision.reason += ": fastest accepted candidate under the objective";
+      else if (record.accepted)
+        decision.reason +=
+            ": passed every gate but did not beat the incumbent by the "
+            "effective margin";
+      decision.evidence.emplace_back(
+          "transforms", encode_transform_sequence(record.transforms));
+      decision.evidence.emplace_back("parent", std::to_string(record.parent));
+      decision.evidence.emplace_back("mean_ms",
+                                     json_number(record.mean_milliseconds));
+      decision.evidence.emplace_back("min_ms",
+                                     json_number(record.minimum_milliseconds));
+      decision.evidence.emplace_back(
+          "planned_bytes", std::to_string(record.memory.planned_bytes));
+      decision.evidence.emplace_back(
+          "resident_bytes", std::to_string(record.resident_bytes));
+      decision.evidence.emplace_back(
+          "cosine_similarity", json_number(record.numerics.cosine_similarity));
+      decision.evidence.emplace_back("relative_l2",
+                                     json_number(record.numerics.relative_l2));
+      decision.evidence.emplace_back(
+          "max_absolute_error",
+          json_number(record.numerics.max_absolute_error));
+      decision.evidence.emplace_back(
+          "nonfinite_count", std::to_string(record.numerics.nonfinite_count));
+      result.plan.decisions.push_back(std::move(decision));
+    }
+  }
   // Rebuild the winner from the base so the returned program is exactly what a
   // clean replay of the recorded plan produces.
   result.optimized = replay(result.plan, base);

@@ -497,6 +497,47 @@ int main(int argc, char **argv) {
       dif::opt::bind_plan_compatibility(
           result.plan, probe.target, probe.budget, precision_policy,
           required_device_bytes, 0U);
+      {
+        dif::opt::PlanDecision policy;
+        policy.subject = "plan";
+        policy.decision = "precision-policy";
+        policy.reason =
+            "declared on the difopt command line (--precision-policy, default "
+            "diffir-declared-v1); numeric-class candidates were admitted only "
+            "under the fixed acceptance bars recorded here";
+        policy.evidence.emplace_back("precision_policy", precision_policy);
+        policy.evidence.emplace_back(
+            "max_absolute_error", dif::opt::json_number(bars.max_absolute_error));
+        policy.evidence.emplace_back(
+            "min_cosine_similarity",
+            dif::opt::json_number(bars.min_cosine_similarity));
+        policy.evidence.emplace_back(
+            "max_relative_l2", dif::opt::json_number(bars.max_relative_l2));
+        policy.evidence.emplace_back("min_norm_ratio",
+                                     dif::opt::json_number(bars.min_norm_ratio));
+        policy.evidence.emplace_back("max_norm_ratio",
+                                     dif::opt::json_number(bars.max_norm_ratio));
+        result.plan.decisions.push_back(std::move(policy));
+        dif::opt::PlanDecision target;
+        target.subject = "plan";
+        target.decision = "required";
+        target.reason =
+            "bound to the probed target capability and runtime budget class; "
+            "replay fails closed when the compiler revision, capability "
+            "fingerprint, precision policy, budget class, usable VRAM, or "
+            "workspace budget differs";
+        target.evidence.emplace_back(
+            "target_fingerprint", dif::target::target_fingerprint(probe.target));
+        target.evidence.emplace_back(
+            "architecture",
+            std::string(dif::target::architecture_name(probe.target.architecture)));
+        target.evidence.emplace_back(
+            "budget_class", dif::target::runtime_budget_class(probe.budget));
+        target.evidence.emplace_back("minimum_usable_device_bytes",
+                                     std::to_string(required_device_bytes));
+        target.evidence.emplace_back("measurement_backend", backend);
+        result.plan.decisions.push_back(std::move(target));
+      }
       dif::opt::write_plan(result.plan, plan_path);
       std::cout << "PLAN fingerprint="
                 << dif::opt::plan_fingerprint(result.plan)

@@ -145,7 +145,96 @@ std::string json_number(double value) {
   return buffer;
 }
 
-std::string serialize_plan(const OptimizationPlan &plan) {
+bool numeric_text(std::string_view text) {
+  if (text.empty())
+    return false;
+  std::size_t index = 0U;
+  if (text[index] == '-')
+    ++index;
+  if (index >= text.size())
+    return false;
+  bool digits = false;
+  bool dot = false;
+  for (; index < text.size(); ++index) {
+    const char character = text[index];
+    if (character >= '0' && character <= '9') {
+      digits = true;
+      continue;
+    }
+    if (character == '.' && !dot) {
+      dot = true;
+      continue;
+    }
+    return false;
+  }
+  return digits && text.back() != '.';
+}
+
+std::string encode_decisions(const std::vector<PlanDecision> &decisions) {
+  std::string out = "[";
+  for (std::size_t index = 0; index < decisions.size(); ++index) {
+    const auto &decision = decisions[index];
+    out += index == 0U ? "\n" : ",\n";
+    out += "    {\"subject\": " + json_quote(decision.subject) +
+           ", \"id\": " + std::to_string(decision.subject_id) +
+           ", \"decision\": " + json_quote(decision.decision) +
+           ", \"reason\": " + json_quote(decision.reason) +
+           ", \"evidence\": {";
+    for (std::size_t item = 0; item < decision.evidence.size(); ++item) {
+      const auto &[key, value] = decision.evidence[item];
+      if (item != 0U)
+        out += ", ";
+      out += json_quote(key) + ": " +
+             (numeric_text(value) ? value : json_quote(value));
+    }
+    out += "}}";
+  }
+  out += decisions.empty() ? "]" : "\n  ]";
+  return out;
+}
+
+std::vector<PlanDecision> decode_decisions(const json::Value &value) {
+  if (!value.is_array())
+    fail("optimization plan decisions must be an array");
+  std::vector<PlanDecision> result;
+  for (const auto &entry : value.array()) {
+    if (!entry.is_object())
+      fail("optimization plan decision is not an object");
+    PlanDecision decision;
+    decision.subject = required(entry, "subject").string();
+    const auto id = required(entry, "id").number();
+    if (!(id >= 0.0) || id != std::floor(id))
+      fail("optimization plan decision id must be a non-negative integer");
+    decision.subject_id = static_cast<std::uint64_t>(id);
+    decision.decision = required(entry, "decision").string();
+    decision.reason = required(entry, "reason").string();
+    const auto &evidence = required(entry, "evidence");
+    if (!evidence.is_object())
+      fail("optimization plan decision evidence must be an object");
+    for (const auto &[key, item] : evidence.object()) {
+      std::string text;
+      if (std::holds_alternative<double>(item.storage)) {
+        const auto number = item.number();
+        if (number == std::floor(number) && std::fabs(number) < 1.0e18)
+          text = std::to_string(static_cast<long long>(number));
+        else
+          text = json_number(number);
+      } else if (std::holds_alternative<std::string>(item.storage)) {
+        text = item.string();
+      } else if (std::holds_alternative<bool>(item.storage)) {
+        text = item.boolean() ? "true" : "false";
+      } else {
+        fail("optimization plan decision evidence values must be scalars");
+      }
+      decision.evidence.emplace_back(key, std::move(text));
+    }
+    result.push_back(std::move(decision));
+  }
+  return result;
+}
+
+std::string serialize_plan(const OptimizationPlan &plan,
+                           bool include_decisions) {
   std::string out = "{\n";
   out += "  \"kind\": " + json_quote(kPlanKind) + ",\n";
   out += "  \"version\": " + std::to_string(kPlanVersion) + ",\n";
@@ -185,8 +274,10 @@ std::string serialize_plan(const OptimizationPlan &plan) {
            ", \"tensors\": " + encode_ids(transform.tensors) +
            ", \"parameters\": " + encode_parameters(transform.parameters) + "}";
   }
-  out += plan.transforms.empty() ? "]\n" : "\n  ]\n";
-  out += "}\n";
+  out += plan.transforms.empty() ? "]" : "\n  ]";
+  if (include_decisions && !plan.decisions.empty())
+    out += ",\n  \"decisions\": " + encode_decisions(plan.decisions);
+  out += "\n}\n";
   return out;
 }
 
@@ -247,6 +338,8 @@ OptimizationPlan parse_plan(std::string_view text) {
                                        "parameters");
     plan.transforms.push_back(std::move(transform));
   }
+  if (const auto *decisions = document.find("decisions"))
+    plan.decisions = decode_decisions(*decisions);
   return plan;
 }
 
@@ -322,7 +415,8 @@ void validate_plan_compatibility(
 }
 
 std::string plan_fingerprint(const OptimizationPlan &plan) {
-  const auto text = serialize_plan(plan);
+  // Decisions are provenance, not identity.
+  const auto text = serialize_plan(plan, false);
   const auto bytes = std::span<const std::uint8_t>(
       reinterpret_cast<const std::uint8_t *>(text.data()), text.size());
   return hex_digest(sha256(bytes));

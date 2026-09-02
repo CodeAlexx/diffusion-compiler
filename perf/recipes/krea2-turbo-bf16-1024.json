@@ -1,0 +1,90 @@
+{
+  "kind": "diffusion-compiler-benchmark-recipe",
+  "version": 1,
+  "name": "krea2-turbo-bf16-1024",
+  "output_kind": "image",
+  "description": "Krea 2 Turbo BF16 literal prompt -> saved 1024x1024 PNG through the native Qwen3-VL-4B tokenizer/conditioner, TextFusion, 8-step Euler denoiser, and Qwen-Image VAE. Transcribed from the 2026-08-31 prompt-to-PNG 2x gate replay; every stage is a fresh process. The prepared bundles and creator fixtures under artifacts/krea2-* must be regenerated before this recipe passes preflight.",
+  "workload": {
+    "model_family": "Krea 2 Turbo",
+    "task": "text-to-image",
+    "geometry": "1024x1024, 4096 image tokens, 512 text tokens",
+    "blocks": 28,
+    "sampler": "8 Euler evaluations, CFG 0, mu 1.15, seed 20260831",
+    "precision_class": "BF16 (exact route)",
+    "quality_status": "bit-identical denoiser trajectory; VAE gate cosine 0.99999339"
+  },
+  "comparator": {
+    "name": "creator ComfyUI/PyTorch BF16 eager chain (fresh process per stage)",
+    "wall_seconds": 59.14,
+    "target_ratio": 2.0
+  },
+  "variables": {
+    "DC_ART": "${recipe_dir}/../../artifacts/krea2-denoiser-2026-08-31",
+    "DC_COND": "${recipe_dir}/../../artifacts/krea2-conditioner-2026-08-31",
+    "QWEN_PROCESSOR": "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17",
+    "QWEN_IMAGE_VAE_CONFIG": "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/75e0b4be04f60ec59a75f475837eced720f823b6/vae/config.json",
+    "CACHE": "${recipe_dir}/../../.difcache"
+  },
+  "prompt": {"file": "${DC_COND}/prompt.txt"},
+  "inputs": [
+    {"name": "creator_chain_fixture", "path": "${DC_ART}/creator-prompt-to-png-live-chain-v3.safetensors"},
+    {"name": "creator_vae_fixture", "path": "${DC_ART}/creator-prompt-to-png-live-chain-v3-vae.safetensors"}
+  ],
+  "model_files": [
+    "${DC_COND}/krea2-qwen3vl-4b.difbind",
+    "${DC_COND}/krea2-text-prepared-bf16.difbind",
+    "${DC_ART}/krea2-turbo-prepared-bf16.difbind",
+    "${DC_ART}/krea2-vae-prepared-bf16.difbind"
+  ],
+  "required_files": [
+    "${DC_COND}/krea2-qwen3vl-4b.difir",
+    "${QWEN_PROCESSOR}",
+    "${QWEN_IMAGE_VAE_CONFIG}"
+  ],
+  "stages": [
+    {"name": "tokenize", "after": [], "argv": [
+      "${build}/diftokenize", "--processor", "${QWEN_PROCESSOR}",
+      "--prompt-file", "${prompt_file}", "--strip-trailing-newline",
+      "--krea2-inputs-out", "${workdir}/tokenizer.safetensors"]},
+    {"name": "condition", "argv": [
+      "${build}/difcondition", "run", "--krea2",
+      "--program", "${DC_COND}/krea2-qwen3vl-4b.difir",
+      "--bundle", "${DC_COND}/krea2-qwen3vl-4b.difbind",
+      "--inputs", "${workdir}/tokenizer.safetensors",
+      "--output", "${workdir}/taps.safetensors",
+      "--report", "${workdir}/qwen-report.json",
+      "--resident-streamed", "--cache-dir", "${CACHE}", "--min-free-mib", "1024"]},
+    {"name": "text-fusion", "argv": [
+      "${build}/difkrea2text",
+      "--bundle", "${DC_COND}/krea2-text-prepared-bf16.difbind",
+      "--taps", "${workdir}/taps.safetensors",
+      "--mask-inputs", "${workdir}/tokenizer.safetensors", "--no-compare",
+      "--output", "${workdir}/conditioning.safetensors",
+      "--report", "${workdir}/text-report.json",
+      "--diffir", "${workdir}/text.difir"]},
+    {"name": "denoise", "argv": [
+      "${build}/difkrea2sample",
+      "--bundle", "${DC_ART}/krea2-turbo-prepared-bf16.difbind",
+      "--positive-conditioning", "${workdir}/conditioning.safetensors",
+      "--positive-tokenizer", "${workdir}/tokenizer.safetensors",
+      "--initial-fixture", "${input:creator_chain_fixture}",
+      "--reference", "${input:creator_chain_fixture}",
+      "--output", "${workdir}/sampler.safetensors",
+      "--report", "${workdir}/sampler-report.json",
+      "--diffir", "${workdir}/sampler.difir",
+      "--steps", "8", "--guidance", "0", "--mu", "1.15", "--seed", "20260831",
+      "--resident-plan-mib", "21850", "--resident-order", "largest", "--alias-reshapes",
+      "--lazy-resident-upload", "--streamed-stage-threads", "4"]},
+    {"name": "vae", "argv": [
+      "${build}/difkrea2vae",
+      "--bundle", "${DC_ART}/krea2-vae-prepared-bf16.difbind",
+      "--sampler", "${workdir}/sampler.safetensors",
+      "--reference", "${input:creator_vae_fixture}",
+      "--config", "${QWEN_IMAGE_VAE_CONFIG}",
+      "--png", "${output}",
+      "--output", "${workdir}/vae.safetensors",
+      "--report", "${workdir}/vae-report.json",
+      "--diffir", "${workdir}/vae.difir"]}
+  ],
+  "output": "${workdir}/image.png"
+}
