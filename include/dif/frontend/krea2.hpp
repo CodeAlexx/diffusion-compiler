@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dif/frontend/qwen3vl_conditioner.hpp"
+#include "dif/frontend/provenance.hpp"
 #include "dif/ir/ir.hpp"
 
 #include <cstdint>
@@ -147,10 +148,19 @@ make_krea2_time_conditioning(const Krea2Config &config = {});
 // admitting the conditioner and outer model. Checkpoint parameters are bound
 // in BF16 exactly as creator `model.to(torch.bfloat16)` materializes them;
 // source F32 tensors therefore require the runtime's explicit conversion.
+// Krea AI's official release is the semantic oracle for this frontend. The
+// pinned revision travels with every provenance table the frontend writes.
+inline constexpr std::string_view kKrea2Creator = "krea-ai/krea-2";
+inline constexpr std::string_view kKrea2CreatorRevision =
+    "db3984fbc6e13b34c0064990fc2d95ac64d00058";
+
 struct Krea2BlockBuild {
   ir::Program program;
   Krea2Config config;
   std::uint64_t block_index{};
+  // Creator module / section per operation, recorded by this builder from
+  // the boundary tensors it produced.
+  ProvenanceTable provenance;
   std::uint32_t sequence_input{};
   std::uint32_t modulation_input{};
   std::uint32_t positions_input{};
@@ -217,6 +227,7 @@ Krea2TextFusionBuild make_krea2_text_fusion(bool capture_boundaries = true,
 struct Krea2DenoiserBuild {
   ir::Program program;
   Krea2Config config;
+  ProvenanceTable provenance;
   std::uint32_t image_tokens_input{};
   std::uint32_t context_input{};
   std::uint32_t timestep_input{};

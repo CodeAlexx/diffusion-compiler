@@ -634,6 +634,68 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
   add_operation(Opcode::Add, {build.attention_residual, gated_mlp},
                 {build.final_output});
 
+  // Record the creator section each operation was lowered from, driven by the
+  // boundary tensors this builder itself produced (never by tensor names).
+  build.provenance.frontend = "krea2";
+  build.provenance.creator = std::string(kKrea2Creator);
+  build.provenance.creator_revision = std::string(kKrea2CreatorRevision);
+  {
+    std::string section = "modulation";
+    for (const auto &op : program.operations) {
+      const auto produces = [&](std::uint32_t id) {
+        return std::find(op.outputs.begin(), op.outputs.end(), id) !=
+               op.outputs.end();
+      };
+      if (op.opcode == Opcode::Attention ||
+          op.opcode == Opcode::BooleanMaskToBias)
+        section = "attention.core";
+      else if (op.opcode == Opcode::RotaryFrequency ||
+               op.opcode == Opcode::RotaryApply)
+        section = "attention.rotary";
+      else if (produces(build.query) || produces(build.key))
+        section = "attention.qknorm";
+      else if (produces(build.attention_gate))
+        section = "attention.gate";
+      else if (produces(build.output_projection))
+        section = "attention.out";
+      else if (produces(build.attention_residual))
+        section = "attention.residual";
+      else if (produces(build.mlp_gate) || produces(build.mlp_up))
+        section = "mlp.gate_up";
+      else if (produces(build.mlp_gate_activated) ||
+               produces(build.mlp_activation))
+        section = "mlp.activation";
+      else if (produces(build.mlp_output))
+        section = "mlp.down";
+      else if (produces(build.final_output))
+        section = "mlp.residual";
+      std::string module = "blocks." + std::to_string(block_index) + ".";
+      if (section.rfind("attention", 0U) == 0U)
+        module += "attn";
+      else if (section.rfind("mlp", 0U) == 0U)
+        module += "mlp";
+      else
+        module += "mod";
+      build.provenance.records.push_back(
+          {op.id, std::move(module), static_cast<std::int64_t>(block_index),
+           section});
+      // Transitions that take effect after a boundary producer.
+      if (produces(build.attention_input))
+        section = "attention.qkv";
+      else if (produces(build.attention_output))
+        section = "attention.gate";
+      else if (produces(build.attention_residual))
+        section = "modulation.post";
+      else if (produces(build.mlp_input))
+        section = "mlp.gate_up";
+      else if (produces(build.mlp_output))
+        section = "mlp.residual";
+    }
+  }
+  for (std::size_t index = 0U; index < build.checkpoint_tensors.size(); ++index)
+    build.provenance.weight_names.emplace_back(build.checkpoint_tensors[index],
+                                               build.checkpoint_names[index]);
+
   verify(program);
   return build;
 }
@@ -1067,8 +1129,38 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
   operation(Opcode::Concat, {build.context_input, build.projected_image},
             {combined}, {Attribute::u64(AttrKey::Axis, 1U)});
 
+  build.provenance.frontend = "krea2";
+  build.provenance.creator = std::string(kKrea2Creator);
+  build.provenance.creator_revision = std::string(kKrea2CreatorRevision);
+  // Operations lowered so far are the patch projection, the timestep tower,
+  // and the sequence concat; classify them from the tensors they produced.
+  {
+    std::string section = "patch.first";
+    std::string module = "first";
+    for (const auto &op : program.operations) {
+      const auto produces = [&](std::uint32_t id) {
+        return std::find(op.outputs.begin(), op.outputs.end(), id) !=
+               op.outputs.end();
+      };
+      if (op.opcode == Opcode::Concat) {
+        section = "sequence.concat";
+        module = "denoiser";
+      }
+      build.provenance.records.push_back({op.id, module, -1, section});
+      if (produces(build.projected_image)) {
+        section = "timestep.tower";
+        module = "tmlp/tproj";
+      }
+    }
+  }
+
   for (std::uint64_t layer = 0U; layer < Krea2Config::kLayers; ++layer) {
     const auto block = make_krea2_block(config, layer, false);
+    const auto layer_first_operation = next_operation;
+    for (const auto &record : block.provenance.records)
+      build.provenance.records.push_back(
+          {layer_first_operation + (record.operation_id - 1U),
+           record.creator_module, record.block, record.semantic_tag});
     std::unordered_map<std::uint32_t, std::uint32_t> remap{
         {block.sequence_input, combined},
         {block.modulation_input, build.modulation_output},
@@ -1111,6 +1203,7 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
     combined = remap.at(block.final_output);
     build.block_outputs.push_back(combined);
   }
+  const auto after_blocks_operation = next_operation;
 
   const auto combined_flat = bf16({batch * sequence, features});
   operation(Opcode::Reshape, {combined}, {combined_flat});
@@ -1154,6 +1247,12 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
   operation(Opcode::Slice, {final_sequence}, {build.velocity_output},
             {Attribute::u64(AttrKey::Axis, 1U),
              Attribute::u64(AttrKey::Start, config.text_tokens)});
+  for (const auto &op : program.operations)
+    if (op.id >= after_blocks_operation)
+      build.provenance.records.push_back({op.id, "last", -1, "final.head"});
+  for (std::size_t index = 0U; index < build.checkpoint_tensors.size(); ++index)
+    build.provenance.weight_names.emplace_back(build.checkpoint_tensors[index],
+                                               build.checkpoint_names[index]);
 
   verify(program);
   return build;

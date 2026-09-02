@@ -657,6 +657,9 @@ int main(int argc, char **argv) {
     }
     dif::ir::verify(denoiser.program);
     dif::ir::write_file(denoiser.program, arguments.diffir);
+    dif::frontend::write_provenance(
+        denoiser.provenance,
+        dif::frontend::provenance_sidecar_path(arguments.diffir));
     const auto checkpoint_bind_ms = milliseconds_since(phase_start);
 
     phase_start = std::chrono::steady_clock::now();

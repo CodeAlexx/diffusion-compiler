@@ -2457,6 +2457,15 @@ public:
     RunResult result;
     result.backend_name = "cpu";
     result.device_name = "host";
+    // Diagnostic capture of internal boundaries: the reference executor keeps
+    // every tensor of the last iteration, so a requested id is copied out.
+    for (const auto id : options.capture_intermediate_tensors) {
+      const auto found = final_tensors.find(id);
+      if (found == final_tensors.end())
+        fail("capture requested for tensor " + std::to_string(id) +
+             " which the program never materialized");
+      result.captured_intermediates.emplace(id, found->second);
+    }
     if (tracing) {
       result.trace_events = std::move(trace_events);
       result.trace_milliseconds =

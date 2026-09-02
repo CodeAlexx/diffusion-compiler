@@ -45,6 +45,7 @@ add_library(difcore
   src/frontend/qwen3vl_conditioner.cpp
   src/frontend/qwen3vl_vision.cpp
   src/frontend/krea2.cpp
+  src/frontend/provenance.cpp
   src/frontend/krea2_vae.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
@@ -203,6 +204,9 @@ target_link_libraries(diftrace PRIVATE difcore)
 
 add_executable(difplan tools/difplan.cpp)
 target_link_libraries(difplan PRIVATE difcore)
+
+add_executable(difbisect tools/difbisect.cpp)
+target_link_libraries(difbisect PRIVATE difcore)
 
 add_executable(diftune tools/diftune.cpp)
 target_link_libraries(diftune PRIVATE difcore)
@@ -395,6 +399,16 @@ if(DIF_BUILD_TESTS)
       DIF_DIFOPT_PATH="$<TARGET_FILE:difopt>")
   add_dependencies(dif_telemetry_tests difbench diftrace difplan difrun difopt)
   add_test(NAME dif_telemetry_tests COMMAND dif_telemetry_tests)
+
+  add_executable(dif_bisect_tests tests/bisect_tests.cpp)
+  target_link_libraries(dif_bisect_tests PRIVATE difcore)
+  target_compile_definitions(
+      dif_bisect_tests PRIVATE
+      DIF_DIFBISECT_PATH="$<TARGET_FILE:difbisect>"
+      DIF_DIFINSPECT_PATH="$<TARGET_FILE:difinspect>"
+      DIF_DIFRUN_PATH="$<TARGET_FILE:difrun>")
+  add_dependencies(dif_bisect_tests difbisect difinspect difrun)
+  add_test(NAME dif_bisect_tests COMMAND dif_bisect_tests)
 
   add_executable(dif_difopt_cli_tests tests/difopt_cli_tests.cpp)
   target_link_libraries(dif_difopt_cli_tests PRIVATE difcore)

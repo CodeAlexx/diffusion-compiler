@@ -232,6 +232,30 @@ attribution vocabulary (`include/dif/telemetry/vocabulary.hpp`).
   excluded from plan identity, and never inferred after the fact: a subject
   without a recorded decision is reported as such.
 
+## Debugging surfaces: difbisect and difinspect provenance
+
+Phase C adds the two debugging surfaces on the same telemetry schema.
+
+- `difbisect pairs|manifest|program` is the generic first-divergence finder
+  between native captures and an oracle fixture. Boundaries are compared in
+  semantic order (an explicit `--order`, a manifest, or the producer order of
+  a DiffIR program whose mapped tensors are captured by the runtime), each
+  judged against explicit bars (cosine, relative L2, norm ratio, max
+  absolute, non-finite). The report names the last boundary that passed and
+  the first that failed, lists the uncaptured operations between them as an
+  unobserved span, and never asserts a divergence at a boundary nobody
+  observed. A boundary missing on one side is reported as not observed.
+- `difinspect FILE.difir --source [--provenance F] [--bundle F] [--plan F]
+  [--trace F] [--op ID] [--json]` navigates creator semantic, frontend,
+  DiffIR, compiler region, and selected backend implementation per
+  operation. Frontends record provenance as they build (module, block,
+  section, creator revision, and checkpoint weight names) into a sidecar
+  `FILE.difir.provenance.json`; the Krea 2 frontend records it for every
+  block and denoiser operation. Weight storage identity comes from the sealed
+  bundle, compiler transforms and decisions from the plan, and the backend
+  implementation from the events a runtime trace actually observed. Nothing
+  is inferred from tensor names; an absent link is reported as absent.
+
 ## Build and test
 
 Requirements are CMake 3.24 or newer, a C++20 compiler, and Ninja or another
@@ -269,6 +293,9 @@ Core tools include:
 - `difbench`, `diftrace`, and `difplan` for the complete prompt-to-saved-output
   wall, attributed runtime tracing, and recorded plan decisions, all with
   `--json`.
+- `difbisect` for last-known-good / first-known-bad boundaries against an
+  oracle fixture, and `difinspect --source` for creator-to-backend provenance
+  per operation.
 - `difweights`, `difcast`, `difcompare`, and `difquant` for model storage and
   numerical gates.
 - `difschedule` for authenticated flow schedules.
