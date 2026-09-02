@@ -8808,7 +8808,7 @@ public:
             options.deterministic_linear_algorithms);
         linear_plans_.emplace(op.id, plan);
         if (shareable) {
-          std::cout << "CUDA_LINEAR_PLAN_CLASS operation=" << op.id
+          std::cerr << "CUDA_LINEAR_PLAN_CLASS operation=" << op.id
                     << " key=" << key << " "
                     << plan->selected_algorithm_description() << "\n";
           shared_plans.emplace(std::move(key), std::move(plan));
@@ -8818,7 +8818,7 @@ public:
       const auto unique_plan_count =
           static_cast<std::uint64_t>(shared_plans.size()) +
           isolated_plan_count;
-      std::cout << "CUDA_LINEAR_PLAN_POOL operations="
+      std::cerr << "CUDA_LINEAR_PLAN_POOL operations="
                 << linear_operation_count
                 << " unique=" << unique_plan_count
                 << " reused=" << linear_operation_count - unique_plan_count

@@ -380,6 +380,28 @@ SearchResult optimize(
       result.candidates[result.winner].program_fingerprint;
   result.plan.candidate_fingerprint =
       result.candidates[result.winner].candidate_fingerprint;
+  for (const auto &status : format_statuses(options.discovery)) {
+    // Bounded physical-format competition: every requested format is
+    // accounted for, competing or not, with the capability and availability
+    // facts the decision was made from.
+    PlanDecision decision;
+    decision.subject = "physical-format";
+    decision.subject_id = static_cast<std::uint64_t>(status.format);
+    decision.decision = status.competes ? "competes" : "excluded";
+    decision.reason = status.legality_reason + "; " + status.availability_reason;
+    decision.evidence.emplace_back("format",
+                                   std::string(physical_format_name(status.format)));
+    decision.evidence.emplace_back("legal_on_target",
+                                   status.legal_on_target ? "true" : "false");
+    decision.evidence.emplace_back(
+        "availability",
+        std::string(format_availability_name(status.availability)));
+    if (options.discovery.target)
+      decision.evidence.emplace_back(
+          "target_fingerprint",
+          target::target_fingerprint(*options.discovery.target));
+    result.plan.decisions.push_back(std::move(decision));
+  }
   {
     // Record why the winner was selected and why every other measured
     // candidate was not, from the verdicts the gate actually returned.

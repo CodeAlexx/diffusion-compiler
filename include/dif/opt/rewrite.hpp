@@ -1,11 +1,14 @@
 #pragma once
 
 #include "dif/ir/ir.hpp"
+#include "dif/opt/physical_format.hpp"
 #include "dif/opt/transform.hpp"
+#include "dif/target/profile.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/runtime/executor.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -57,7 +60,19 @@ struct DiscoveryOptions {
   // Upper bound on how many precision candidates a single discovery call may
   // propose, so one pass over a fifty-block denoiser cannot flood the beam.
   std::size_t max_precision_candidates{8U};
+  // Bounded physical-format competition. When non-empty, the precision and
+  // quantization candidates above are derived from these formats instead:
+  // only formats that are legal on `target` and implemented as search
+  // candidates in this build produce transforms. The compiler decides from
+  // runtime-discovered capability; product names never enter the decision.
+  std::vector<PhysicalFormat> physical_formats;
+  std::optional<target::TargetProfile> target;
 };
+
+// The status of every requested physical format under the options' target:
+// what competes, and why the rest do not. Empty when no formats were
+// requested.
+std::vector<FormatStatus> format_statuses(const DiscoveryOptions &options);
 
 // Enumerates the transforms that are legal on this context right now. The
 // result is deterministic and ordered, so an identical context always yields an

@@ -9,8 +9,10 @@
 #include "dif/support/sha256.hpp"
 #include "dif/weights/bundle.hpp"
 #include "dif/weights/safetensors.hpp"
+#include "dif/telemetry/schema.hpp"
 
 #include <algorithm>
+#include <set>
 #include <array>
 #include <filesystem>
 #include <iostream>
@@ -864,7 +866,8 @@ dif::weights::WeightBundle make_h3_denoiser_bundle(
 }
 
 void usage() {
-  std::cerr << "usage: difweights inspect-shard FILE.safetensors\n"
+  std::cerr << "usage: difweights stats FILE.safetensors|FILE.index.json [--top N] [--json]\n"
+               "       difweights inspect-shard FILE.safetensors\n"
                "       difweights inspect-index FILE.index.json\n"
                "       difweights inspect-bundle FILE.difbind\n"
                "       difweights make-h3-bundle INDEX PROGRAM.difir OUT.difbind\n"
@@ -895,6 +898,178 @@ int main(int argc, char **argv) {
       return 2;
     }
     const std::string command = argv[1];
+    if (command == "stats" && argc >= 3) {
+      // Checkpoint storage statistics: counts, dtypes, bytes, shapes, and
+      // repeated storage patterns. Deliberately no model semantics: tensor
+      // names are reported as examples, never interpreted.
+      const std::filesystem::path source = argv[2];
+      bool json = false;
+      std::size_t top = 20U;
+      for (int argument = 3; argument < argc; ++argument) {
+        const std::string option = argv[argument];
+        if (option == "--json")
+          json = true;
+        else if (option == "--top" && argument + 1 < argc)
+          top = static_cast<std::size_t>(std::stoul(argv[++argument]));
+        else
+          dif::fail("unknown difweights stats option: " + option);
+      }
+      struct Entry {
+        std::string name;
+        dif::ir::DType dtype{};
+        std::vector<std::uint64_t> dims;
+        std::uint64_t bytes{};
+        std::string shard;
+      };
+      std::vector<Entry> entries;
+      std::vector<std::pair<std::string, std::uint64_t>> shard_sizes;
+      const auto collect = [&](const std::filesystem::path &shard) {
+        const auto file = dif::weights::read_safetensors(shard);
+        shard_sizes.emplace_back(shard.string(), file.file_size);
+        for (const auto &[name, tensor] : file.tensors)
+          entries.push_back({name, tensor.dtype, tensor.dims, tensor.byte_count,
+                             shard.string()});
+      };
+      if (source.extension() == ".json") {
+        const auto index = dif::weights::read_safetensors_index(source);
+        std::set<std::filesystem::path> shards;
+        for (const auto &[name, shard] : index.weight_map)
+          shards.insert(shard.is_absolute() ? shard
+                                            : source.parent_path() / shard);
+        for (const auto &shard : shards)
+          collect(shard);
+      } else {
+        collect(source);
+      }
+      std::uint64_t total_bytes = 0U;
+      std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> by_dtype;
+      std::map<std::size_t, std::uint64_t> by_rank;
+      struct Pattern {
+        std::uint64_t count{};
+        std::uint64_t bytes{};
+        std::vector<std::string> examples;
+      };
+      std::map<std::string, Pattern> patterns;
+      for (const auto &entry : entries) {
+        total_bytes += entry.bytes;
+        auto &dtype = by_dtype[std::string(dif::ir::dtype_name(entry.dtype))];
+        ++dtype.first;
+        dtype.second += entry.bytes;
+        ++by_rank[entry.dims.size()];
+        std::string key = std::string(dif::ir::dtype_name(entry.dtype)) + ":";
+        for (std::size_t index = 0; index < entry.dims.size(); ++index)
+          key += (index ? "x" : "") + std::to_string(entry.dims[index]);
+        auto &pattern = patterns[key];
+        ++pattern.count;
+        pattern.bytes += entry.bytes;
+        if (pattern.examples.size() < 3U)
+          pattern.examples.push_back(entry.name);
+      }
+      std::vector<std::pair<std::string, Pattern>> ordered_patterns(
+          patterns.begin(), patterns.end());
+      std::sort(ordered_patterns.begin(), ordered_patterns.end(),
+                [](const auto &left, const auto &right) {
+                  if (left.second.count != right.second.count)
+                    return left.second.count > right.second.count;
+                  if (left.second.bytes != right.second.bytes)
+                    return left.second.bytes > right.second.bytes;
+                  return left.first < right.first;
+                });
+      std::vector<const Entry *> largest;
+      for (const auto &entry : entries)
+        largest.push_back(&entry);
+      std::sort(largest.begin(), largest.end(),
+                [](const Entry *left, const Entry *right) {
+                  if (left->bytes != right->bytes)
+                    return left->bytes > right->bytes;
+                  return left->name < right->name;
+                });
+      if (largest.size() > top)
+        largest.resize(top);
+      auto document = dif::telemetry::make_document("weights-report");
+      document.set("source", std::filesystem::absolute(source).string());
+      document.set("note", "storage statistics only; no model semantics are "
+                           "inferred from tensor names");
+      dif::telemetry::Object totals;
+      totals.set("tensors", entries.size());
+      totals.set("bytes", total_bytes);
+      totals.set("shards", shard_sizes.size());
+      totals.set("distinct_shape_patterns", patterns.size());
+      document.set("totals", std::move(totals));
+      dif::telemetry::Array shards;
+      for (const auto &[path, bytes] : shard_sizes) {
+        dif::telemetry::Object shard;
+        shard.set("path", path);
+        shard.set("bytes", bytes);
+        shards.push_back(std::move(shard));
+      }
+      document.set("shards", std::move(shards));
+      dif::telemetry::Object dtypes;
+      for (const auto &[name, counts] : by_dtype) {
+        dif::telemetry::Object entry;
+        entry.set("count", counts.first);
+        entry.set("bytes", counts.second);
+        dtypes.set(name, std::move(entry));
+      }
+      document.set("by_dtype", std::move(dtypes));
+      dif::telemetry::Object ranks;
+      for (const auto &[rank, count] : by_rank)
+        ranks.set(std::to_string(rank), count);
+      document.set("by_rank", std::move(ranks));
+      dif::telemetry::Array pattern_entries;
+      std::size_t emitted = 0U;
+      for (const auto &[key, pattern] : ordered_patterns) {
+        if (emitted++ >= std::max<std::size_t>(top, 100U))
+          break;
+        dif::telemetry::Object entry;
+        entry.set("pattern", key);
+        entry.set("count", pattern.count);
+        entry.set("bytes", pattern.bytes);
+        entry.set("repeated", pattern.count > 1U);
+        dif::telemetry::Array examples;
+        for (const auto &example : pattern.examples)
+          examples.push_back(example);
+        entry.set("example_names", std::move(examples));
+        pattern_entries.push_back(std::move(entry));
+      }
+      document.set("shape_patterns", std::move(pattern_entries));
+      dif::telemetry::Array largest_entries;
+      for (const auto *entry : largest) {
+        dif::telemetry::Object item;
+        item.set("name", entry->name);
+        item.set("dtype", dif::ir::dtype_name(entry->dtype));
+        dif::telemetry::Array dims;
+        for (const auto dim : entry->dims)
+          dims.push_back(dim);
+        item.set("dims", std::move(dims));
+        item.set("bytes", entry->bytes);
+        item.set("shard", entry->shard);
+        largest_entries.push_back(std::move(item));
+      }
+      document.set("largest", std::move(largest_entries));
+      if (json) {
+        std::cout << dif::telemetry::serialize(dif::telemetry::Value(document));
+        return 0;
+      }
+      std::cout << "WEIGHTS source=" << source.string()
+                << " tensors=" << entries.size() << " bytes=" << total_bytes
+                << " shards=" << shard_sizes.size()
+                << " shape_patterns=" << patterns.size() << "\n";
+      for (const auto &[name, counts] : by_dtype)
+        std::cout << "dtype " << name << " count=" << counts.first
+                  << " bytes=" << counts.second << "\n";
+      for (const auto &[key, pattern] : ordered_patterns) {
+        if (pattern.count < 2U)
+          break;
+        std::cout << "pattern " << key << " count=" << pattern.count
+                  << " bytes=" << pattern.bytes << " e.g. "
+                  << pattern.examples.front() << "\n";
+      }
+      for (const auto *entry : largest)
+        std::cout << "largest " << entry->name << " bytes=" << entry->bytes
+                  << "\n";
+      return 0;
+    }
     if (command == "inspect-shard" && argc == 3) {
       const auto file = dif::weights::read_safetensors(argv[2]);
       std::cout << "SAFETENSORS path=" << file.path << " bytes=" << file.file_size

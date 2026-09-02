@@ -1794,6 +1794,25 @@ std::vector<Transform> discover(const RewriteContext &context,
       }
     }
 
+    // Bounded physical-format competition: derive the precision targets and
+    // quantization widths from the formats that are legal on the target and
+    // implemented as search candidates; everything else is reported through
+    // format_statuses() and never proposed.
+    std::vector<ir::DType> precisions = options.precisions;
+    std::vector<std::uint64_t> quantization_bits = options.quantization_bits;
+    if (!options.physical_formats.empty()) {
+      precisions.clear();
+      quantization_bits.clear();
+      for (const auto &status : format_statuses(options)) {
+        if (!status.competes)
+          continue;
+        if (const auto dtype = format_precision(status.format))
+          precisions.push_back(*dtype);
+        if (const auto bits = format_quantization_bits(status.format))
+          quantization_bits.push_back(*bits);
+      }
+    }
+
     std::vector<std::pair<std::uint64_t, std::uint32_t>> precision_candidates;
     std::unordered_map<std::uint32_t, ir::DType> current_precision;
     for (const auto &operation : program.operations) {
@@ -1815,7 +1834,7 @@ std::vector<Transform> discover(const RewriteContext &context,
       (void)elements;
       if (emitted >= options.max_precision_candidates)
         break;
-      for (const auto target : options.precisions) {
+      for (const auto target : precisions) {
         if (target == current_precision.at(id))
           continue;
         if (emitted >= options.max_precision_candidates)
@@ -1829,7 +1848,7 @@ std::vector<Transform> discover(const RewriteContext &context,
       }
     }
 
-    for (const auto bits : options.quantization_bits) {
+    for (const auto bits : quantization_bits) {
       if (bits != 4U && bits != 5U)
         continue;
       for (const auto group : options.quantization_group_sizes) {
@@ -1866,6 +1885,14 @@ std::vector<Transform> discover(const RewriteContext &context,
   }
 
   return transforms;
+}
+
+std::vector<FormatStatus> format_statuses(const DiscoveryOptions &options) {
+  std::vector<FormatStatus> statuses;
+  for (const auto format : options.physical_formats)
+    statuses.push_back(physical_format_status(
+        format, options.target ? &*options.target : nullptr));
+  return statuses;
 }
 
 } // namespace dif::opt

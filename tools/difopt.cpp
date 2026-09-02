@@ -4,6 +4,8 @@
 #include "dif/opt/bindings.hpp"
 #include "dif/weights/bundle.hpp"
 #include "dif/opt/plan.hpp"
+#include "dif/opt/physical_format.hpp"
+#include "dif/telemetry/schema.hpp"
 #include "dif/opt/search.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/device_probe.hpp"
@@ -105,6 +107,13 @@ void usage() {
       "  --beam N --depth N --max-candidates N --margin F\n"
       "  --latency-tolerance F        memory objective latency ceiling\n"
       "  --no-structural --no-schedule --no-numeric --no-memory\n"
+      "  --formats LIST               bounded physical-format competition:\n"
+      "                               fp32,bf16,fp16,fp8-e4m3,int8-convrot,int4-group,\n"
+      "                               int5-group,squareq-w8,squareq-w4,squareq-nvfp4;\n"
+      "                               only formats legal on the probed target and\n"
+      "                               implemented as search candidates compete\n"
+      "  --formats-table [--json]     print every format's legality/availability\n"
+      "                               for the probed backend target and exit\n"
       "  --arithmetic-folding         fold arithmetic constants (backend rounding)\n"
       "  --blocks 64,128,256 --prefetch 1,2,4 --quant-bits 4,5 --quant-groups 64\n"
       "\n"
@@ -139,6 +148,8 @@ int main(int argc, char **argv) {
     bool verify_shards = false;
     std::string backend = "cpu";
     std::string precision_policy = "diffir-declared-v1";
+    bool formats_table = false;
+    bool json_output = false;
     dif::frontend::H3DenoiserConfig h3;
     h3.video_tokens = 2;
     h3.audio_tokens = 1;
@@ -267,6 +278,21 @@ int main(int argc, char **argv) {
         options.discovery.memory = false;
       else if (option == "--arithmetic-folding")
         options.discovery.arithmetic_constant_folding = true;
+      else if (option == "--formats") {
+        std::stringstream names(value());
+        std::string name;
+        while (std::getline(names, name, ',')) {
+          if (name.empty())
+            continue;
+          dif::opt::PhysicalFormat format;
+          if (!dif::opt::physical_format_from_name(name, format))
+            dif::fail("unknown physical format: " + name);
+          options.discovery.physical_formats.push_back(format);
+        }
+      } else if (option == "--formats-table")
+        formats_table = true;
+      else if (option == "--json")
+        json_output = true;
       else if (option == "--blocks")
         options.discovery.block_sizes = number_list(value(), "block size");
       else if (option == "--prefetch")
@@ -306,6 +332,71 @@ int main(int argc, char **argv) {
         usage();
         return 2;
       }
+    }
+
+    const auto probe_target = [&]() {
+      dif::runtime::BudgetRequest request;
+      request.reserved_device_memory_bytes = options.minimum_free_bytes;
+      return dif::runtime::probe_device(
+          backend == "cuda" ? dif::runtime::ProbeBackend::Cuda
+                            : dif::runtime::ProbeBackend::Host,
+          0, request);
+    };
+    if (formats_table) {
+      if (backend != "cpu" && backend != "cuda")
+        dif::fail("backend must be cpu or cuda");
+      const auto probe = probe_target();
+      auto document = dif::telemetry::make_document("physical-formats");
+      document.set("hardware", dif::telemetry::hardware_section(probe.target));
+      dif::telemetry::Array formats;
+      for (const auto format : dif::opt::all_physical_formats()) {
+        const auto status =
+            dif::opt::physical_format_status(format, &probe.target);
+        dif::telemetry::Object entry;
+        entry.set("format", dif::opt::physical_format_name(format));
+        entry.set("legal_on_target", status.legal_on_target);
+        entry.set("legality_reason", status.legality_reason);
+        entry.set("availability",
+                  dif::opt::format_availability_name(status.availability));
+        entry.set("availability_reason", status.availability_reason);
+        entry.set("competes", status.competes);
+        formats.push_back(std::move(entry));
+      }
+      document.set("formats", std::move(formats));
+      document.set("selection_order",
+                   "legality -> execute -> numerical gate -> decoded quality "
+                   "where required -> memory -> timing");
+      if (json_output) {
+        std::cout << dif::telemetry::serialize(dif::telemetry::Value(document));
+        return 0;
+      }
+      std::cout << "target " << probe.target.product_name << " ("
+                << dif::target::architecture_name(probe.target.architecture)
+                << ") fingerprint="
+                << dif::target::target_fingerprint(probe.target) << "\n";
+      for (const auto &entry : document.find("formats")->array()) {
+        const auto &object = entry.object();
+        std::cout << std::left << std::setw(14) << object.find("format")->string()
+                  << (object.find("legal_on_target")->boolean() ? " legal   " : " illegal ")
+                  << std::setw(17) << object.find("availability")->string()
+                  << (object.find("competes")->boolean() ? " competes  " : " excluded  ")
+                  << object.find("legality_reason")->string() << "; "
+                  << object.find("availability_reason")->string() << "\n";
+      }
+      return 0;
+    }
+    if (!options.discovery.physical_formats.empty()) {
+      if (backend != "cpu" && backend != "cuda")
+        dif::fail("backend must be cpu or cuda");
+      options.discovery.target = probe_target().target;
+      for (const auto &status : dif::opt::format_statuses(options.discovery))
+        std::cout << "FORMAT " << dif::opt::physical_format_name(status.format)
+                  << (status.competes ? " competes" : " excluded")
+                  << " legal=" << (status.legal_on_target ? 1 : 0)
+                  << " availability="
+                  << dif::opt::format_availability_name(status.availability)
+                  << " reason=\"" << status.legality_reason << "; "
+                  << status.availability_reason << "\"\n";
     }
 
     if (program_path.empty() == !build_h3) {

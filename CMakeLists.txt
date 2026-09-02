@@ -55,6 +55,7 @@ add_library(difcore
     src/ir/verify.cpp
     src/opt/bindings.cpp
     src/opt/gate.cpp
+    src/opt/physical_format.cpp
     src/opt/plan.cpp
     src/opt/rewrite.cpp
     src/opt/search.cpp
@@ -399,6 +400,15 @@ if(DIF_BUILD_TESTS)
       DIF_DIFOPT_PATH="$<TARGET_FILE:difopt>")
   add_dependencies(dif_telemetry_tests difbench diftrace difplan difrun difopt)
   add_test(NAME dif_telemetry_tests COMMAND dif_telemetry_tests)
+
+  add_executable(dif_format_tests tests/format_tests.cpp)
+  target_link_libraries(dif_format_tests PRIVATE difcore)
+  target_compile_definitions(
+      dif_format_tests PRIVATE
+      DIF_DIFOPT_PATH="$<TARGET_FILE:difopt>"
+      DIF_DIFWEIGHTS_PATH="$<TARGET_FILE:difweights>")
+  add_dependencies(dif_format_tests difopt difweights)
+  add_test(NAME dif_format_tests COMMAND dif_format_tests)
 
   add_executable(dif_bisect_tests tests/bisect_tests.cpp)
   target_link_libraries(dif_bisect_tests PRIVATE difcore)

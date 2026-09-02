@@ -256,6 +256,37 @@ Phase C adds the two debugging surfaces on the same telemetry schema.
   implementation from the events a runtime trace actually observed. Nothing
   is inferred from tensor names; an absent link is reported as absent.
 
+## Bounded implementation competition and physical-format hooks
+
+Phase D makes the optimizer's candidate space target-aware without adding a
+second search. `include/dif/opt/physical_format.hpp` registers the
+compiler-wide physical formats a generic `Linear` (or any uniform-float
+operation) may be lowered to: `fp32`, `bf16`, `fp16`, `fp8-e4m3`,
+`int8-convrot`, `int4-group`, `int5-group`, and the SquareQ hooks
+`squareq-w8`, `squareq-w4`, `squareq-nvfp4`. Each format carries the
+architecture capabilities it requires and how this build can use it: a
+search candidate (a DiffIR transform the optimizer measures), execution
+policy (ConvRot INT8 over a prepared cache, reported but not searched), or a
+hook only (identity and requirements registered, no backend implementation).
+Legality is decided from the probed `TargetProfile`, never from a product
+name.
+
+- `difopt --formats LIST ...` runs the existing search with the precision and
+  quantization candidates derived from the requested formats; only formats
+  that are legal on the probed target and implemented as search candidates
+  produce transforms. Every requested format is recorded in the plan as a
+  `physical-format` decision with the capability and availability facts, so
+  an agent can see that FP8 or SquareQ was excluded and why. The acceptance
+  order is unchanged: verify, execute, numerical gate, memory, then timing.
+- `difopt --formats-table --backend cuda [--json]` prints the legality and
+  availability of every format for the probed target.
+- `diftune --json [--report FILE]` reports its block-size and Linear-math
+  candidates with verdicts on the shared schema.
+- `difweights stats FILE.safetensors|INDEX.json [--json]` reports checkpoint
+  storage statistics: counts, dtypes, bytes, ranks, repeated shape patterns,
+  and the largest tensors. Tensor names appear only as examples; no model
+  semantics are inferred from them.
+
 ## Build and test
 
 Requirements are CMake 3.24 or newer, a C++20 compiler, and Ninja or another
@@ -296,6 +327,9 @@ Core tools include:
 - `difbisect` for last-known-good / first-known-bad boundaries against an
   oracle fixture, and `difinspect --source` for creator-to-backend provenance
   per operation.
+- `difopt --formats` / `--formats-table`, `diftune --json`, and
+  `difweights stats` for target-aware physical-format competition, tuning
+  reports, and checkpoint storage statistics.
 - `difweights`, `difcast`, `difcompare`, and `difquant` for model storage and
   numerical gates.
 - `difschedule` for authenticated flow schedules.

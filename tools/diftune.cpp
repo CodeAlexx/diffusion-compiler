@@ -4,6 +4,7 @@
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/tune/database.hpp"
+#include "dif/telemetry/schema.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -157,7 +159,10 @@ void usage() {
          " [--reference ID=FILE ...] [--blocks keep|64,128,256,512]"
          " [--linear-math strict,tf32] [--warmups N] [--iterations N]"
          " [--min-free-mib N] [--max-abs N] [--min-cos N]"
-         " [--min-norm-ratio N] [--max-norm-ratio N]\n";
+         " [--min-norm-ratio N] [--max-norm-ratio N]"
+         " [--json] [--report FILE]\n"
+         "Order per candidate: verify -> execute -> numerical admission ->"
+         " timing; only admitted candidates rank on time.\n";
 }
 
 } // namespace
@@ -166,6 +171,8 @@ int main(int argc, char **argv) {
   try {
     std::filesystem::path program_path;
     std::filesystem::path database_path;
+    bool json_output = false;
+    std::filesystem::path report_path;
     std::vector<Binding> input_paths;
     std::vector<Binding> reference_paths;
     std::vector<std::uint64_t> block_sizes = {64, 128, 256, 512};
@@ -206,6 +213,10 @@ int main(int argc, char **argv) {
         min_norm_ratio_bar = std::stod(argv[++i]);
       else if (option == "--max-norm-ratio" && i + 1 < argc)
         max_norm_ratio_bar = std::stod(argv[++i]);
+      else if (option == "--json")
+        json_output = true;
+      else if (option == "--report" && i + 1 < argc)
+        report_path = argv[++i];
       else {
         usage();
         return 2;
@@ -241,6 +252,7 @@ int main(int argc, char **argv) {
     dif::tune::Database database(database_path);
     double best = std::numeric_limits<double>::infinity();
     std::string best_hash;
+    dif::telemetry::Array candidate_entries;
 
     for (const auto block_size : block_sizes) {
       for (const auto math_mode : linear_modes) {
@@ -275,7 +287,8 @@ int main(int argc, char **argv) {
                 std::chrono::system_clock::now().time_since_epoch())
                 .count();
         database.record(measurement);
-        std::cout << "CANDIDATE block=" << block_name(block_size)
+        if (!json_output)
+          std::cout << "CANDIDATE block=" << block_name(block_size)
                   << " linear_math=" << math_name(math_mode)
                   << " hash=" << candidate_hash << " status=" << measurement.status
                   << " mean_ms=" << result.mean_milliseconds
@@ -288,11 +301,55 @@ int main(int argc, char **argv) {
           best = result.mean_milliseconds;
           best_hash = candidate_hash;
         }
+        dif::telemetry::Object entry;
+        entry.set("block_size", block_size);
+        entry.set("linear_math", math_name(math_mode));
+        entry.set("candidate_fingerprint", candidate_hash);
+        entry.set("status", measurement.status);
+        entry.set("mean_ms", result.mean_milliseconds);
+        entry.set("min_ms", result.minimum_milliseconds);
+        entry.set("max_ms", result.maximum_milliseconds);
+        entry.set("preparation_ms", result.preparation_milliseconds);
+        entry.set("max_absolute_error", metrics.max_abs);
+        entry.set("cosine", metrics.cosine);
+        entry.set("norm_ratio", metrics.norm_ratio);
+        entry.set("nonfinite", metrics.nonfinite);
+        candidate_entries.push_back(std::move(entry));
       }
+    }
+    if (json_output || !report_path.empty()) {
+      auto document = dif::telemetry::make_document("tune-report");
+      document.set("program_fingerprint", base_hash);
+      document.set("backend", "cuda");
+      document.set("selection_order",
+                   "verify -> execute -> numerical admission -> timing");
+      dif::telemetry::Object bars;
+      bars.set("max_absolute", max_abs_bar);
+      bars.set("min_cosine", min_cos_bar);
+      bars.set("min_norm_ratio", min_norm_ratio_bar);
+      bars.set("max_norm_ratio", max_norm_ratio_bar);
+      document.set("bars", std::move(bars));
+      document.set("candidates", candidate_entries);
+      document.set("best_candidate_fingerprint",
+                   best_hash.empty() ? dif::telemetry::Value(nullptr)
+                                     : dif::telemetry::Value(best_hash));
+      document.set("best_mean_ms", best_hash.empty()
+                                       ? dif::telemetry::Value(nullptr)
+                                       : dif::telemetry::Value(best));
+      document.set("status", best_hash.empty() ? "no-candidate-admitted"
+                                               : "admitted");
+      const auto text = dif::telemetry::serialize(dif::telemetry::Value(document));
+      if (!report_path.empty()) {
+        std::ofstream stream(report_path, std::ios::binary | std::ios::trunc);
+        stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+      }
+      if (json_output)
+        std::cout << text;
     }
     if (best_hash.empty())
       dif::fail("no tuning candidate passed numerical admission");
-    std::cout << "BEST hash=" << best_hash << " mean_ms=" << best << "\n";
+    if (!json_output)
+      std::cout << "BEST hash=" << best_hash << " mean_ms=" << best << "\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "diftune: " << error.what() << "\n";
