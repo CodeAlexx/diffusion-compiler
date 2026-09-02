@@ -18,6 +18,9 @@
 #if DIF_HAS_FLASH_ATTENTION
 #include "dif/runtime/flash_attention.hpp"
 #endif
+#if DIF_HAS_EXACT_STREAM_ATTENTION
+#include "dif/runtime/exact_stream_attention.hpp"
+#endif
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/telemetry/trace_sink.hpp"
@@ -425,6 +428,10 @@ void count_ck_attention_dispatch() {
   if (active_telemetry)
     ++active_telemetry->ck_attention_dispatches;
   trace_submit(telemetry::category::attention, "ck-int8-dso");
+}
+
+void count_exact_stream_attention_dispatch() {
+  trace_submit(telemetry::category::attention, "exact-stream");
 }
 
 template <typename... Arguments>
@@ -8041,6 +8048,20 @@ public:
            "built without it");
 #endif
     }
+    // Exact stream attention (Implementation 5) keeps softmax state and the
+    // output accumulator in registers and streams K/V tiles through shared
+    // memory, so it requires no workspace and no additional global VRAM.
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::Attention ||
+          operation.u64(ir::AttrKey::Implementation, 1U) != 5U)
+        continue;
+#if DIF_HAS_EXACT_STREAM_ATTENTION
+      uses_exact_stream_attention_ = true;
+#else
+      fail("DiffIR requests exact stream attention but this CUDA backend was "
+           "built without it");
+#endif
+    }
 
     fused_linear_swiglu_plans_ =
         find_fused_linear_swiglu_plans(program_, options, major);
@@ -10879,6 +10900,36 @@ public:
           fail(std::string("native FlashAttention execution failed: ") + error);
       }
 #endif
+#if DIF_HAS_EXACT_STREAM_ATTENTION
+      else if (op.opcode == ir::Opcode::Attention &&
+               op.u64(ir::AttrKey::Implementation, 1U) == 5U) {
+        const auto *query = program_.tensor(op.inputs.at(0));
+        const auto batched = query->dims.size() == 4U;
+        const auto batch = static_cast<std::uint32_t>(
+            batched ? query->dims.at(0) : 1U);
+        const auto sequence = static_cast<std::uint32_t>(
+            query->dims.at(batched ? 1U : 0U));
+        const auto heads = static_cast<std::uint32_t>(
+            query->dims.at(batched ? 2U : 1U));
+        const auto head_dimension =
+            static_cast<std::uint32_t>(query->dims.back());
+        const auto key_value_heads = static_cast<std::uint32_t>(
+            op.u64(ir::AttrKey::KvHeads, heads));
+        const auto scale = static_cast<float>(op.f64(
+            ir::AttrKey::AttentionScale,
+            1.0 / std::sqrt(static_cast<double>(head_dimension))));
+        count_exact_stream_attention_dispatch();
+        if (const auto *error = exact_stream_attention_bf16_forward(
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2))),
+                static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+                batch, sequence, heads, key_value_heads, head_dimension,
+                scale, reinterpret_cast<std::uintptr_t>(context_.stream())))
+          fail(std::string("exact stream attention execution failed: ") +
+               error);
+      }
+#endif
 #if DIF_HAS_CUDNN
       else if (op.opcode == ir::Opcode::Conv2d) {
         count_cudnn_convolution_dispatch();
@@ -11704,6 +11755,8 @@ public:
       result += "-materialized-f32-attention";
     if (flash_attention_workspace_bytes_ != 0U)
       result += "-native-flash-attention";
+    if (uses_exact_stream_attention_)
+      result += "-exact-stream-attention";
     return result;
   }
   double preparation_milliseconds() const override {
@@ -11944,6 +11997,7 @@ private:
   std::uint64_t resident_major_page_faults_{};
   std::uint64_t resident_prefault_checksum_{};
   bool uses_cudnn_attention_{};
+  bool uses_exact_stream_attention_{};
   std::uint32_t cudnn_attention_heuristic_{};
 };
 

@@ -152,6 +152,10 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   if(DIF_CUTLASS_INCLUDE_DIR)
     enable_language(CUDA)
     target_sources(difcore PRIVATE src/runtime/cutlass_gemm.cu)
+    # Project-owned exact streaming attention (Attention Implementation 5).
+    # Needs only the CUDA toolchain, which this branch enables.
+    target_sources(difcore PRIVATE src/runtime/exact_stream_attention.cu)
+    target_compile_definitions(difcore PUBLIC DIF_HAS_EXACT_STREAM_ATTENTION=1)
     # CUTLASS 2.x epilogue visitors use CUTE constexpr tuple/move helpers from
     # device callbacks and require relaxed constexpr under CUDA 12.x.
     set_source_files_properties(src/runtime/cutlass_gemm.cu PROPERTIES
@@ -203,7 +207,8 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
     endif()
   else()
     target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=0
-                                              DIF_HAS_FLASH_ATTENTION=0)
+                                              DIF_HAS_FLASH_ATTENTION=0
+                                              DIF_HAS_EXACT_STREAM_ATTENTION=0)
     message(STATUS "Diffusion compiler CUTLASS GEMM: disabled")
   endif()
   if(DIF_ENABLE_CUDNN)
@@ -233,7 +238,8 @@ else()
   target_sources(difcore PRIVATE src/runtime/cuda_executor_stub.cpp)
   target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=0 DIF_HAS_CUDNN=0
                                             DIF_HAS_CUTLASS=0
-                                            DIF_HAS_FLASH_ATTENTION=0)
+                                            DIF_HAS_FLASH_ATTENTION=0
+                                            DIF_HAS_EXACT_STREAM_ATTENTION=0)
 endif()
 
 add_executable(difc tools/difc.cpp)

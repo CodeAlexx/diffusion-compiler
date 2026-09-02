@@ -180,6 +180,40 @@ An exact-output QKV/RMSNorm/RoPE fusion improved isolated hot denoiser timing
 but regressed complete wall to 84.49 seconds warm and 92.05 seconds cold. It was
 removed; local kernel wins do not override the complete-wall result.
 
+### Exact stream attention (Implementation 5) — RTX 5080
+
+`dif_exact_stream_attention` is a project-owned exact dense non-causal
+attention backend for `Opcode::Attention` (noncausal BF16 `[S,H,128]` /
+`[B,S,H,128]`, full heads, no bias): flash-style FP32 online softmax, K/V
+tiles streamed through 48 KiB of shared memory with cp.async double
+buffering, Q fragments and the FP32 output accumulator register resident,
+zero global workspace.  Q·Kt runs on the BF16/FP32-accumulate tensor path;
+each 32-column P·V partial runs on the full-rate f16-accumulate path and is
+folded into the FP32 accumulator per tile (GeForce parts halve
+FP32-accumulate tensor throughput: measured 124.9 vs 248.3 TFLOPS on the
+RTX 5080 at 300 W).
+
+Isolated H3 DiT geometry `[16880,56,128]` BF16, warm, 20 iterations, three
+interleaved sessions, real-data inputs (constant-fill inputs understate time
+by ~13% through power draw): exact-stream 67.50–67.77 ms vs cuDNN SDPA
+69.97–70.10 ms (1.035x) vs native FlashAttention-2 74.87 ms.  Numerics vs
+cuDNN: cosine 0.9999967, rel L2 2.55e-3, max abs 4.88e-4, 0 nonfinite —
+tighter than the cuDNN-vs-FlashAttention exact noise floor (3.10e-3).
+Against an f64 oracle at the full geometry: cosine 0.9999986, rel L2
+1.69e-3.
+
+Whole-system A/B on the RTX 5080 T2VA chain (832x480x124, S=15,283, 20
+schedule points, 19 evaluations, ConvRot INT8 resident 28): denoiser wall
+105.56/105.86 s (cuDNN) vs 103.43/103.52 s (exact-stream), attention GPU
+time 54.55/54.83 s vs 52.35/52.41 s — a reproducible 2.2-second (2.1%)
+complete-denoise saving with byte-identical planned VRAM
+(13,878,443,008 bytes) and bit-identical repeat runs per backend.
+End-to-end latent divergence from cuDNN (cosine 0.913 after 19 evaluations)
+is smaller than exchanging cuDNN for FlashAttention-2 (0.907); decoded MP4s
+from both backends passed visual inspection.  The frozen RTX 3090 Ti FL2VA
+row above is unchanged; its fixtures and GPU gate cannot run on this
+machine.
+
 ## Reporting rules
 
 - Freeze checkpoint, prompt, seed, resolution, steps, guidance, scheduler, and

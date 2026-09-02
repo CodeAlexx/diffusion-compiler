@@ -214,7 +214,8 @@ dif::ir::Program make_row_pack(std::uint64_t sequence,
 
 dif::ir::Program make_h3_attention(std::uint64_t sequence, std::uint64_t heads,
                                    std::uint64_t dim, std::uint64_t rotary,
-                                   std::uint64_t block) {
+                                   std::uint64_t block,
+                                   std::uint64_t implementation = 1U) {
   using namespace dif::ir;
   Program program;
   program.tensors = {
@@ -229,6 +230,11 @@ dif::ir::Program make_h3_attention(std::uint64_t sequence, std::uint64_t heads,
       tensor(9, TensorRole::Internal, {sequence, heads, dim}),
       tensor(10, TensorRole::Output, {sequence, heads, dim}),
   };
+  // Backend attention implementations execute the production H3 dtype.  The
+  // generated implementation keeps the historical F32 fixture behavior.
+  if (implementation != 1U)
+    for (auto &description : program.tensors)
+      description.dtype = DType::BF16;
   const auto norm_attrs = std::vector<Attribute>{
       Attribute::f64(AttrKey::Epsilon, 1.0e-5),
       Attribute::u64(AttrKey::Heads, heads),
@@ -246,7 +252,8 @@ dif::ir::Program make_h3_attention(std::uint64_t sequence, std::uint64_t heads,
        {Attribute::f64(AttrKey::AttentionScale,
                        1.0 / std::sqrt(static_cast<double>(dim))),
         Attribute::boolean(AttrKey::Causal, false),
-        Attribute::u64(AttrKey::BlockSize, 64)}},
+        Attribute::u64(AttrKey::BlockSize, 64),
+        Attribute::u64(AttrKey::Implementation, implementation)}},
   };
   return program;
 }
@@ -346,7 +353,8 @@ void usage() {
             << "  difc make-patchify3d OUT.difir B C T H W PT PH PW f32|bf16|f16\n"
             << "  difc make-unpatchify3d OUT.difir B C T H W PT PH PW f32|bf16|f16\n"
             << "  difc make-row-pack OUT.difir SEQ TEXT VIDEO AUDIO WIDTH f32|bf16|f16\n"
-            << "  difc make-h3-attention OUT.difir S HEADS DIM ROTARY BLOCK\n"
+            << "  difc make-h3-attention OUT.difir S HEADS DIM ROTARY BLOCK "
+               "[generated|cudnn|flash|exact-stream]\n"
             << "  difc make-h3-block OUT.difir S HIDDEN HEADS DIM FFN ROTARY BLOCK\n"
             << "  difc make-h3-block-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY BLOCK\n"
             << "  difc make-h3-stack-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY LAYERS BLOCK resident|streamed\n"
@@ -360,7 +368,7 @@ void usage() {
             << "  difc make-h3-block-raw-bf16 OUT.difir S HIDDEN HEADS DIM FFN ROTARY BLOCK resident|streamed\n"
             << "  difc set-linear-math IN.difir OUT.difir "
                "strict|tf32|direct-int5\n"
-            << "  difc set-attention-implementation IN.difir OUT.difir generated|cudnn\n"
+            << "  difc set-attention-implementation IN.difir OUT.difir generated|cudnn|flash|exact-stream\n"
             << "  difc set-elementwise-fusion IN.difir OUT.difir on|off\n"
             << "  difc set-constant-residency IN.difir OUT.difir resident|streamed\n"
             << "  difc expose-tensors IN.difir OUT.difir ID [ID ...]\n"
@@ -436,11 +444,23 @@ int main(int argc, char **argv) {
                 << dif::hex_digest(dif::ir::fingerprint(program)) << "\n";
       return 0;
     }
-    if (command == "make-h3-attention" && argc == 8) {
+    if (command == "make-h3-attention" && (argc == 8 || argc == 9)) {
+      std::uint64_t implementation = 1U;
+      if (argc == 9) {
+        const std::string mode = argv[8];
+        implementation = mode == "generated"      ? 1U
+                         : mode == "cudnn"        ? 2U
+                         : mode == "flash"        ? 4U
+                         : mode == "exact-stream" ? 5U
+                                                  : 0U;
+        if (implementation == 0U)
+          dif::fail("attention implementation must be generated, cudnn, "
+                    "flash, or exact-stream");
+      }
       const auto program = make_h3_attention(
           number(argv[3], "sequence"), number(argv[4], "heads"),
           number(argv[5], "head dimension"), number(argv[6], "rotary dimension"),
-          number(argv[7], "block size"));
+          number(argv[7], "block size"), implementation);
       dif::ir::write_file(program, argv[2]);
       std::cout << "PROGRAM path=" << argv[2]
                 << " fingerprint=" << dif::hex_digest(dif::ir::fingerprint(program))
@@ -761,10 +781,14 @@ int main(int argc, char **argv) {
     if (command == "set-attention-implementation" && argc == 5) {
       auto program = dif::ir::read_file(argv[2]);
       const std::string mode = argv[4];
-      const std::uint64_t implementation =
-          mode == "generated" ? 1U : mode == "cudnn" ? 2U : 0U;
+      const std::uint64_t implementation = mode == "generated"      ? 1U
+                                           : mode == "cudnn"        ? 2U
+                                           : mode == "flash"        ? 4U
+                                           : mode == "exact-stream" ? 5U
+                                                                    : 0U;
       if (implementation == 0U)
-        dif::fail("attention implementation must be generated or cudnn");
+        dif::fail("attention implementation must be generated, cudnn, flash, "
+                  "or exact-stream");
       std::size_t changed = 0;
       for (auto &operation : program.operations) {
         if (operation.opcode != dif::ir::Opcode::Attention)
