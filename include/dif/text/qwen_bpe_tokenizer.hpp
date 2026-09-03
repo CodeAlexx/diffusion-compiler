@@ -61,6 +61,14 @@ private:
   std::unordered_map<std::string, std::int32_t> vocab_;
   std::unordered_map<std::string, std::uint32_t> merge_ranks_;
   std::vector<AddedToken> added_;
+  // Dialect switches, all fixed by the loader from tokenizer.json:
+  //   nfc_          normalizer {type: NFC} (Qwen2) vs null (Mistral Tekken)
+  //   digit_run_    Split alternative \p{N} (1) vs \p{N}{1,3} (Tekken: 3)
+  //   ignore_merges_ BPE ignore_merges: a whole pre-token already in the
+  //                  vocab is emitted as one id without running merges
+  bool nfc_{true};
+  std::size_t digit_run_{1U};
+  bool ignore_merges_{false};
   std::string byte_map_[256];
 };
 

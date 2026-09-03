@@ -27,6 +27,11 @@ namespace {
 constexpr std::string_view kQwenSplitPattern =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
+// The Mistral Tekken (Mistral Small 3.x) Split pattern: identical to the Qwen2
+// pattern except numbers are taken in runs of up to three digits.
+constexpr std::string_view kTekkenSplitPattern =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+
 std::string read_file(const std::filesystem::path &path) {
   std::ifstream in(path, std::ios::binary);
   if (!in)
@@ -73,7 +78,12 @@ std::int32_t to_token_id(double value, const char *context) {
   return static_cast<std::int32_t>(value);
 }
 
-void verify_pipeline(const dif::json::Value &root) {
+struct PipelineDialect {
+  bool nfc{true};
+  std::size_t digit_run{1U};
+};
+
+PipelineDialect verify_pipeline(const dif::json::Value &root) {
   for (const char *key : {"truncation", "padding"}) {
     const dif::json::Value *value = root.find(key);
     if (value != nullptr && !is_null(*value))
@@ -83,9 +93,12 @@ void verify_pipeline(const dif::json::Value &root) {
 
   const dif::json::Value &normalizer =
       require_key(root, "normalizer", "tokenizer.json");
-  if (!normalizer.is_object() ||
-      require_key(normalizer, "type", "normalizer").string() != "NFC")
-    dif::fail("tokenizer.json: normalizer must be exactly {type: NFC}");
+  PipelineDialect dialect;
+  if (is_null(normalizer))
+    dialect.nfc = false; // Mistral Tekken: no normalizer
+  else if (!normalizer.is_object() ||
+           require_key(normalizer, "type", "normalizer").string() != "NFC")
+    dif::fail("tokenizer.json: normalizer must be null or exactly {type: NFC}");
 
   const dif::json::Value &pre =
       require_key(root, "pre_tokenizer", "tokenizer.json");
@@ -104,9 +117,15 @@ void verify_pipeline(const dif::json::Value &root) {
     dif::fail("tokenizer.json: Split.invert must be false");
   const dif::json::Value &pattern = require_key(split, "pattern", "Split");
   const dif::json::Value *regex = pattern.find("Regex");
-  if (regex == nullptr || regex->string() != kQwenSplitPattern)
-    dif::fail("tokenizer.json: Split.pattern.Regex is not the Qwen2 pattern "
-              "this tokenizer implements");
+  if (regex == nullptr)
+    dif::fail("tokenizer.json: Split.pattern must be a Regex");
+  if (regex->string() == kQwenSplitPattern)
+    dialect.digit_run = 1U;
+  else if (regex->string() == kTekkenSplitPattern)
+    dialect.digit_run = 3U;
+  else
+    dif::fail("tokenizer.json: Split.pattern.Regex is neither the Qwen2 nor "
+              "the Mistral Tekken pattern this tokenizer implements");
 
   const dif::json::Value &byte_level = parts[1];
   if (require_key(byte_level, "type", "pretokenizers[1]").string() !=
@@ -118,10 +137,16 @@ void verify_pipeline(const dif::json::Value &root) {
     dif::fail("tokenizer.json: ByteLevel.use_regex must be false");
 
   const dif::json::Value *post = root.find("post_processor");
-  if (post != nullptr && !is_null(*post) &&
-      require_key(*post, "type", "post_processor").string() != "ByteLevel")
-    dif::fail("tokenizer.json: post_processor must be null or ByteLevel "
-              "(anything else could add ids)");
+  if (post != nullptr && !is_null(*post)) {
+    const auto &type = require_key(*post, "type", "post_processor").string();
+    // TemplateProcessing (Mistral: prepend <s>) is accepted because encode()
+    // reproduces add_special_tokens=False; the prompt renderer writes the
+    // BOS text explicitly, exactly as apply_chat_template does.
+    if (type != "ByteLevel" && type != "TemplateProcessing")
+      dif::fail("tokenizer.json: post_processor must be null, ByteLevel or "
+                "TemplateProcessing (anything else could add ids)");
+  }
+  return dialect;
 }
 
 char32_t lower_ascii(char32_t cp) {
@@ -139,7 +164,7 @@ bool is_cr_lf(char32_t cp) { return cp == U'\r' || cp == U'\n'; }
 // \s; U+001C..1F, U+200B, U+00AD, U+180E are NOT); (?i:) folds ASCII only
 // (U+017F LATIN SMALL LETTER LONG S does not match 's).
 std::vector<std::pair<std::size_t, std::size_t>>
-pretokenize(const std::vector<char32_t> &s) {
+pretokenize(const std::vector<char32_t> &s, std::size_t digit_run) {
   namespace uni = dif::text::unicode;
   std::vector<std::pair<std::size_t, std::size_t>> out;
   const std::size_t n = s.size();
@@ -184,10 +209,13 @@ pretokenize(const std::vector<char32_t> &s) {
         continue;
       }
     }
-    // Alt 3: \p{N}
+    // Alt 3: \p{N} (Qwen2) or \p{N}{1,3} (Tekken)
     if (uni::is_number(s[i])) {
-      out.emplace_back(i, i + 1);
-      ++i;
+      std::size_t j = i + 1;
+      while (j < n && j - i < digit_run && uni::is_number(s[j]))
+        ++j;
+      out.emplace_back(i, j);
+      i = j;
       continue;
     }
     // Alt 4: ` ?[^\s\p{L}\p{N}]+[\r\n]*`
@@ -259,15 +287,18 @@ QwenBpeTokenizer::load(const std::filesystem::path &tokenizer_json,
 
   const std::string text = read_file(tokenizer_json);
   const dif::json::Value root = dif::json::parse(text);
-  verify_pipeline(root);
+  const auto dialect = verify_pipeline(root);
+  tok.nfc_ = dialect.nfc;
+  tok.digit_run_ = dialect.digit_run;
 
   const dif::json::Value &model = require_key(root, "model", "tokenizer.json");
   if (require_key(model, "type", "model").string() != "BPE")
     dif::fail("tokenizer.json: model.type must be BPE");
-  for (const char *key : {"byte_fallback", "fuse_unk", "ignore_merges"})
+  for (const char *key : {"byte_fallback", "fuse_unk"})
     if (!flag_is_false(model, key))
       dif::fail(std::string("tokenizer.json: unsupported model flag '") + key +
                 "'");
+  tok.ignore_merges_ = !flag_is_false(model, "ignore_merges");
   if (const dif::json::Value *dropout = model.find("dropout");
       dropout != nullptr && !is_null(*dropout))
     dif::fail("tokenizer.json: BPE dropout is unsupported");
@@ -414,9 +445,9 @@ void QwenBpeTokenizer::encode_segment(std::string_view utf8_segment,
   if (utf8_segment.empty())
     return;
   const std::vector<char32_t> raw = unicode::decode_utf8(utf8_segment);
-  const std::vector<char32_t> norm = unicode::nfc(raw);
+  const std::vector<char32_t> norm = nfc_ ? unicode::nfc(raw) : raw;
   std::string utf8;
-  for (const auto &[begin, end] : pretokenize(norm)) {
+  for (const auto &[begin, end] : pretokenize(norm, digit_run_)) {
     std::vector<std::string> word;
     for (std::size_t k = begin; k < end; ++k) {
       utf8.clear();
@@ -439,6 +470,13 @@ QwenBpeTokenizer::bpe(std::vector<std::string> word) const {
   if (word.size() < 2U)
     return word;
   std::string key;
+  if (ignore_merges_) {
+    for (const auto &symbol : word)
+      key.append(symbol);
+    if (vocab_.count(key) != 0U)
+      return {key};
+    key.clear();
+  }
   while (true) {
     std::uint32_t best_rank = std::numeric_limits<std::uint32_t>::max();
     std::size_t best_index = word.size();

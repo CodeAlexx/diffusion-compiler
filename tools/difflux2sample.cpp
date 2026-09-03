@@ -791,9 +791,6 @@ Arguments parse(int argc, char **argv) {
     usage_error("resident plan MiB overflows bytes");
   if (result.flux2_model != "klein9b" && result.flux2_model != "dev")
     usage_error("--flux2-model must be klein9b or dev");
-  if (result.flux2_model == "dev" && result.positive_conditioning.empty())
-    usage_error("--flux2-model dev needs --positive-conditioning FILE (the "
-                "Mistral conditioner frontend is not in this build yet)");
   if (result.transformer_checkpoint.empty())
     result.transformer_checkpoint =
         result.model_directory / "flux-2-klein-base-9b.safetensors";
@@ -977,18 +974,24 @@ ConditioningResult condition(const Arguments &arguments) {
   }
 
   auto started = Clock::now();
+  const bool dev = arguments.flux2_model == "dev";
   const auto tokenizer = dif::text::QwenBpeTokenizer::load(
       arguments.model_directory / "tokenizer" / "tokenizer.json",
       arguments.model_directory / "tokenizer" / "tokenizer_config.json");
-  const auto positive_inputs = dif::frontend::make_flux2_qwen_prompt_inputs(
-      tokenizer, arguments.prompt);
+  const auto positive_inputs =
+      dev ? dif::frontend::make_flux2_mistral_prompt_inputs(tokenizer,
+                                                            arguments.prompt)
+          : dif::frontend::make_flux2_qwen_prompt_inputs(tokenizer,
+                                                         arguments.prompt);
   const auto negative_inputs =
-      dif::frontend::make_flux2_qwen_prompt_inputs(tokenizer, "");
+      dev ? positive_inputs // [dev] is guidance-distilled: no negative pass
+          : dif::frontend::make_flux2_qwen_prompt_inputs(tokenizer, "");
   result.prompt_tokens = positive_inputs.valid_tokens;
   result.empty_tokens = negative_inputs.valid_tokens;
   result.tokenizer_ms = elapsed_ms(started);
 
-  const auto config = dif::frontend::make_flux2_klein_9b_conditioner_config();
+  const auto config = dev ? dif::frontend::make_flux2_dev_conditioner_config()
+                          : dif::frontend::make_flux2_klein_9b_conditioner_config();
   const auto build =
       dif::frontend::build_qwen3vl_conditioner_program(512U, config);
   auto bindings =
@@ -1027,6 +1030,10 @@ ConditioningResult condition(const Arguments &arguments) {
   result.fingerprint =
       dif::hex_digest(dif::ir::fingerprint(build.program));
 
+  if (dev) {
+    result.negative = result.positive; // unused by the dev path
+    return result;
+  }
   bind_prompt_inputs(bindings, build, negative_inputs);
   started = Clock::now();
   auto negative = prepared->run(bindings, options);
