@@ -39,3 +39,6 @@
 .netrc
 .npmrc
 .pypirc
+
+# Committed regression fixtures are exempt from the artifact ignores above.
+!perf/regress/fixtures/**

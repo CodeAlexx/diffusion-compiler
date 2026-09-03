@@ -182,6 +182,15 @@ attribution vocabulary (`include/dif/telemetry/vocabulary.hpp`).
   excluded from plan identity, and never inferred after the fact: a subject
   without a recorded decision is reported as such.
 
+- Two gates paid for elsewhere and adopted here as well: `difbisect
+  validate-oracle` rejects any oracle boundary tensor that is non-finite or
+  constant (a degenerate reference cannot convict; the protocol's own test
+  fixture was all zeros until this check existed), and the smoke tier of
+  `perf/regress/suite.json` runs `diftrace program` on a committed 64x128
+  RMSNorm fixture and gates `run_launch_telemetry.host_stream_synchronizes`
+  and `device_mem_allocs` against zero-tolerance baselines (2 and 0), so a
+  run-phase sync or allocation regression fails the suite.
+
 ## Debugging surfaces: difbisect and difinspect provenance
 
 Phase C adds the two debugging surfaces on the same telemetry schema.
