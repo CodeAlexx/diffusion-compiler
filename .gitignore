@@ -6,6 +6,7 @@
 *.md
 !/README.md
 !/PERFORMANCE.md
+!/USAGE.md
 *.log
 *.safetensors
 *.ckpt
