@@ -27,6 +27,8 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <cstdio>
+#include <sys/wait.h>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,9 @@ void usage() {
          "                       --order NAME[,NAME...] [bars] [--json] [--report FILE]\n"
          "       difbisect manifest MANIFEST.json [bars] [--json] [--report FILE]\n"
          "       difbisect validate-oracle MANIFEST.json [--json]\n"
+         "       difbisect revert-check --repo DIR --commit SHA (--build-dir DIR | --no-build)\n"
+         "                       [--targets T[,T...]] [--keep] [--json] [--report FILE]\n"
+         "                       -- GATE [ARG...]   ({repo} and {build} expand in GATE)\n"
          "       difbisect program --backend cpu|cuda --program FILE.difir\n"
          "                       [--weight-bundle FILE.difbind] [--input ID=FILE ...]\n"
          "                       --oracle FILE.safetensors --map TENSOR_ID=NAME [--map ...]\n"
@@ -867,6 +872,272 @@ int command_validate_oracle(int argc, char **argv) {
   return valid ? 0 : 1;
 }
 
+
+// ---------------------------------------------------------------------------
+// revert-check: suspect the harness before convicting a commit. Runs the gate
+// on a detached worktree of HEAD (expected to fail), reverts the convicted
+// commit onto it, rebuilds when asked, and runs the gate again.
+//   CONFIRMED     HEAD fails, HEAD minus the commit passes   (exit 0)
+//   NOT_ISOLATED  both fail: the commit is not the sole cause (exit 1)
+//   HEAD_PASSES   the premise is wrong: HEAD already passes  (exit 1)
+//   BLOCKED       revert conflict, build failure, or a gate that cannot
+//                 start (exit 3), never PASS by default.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string shell_quote(const std::string &value) {
+  std::string quoted = "'";
+  for (const auto character : value) {
+    if (character == '\'')
+      quoted += "'\\''";
+    else
+      quoted += character;
+  }
+  return quoted + "'";
+}
+
+int shell(const std::string &command, const std::string &log) {
+  const auto full = command + " >> " + shell_quote(log) + " 2>&1";
+  const auto status = std::system(full.c_str());
+  if (status == -1)
+    return -1;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+std::string git_output(const std::filesystem::path &repository,
+                       const std::string &arguments) {
+  const auto command = "git -C " + shell_quote(repository.string()) + " " +
+                       arguments + " 2>/dev/null";
+  std::string output;
+  if (FILE *pipe = popen(command.c_str(), "r")) {
+    char buffer[512];
+    while (fgets(buffer, sizeof(buffer), pipe))
+      output += buffer;
+    (void)pclose(pipe);
+  }
+  while (!output.empty() && (output.back() == '\n' || output.back() == '\r'))
+    output.pop_back();
+  return output;
+}
+
+std::string expand_placeholders(std::string text,
+                                const std::filesystem::path &repository,
+                                const std::filesystem::path &build) {
+  const auto replace_all = [&](const std::string &needle,
+                               const std::string &value) {
+    for (auto at = text.find(needle); at != std::string::npos;
+         at = text.find(needle, at + value.size()))
+      text.replace(at, needle.size(), value);
+  };
+  replace_all("{repo}", repository.string());
+  replace_all("{build}", build.string());
+  return text;
+}
+
+} // namespace
+
+int command_revert_check(int argc, char **argv) {
+  std::filesystem::path repository;
+  std::string commit;
+  std::filesystem::path build_dir;
+  bool no_build = false;
+  std::string targets;
+  bool keep = false;
+  bool json_output = false;
+  std::filesystem::path report;
+  std::vector<std::string> gate;
+  for (int index = 2; index < argc; ++index) {
+    const std::string option = argv[index];
+    auto value = [&](const char *label) -> std::string {
+      if (++index >= argc)
+        dif::fail(std::string("missing value for ") + label);
+      return argv[index];
+    };
+    if (option == "--") {
+      for (int rest = index + 1; rest < argc; ++rest)
+        gate.emplace_back(argv[rest]);
+      break;
+    }
+    if (option == "--repo")
+      repository = value("--repo");
+    else if (option == "--commit")
+      commit = value("--commit");
+    else if (option == "--build-dir")
+      build_dir = value("--build-dir");
+    else if (option == "--no-build")
+      no_build = true;
+    else if (option == "--targets")
+      targets = value("--targets");
+    else if (option == "--keep")
+      keep = true;
+    else if (option == "--json")
+      json_output = true;
+    else if (option == "--report")
+      report = value("--report");
+    else
+      dif::fail("unknown revert-check option: " + option);
+  }
+  if (repository.empty() || commit.empty() || gate.empty() ||
+      (build_dir.empty() && !no_build))
+    dif::fail("revert-check needs --repo, --commit, --build-dir or --no-build, "
+              "and a gate after --");
+
+  auto document = dif::telemetry::make_document("revert-check-report");
+  document.set("repository", std::filesystem::absolute(repository).string());
+  const auto head = git_output(repository, "rev-parse HEAD");
+  const auto resolved =
+      git_output(repository, "rev-parse --verify --quiet " +
+                                 shell_quote(commit + "^{commit}"));
+  document.set("head", head);
+  document.set("commit", resolved);
+  std::string verdict = "BLOCKED";
+  std::string reason;
+  int head_status = -1;
+  int reverted_status = -1;
+  const auto finish = [&](int exit_code) {
+    document.set("verdict", verdict);
+    document.set("reason", reason);
+    document.set("gate_status_head", static_cast<double>(head_status));
+    document.set("gate_status_reverted", static_cast<double>(reverted_status));
+    const auto text = dif::telemetry::serialize(document);
+    if (!report.empty()) {
+      std::ofstream stream(report, std::ios::binary | std::ios::trunc);
+      stream << text << '\n';
+    }
+    if (json_output)
+      std::cout << text << '\n';
+    else
+      std::cout << "REVERT_CHECK " << verdict << " commit=" << resolved
+                << " head=" << head << " gate_head=" << head_status
+                << " gate_reverted=" << reverted_status
+                << (reason.empty() ? "" : " reason=\"" + reason + "\"") << '\n';
+    return exit_code;
+  };
+  if (head.empty() || resolved.empty()) {
+    reason = "cannot resolve HEAD or the commit in the repository";
+    return finish(3);
+  }
+  const auto worktree = std::filesystem::temp_directory_path() /
+                        ("difbisect-revert-" + resolved.substr(0, 12));
+  const auto log = worktree.string() + ".log";
+  std::filesystem::remove(log);
+  (void)shell("git -C " + shell_quote(repository.string()) +
+                  " worktree remove --force " + shell_quote(worktree.string()),
+              log);
+  std::filesystem::remove_all(worktree);
+  document.set("worktree", worktree.string());
+  document.set("log", log);
+  const auto cleanup = [&] {
+    if (keep)
+      return;
+    (void)shell("git -C " + shell_quote(repository.string()) +
+                    " worktree remove --force " +
+                    shell_quote(worktree.string()),
+                log);
+    std::filesystem::remove_all(worktree);
+    (void)shell("git -C " + shell_quote(repository.string()) + " worktree prune",
+                log);
+  };
+  if (shell("git -C " + shell_quote(repository.string()) +
+                " worktree add --detach " + shell_quote(worktree.string()) +
+                " " + shell_quote(head),
+            log) != 0) {
+    reason = "cannot create the HEAD worktree";
+    return finish(3);
+  }
+  const auto build = no_build ? worktree : worktree / "build";
+  const auto configure_and_build = [&]() -> bool {
+    if (no_build)
+      return true;
+    // Reuse the user-facing configuration of the given build directory.
+    std::string defines;
+    std::ifstream cache(build_dir / "CMakeCache.txt");
+    std::string line;
+    while (std::getline(cache, line)) {
+      if (line.rfind("DIF_", 0) == 0 || line.rfind("CMAKE_BUILD_TYPE:", 0) == 0 ||
+          line.rfind("CMAKE_CUDA_ARCHITECTURES:", 0) == 0) {
+        const auto colon = line.find(':');
+        const auto equals = line.find('=');
+        if (colon == std::string::npos || equals == std::string::npos ||
+            equals < colon)
+          continue;
+        defines += " -D" + line.substr(0, colon) + "=" +
+                   shell_quote(line.substr(equals + 1));
+      }
+    }
+    if (shell("cmake -S " + shell_quote(worktree.string()) + " -B " +
+                  shell_quote(build.string()) + " -G Ninja" + defines,
+              log) != 0)
+      return false;
+    std::string target_arguments;
+    std::string current;
+    for (const auto character : targets + ",") {
+      if (character == ',') {
+        if (!current.empty())
+          target_arguments += " --target " + shell_quote(current);
+        current.clear();
+      } else {
+        current += character;
+      }
+    }
+    return shell("cmake --build " + shell_quote(build.string()) +
+                     target_arguments,
+                 log) == 0;
+  };
+  const auto run_gate = [&]() -> int {
+    std::string command = "cd " + shell_quote(worktree.string()) + " &&";
+    for (const auto &argument : gate)
+      command += " " + shell_quote(expand_placeholders(argument, worktree, build));
+    return shell(command, log);
+  };
+  if (!configure_and_build()) {
+    reason = "build of HEAD failed";
+    cleanup();
+    return finish(3);
+  }
+  head_status = run_gate();
+  if (head_status < 0) {
+    reason = "gate could not start on HEAD";
+    cleanup();
+    return finish(3);
+  }
+  if (head_status == 0) {
+    verdict = "HEAD_PASSES";
+    reason = "the gate passes on HEAD; nothing to isolate";
+    cleanup();
+    return finish(1);
+  }
+  if (shell("git -C " + shell_quote(worktree.string()) +
+                " revert --no-commit --no-edit " + shell_quote(resolved),
+            log) != 0) {
+    reason = "revert of the commit onto HEAD conflicts";
+    cleanup();
+    return finish(3);
+  }
+  if (!configure_and_build()) {
+    reason = "build of HEAD minus the commit failed";
+    cleanup();
+    return finish(3);
+  }
+  reverted_status = run_gate();
+  if (reverted_status < 0) {
+    reason = "gate could not start on the reverted tree";
+    cleanup();
+    return finish(3);
+  }
+  if (reverted_status == 0) {
+    verdict = "CONFIRMED";
+    reason = "HEAD fails and HEAD minus the commit passes";
+    cleanup();
+    return finish(0);
+  }
+  verdict = "NOT_ISOLATED";
+  reason = "the gate still fails with the commit reverted: suspect the harness "
+           "or another change";
+  cleanup();
+  return finish(1);
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc < 2) {
@@ -876,6 +1147,8 @@ int main(int argc, char **argv) {
     const std::string command = argv[1];
     if (command == "validate-oracle")
       return command_validate_oracle(argc, argv);
+    if (command == "revert-check")
+      return command_revert_check(argc, argv);
     if (command == "pairs")
       return command_pairs(argc, argv);
     if (command == "manifest")

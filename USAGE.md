@@ -407,6 +407,7 @@ program files, and conditioner ConvRot cache.
 difbisect pairs --native FILE.safetensors --oracle FILE.safetensors --order NAME[,NAME...] [bars] [--json] [--report FILE]
 difbisect manifest MANIFEST.json [bars] [--json] [--report FILE]
 difbisect validate-oracle MANIFEST.json [--json]
+difbisect revert-check --repo DIR --commit SHA (--build-dir DIR | --no-build) [--targets T,...] [--keep] [--json] [--report FILE] -- GATE [ARG...]
 difbisect program --backend cpu|cuda --program FILE.difir [--weight-bundle FILE.difbind] [--input ID=FILE ...]
           --oracle FILE.safetensors --map TENSOR_ID=NAME [--map ...] [--oracle-manifest FILE.json]
           [bars] [--json] [--report FILE]
@@ -525,6 +526,16 @@ The complete chain, in order, is transcribed in
 `difh3encode` for each keyframe, `difcondition run`, `difh3noise`,
 `difh3state`, `difh3infer`, `difvaedecode`, `difaudiodecode`, and ffmpeg
 muxing (or `difh3media`).
+
+`revert-check` suspects the harness before convicting a commit: it runs the
+gate on a detached worktree of HEAD (expected to fail), reverts the commit
+onto it, rebuilds with the given build directory's `DIF_*` configuration
+(or `--no-build`), and runs the gate again. `{repo}` and `{build}` in the
+gate expand to the worktree and its build directory. Verdicts: `CONFIRMED`
+(exit 0) when HEAD fails and HEAD minus the commit passes; `NOT_ISOLATED`
+(exit 1) when both fail; `HEAD_PASSES` (exit 1) when the premise is wrong;
+`BLOCKED` (exit 3) on a revert conflict, a build failure, or a gate that
+cannot start. The worktree is removed unless `--keep` is given.
 
 #### diftokenize
 

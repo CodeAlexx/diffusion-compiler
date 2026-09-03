@@ -396,6 +396,61 @@ void test_difinspect_source() {
 
 } // namespace
 
+
+// revert-check: a temporary git repository whose second commit breaks a
+// file-content gate. HEAD fails, HEAD minus that commit passes: CONFIRMED.
+// A gate that fails regardless is NOT_ISOLATED; one that already passes on
+// HEAD is HEAD_PASSES; an unknown commit is BLOCKED.
+void test_difbisect_revert_check() {
+#ifdef DIF_DIFBISECT_PATH
+  const auto repo = workspace() / "revert-repo";
+  std::filesystem::remove_all(repo);
+  std::filesystem::create_directories(repo);
+  auto git = [&](const std::string &arguments) {
+    const auto command = "git -C " + quote(repo.string()) + " " + arguments +
+                         " > /dev/null 2>&1";
+    return std::system(command.c_str()) == 0;
+  };
+  if (!git("init -q") || !git("config user.email t@example.com") ||
+      !git("config user.name test")) {
+    std::cout << "revert-check test skipped: git unavailable\n";
+    return;
+  }
+  { std::ofstream(repo / "gate.txt") << "ok\n"; }
+  expect(git("add gate.txt") && git("commit -q -m good"), "revert-check: good commit");
+  { std::ofstream(repo / "gate.txt") << "bad\n"; }
+  expect(git("commit -q -am bad"), "revert-check: bad commit");
+  auto confirmed = run(DIF_DIFBISECT_PATH,
+                       {"revert-check", "--repo", repo.string(), "--commit", "HEAD",
+                        "--no-build", "--", "grep", "-q", "ok", "{repo}/gate.txt"});
+  expect(confirmed.exit_code == 0 &&
+             confirmed.output.find("REVERT_CHECK CONFIRMED") != std::string::npos,
+         "revert-check confirms the breaking commit: " + confirmed.output.substr(0, 160));
+  auto not_isolated = run(DIF_DIFBISECT_PATH,
+                          {"revert-check", "--repo", repo.string(), "--commit", "HEAD",
+                           "--no-build", "--", "false"});
+  expect(not_isolated.exit_code == 1 &&
+             not_isolated.output.find("NOT_ISOLATED") != std::string::npos,
+         "revert-check reports NOT_ISOLATED when the gate fails either way");
+  auto head_passes = run(DIF_DIFBISECT_PATH,
+                         {"revert-check", "--repo", repo.string(), "--commit", "HEAD",
+                          "--no-build", "--", "true"});
+  expect(head_passes.exit_code == 1 &&
+             head_passes.output.find("HEAD_PASSES") != std::string::npos,
+         "revert-check reports HEAD_PASSES when the premise is wrong");
+  auto blocked = run(DIF_DIFBISECT_PATH,
+                     {"revert-check", "--repo", repo.string(), "--commit",
+                      "0000000000000000000000000000000000000000", "--no-build",
+                      "--", "true"});
+  expect(blocked.exit_code == 3 && blocked.output.find("BLOCKED") != std::string::npos,
+         "revert-check is BLOCKED on an unknown commit");
+  expect(std::system(("test \"$(git -C " + quote(repo.string()) +
+                      " worktree list | wc -l)\" = 1")
+                         .c_str()) == 0,
+         "revert-check removes its worktree");
+#endif
+}
+
 int main() {
   try {
     std::filesystem::remove_all(workspace());
@@ -405,6 +460,7 @@ int main() {
     test_difbisect_pairs();
     test_difbisect_program();
     test_difinspect_source();
+    test_difbisect_revert_check();
   } catch (const std::exception &error) {
     std::cerr << "bisect tests: " << error.what() << "\n";
     return 1;
