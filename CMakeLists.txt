@@ -582,7 +582,8 @@ install(TARGETS diftokenize RUNTIME DESTINATION bin)
 if(DIF_BUILD_TESTS)
   add_executable(dif_tokenizer_tests tests/tokenizer_tests.cpp)
   target_link_libraries(dif_tokenizer_tests PRIVATE dif_text)
-  add_test(NAME dif_tokenizer_tests COMMAND dif_tokenizer_tests)
+  add_test(NAME dif_tokenizer_tests COMMAND dif_tokenizer_tests
+           ${CMAKE_SOURCE_DIR}/perf/regress/fixtures/tokenizer-mistral-tekken)
   set_tests_properties(dif_tokenizer_tests PROPERTIES SKIP_RETURN_CODE 77)
 
   add_executable(dif_flux2_prompt_tests tests/flux2_prompt_tests.cpp)

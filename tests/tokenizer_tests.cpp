@@ -12,11 +12,13 @@
 
 #include "dif/support/error.hpp"
 #include "dif/text/qwen_bpe_tokenizer.hpp"
+#include "dif/support/json.hpp"
 #include "dif/text/unicode.hpp"
 
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <iterator>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -128,8 +130,55 @@ std::string first_divergence(const std::vector<std::int32_t> &got,
 
 } // namespace
 
-int main() {
+// Mistral Tekken dialect gate (FLUX.2 [dev] tokenizer): every case in
+// perf/regress/fixtures/tokenizer-mistral-tekken/cases.json was produced by
+// the reference `tokenizers` library with add_special_tokens=False. Runs when
+// the Dev tokenizer files are present (DIF_FLUX2_DEV_TOKENIZER_DIR or the HF
+// cache snapshot); otherwise it is reported as skipped, never as passed.
+void run_tekken_gate(const std::filesystem::path &fixture_dir) {
+  std::filesystem::path tokenizer_dir;
+  if (const char *env = std::getenv("DIF_FLUX2_DEV_TOKENIZER_DIR"))
+    tokenizer_dir = env;
+  else {
+    const std::filesystem::path snapshots =
+        "/home/alex/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-dev/snapshots";
+    if (std::filesystem::exists(snapshots))
+      for (const auto &entry : std::filesystem::directory_iterator(snapshots))
+        if (std::filesystem::exists(entry.path() / "tokenizer" / "tokenizer.json"))
+          tokenizer_dir = entry.path() / "tokenizer";
+  }
+  const auto cases_path = fixture_dir / "cases.json";
+  if (tokenizer_dir.empty() || !std::filesystem::exists(cases_path)) {
+    std::cout << "SKIP: Mistral Tekken gate (tokenizer dir or fixture not found)\n";
+    return;
+  }
+  const auto tokenizer = dif::text::QwenBpeTokenizer::load(
+      tokenizer_dir / "tokenizer.json", tokenizer_dir / "tokenizer_config.json");
+  std::ifstream in(cases_path, std::ios::binary);
+  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const auto root = dif::json::parse(text);
+  std::size_t checked = 0U;
+  for (const auto &entry : root.find("cases")->array()) {
+    const auto &prompt = entry.find("text")->string();
+    std::vector<std::int32_t> want;
+    for (const auto &id : entry.find("ids")->array())
+      want.push_back(static_cast<std::int32_t>(id.number()));
+    const auto got = tokenizer.encode(prompt);
+    if (got != want) {
+      ++failures;
+      std::cerr << "FAIL: Tekken ids differ for " << prompt.substr(0, 40) << " (got "
+                << got.size() << " ids, want " << want.size() << ")\n";
+    }
+    ++checked;
+  }
+  std::cout << "Mistral Tekken gate: " << checked << " cases checked, "
+            << (failures == 0 ? "all match" : "mismatches") << "\n";
+}
+
+int main(int argc, char **argv) {
   run_unit_tests();
+  run_tekken_gate(argc > 1 ? std::filesystem::path(argv[1])
+                           : std::filesystem::path("perf/regress/fixtures/tokenizer-mistral-tekken"));
 
   const char *processor_env = std::getenv("DIF_H3_PROCESSOR");
   const std::filesystem::path processor =
