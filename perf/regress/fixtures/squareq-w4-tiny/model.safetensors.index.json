@@ -1,0 +1,11 @@
+{
+ "metadata": {
+  "format": "squareq_w4_v1"
+ },
+ "weight_map": {
+  "blocks.0.linear.qweight": "model-00001-of-00001.safetensors",
+  "blocks.0.linear.wscales": "model-00001-of-00001.safetensors",
+  "blocks.0.linear.lora_down": "model-00001-of-00001.safetensors",
+  "blocks.0.linear.lora_up": "model-00001-of-00001.safetensors"
+ }
+}

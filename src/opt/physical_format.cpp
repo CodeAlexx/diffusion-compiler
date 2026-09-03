@@ -141,8 +141,15 @@ FormatStatus physical_format_status(PhysicalFormat format,
         "no FP8 Linear implementation in this build; identity and target "
         "requirements are registered so a later backend can compete";
     break;
-  case PhysicalFormat::SquareQW8:
   case PhysicalFormat::SquareQW4:
+    status.availability = FormatAvailability::ExecutionPolicy;
+    status.availability_reason =
+        "SquareQ W4 slab (squareq_w4_v1) consumed by the frontend rewrite "
+        "dif::frontend::rewrite_linear_weights_squareq_w4: dequantize_int4 + "
+        "Hadamard-256 + low-rank on existing DiffIR semantics; selected by "
+        "the tool (difflux2sample --squareq-w4-slab), not by the search";
+    break;
+  case PhysicalFormat::SquareQW8:
   case PhysicalFormat::SquareQNvfp4:
     status.availability = FormatAvailability::HookOnly;
     status.availability_reason =

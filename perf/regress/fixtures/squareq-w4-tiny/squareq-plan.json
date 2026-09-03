@@ -1,0 +1,26 @@
+{
+ "plan_version": 1,
+ "format": "squareq_w4_v1",
+ "model": "fixture",
+ "source": "random",
+ "hblock": 256,
+ "group": 64,
+ "layers": {
+  "blocks.0.linear.weight": {
+   "out": 256,
+   "in": 512,
+   "rank": 32,
+   "format": "squareq_w4_v1",
+   "cos_w": 0.9967433054136405,
+   "rel_l2": 0.0806589126586914,
+   "bytes_q": 118784,
+   "bytes_bf16": 262144
+  }
+ },
+ "passthrough": [],
+ "totals": {
+  "quantized_layers": 1,
+  "cos_w_min": 0.9967433054136405,
+  "cos_w_mean": 0.9967433054136405
+ }
+}

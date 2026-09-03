@@ -56,6 +56,8 @@ std::optional<ir::DType> dtype(std::string_view name) {
     return ir::DType::F16;
   if (name == "I8")
     return ir::DType::I8;
+  if (name == "U8")
+    return ir::DType::I8; // unsigned bytes map onto the packed-byte type
   if (name == "I32")
     return ir::DType::I32;
   if (name == "BOOL")

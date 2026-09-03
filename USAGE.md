@@ -880,6 +880,19 @@ difflux2sample --model-dir DIR --vae-checkpoint ae.safetensors --prompt TEXT --o
                [--int8-weight-only-group32 CHECKPOINT_NAME ...] [--cache-dir DIR] [--profile-pipeline]
 ```
 
+SquareQ W4 slab (`--squareq-w4-slab DIR`): DIR holds a SquareQ v3 slab
+(`model.safetensors.index.json` shards plus `squareq-plan.json`, format
+`squareq_w4_v1`, built by mojodiffusion `scripts/squareq_build_slab.py`).
+Every transformer Linear weight named in the plan is replaced before prepare
+by `dequantize_int4` (group 64) + a Hadamard-256 block rotation + the rank-R
+low-rank branch on existing DiffIR semantics, and its BF16 binding is
+dropped, so the resident weight budget shrinks to about 0.28x. The receipt
+(`FLUX2_SQUAREQ_W4` line, report `squareq_w4`) records format, rank, Linear
+count, slab bytes, replaced BF16 bytes and the plan's minimum weight cosine.
+Fails closed on a wrong format tag, a geometry or rank disagreement with the
+plan, or a missing slab tensor. Gate: `dif_squareq_w4_tests` against
+`perf/regress/fixtures/squareq-w4-tiny` (tools/export_squareq_w4_fixture.py).
+
 `difflux2block` is the source-faithful gate for one double block, single
 block, the whole transformer, or the VAE against a creator fixture.
 `difflux2sample` is the complete native prompt-to-PNG path: it tokenizes and

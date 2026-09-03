@@ -5,6 +5,7 @@
 // framework runtime is loaded by this process.
 
 #include "dif/frontend/flux2.hpp"
+#include "dif/frontend/squareq_w4.hpp"
 #include "dif/frontend/flux2_prompt.hpp"
 #include "dif/frontend/flux2_vae.hpp"
 #include "dif/compiler/layout_plan.hpp"
@@ -91,6 +92,9 @@ struct Arguments {
   bool streamed_keep_mapped_pages{true};
   bool profile_pipeline{};
   bool int8_weight_only_all_linears{};
+  // --squareq-w4-slab DIR: SquareQ v3 W4 slab (index + squareq-plan.json)
+  // replacing every planned transformer Linear weight (dequant-first).
+  fs::path squareq_w4_slab;
   bool int8_weight_only_row_scaled_all_linears{};
   std::uint32_t int8_weight_only_group_size{64U};
   std::vector<std::string> int8_weight_only_exclude_names;
@@ -345,6 +349,8 @@ Arguments parse(int argc, char **argv) {
       result.profile_pipeline = true;
     else if (option == "--int8-weight-only-all-linears")
       result.int8_weight_only_all_linears = true;
+    else if (option == "--squareq-w4-slab")
+      result.squareq_w4_slab = value();
     else if (option == "--int8-weight-only-row-scaled-all-linears")
       result.int8_weight_only_row_scaled_all_linears = true;
     else if (option == "--int8-weight-only-group-size")
@@ -1146,6 +1152,7 @@ struct DenoiseResult {
   std::vector<std::uint32_t> fp8_double_blocks;
   bool fp8_row_scaled{};
   std::uint32_t int8_weight_only_linear_count{};
+  dif::frontend::SquareQW4RewriteResult squareq_w4;
   std::uint32_t int8_weight_only_group_size{64U};
   std::uint64_t int8_weight_only_bytes{};
   bool int8_weight_only_row_scaled{};
@@ -3268,6 +3275,17 @@ DenoiseResult denoise(const Arguments &arguments,
                 transformer.checkpoint_names.at(index));
     bindings.emplace(id, std::move(tensor));
   }
+  if (!arguments.squareq_w4_slab.empty()) {
+    result.squareq_w4 = dif::frontend::rewrite_linear_weights_squareq_w4(
+        transformer.program, bindings, transformer.checkpoint_tensors,
+        transformer.checkpoint_names, arguments.squareq_w4_slab);
+    std::cerr << "FLUX2_SQUAREQ_W4 format=" << result.squareq_w4.format
+              << " rank=" << result.squareq_w4.rank
+              << " linears=" << result.squareq_w4.linear_count
+              << " slab_bytes=" << result.squareq_w4.quantized_bytes
+              << " bf16_bytes_replaced=" << result.squareq_w4.bf16_bytes_replaced
+              << " plan_cos_w_min=" << result.squareq_w4.plan_cos_w_min << '\n';
+  }
   auto w8a8_blocks = arguments.w8a8_single_linear1_block_ids;
   if (w8a8_blocks.empty())
     for (std::uint32_t block = 0U;
@@ -4373,6 +4391,14 @@ int main(int argc, char **argv) {
            << denoised.streamed_weight_bytes
            << ",\n    \"required_bytes\": "
            << denoised.residency_required_bytes << "\n  },\n"
+           << "  \"squareq_w4\": {\n"
+           << "    \"format\": " << std::quoted(denoised.squareq_w4.format)
+           << ",\n    \"rank\": " << denoised.squareq_w4.rank
+           << ",\n    \"linear_count\": " << denoised.squareq_w4.linear_count
+           << ",\n    \"slab_bytes\": " << denoised.squareq_w4.quantized_bytes
+           << ",\n    \"bf16_bytes_replaced\": " << denoised.squareq_w4.bf16_bytes_replaced
+           << ",\n    \"plan_cos_w_min\": " << denoised.squareq_w4.plan_cos_w_min
+           << "\n  },\n"
            << "  \"int8_weight_only_candidate\": {\n"
            << "    \"linear_count\": "
            << denoised.int8_weight_only_linear_count

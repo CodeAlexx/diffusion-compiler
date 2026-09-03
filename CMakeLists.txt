@@ -52,6 +52,7 @@ add_library(difcore
   src/frontend/provenance.cpp
   src/frontend/krea2_vae.cpp
   src/frontend/flux2.cpp
+  src/frontend/squareq_w4.cpp
   src/frontend/flux2_vae.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
@@ -413,6 +414,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_flux2_frontend_tests tests/flux2_frontend_tests.cpp)
   target_link_libraries(dif_flux2_frontend_tests PRIVATE difcore)
   add_test(NAME dif_flux2_frontend_tests COMMAND dif_flux2_frontend_tests)
+  add_executable(dif_squareq_w4_tests tests/squareq_w4_tests.cpp)
+  target_link_libraries(dif_squareq_w4_tests PRIVATE difcore)
+  add_test(NAME dif_squareq_w4_tests COMMAND dif_squareq_w4_tests
+           ${CMAKE_SOURCE_DIR}/perf/regress/fixtures/squareq-w4-tiny)
 
   add_executable(dif_lora_tests tests/lora_tests.cpp)
   target_link_libraries(dif_lora_tests PRIVATE difcore)
