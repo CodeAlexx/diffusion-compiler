@@ -8624,6 +8624,51 @@ public:
           std::max(cudnn_workspace_bytes_, found->second->workspace_bytes());
       uses_cudnn_attention_ = true;
     }
+    // AttentionBackward implementation 2: cuDNN SDPA backward over the saved
+    // logsumexp. One plan per geometry, shared across operations.
+    std::unordered_map<CudnnAttentionKey,
+                       std::shared_ptr<CudnnAttentionBackwardPlan>,
+                       CudnnAttentionKeyHash>
+        cudnn_backward_plan_cache;
+    for (const auto &op : program_.operations) {
+      if (op.opcode != ir::Opcode::AttentionBackward ||
+          op.u64(ir::AttrKey::Implementation, 1U) != 2U)
+        continue;
+      const auto *query = program_.tensor(op.inputs.at(1));
+      if (!query || query->dims.size() != 3U)
+        fail("cuDNN attention backward requires an [S,H,D] query");
+      const auto sequence = query->dims.at(0);
+      const auto heads = query->dims.at(1);
+      const auto head_dim = query->dims.at(2);
+      const CudnnAttentionKey key{
+          query->dtype,
+          1U,
+          sequence,
+          heads,
+          op.u64(ir::AttrKey::KvHeads, heads),
+          head_dim,
+          std::bit_cast<std::uint64_t>(op.f64(
+              ir::AttrKey::AttentionScale,
+              1.0 / std::sqrt(static_cast<double>(head_dim)))),
+          op.boolean(ir::AttrKey::Causal, false),
+          false,
+          options.cudnn_attention_heuristic,
+      };
+      auto found = cudnn_backward_plan_cache.find(key);
+      if (found == cudnn_backward_plan_cache.end()) {
+        auto plan = std::make_shared<CudnnAttentionBackwardPlan>(
+            *query, key.kv_heads, std::bit_cast<double>(key.scale_bits),
+            key.causal, key.heuristic);
+        found = cudnn_backward_plan_cache.emplace(key, std::move(plan)).first;
+      }
+      cudnn_attention_backward_plans_.emplace(op.id, found->second);
+      cudnn_workspace_bytes_ =
+          std::max(cudnn_workspace_bytes_, found->second->workspace_bytes());
+      // Packed [H,S] F32 copy of the program's [S,H] logsumexp per operation.
+      cudnn_backward_stats_bytes_ +=
+          align_256(sequence * heads * sizeof(float));
+      uses_cudnn_attention_ = true;
+    }
     for (const auto &op : program_.operations) {
       if (op.opcode != ir::Opcode::Conv2d)
         continue;
@@ -8903,10 +8948,12 @@ public:
                                cudnn_workspace_bytes_ +
                                materialized_f32_attention_score_bytes_;
     if (base_required > std::numeric_limits<std::uint64_t>::max() -
-                            ck_attention_scratch_bytes_)
-      fail("DiffIR allocation plus H3 CK scratch overflow");
+                            ck_attention_scratch_bytes_ -
+                            cudnn_backward_stats_bytes_)
+      fail("DiffIR allocation plus attention scratch overflow");
     const auto base_with_attention =
-        base_required + ck_attention_scratch_bytes_;
+        base_required + ck_attention_scratch_bytes_ +
+        cudnn_backward_stats_bytes_;
     if (base_with_attention > std::numeric_limits<std::uint64_t>::max() -
                             h3_w8a8_bytes)
       fail("DiffIR allocation plus H3 W8A8 storage overflow");
@@ -9404,6 +9451,22 @@ public:
     }
     if (h3_ck_attention_plan_)
       h3_ck_attention_plan_->allocate(arena_.get());
+#if DIF_HAS_CUDNN
+    for (const auto &[operation_id, plan] : cudnn_attention_backward_plans_) {
+      const auto &op = *std::find_if(
+          program_.operations.begin(), program_.operations.end(),
+          [&](const ir::Operation &candidate) {
+            return candidate.id == operation_id;
+          });
+      const auto *query = program_.tensor(op.inputs.at(1));
+      cudnn_backward_stats_.emplace(
+          operation_id,
+          std::make_unique<Workspace>(
+              static_cast<std::size_t>(query->dims.at(0) * query->dims.at(1) *
+                                       sizeof(float)),
+              arena_.get()));
+    }
+#endif
     for (auto &plan : h3_w8a8_mlp_plans_) {
       if (plan.resident)
         allocate_h3_w8a8_weights(plan, arena_.get());
@@ -10832,6 +10895,39 @@ public:
             reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
             reinterpret_cast<std::uintptr_t>(context_.stream()));
       }
+      else if (op.opcode == ir::Opcode::AttentionBackward &&
+               op.u64(ir::AttrKey::Implementation, 1U) == 2U) {
+        count_cudnn_attention_dispatch();
+        // Transpose the program's F32 [S,H] logsumexp into the packed [H,S]
+        // stats cuDNN reads: C(SxH, column-major, ld S) = A^T with A the
+        // HxS column-major view of the row-major [S,H] buffer (ld H).
+        const auto *query = program_.tensor(op.inputs.at(1));
+        const auto stats_sequence = static_cast<int>(query->dims.at(0));
+        const auto stats_heads = static_cast<int>(query->dims.at(1));
+        const auto &stats = cudnn_backward_stats_.at(op.id);
+        const float one = 1.0f;
+        const float zero = 0.0f;
+        const auto *lse =
+            reinterpret_cast<const float *>(buffers_.at(op.inputs.at(5)));
+        auto *packed = reinterpret_cast<float *>(stats->pointer());
+        if (cublasSgeam(context_.cublas(), CUBLAS_OP_T, CUBLAS_OP_N,
+                        stats_sequence, stats_heads, &one, lse, stats_heads,
+                        &zero, packed, stats_sequence, packed,
+                        stats_sequence) != CUBLAS_STATUS_SUCCESS)
+          fail("cublasSgeam attention backward stats transpose failed");
+        cudnn_attention_backward_plans_.at(op.id)->execute(
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2))),
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(3))),
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(4))),
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+            static_cast<std::uintptr_t>(stats->pointer()),
+            static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+            static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(1))),
+            static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(2))),
+            reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
+            reinterpret_cast<std::uintptr_t>(context_.stream()));
+      }
       else if (op.opcode == ir::Opcode::Attention &&
                op.u64(ir::AttrKey::Implementation, 1U) == 2U) {
         count_cudnn_attention_dispatch();
@@ -11788,6 +11884,12 @@ private:
 #if DIF_HAS_CUDNN
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnAttentionPlan>>
       cudnn_attention_plans_;
+  std::unordered_map<std::uint32_t,
+                     std::shared_ptr<CudnnAttentionBackwardPlan>>
+      cudnn_attention_backward_plans_;
+  std::unordered_map<std::uint32_t, std::unique_ptr<Workspace>>
+      cudnn_backward_stats_;
+  std::uint64_t cudnn_backward_stats_bytes_{};
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv2dPlan>>
       cudnn_conv_plans_;
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv3dPlan>>

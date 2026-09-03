@@ -24,6 +24,11 @@ constexpr std::int64_t kValueUid = 3;
 constexpr std::int64_t kOutputUid = 4;
 constexpr std::int64_t kScaleUid = 5;
 constexpr std::int64_t kBiasUid = 6;
+constexpr std::int64_t kGradOutputUid = 7;
+constexpr std::int64_t kStatsUid = 8;
+constexpr std::int64_t kGradQueryUid = 9;
+constexpr std::int64_t kGradKeyUid = 10;
+constexpr std::int64_t kGradValueUid = 11;
 
 void check(cudnnStatus_t status, const char *action) {
   if (status == CUDNN_STATUS_SUCCESS)
@@ -254,6 +259,196 @@ void CudnnAttentionPlan::execute(std::uintptr_t query, std::uintptr_t key,
       impl_->handle, bindings, reinterpret_cast<void *>(workspace));
   if (!status.is_good())
     fail("cuDNN attention execute: " + status.get_message());
+}
+
+struct CudnnAttentionBackwardPlan::Impl {
+  cudnnHandle_t handle{};
+  std::shared_ptr<fe::graph::Graph> graph;
+  std::size_t workspace{};
+  float scale{};
+
+  ~Impl() {
+    graph.reset();
+    if (handle)
+      (void)cudnnDestroy(handle);
+  }
+};
+
+CudnnAttentionBackwardPlan::CudnnAttentionBackwardPlan(
+    const ir::TensorDesc &query, std::uint64_t kv_heads, double scale,
+    bool causal, std::uint32_t heuristic)
+    : impl_(std::make_unique<Impl>()) {
+  if ((query.dtype != ir::DType::BF16 && query.dtype != ir::DType::F16) ||
+      query.dims.size() != 3U)
+    fail("cuDNN attention backward requires BF16 or F16 [S,H,D]");
+  const auto sequence = dimension(query.dims[0], "sequence");
+  const auto heads = dimension(query.dims[1], "heads");
+  const auto head_dim = dimension(query.dims[2], "head dimension");
+  const auto key_value_heads = dimension(kv_heads, "kv heads");
+  if (key_value_heads > heads || heads % key_value_heads != 0)
+    fail("cuDNN attention backward kv heads must divide the query head count");
+  if (!(scale > 0.0))
+    fail("cuDNN attention backward scale must be positive");
+
+  check(cudnnCreate(&impl_->handle), "cudnnCreate");
+  impl_->graph = std::make_shared<fe::graph::Graph>();
+  impl_->graph
+      ->set_io_data_type(query.dtype == ir::DType::BF16
+                             ? fe::DataType_t::BFLOAT16
+                             : fe::DataType_t::HALF)
+      .set_intermediate_data_type(fe::DataType_t::FLOAT)
+      .set_compute_data_type(fe::DataType_t::FLOAT);
+  impl_->scale = static_cast<float>(scale);
+  constexpr std::int64_t batch = 1;
+  // Same [B,H,S,D] view over DiffIR's [S,H,D] bytes as the forward plan.
+  const std::vector<std::int64_t> dims{batch, heads, sequence, head_dim};
+  const std::vector<std::int64_t> strides{
+      heads * sequence * head_dim, head_dim, heads * head_dim, 1};
+  const std::vector<std::int64_t> key_value_dims{batch, key_value_heads,
+                                                 sequence, head_dim};
+  const std::vector<std::int64_t> key_value_strides{
+      key_value_heads * sequence * head_dim, head_dim,
+      key_value_heads * head_dim, 1};
+  // cuDNN reads its softmax stats as the packed [B,H,S,1] tensor its own
+  // forward writes (strides {H*S, S, 1, 1}); the strides declared here are
+  // not honoured for other layouts (measured: cosine 0.998 against the math
+  // path with the program's [S,H] strides). The executor hands in a packed
+  // transposed copy of the program's F32 [S,H] logsumexp.
+  const std::vector<std::int64_t> stats_dims{batch, heads, sequence, 1};
+  const std::vector<std::int64_t> stats_strides{heads * sequence, sequence, 1, 1};
+  auto tensor = [&](const char *name, std::int64_t uid,
+                    const std::vector<std::int64_t> &tensor_dims,
+                    const std::vector<std::int64_t> &tensor_strides) {
+    return impl_->graph->tensor(fe::graph::Tensor_attributes()
+                                    .set_name(name)
+                                    .set_uid(uid)
+                                    .set_dim(tensor_dims)
+                                    .set_stride(tensor_strides));
+  };
+  auto q = tensor("Q", kQueryUid, dims, strides);
+  auto k = tensor("K", kKeyUid, key_value_dims, key_value_strides);
+  auto v = tensor("V", kValueUid, key_value_dims, key_value_strides);
+  auto o = tensor("O", kOutputUid, dims, strides);
+  auto d_o = tensor("dO", kGradOutputUid, dims, strides);
+  auto stats = impl_->graph->tensor(fe::graph::Tensor_attributes()
+                                        .set_name("Stats")
+                                        .set_uid(kStatsUid)
+                                        .set_dim(stats_dims)
+                                        .set_stride(stats_strides)
+                                        .set_data_type(fe::DataType_t::FLOAT));
+  auto attention_scale =
+      impl_->graph->tensor(fe::graph::Tensor_attributes()
+                               .set_name("Attn_scale")
+                               .set_uid(kScaleUid)
+                               .set_dim({1, 1, 1, 1})
+                               .set_stride({1, 1, 1, 1})
+                               .set_is_pass_by_value(true)
+                               .set_data_type(fe::DataType_t::FLOAT));
+  auto attributes = fe::graph::SDPA_backward_attributes()
+                        .set_name("dif_cudnn_sdpa_backward")
+                        .set_attn_scale(attention_scale);
+  if (causal)
+    attributes.set_causal_mask(true);
+  const bool deterministic = heuristic == 4U;
+  if (deterministic)
+    attributes.set_deterministic_algorithm(true);
+  auto [grad_q, grad_k, grad_v] =
+      impl_->graph->sdpa_backward(q, k, v, o, d_o, stats, attributes);
+  grad_q->set_output(true).set_uid(kGradQueryUid).set_dim(dims).set_stride(strides);
+  grad_k->set_output(true)
+      .set_uid(kGradKeyUid)
+      .set_dim(key_value_dims)
+      .set_stride(key_value_strides);
+  grad_v->set_output(true)
+      .set_uid(kGradValueUid)
+      .set_dim(key_value_dims)
+      .set_stride(key_value_strides);
+
+  fe::HeurMode_t mode = fe::HeurMode_t::A;
+  switch (heuristic) {
+  case 0U:
+  case 3U:
+  case 4U:
+    mode = fe::HeurMode_t::A;
+    break;
+  case 1U:
+    mode = fe::HeurMode_t::B;
+    break;
+  case 2U:
+    mode = fe::HeurMode_t::FALLBACK;
+    break;
+  default:
+    fail("cuDNN attention backward heuristic must be A, B, FALLBACK, autotune, "
+         "or deterministic");
+  }
+  auto status = fe::error_t{fe::error_code_t::OK, ""};
+  if (deterministic) {
+    status = impl_->graph->validate();
+    if (status.is_good())
+      status = impl_->graph->build_operation_graph(impl_->handle);
+    if (status.is_good())
+      status = impl_->graph->create_execution_plans({mode});
+    if (status.is_good())
+      impl_->graph->deselect_numeric_notes(
+          {fe::NumericalNote_t::NONDETERMINISTIC});
+    if (status.is_good())
+      status = impl_->graph->check_support(impl_->handle);
+    if (status.is_good())
+      status = impl_->graph->build_plans(
+          impl_->handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE, false);
+  } else {
+    status = impl_->graph->build(impl_->handle, {mode},
+                                 fe::BuildPlanPolicy_t::HEURISTICS_CHOICE,
+                                 false);
+  }
+  if (!status.is_good())
+    fail("cuDNN attention backward graph build: " + status.get_message());
+  std::int64_t workspace = 0;
+  status = impl_->graph->get_workspace_size(workspace);
+  if (!status.is_good())
+    fail("cuDNN attention backward workspace query: " + status.get_message());
+  if (workspace < 0 ||
+      static_cast<std::uint64_t>(workspace) >
+          static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+    fail("cuDNN attention backward workspace is outside size_t range");
+  impl_->workspace = static_cast<std::size_t>(workspace);
+}
+
+CudnnAttentionBackwardPlan::~CudnnAttentionBackwardPlan() = default;
+
+std::size_t CudnnAttentionBackwardPlan::workspace_bytes() const {
+  return impl_->workspace;
+}
+
+void CudnnAttentionBackwardPlan::execute(
+    std::uintptr_t query, std::uintptr_t key, std::uintptr_t value,
+    std::uintptr_t output, std::uintptr_t grad_output, std::uintptr_t logsumexp,
+    std::uintptr_t grad_query, std::uintptr_t grad_key,
+    std::uintptr_t grad_value, std::uintptr_t workspace,
+    std::uintptr_t stream) {
+  if (!query || !key || !value || !output || !grad_output || !logsumexp ||
+      !grad_query || !grad_key || !grad_value)
+    fail("cuDNN attention backward received a null tensor pointer");
+  if (impl_->workspace != 0U && !workspace)
+    fail("cuDNN attention backward received a null workspace");
+  check(cudnnSetStream(impl_->handle, reinterpret_cast<cudaStream_t>(stream)),
+        "cudnnSetStream");
+  std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> bindings{
+      {kQueryUid, reinterpret_cast<void *>(query)},
+      {kKeyUid, reinterpret_cast<void *>(key)},
+      {kValueUid, reinterpret_cast<void *>(value)},
+      {kOutputUid, reinterpret_cast<void *>(output)},
+      {kGradOutputUid, reinterpret_cast<void *>(grad_output)},
+      {kStatsUid, reinterpret_cast<void *>(logsumexp)},
+      {kGradQueryUid, reinterpret_cast<void *>(grad_query)},
+      {kGradKeyUid, reinterpret_cast<void *>(grad_key)},
+      {kGradValueUid, reinterpret_cast<void *>(grad_value)},
+      {kScaleUid, &impl_->scale},
+  };
+  auto status = impl_->graph->execute(
+      impl_->handle, bindings, reinterpret_cast<void *>(workspace));
+  if (!status.is_good())
+    fail("cuDNN attention backward execute: " + status.get_message());
 }
 
 } // namespace dif::runtime
