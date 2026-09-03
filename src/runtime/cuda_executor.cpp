@@ -8282,6 +8282,9 @@ public:
               program_, operation, library);
         else if (!h3_ck_attention_plan_->compatible(program_, operation))
           fail("H3 CK attention scratch reuse requires one H3 geometry");
+        h3_ck_attention_layer_.emplace(
+            operation.id,
+            static_cast<std::uint32_t>(h3_ck_attention_plans_.size()));
         h3_ck_attention_plans_.emplace(operation.id, h3_ck_attention_plan_);
       }
       if (h3_ck_attention_plans_.empty())
@@ -8289,6 +8292,34 @@ public:
              "operation was selected");
       ck_attention_scratch_bytes_ =
           h3_ck_attention_plan_->scratch_bytes();
+    }
+    {
+      // Hybrid sub-range: which routed operations follow the per-run
+      // h3_int8_attention_active switch.
+      const auto routed =
+          static_cast<std::uint32_t>(h3_ck_attention_plans_.size());
+      const bool explicit_subrange =
+          options.h3_int8_attention_hybrid_first_layer != 0U ||
+          options.h3_int8_attention_hybrid_layers !=
+              std::numeric_limits<std::uint32_t>::max();
+      if (explicit_subrange && !options.h3_int8_attention_hybrid)
+        fail("h3_int8_attention_hybrid_first_layer/layers require "
+             "h3_int8_attention_hybrid");
+      if (explicit_subrange &&
+          (routed == 0U ||
+           options.h3_int8_attention_hybrid_first_layer >= routed ||
+           options.h3_int8_attention_hybrid_layers == 0U ||
+           options.h3_int8_attention_hybrid_layers >
+               routed - options.h3_int8_attention_hybrid_first_layer))
+        fail("H3 INT8 attention hybrid sub-range leaves the routed "
+             "attention operations (" + std::to_string(routed) + ")");
+      h3_int8_attention_hybrid_first_layer_ =
+          options.h3_int8_attention_hybrid_first_layer;
+      h3_int8_attention_hybrid_layers_ =
+          routed == 0U
+              ? 0U
+              : std::min(options.h3_int8_attention_hybrid_layers,
+                         routed - options.h3_int8_attention_hybrid_first_layer);
     }
     {
       std::unordered_map<std::uint32_t, std::uint32_t> direct_aliases;
@@ -8625,6 +8656,53 @@ public:
       cudnn_workspace_bytes_ =
           std::max(cudnn_workspace_bytes_, found->second->workspace_bytes());
       uses_cudnn_attention_ = true;
+    }
+    // Exact query-row overlay for the INT8 attention route: one cuDNN plan
+    // per range (query rows = the range, K/V rows = the full sequence),
+    // shared by every routed operation because the route admits exactly one
+    // H3 attention geometry.
+    if (!options.h3_int8_attention_exact_query_ranges.empty()) {
+      if (h3_ck_attention_plans_.empty())
+        fail("h3_int8_attention_exact_query_ranges require an H3 INT8 "
+             "attention route");
+      auto ranges = options.h3_int8_attention_exact_query_ranges;
+      std::sort(ranges.begin(), ranges.end(),
+                [](const auto &a, const auto &b) { return a.begin < b.begin; });
+      const ir::Operation *routed_operation = nullptr;
+      for (const auto &op : program_.operations)
+        if (h3_ck_attention_plans_.contains(op.id)) {
+          routed_operation = &op;
+          break;
+        }
+      const auto *query = program_.tensor(routed_operation->inputs.at(0));
+      if (!query || query->dims.size() != 3U)
+        fail("H3 exact query-row overlay requires the [S,H,D] route geometry");
+      const auto sequence = query->dims.at(0);
+      std::uint64_t previous_end = 0U;
+      for (const auto &range : ranges) {
+        if (range.count == 0U ||
+            static_cast<std::uint64_t>(range.begin) + range.count > sequence ||
+            range.begin < previous_end)
+          fail("H3 exact query-row range is empty, out of bounds, or "
+               "overlaps another range: [" + std::to_string(range.begin) +
+               ", +" + std::to_string(range.count) + ") of " +
+               std::to_string(sequence));
+        previous_end = static_cast<std::uint64_t>(range.begin) + range.count;
+        ir::TensorDesc subset = *query;
+        subset.dims = {range.count, query->dims.at(1), query->dims.at(2)};
+        auto plan = std::make_shared<CudnnAttentionPlan>(
+            subset,
+            routed_operation->u64(ir::AttrKey::KvHeads, query->dims.at(1)),
+            routed_operation->f64(
+                ir::AttrKey::AttentionScale,
+                1.0 / std::sqrt(static_cast<double>(query->dims.at(2)))),
+            false, false, options.cudnn_attention_heuristic, sequence);
+        cudnn_workspace_bytes_ =
+            std::max(cudnn_workspace_bytes_, plan->workspace_bytes());
+        h3_exact_query_range_plans_.push_back(std::move(plan));
+        uses_cudnn_attention_ = true;
+      }
+      h3_exact_query_ranges_ = std::move(ranges);
     }
     // AttentionBackward implementation 2: cuDNN SDPA backward over the saved
     // logsumexp. One plan per geometry, shared across operations.
@@ -10352,6 +10430,7 @@ public:
       fail("intermediate capture requires zero warmups and one iteration");
     LaunchTelemetry run_telemetry;
     TelemetryScope telemetry_scope(run_telemetry);
+    h3_exact_query_row_dispatches_ = 0U;
     Tracer run_tracer;
     std::optional<TracerScope> tracer_scope;
     const bool tracing = telemetry::trace_events_requested(options);
@@ -10834,6 +10913,7 @@ public:
       } else if (op.opcode == ir::Opcode::Attention &&
                h3_ck_attention_plans_.contains(op.id) &&
                (options.h3_int8_attention_active ||
+                !h3_hybrid_member(op.id) ||
                 (!h3_int8_attention_hybrid_ &&
                  [&] {
                    fail("exact attention for this run requires "
@@ -10843,6 +10923,30 @@ public:
         count_ck_attention_dispatch();
         h3_ck_attention_plans_.at(op.id)->execute(op, buffers_,
                                                   context_.stream());
+#if DIF_HAS_CUDNN
+        if (!h3_exact_query_range_plans_.empty()) {
+          const auto *query = program_.tensor(op.inputs.at(0));
+          const auto row_bytes =
+              query->dims.at(1) * query->dims.at(2) *
+              static_cast<std::uint64_t>(ir::dtype_size(query->dtype));
+          for (std::size_t index = 0U; index < h3_exact_query_ranges_.size();
+               ++index) {
+            const auto offset = h3_exact_query_ranges_[index].begin * row_bytes;
+            count_cudnn_attention_dispatch();
+            ++h3_exact_query_row_dispatches_;
+            h3_exact_query_range_plans_[index]->execute(
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))) +
+                    offset,
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2))),
+                0U,
+                static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))) +
+                    offset,
+                reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
+                reinterpret_cast<std::uintptr_t>(context_.stream()));
+          }
+        }
+#endif
       } else if (op.opcode == ir::Opcode::Attention &&
                  op.u64(ir::AttrKey::Implementation, 1U) == 3U) {
         materialized_f32_attention_plans_.at(op.id).execute(
@@ -11323,6 +11427,10 @@ public:
            plan->classification(),
            plan->implementation(),
            plan->path().string()});
+    result.h3_int8_attention_hybrid_first_layer =
+        h3_int8_attention_hybrid_first_layer_;
+    result.h3_int8_attention_hybrid_layers = h3_int8_attention_hybrid_layers_;
+    result.h3_int8_attention_exact_query_ranges = h3_exact_query_ranges_;
     result.h3_groupwise_int8.reserve(h3_groupwise_plans_.size());
     for (const auto &plan : h3_groupwise_plans_)
       result.h3_groupwise_int8.push_back(
@@ -11568,6 +11676,8 @@ public:
       streamed_prefetcher_->release_mapped_pages();
     result.preparation_telemetry = preparation_telemetry_;
     result.run_telemetry = run_telemetry;
+    result.h3_int8_attention_exact_row_dispatches =
+        h3_exact_query_row_dispatches_;
     result.captured_intermediates = std::move(captured_intermediates);
     if (options.profile_pipeline) {
       const auto print = [](const char *phase, const LaunchTelemetry &t) {
@@ -11887,12 +11997,28 @@ private:
   std::shared_ptr<CkAttentionPlan> h3_ck_attention_plan_;
   std::unordered_map<std::uint32_t, std::shared_ptr<CkAttentionPlan>>
       h3_ck_attention_plans_;
+  // Route layer index (program order within the INT8 attention route) per
+  // routed operation, the hybrid sub-range that follows the per-run switch,
+  // and the exact query-row overlay ranges with one shared cuDNN plan each.
+  bool h3_hybrid_member(std::uint32_t operation_id) const {
+    const auto layer = h3_ck_attention_layer_.find(operation_id);
+    return layer != h3_ck_attention_layer_.end() &&
+           layer->second >= h3_int8_attention_hybrid_first_layer_ &&
+           layer->second < h3_int8_attention_hybrid_first_layer_ +
+                               h3_int8_attention_hybrid_layers_;
+  }
+  std::unordered_map<std::uint32_t, std::uint32_t> h3_ck_attention_layer_;
+  std::uint32_t h3_int8_attention_hybrid_first_layer_{};
+  std::uint32_t h3_int8_attention_hybrid_layers_{};
+  std::vector<RunOptions::QueryRowRange> h3_exact_query_ranges_;
+  std::uint64_t h3_exact_query_row_dispatches_{};
   std::unordered_map<std::uint32_t, MaterializedF32AttentionPlan>
       materialized_f32_attention_plans_;
   CUfunction materialized_f32_attention_softmax_{};
 #if DIF_HAS_CUDNN
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnAttentionPlan>>
       cudnn_attention_plans_;
+  std::vector<std::shared_ptr<CudnnAttentionPlan>> h3_exact_query_range_plans_;
   std::unordered_map<std::uint32_t,
                      std::shared_ptr<CudnnAttentionBackwardPlan>>
       cudnn_attention_backward_plans_;

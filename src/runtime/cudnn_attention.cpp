@@ -65,7 +65,8 @@ struct CudnnAttentionPlan::Impl {
 CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
                                        std::uint64_t kv_heads, double scale,
                                        bool causal, bool additive_bias,
-                                       std::uint32_t heuristic)
+                                       std::uint32_t heuristic,
+                                       std::uint64_t key_value_sequence)
     : impl_(std::make_unique<Impl>()) {
   if ((query.dtype != ir::DType::BF16 && query.dtype != ir::DType::F16) ||
       (query.dims.size() != 3U && query.dims.size() != 4U))
@@ -82,6 +83,11 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
   const auto key_value_heads = dimension(kv_heads, "kv heads");
   if (key_value_heads > heads || heads % key_value_heads != 0)
     fail("cuDNN attention kv heads must divide the query head count");
+  const auto kv_sequence =
+      key_value_sequence == 0U ? sequence
+                               : dimension(key_value_sequence, "kv sequence");
+  if (causal && kv_sequence != sequence)
+    fail("cuDNN attention causal masks require equal query and K/V rows");
   if (!(scale > 0.0))
     fail("cuDNN attention scale must be positive");
 
@@ -104,9 +110,9 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
   const std::vector<std::int64_t> strides{
       heads * sequence * head_dim, head_dim, heads * head_dim, 1};
   const std::vector<std::int64_t> key_value_dims{batch, key_value_heads,
-                                                 sequence, head_dim};
+                                                 kv_sequence, head_dim};
   const std::vector<std::int64_t> key_value_strides{
-      key_value_heads * sequence * head_dim, head_dim,
+      key_value_heads * kv_sequence * head_dim, head_dim,
       key_value_heads * head_dim, 1};
   auto tensor = [&](const char *name, std::int64_t uid,
                     const std::vector<std::int64_t> &tensor_dims,
@@ -135,9 +141,9 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
   if (causal)
     attributes.set_causal_mask(true);
   if (additive_bias) {
-    const std::vector<std::int64_t> bias_dims{batch, 1, sequence, sequence};
+    const std::vector<std::int64_t> bias_dims{batch, 1, sequence, kv_sequence};
     const std::vector<std::int64_t> bias_strides{
-        sequence * sequence, sequence * sequence, sequence, 1};
+        sequence * kv_sequence, sequence * kv_sequence, kv_sequence, 1};
     auto bias = tensor("Bias", kBiasUid, bias_dims, bias_strides);
     attributes.set_bias(bias);
   }

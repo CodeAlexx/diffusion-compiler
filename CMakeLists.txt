@@ -439,6 +439,11 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_owned_attention_tests tests/owned_attention_tests.cpp)
   target_link_libraries(dif_owned_attention_tests PRIVATE difcore)
   add_test(NAME dif_owned_attention_tests COMMAND dif_owned_attention_tests)
+  add_executable(dif_h3_route_refinement_tests
+                 tests/h3_route_refinement_tests.cpp)
+  target_link_libraries(dif_h3_route_refinement_tests PRIVATE difcore)
+  add_test(NAME dif_h3_route_refinement_tests
+           COMMAND dif_h3_route_refinement_tests)
   add_executable(dif_epilogue_tests tests/epilogue_tests.cpp)
   target_link_libraries(dif_epilogue_tests PRIVATE difcore)
   add_test(NAME dif_epilogue_tests COMMAND dif_epilogue_tests)

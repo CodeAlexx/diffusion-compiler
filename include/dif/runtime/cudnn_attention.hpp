@@ -12,9 +12,13 @@ class CudnnAttentionPlan {
 public:
   // kv_heads: number of K/V heads (GQA); must divide the query head count.
   // Pass query.dims[1] for dense attention.
+  // key_value_sequence: K/V row count when it differs from the query row
+  // count (a query-row subset attending to the full sequence). Zero keeps
+  // the historical square contract.
   CudnnAttentionPlan(const ir::TensorDesc &query, std::uint64_t kv_heads,
                      double scale, bool causal, bool additive_bias = false,
-                     std::uint32_t heuristic = 0U);
+                     std::uint32_t heuristic = 0U,
+                     std::uint64_t key_value_sequence = 0U);
   ~CudnnAttentionPlan();
 
   CudnnAttentionPlan(const CudnnAttentionPlan &) = delete;

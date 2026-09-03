@@ -236,6 +236,28 @@ struct RunOptions {
   // and the approximate route on the rest.
   bool h3_int8_attention_hybrid{false};
   bool h3_int8_attention_active{true};
+  // Sub-range of the INT8-routed transformer Attention operations (counted
+  // in program order from the first routed operation) that obeys the per-run
+  // h3_int8_attention_active switch. Routed operations outside the sub-range
+  // stay on the approximate kernel on every run. Default: the whole route
+  // participates. Requires h3_int8_attention_hybrid; fails closed when the
+  // sub-range leaves the route.
+  std::uint32_t h3_int8_attention_hybrid_first_layer{};
+  std::uint32_t h3_int8_attention_hybrid_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  // Row-subset exact overlay on the H3 INT8 attention route. After the
+  // approximate kernel writes the packed output, each listed contiguous
+  // query-row range is recomputed by the exact cuDNN plan against the full
+  // K/V sequence and overwrites those output rows in place (the packed
+  // [S,H,D] layout makes a row range one contiguous slab, so no gather or
+  // stitch copy exists). Explicit compiler precision policy: the runtime
+  // never guesses modality rows. Fails closed on an empty, out-of-bounds or
+  // overlapping range, and when no INT8 attention route is prepared.
+  struct QueryRowRange {
+    std::uint32_t begin{};
+    std::uint32_t count{};
+  };
+  std::vector<QueryRowRange> h3_int8_attention_exact_query_ranges;
   std::uint32_t linear_tuning_warmups{3};
   std::uint32_t linear_tuning_iterations{10};
   std::uint32_t linear_tuning_sessions{3};
@@ -632,6 +654,14 @@ struct RunResult {
   std::vector<H3W8A8MlpResult> h3_w8a8_mlps;
   std::vector<H3W8A8AttentionResult> h3_w8a8_attentions;
   std::vector<H3CKAttentionResult> h3_ck_attentions;
+  // Receipt for the two route refinements above: which routed operations
+  // (program-order layer indices within the route) follow the per-run
+  // switch, which query-row ranges were recomputed exactly, and how many
+  // exact row-range dispatches this run() issued.
+  std::uint32_t h3_int8_attention_hybrid_first_layer{};
+  std::uint32_t h3_int8_attention_hybrid_layers{};
+  std::vector<RunOptions::QueryRowRange> h3_int8_attention_exact_query_ranges;
+  std::uint64_t h3_int8_attention_exact_row_dispatches{};
   std::vector<H3GroupwiseInt8Result> h3_groupwise_int8;
   std::vector<H3ModulationCacheResult> h3_modulation_caches;
   std::uint32_t repeated_invariant_operation_count{};

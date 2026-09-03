@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -69,6 +70,24 @@ struct Options {
   // --h3-int8-attention-first-step N: evaluations before N run exact cuDNN
   // attention, later ones the INT8 route.
   std::uint32_t h3_int8_attention_first_step{};
+  // --h3-int8-attention-hybrid-first-layer/-layers: only this sub-range of
+  // the INT8-routed attention operations follows the exact-first-N switch;
+  // the rest stays INT8 on every evaluation.
+  std::uint32_t h3_int8_attention_hybrid_first_layer{};
+  std::uint32_t h3_int8_attention_hybrid_layers{
+      std::numeric_limits<std::uint32_t>::max()};
+  // --h3-int8-attention-exact-rows SPEC (repeatable): query-row ranges that
+  // the INT8 attention route recomputes exactly against the full K/V
+  // sequence. SPEC is text | condition | audio | video | BEGIN:COUNT.
+  std::vector<std::string> h3_int8_attention_exact_rows;
+  // --profile-operations-json PATH: per-evaluation, per-operation device
+  // timings (requires --profile-pipeline).
+  std::filesystem::path profile_operations_json;
+  // --h3-atlas-shadow: every evaluation runs twice on the same inputs, first
+  // with the INT8 attention route (captures and outputs written with an
+  // "-int8" infix, results discarded), then exact attention, whose outputs
+  // advance the trajectory. Requires --capture-denoiser-dir.
+  bool atlas_shadow{false};
   // EasyCache-style whole-model step skipping (experiment). On a full step the
   // delta (model output minus model input) is cached per stream; a step is
   // skipped, returning input plus the cached delta, while the accumulated
@@ -490,6 +509,20 @@ Options parse(int argc, char **argv) {
     else if (option == "--h3-int8-attention-first-step")
       options.h3_int8_attention_first_step = static_cast<std::uint32_t>(
           number(value("--h3-int8-attention-first-step"), "INT8 attention first step"));
+    else if (option == "--h3-int8-attention-hybrid-first-layer")
+      options.h3_int8_attention_hybrid_first_layer = static_cast<std::uint32_t>(
+          number(value("--h3-int8-attention-hybrid-first-layer"),
+                 "hybrid first layer"));
+    else if (option == "--h3-int8-attention-hybrid-layers")
+      options.h3_int8_attention_hybrid_layers = static_cast<std::uint32_t>(
+          number(value("--h3-int8-attention-hybrid-layers"), "hybrid layers"));
+    else if (option == "--h3-int8-attention-exact-rows")
+      options.h3_int8_attention_exact_rows.push_back(
+          value("--h3-int8-attention-exact-rows"));
+    else if (option == "--profile-operations-json")
+      options.profile_operations_json = value("--profile-operations-json");
+    else if (option == "--h3-atlas-shadow")
+      options.atlas_shadow = true;
     else if (option == "--h3-resident-readahead-mib")
       options.h3_resident_readahead_mib =
           number(value("--h3-resident-readahead-mib"), "resident read-ahead MiB");
@@ -993,6 +1026,72 @@ int run_request(const Options &options, ServerState &state,
             static_cast<std::uint32_t>(row));
       }
     }
+    {
+      // Modality row ranges of the packed sequence, proven from the frontend
+      // layout (contiguity checked, never assumed).
+      auto contiguous = [](const std::vector<std::int32_t> &rows,
+                           const char *label) {
+        for (std::size_t i = 1; i < rows.size(); ++i)
+          if (rows[i] != rows[i - 1] + 1)
+            dif::fail(std::string("H3 ") + label +
+                      " rows are not one contiguous range");
+        if (!rows.empty() && rows.front() < 0)
+          dif::fail(std::string("H3 ") + label + " rows are negative");
+      };
+      contiguous(layout.text_indices, "text");
+      contiguous(layout.audio_indices, "audio");
+      const auto text_begin = 0U;
+      const auto text_count =
+          static_cast<std::uint32_t>(layout.text_indices.size());
+      const auto condition_begin = text_count;
+      const auto condition_count =
+          static_cast<std::uint32_t>(layout.num_condition_video_rows);
+      const auto audio_begin = layout.audio_indices.empty()
+                                   ? 0U
+                                   : static_cast<std::uint32_t>(
+                                         layout.audio_indices.front());
+      const auto audio_count =
+          static_cast<std::uint32_t>(layout.audio_indices.size());
+      if (audio_begin != condition_begin + condition_count)
+        dif::fail("H3 audio rows do not follow the condition rows");
+      const auto video_begin = audio_begin + audio_count;
+      const auto video_count =
+          static_cast<std::uint32_t>(layout.sequence_length) - video_begin;
+      std::cout << "H3_LAYOUT sequence=" << layout.sequence_length
+                << " text=[" << text_begin << "," << text_begin + text_count
+                << ") condition_video=[" << condition_begin << ","
+                << condition_begin + condition_count << ") audio=["
+                << audio_begin << "," << audio_begin + audio_count
+                << ") target_video=[" << video_begin << ","
+                << video_begin + video_count << ")\n";
+      for (const auto &spec : options.h3_int8_attention_exact_rows) {
+        dif::runtime::RunOptions::QueryRowRange range;
+        if (spec == "text")
+          range = {text_begin, text_count};
+        else if (spec == "condition")
+          range = {condition_begin, condition_count};
+        else if (spec == "audio")
+          range = {audio_begin, audio_count};
+        else if (spec == "video")
+          range = {video_begin, video_count};
+        else {
+          const auto colon = spec.find(':');
+          if (colon == std::string::npos)
+            dif::fail("--h3-int8-attention-exact-rows expects text|condition|"
+                      "audio|video|BEGIN:COUNT");
+          range = {static_cast<std::uint32_t>(
+                       number(spec.substr(0, colon), "exact rows begin")),
+                   static_cast<std::uint32_t>(
+                       number(spec.substr(colon + 1), "exact rows count"))};
+        }
+        denoiser_run_options.h3_int8_attention_exact_query_ranges.push_back(
+            range);
+      }
+      denoiser_run_options.h3_int8_attention_hybrid_first_layer =
+          options.h3_int8_attention_hybrid_first_layer;
+      denoiser_run_options.h3_int8_attention_hybrid_layers =
+          options.h3_int8_attention_hybrid_layers;
+    }
     denoiser_run_options.h3_int8_compact_adaln =
         options.h3_int8_compact_adaln;
     denoiser_run_options.resident_streamed_constants =
@@ -1016,7 +1115,11 @@ int run_request(const Options &options, ServerState &state,
     denoiser_run_options.h3_int8_attention_layers =
         options.h3_int8_attention_layers;
     denoiser_run_options.h3_int8_attention_hybrid =
-        options.h3_int8_attention_first_step != 0U;
+        options.h3_int8_attention_first_step != 0U || options.atlas_shadow;
+    if (options.atlas_shadow && options.capture_denoiser_directory.empty())
+      dif::fail("--h3-atlas-shadow requires --capture-denoiser-dir");
+    if (!options.profile_operations_json.empty() && !options.profile_pipeline)
+      dif::fail("--profile-operations-json requires --profile-pipeline");
     denoiser_run_options.h3_modulation_cache = options.h3_modulation_cache;
     denoiser_run_options.h3_modulation_source_index =
         options.h3_modulation_source_index;
@@ -1029,6 +1132,17 @@ int run_request(const Options &options, ServerState &state,
     double denoiser_prepare_ms = 0.0;
     bool denoiser_reused = false;
     std::uint32_t ec_skipped_total = 0U;
+    std::uint64_t last_exact_row_dispatches = 0U;
+    std::uint32_t last_hybrid_first_layer = 0U;
+    std::uint32_t last_hybrid_layers = 0U;
+    std::vector<dif::runtime::RunOptions::QueryRowRange> last_exact_query_ranges;
+    struct ProfileStep {
+      std::uint64_t index;
+      bool int8_attention_active;
+      double mean_milliseconds;
+      std::vector<dif::runtime::OperationTiming> timings;
+    };
+    std::vector<ProfileStep> profile_steps;
     double denoiser_kernel_ms = 0.0;
     double denoiser_bundle_map_ms = 0.0;
     double denoiser_step_layout_ms = 0.0;
@@ -1242,7 +1356,53 @@ int run_request(const Options &options, ServerState &state,
           result.backend_name = backend_name;
           result.device_name = device_name;
         } else {
+          if (options.atlas_shadow) {
+            auto shadow_options = denoiser_run_options;
+            shadow_options.h3_int8_attention_active = true;
+            const auto shadow = prepared->run(inputs, shadow_options);
+            for (const auto tensor_id : options.capture_denoiser_tensors) {
+              const auto captured = shadow.captured_intermediates.find(tensor_id);
+              if (captured == shadow.captured_intermediates.end())
+                dif::fail("shadow denoiser capture was not returned for tensor " +
+                          std::to_string(tensor_id));
+              dif::runtime::write_tensor(
+                  captured->second,
+                  options.capture_denoiser_directory /
+                      ("step-" + std::to_string(step) + "-int8-tensor-" +
+                       std::to_string(tensor_id) + ".diftensor"));
+            }
+            dif::runtime::write_tensor(
+                shadow.outputs.at(video_output),
+                options.capture_denoiser_directory /
+                    ("step-" + std::to_string(step) + "-int8-output-video.diftensor"));
+            dif::runtime::write_tensor(
+                shadow.outputs.at(audio_output),
+                options.capture_denoiser_directory /
+                    ("step-" + std::to_string(step) + "-int8-output-audio.diftensor"));
+            std::cout << "H3_ATLAS_SHADOW index=" << step
+                      << " int8_denoiser_ms=" << shadow.mean_milliseconds << "\n";
+            denoiser_run_options.h3_int8_attention_active = false;
+          }
           result = prepared->run(inputs, denoiser_run_options);
+          if (options.atlas_shadow) {
+            dif::runtime::write_tensor(
+                result.outputs.at(video_output),
+                options.capture_denoiser_directory /
+                    ("step-" + std::to_string(step) + "-exact-output-video.diftensor"));
+            dif::runtime::write_tensor(
+                result.outputs.at(audio_output),
+                options.capture_denoiser_directory /
+                    ("step-" + std::to_string(step) + "-exact-output-audio.diftensor"));
+          }
+        }
+        last_exact_row_dispatches = result.h3_int8_attention_exact_row_dispatches;
+        last_hybrid_first_layer = result.h3_int8_attention_hybrid_first_layer;
+        last_hybrid_layers = result.h3_int8_attention_hybrid_layers;
+        last_exact_query_ranges = result.h3_int8_attention_exact_query_ranges;
+        if (!options.profile_operations_json.empty() && !ec_skip) {
+          profile_steps.push_back(
+              {step, denoiser_run_options.h3_int8_attention_active,
+               result.mean_milliseconds, result.operation_timings});
         }
         if (options.h3_easycache_threshold > 0.0F) {
           const auto current = video.f32();
@@ -1556,6 +1716,29 @@ int run_request(const Options &options, ServerState &state,
                   << " command_wall_ms=" << command_wall_ms << '\n'
                   << std::defaultfloat << std::setprecision(6);
       }
+      if (!options.profile_operations_json.empty()) {
+        std::ofstream json(options.profile_operations_json);
+        if (!json)
+          dif::fail("cannot write " + options.profile_operations_json.string());
+        json << "{\"schema\":\"h3-operation-profile/1\",\"sequence\":"
+             << layout.sequence_length << ",\"steps\":[";
+        for (std::size_t i = 0; i < profile_steps.size(); ++i) {
+          const auto &ps = profile_steps[i];
+          json << (i ? ",\n" : "\n") << "{\"index\":" << ps.index
+               << ",\"int8_attention_active\":"
+               << (ps.int8_attention_active ? "true" : "false")
+               << ",\"denoiser_ms\":" << ps.mean_milliseconds
+               << ",\"operations\":[";
+          for (std::size_t j = 0; j < ps.timings.size(); ++j) {
+            const auto &t = ps.timings[j];
+            json << (j ? "," : "") << "[" << t.operation_id << ",\""
+                 << dif::ir::opcode_name(t.opcode) << "\",\"" << t.plan
+                 << "\"," << t.mean_milliseconds << "]";
+          }
+          json << "]}";
+        }
+        json << "\n]}\n";
+      }
       std::cout << "H3_DENOISE PASS backend=" << backend_name << " device=\""
                 << device_name << "\" schedule_points="
                 << video_sigmas.size() << " model_evaluations=" << steps
@@ -1568,6 +1751,18 @@ int run_request(const Options &options, ServerState &state,
                 << " sequence=" << layout.sequence_length
                 << " int8_attention_first_step="
                 << options.h3_int8_attention_first_step
+                << " int8_attention_hybrid_layers=[" << last_hybrid_first_layer
+                << "," << last_hybrid_first_layer + last_hybrid_layers << ")"
+                << " int8_attention_exact_rows=" << [&] {
+                     std::string text;
+                     for (const auto &range : last_exact_query_ranges)
+                       text += (text.empty() ? "" : ";") + std::string("[") +
+                               std::to_string(range.begin) + "," +
+                               std::to_string(range.begin + range.count) + ")";
+                     return text.empty() ? std::string("none") : text;
+                   }()
+                << " int8_attention_exact_row_dispatches="
+                << last_exact_row_dispatches
                 << " easycache_skipped=" << ec_skipped_total
                 << " persistent_reuse=" << (denoiser_reused ? 1 : 0)
                 << " persistent_request=" << state.requests
