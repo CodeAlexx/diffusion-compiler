@@ -295,6 +295,39 @@ void test_step_one_semantics_and_cuda_parity() {
   }
 }
 
+// Grad-flow gate: a fused inference plan on a differentiated program must be
+// refused at prepare (the plan declares no backward), not silently executed.
+void test_fused_plan_refused_on_training_program() {
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto config = small_config(true);
+  const auto build = dif::frontend::make_dit_lora_training(config);
+  auto inputs = small_inputs(build, 42U);
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  std::uint32_t linear_id = 0U;
+  for (const auto &operation : build.program.operations)
+    if (operation.opcode == dif::ir::Opcode::Linear) {
+      linear_id = operation.id;
+      break;
+    }
+  options.fuse_linear_swiglu_operations = {linear_id};
+  bool refused = false;
+  std::string message;
+  try {
+    (void)dif::runtime::make_cuda_executor()->run(build.program, inputs,
+                                                  options);
+  } catch (const std::exception &error) {
+    refused = true;
+    message = error.what();
+  }
+  expect(refused && message.find("declare no backward") != std::string::npos,
+         "a fused inference plan on a training program is refused at prepare");
+  std::cout << "GATE dit_lora_fused_plan_refused message=" << message << "\n";
+}
+
 void test_export_and_alpha_regression() {
   const auto config = small_config(true);
   const auto build = dif::frontend::make_dit_lora_training(config);
@@ -372,6 +405,7 @@ int main() {
   try {
     test_builder_structure();
     test_step_one_semantics_and_cuda_parity();
+    test_fused_plan_refused_on_training_program();
     test_export_and_alpha_regression();
   } catch (const std::exception &error) {
     std::cerr << "unhandled: " << error.what() << "\n";

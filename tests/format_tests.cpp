@@ -3,12 +3,14 @@
 // the probed target, format decisions recorded into difopt plans, and
 // difweights storage statistics without name semantics.
 
+#include "dif/compiler/compiler.hpp"
 #include "dif/ir/codec.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/opt/physical_format.hpp"
 #include "dif/opt/plan.hpp"
 #include "dif/opt/rewrite.hpp"
 #include "dif/runtime/device_probe.hpp"
+#include "dif/runtime/scalar.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/json.hpp"
 #include "dif/weights/safetensors.hpp"
@@ -124,6 +126,43 @@ dif::runtime::Tensor filled(float value) {
   for (std::size_t index = 0; index < 8U; ++index)
     std::memcpy(bytes.data() + index * sizeof(float), &value, sizeof(float));
   return dif::runtime::Tensor(dif::ir::DType::F32, {8U}, std::move(bytes));
+}
+
+// MXFP8/E8M0 scale reconstruction must use ldexp, never exp2: under
+// fast-math `ex2.approx.ftz` flushes small scales to zero on SM 9x (Mojo
+// lesson, serenitymojo/ops/mxfp4.mojo:99-105). Inspect the generated source.
+void test_mxfp8_scale_reconstruction_uses_ldexp() {
+  using namespace dif::ir;
+  constexpr std::uint64_t rows = 128U;
+  constexpr std::uint64_t inner = 128U;
+  constexpr std::uint64_t columns = 128U;
+  constexpr std::uint64_t scale_blocks = inner / 32U;
+  Program program;
+  program.tensors = {
+      {1U, DType::BF16, TensorRole::Input, {rows, inner}},
+      {2U, DType::FP8E4M3, TensorRole::Output, {rows, inner}},
+      {3U, DType::FP8E8M0, TensorRole::Output, {rows, scale_blocks}},
+      {4U, DType::FP8E4M3, TensorRole::Constant, {columns, inner}},
+      {5U, DType::FP8E8M0, TensorRole::Constant, {columns, scale_blocks}},
+      {6U, DType::BF16, TensorRole::Output, {rows, columns}},
+  };
+  program.operations = {
+      {1U, Opcode::QuantizeFp8Blocks32, {1U}, {2U, 3U},
+       {Attribute::u64(AttrKey::BlockSize, 256U)}},
+      {2U, Opcode::LinearFp8BlockScaled, {2U, 4U, 3U, 5U}, {6U}, {}},
+  };
+  dif::ir::verify(program);
+  const auto generated = dif::compiler::emit_cuda(program);
+  const auto &source = generated.source;
+  expect(source.find("ldexpf(") != std::string::npos,
+         "MXFP8 block quantization reconstructs the E8M0 scale with ldexpf");
+  expect(source.find("exp2f(") == std::string::npos &&
+             source.find("ex2.approx") == std::string::npos &&
+             source.find("powf(2") == std::string::npos,
+         "generated FP8 code never reconstructs a scale with exp2/ex2.approx/powf");
+  expect(dif::runtime::fp8_e8m0_to_float(0U) > 0.0F &&
+             dif::runtime::fp8_e8m0_to_float(0U) < 1.0e-37F,
+         "CPU reference keeps the smallest E8M0 scale non-zero");
 }
 
 void test_format_registry() {
@@ -361,6 +400,7 @@ int main() {
     std::filesystem::remove_all(workspace());
     std::filesystem::create_directories(workspace());
     test_format_registry();
+    test_mxfp8_scale_reconstruction_uses_ldexp();
     test_discovery_gating();
     test_difopt_formats_cli();
     test_difweights_stats();

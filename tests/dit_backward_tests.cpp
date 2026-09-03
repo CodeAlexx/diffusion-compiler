@@ -16,6 +16,7 @@
 #include "dif/support/error.hpp"
 #include "dif/training/autodiff.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -117,6 +118,11 @@ void finite_difference_check(const GradientCase &grad_case,
   for (const auto target : grad_case.targets) {
     const auto analytic = float_values(
         gradients.outputs.at(differentiated.gradients.at(target)));
+    // Grad-flow gate: an all-zero analytic gradient means the backward chain
+    // is cut, which a cosine check against zero cannot see.
+    expect(std::any_of(analytic.begin(), analytic.end(),
+                       [](float value) { return value != 0.0F; }),
+           grad_case.name + " analytic gradient is nonzero (grad-flow gate)");
     const auto &bound = grad_case.bindings.at(target);
     std::vector<float> numeric(analytic.size());
     for (std::size_t index = 0; index < numeric.size(); ++index) {

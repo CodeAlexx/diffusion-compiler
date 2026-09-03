@@ -129,6 +129,20 @@ attribution vocabulary (`include/dif/telemetry/vocabulary.hpp`).
   fused backend plan executed at that operation's slot (for example the H3
   INT8 QKV projection at the QKV weight layout op), so consumers do not
   classify a projection GEMM as layout.
+- Two gates paid for elsewhere and adopted here. `dif_noise_tests` measures
+  every shipped noise source (the torch-parity CPU generator and the H3 GPU
+  generator behind `difh3noise --rng serenity`) for mean, std, sign balance
+  on both halves of each Box-Muller pair, and 3-sigma tail mass, and proves
+  the gate can fail by running a deliberately poisoned Box-Muller (the
+  historical 2^53-divisor bug: mean +0.57, std 1.17, one half never
+  negative). The grad-flow gate refuses, at prepare, any fused inference plan that
+  eliminates a tensor a backward opcode reads or declares no backward at all
+  (`fuse_linear_swiglu_operations`, ConvRot, W8A8, groupwise, modulation
+  cache, CK attention) on a program that contains backward or optimizer
+  opcodes; absorbing a BiasAdd into the cuBLASLt epilogue stays allowed
+  because no backward opcode reads the unbiased intermediate and the
+  epilogue tests gate its byte-identity on the MLP training graph; the DiT
+  backward tests additionally require every analytic gradient to be non-zero.
 - Host file-cache policy for GPU-resident weights is explicit runtime policy,
   not an accident of the loader. The historical default releases each
   resident weight's mapped range with `posix_fadvise(DONTNEED)` after the

@@ -474,6 +474,13 @@ if(DIF_BUILD_TESTS)
   add_dependencies(dif_quality_tests difquality difregress difbisect)
   add_test(NAME dif_quality_tests COMMAND dif_quality_tests)
 
+  add_executable(dif_noise_tests tests/noise_tests.cpp)
+  target_link_libraries(dif_noise_tests PRIVATE difcore)
+  target_compile_definitions(
+      dif_noise_tests PRIVATE DIF_DIFH3NOISE_PATH="$<TARGET_FILE:difh3noise>")
+  add_dependencies(dif_noise_tests difh3noise)
+  add_test(NAME dif_noise_tests COMMAND dif_noise_tests)
+
   add_executable(dif_format_tests tests/format_tests.cpp)
   target_link_libraries(dif_format_tests PRIVATE difcore)
   target_compile_definitions(
