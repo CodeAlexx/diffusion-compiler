@@ -39,6 +39,9 @@ ap.add_argument("--prompt", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--device", default="cpu")
 ap.add_argument("--dtype", default="bfloat16")
+ap.add_argument("--fixture-out", default="",
+                help="also write the gate fixture: valid-token rows of the conditioning "
+                     "plus input_ids/attention_mask/position_ids (see tools/gate_flux2_dev_conditioning.py)")
 a = ap.parse_args()
 
 from transformers import AutoTokenizer, Mistral3ForConditionalGeneration
@@ -77,6 +80,11 @@ print("conditioning:", tuple(conditioning.shape), "dtype", conditioning.dtype,
 save_file({
     "input_ids": input_ids[0].to(torch.int32).contiguous(),
     "attention_mask": attention_mask[0].to(torch.int32).contiguous(),
+    # transformers derives position_ids from cache_position = arange(seq) when
+    # the caller passes only input_ids + attention_mask (the official embedder
+    # does), so left-padded rows occupy positions 0..P-1 and real tokens start
+    # at P. Recorded explicitly so the compiler side binds the same positions.
+    "position_ids": torch.arange(MAX_LENGTH, dtype=torch.int32).contiguous(),
     "conditioning": conditioning[0].to(torch.bfloat16).cpu().contiguous(),
     "hidden_10": hs[10][0].to(torch.bfloat16).cpu().contiguous(),
     "hidden_20": hs[20][0].to(torch.bfloat16).cpu().contiguous(),
@@ -84,3 +92,14 @@ save_file({
 }, a.out + ".safetensors", metadata={"prompt": a.prompt, "padding_side": tok.padding_side,
                                      "valid_tokens": str(valid), "layers": json.dumps(OUTPUT_LAYERS_MISTRAL)})
 print("wrote", a.out + ".safetensors")
+if a.fixture_out:
+    valid = attention_mask[0].bool()
+    save_file({
+        "input_ids": input_ids[0].to(torch.int32).contiguous(),
+        "attention_mask": attention_mask[0].to(torch.int32).contiguous(),
+        "position_ids": torch.arange(MAX_LENGTH, dtype=torch.int32).contiguous(),
+        "conditioning_valid_rows": conditioning[0][valid].to(torch.bfloat16).cpu().contiguous(),
+    }, a.fixture_out, metadata={"prompt": a.prompt, "padding_side": tok.padding_side,
+                                "valid_tokens": str(int(valid.sum())), "layers": json.dumps(OUTPUT_LAYERS_MISTRAL),
+                                "system_message": SYSTEM_MESSAGE})
+    print("wrote fixture", a.fixture_out)

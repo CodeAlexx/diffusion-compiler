@@ -103,6 +103,10 @@ struct Arguments {
   // --squareq-w4-mode dequant|int8 (see dif::frontend::SquareQW4Mode).
   std::string squareq_w4_mode{"dequant"};
   bool squareq_w4_hoist{false};
+  // Stop after the conditioner: write the positive conditioning (and the
+  // prompt token ids) to --state-output and exit. Conditioner parity gates
+  // use this so a text-encoder oracle can be checked without a transformer.
+  bool conditioning_only{false};
   bool int8_weight_only_row_scaled_all_linears{};
   std::uint32_t int8_weight_only_group_size{64U};
   std::vector<std::string> int8_weight_only_exclude_names;
@@ -365,6 +369,8 @@ Arguments parse(int argc, char **argv) {
       result.squareq_w4_mode = value();
     else if (option == "--squareq-w4-hoist")
       result.squareq_w4_hoist = true;
+    else if (option == "--conditioning-only")
+      result.conditioning_only = true;
     else if (option == "--int8-weight-only-row-scaled-all-linears")
       result.int8_weight_only_row_scaled_all_linears = true;
     else if (option == "--int8-weight-only-group-size")
@@ -4339,6 +4345,30 @@ int main(int argc, char **argv) {
     const auto conditioning_started = Clock::now();
     const auto conditioning = condition(arguments);
     const auto conditioning_wall_ms = elapsed_ms(conditioning_started);
+    if (arguments.conditioning_only) {
+      if (arguments.state_output.empty())
+        dif::fail("--conditioning-only needs --state-output FILE");
+      fs::create_directories(arguments.state_output.parent_path());
+      std::vector<dif::weights::SafeTensorWriteSpec> specs{
+          {"positive_conditioning", conditioning.positive.dtype,
+           conditioning.positive.dims},
+          {"negative_conditioning", conditioning.negative.dtype,
+           conditioning.negative.dims}};
+      dif::weights::SafeTensorWriter writer(arguments.state_output, specs);
+      writer.append("positive_conditioning",
+                    std::span<const std::uint8_t>(
+                        conditioning.positive.data(),
+                        conditioning.positive.byte_size()));
+      writer.append("negative_conditioning",
+                    std::span<const std::uint8_t>(
+                        conditioning.negative.data(),
+                        conditioning.negative.byte_size()));
+      (void)writer.finish();
+      std::cerr << "FLUX2_CONDITIONING_ONLY output="
+                << arguments.state_output.string()
+                << " conditioning_wall_ms=" << conditioning_wall_ms << '\n';
+      return 0;
+    }
     auto latent = initial_latent(arguments, latent_height, latent_width);
     const auto initial = latent;
     const auto initial_hash = payload_hash(initial);
