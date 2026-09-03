@@ -53,13 +53,59 @@ runtime::Tensor hadamard_256_bf16() {
                          std::move(bytes)};
 }
 
+float bf16_to_float(std::uint16_t bits) {
+  const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16U;
+  float value = 0.0f;
+  std::memcpy(&value, &wide, sizeof(value));
+  return value;
+}
+
+std::uint16_t float_to_bf16(float value) {
+  std::uint32_t bits = 0U;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::uint32_t rounding = 0x7fffU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>((bits + rounding) >> 16U);
+}
+
+// lora_down [K,R] BF16 -> (H_bd lora_down) with the normalized block
+// Hadamard-256 along K (fast Walsh-Hadamard in double, exact 1/16 scale).
+runtime::Tensor rotate_rows_h256(const runtime::Tensor &lora_down,
+                                 std::uint64_t in_features, std::uint64_t rank) {
+  runtime::Tensor rotated{ir::DType::BF16, {in_features, rank}, {}};
+  rotated.bytes.resize(in_features * rank * 2U);
+  const auto *source = lora_down.data();
+  std::vector<double> column(kHadamardBlock);
+  for (std::uint64_t r = 0U; r < rank; ++r) {
+    for (std::uint64_t block = 0U; block < in_features / kHadamardBlock; ++block) {
+      for (std::uint64_t i = 0U; i < kHadamardBlock; ++i) {
+        std::uint16_t bits = 0U;
+        std::memcpy(&bits, source + ((block * kHadamardBlock + i) * rank + r) * 2U, 2U);
+        column[i] = bf16_to_float(bits);
+      }
+      for (std::uint64_t stride = 1U; stride < kHadamardBlock; stride *= 2U)
+        for (std::uint64_t i = 0U; i < kHadamardBlock; i += 2U * stride)
+          for (std::uint64_t j = i; j < i + stride; ++j) {
+            const double a = column[j], b = column[j + stride];
+            column[j] = a + b;
+            column[j + stride] = a - b;
+          }
+      for (std::uint64_t i = 0U; i < kHadamardBlock; ++i) {
+        const auto bits = float_to_bf16(static_cast<float>(column[i] / 16.0));
+        std::memcpy(rotated.bytes.data() + ((block * kHadamardBlock + i) * rank + r) * 2U,
+                    &bits, 2U);
+      }
+    }
+  }
+  return rotated;
+}
+
 } // namespace
 
 SquareQW4RewriteResult rewrite_linear_weights_squareq_w4(
     ir::Program &program, runtime::TensorMap &bindings,
     std::span<const std::uint32_t> checkpoint_tensors,
     std::span<const std::string> checkpoint_names,
-    const std::filesystem::path &slab_directory) {
+    const std::filesystem::path &slab_directory, SquareQW4Mode mode) {
   if (checkpoint_tensors.size() != checkpoint_names.size())
     fail("SquareQ W4 rewrite: checkpoint tensor/name lists differ in length");
   const auto plan = json::parse(read_text(slab_directory / "squareq-plan.json"));
@@ -79,6 +125,7 @@ SquareQW4RewriteResult rewrite_linear_weights_squareq_w4(
 
   SquareQW4RewriteResult result;
   result.format = kFormat;
+  result.mode = mode;
   if (const auto *totals = plan.find("totals"))
     if (const auto *cos = totals->find("cos_w_min"))
       result.plan_cos_w_min = cos->number();
@@ -189,11 +236,18 @@ SquareQW4RewriteResult rewrite_linear_weights_squareq_w4(
         lora_up.dims != std::vector<std::uint64_t>{out_features, rank})
       fail("SquareQ W4 low-rank shapes disagree for " + name);
 
-    if (hadamard_id == 0U) {
+    if (mode == SquareQW4Mode::DequantBf16 && hadamard_id == 0U) {
       hadamard_id = ++next_tensor;
       program.tensors.push_back({hadamard_id, ir::DType::BF16, weight_desc->roles,
                                  {kHadamardBlock, kHadamardBlock}});
       bindings.emplace(hadamard_id, hadamard_256_bf16());
+    }
+    if (mode == SquareQW4Mode::Int8Compute) {
+      if (linear->inputs.size() != 2U)
+        fail("SquareQ W4 INT8 compute does not take a biased Linear yet: " + name);
+      // lora_down rotated along K by the block Hadamard (H symmetric), so the
+      // low-rank branch lives in the same rotated space as the residual.
+      lora_down = rotate_rows_h256(lora_down, in_features, rank);
     }
     const auto roles = weight_desc->roles;
     const auto q_id = ++next_tensor;
@@ -214,11 +268,16 @@ SquareQW4RewriteResult rewrite_linear_weights_squareq_w4(
     program.tensors.push_back({ld_id, ir::DType::BF16, roles, {in_features, rank}});
     program.tensors.push_back({lu_id, ir::DType::BF16, roles, {out_features, rank}});
     program.tensors.push_back({d_id, ir::DType::BF16, ir::TensorRole::Internal, full});
-    program.tensors.push_back({d2_id, ir::DType::BF16, ir::TensorRole::Internal, blocks});
-    program.tensors.push_back({r2_id, ir::DType::BF16, ir::TensorRole::Internal, blocks});
-    program.tensors.push_back({r_id, ir::DType::BF16, ir::TensorRole::Internal, full});
     program.tensors.push_back({l_id, ir::DType::BF16, ir::TensorRole::Internal, full});
     program.tensors.push_back({w_id, ir::DType::BF16, ir::TensorRole::Internal, full});
+    if (mode == SquareQW4Mode::DequantBf16) {
+      // Only the dequant route materializes the unrotated weight through the
+      // exact Hadamard Linear; the INT8 route folds the rotation into the
+      // activation quantizer and never declares these.
+      program.tensors.push_back({d2_id, ir::DType::BF16, ir::TensorRole::Internal, blocks});
+      program.tensors.push_back({r2_id, ir::DType::BF16, ir::TensorRole::Internal, blocks});
+      program.tensors.push_back({r_id, ir::DType::BF16, ir::TensorRole::Internal, full});
+    }
     result.quantized_bytes += qweight.byte_size() + scales.byte_size() +
                               lora_down.byte_size() + lora_up.byte_size();
     result.bf16_bytes_replaced += weight_desc->byte_count();
@@ -237,18 +296,56 @@ SquareQW4RewriteResult rewrite_linear_weights_squareq_w4(
         program.tensors.end());
 
     auto rewritten = *linear;
-    rewritten.inputs[1] = w_id;
     const auto linear_index =
         static_cast<std::size_t>(std::distance(program.operations.begin(), linear));
-    std::vector<ir::Operation> inserted{
-        {++next_operation, ir::Opcode::DequantizeInt4, {q_id, s_id}, {d_id},
-         {ir::Attribute::u64(ir::AttrKey::GroupSize, kGroup)}},
-        {++next_operation, ir::Opcode::Reshape, {d_id}, {d2_id}, {}},
-        {++next_operation, ir::Opcode::Linear, {d2_id, hadamard_id}, {r2_id}, {}},
-        {++next_operation, ir::Opcode::Reshape, {r2_id}, {r_id}, {}},
-        {++next_operation, ir::Opcode::Linear, {lu_id, ld_id}, {l_id}, {}},
-        {++next_operation, ir::Opcode::Add, {r_id, l_id}, {w_id}, {}},
-    };
+    std::vector<ir::Operation> inserted;
+    if (mode == SquareQW4Mode::DequantBf16) {
+      rewritten.inputs[1] = w_id;
+      inserted = {
+          {++next_operation, ir::Opcode::DequantizeInt4, {q_id, s_id}, {d_id},
+           {ir::Attribute::u64(ir::AttrKey::GroupSize, kGroup)}},
+          {++next_operation, ir::Opcode::Reshape, {d_id}, {d2_id}, {}},
+          {++next_operation, ir::Opcode::Linear, {d2_id, hadamard_id}, {r2_id}, {}},
+          {++next_operation, ir::Opcode::Reshape, {r2_id}, {r_id}, {}},
+          {++next_operation, ir::Opcode::Linear, {lu_id, ld_id}, {l_id}, {}},
+          {++next_operation, ir::Opcode::Add, {r_id, l_id}, {w_id}, {}},
+      };
+    } else {
+      // Rotated effective weight W_r = dequant(residual) + lora_up lora_down_rot^T,
+      // row-quantized on device; activations rotated by H256 and row-quantized;
+      // CUTLASS scaled INT8 GEMM.
+      const auto *x = program.tensor(linear->inputs[0]);
+      if (!x || x->dtype != ir::DType::BF16)
+        fail("SquareQ W4 INT8 compute needs a BF16 Linear input: " + name);
+      const auto wq_id = ++next_tensor;
+      const auto wscale_id = ++next_tensor;
+      const auto xq_id = ++next_tensor;
+      const auto xscale_id = ++next_tensor;
+      const auto x_rows = x->element_count() / x->dims.back();
+      program.tensors.push_back({wq_id, ir::DType::I8, ir::TensorRole::Internal, full});
+      program.tensors.push_back({wscale_id, ir::DType::F32, ir::TensorRole::Internal, {out_features}});
+      program.tensors.push_back({xq_id, ir::DType::I8, ir::TensorRole::Internal, x->dims});
+      program.tensors.push_back({xscale_id, ir::DType::F32, ir::TensorRole::Internal, {x_rows}});
+      rewritten.opcode = ir::Opcode::LinearInt8Scaled;
+      rewritten.inputs = {xq_id, wq_id, xscale_id, wscale_id};
+      rewritten.attributes.clear();
+      inserted = {
+          {++next_operation, ir::Opcode::DequantizeInt4, {q_id, s_id}, {d_id},
+           {ir::Attribute::u64(ir::AttrKey::GroupSize, kGroup)}},
+          {++next_operation, ir::Opcode::Linear, {lu_id, ld_id}, {l_id}, {}},
+          {++next_operation, ir::Opcode::Add, {d_id, l_id}, {w_id}, {}},
+          {++next_operation, ir::Opcode::QuantizeInt8Rows, {w_id}, {wq_id, wscale_id},
+           {ir::Attribute::u64(ir::AttrKey::BlockSize, kHadamardBlock),
+            ir::Attribute::u64(ir::AttrKey::Implementation,
+                               static_cast<std::uint64_t>(ir::Int8RowQuantization::Direct))}},
+          {++next_operation, ir::Opcode::QuantizeInt8Rows, {linear->inputs[0]},
+           {xq_id, xscale_id},
+           {ir::Attribute::u64(ir::AttrKey::BlockSize, kHadamardBlock),
+            ir::Attribute::u64(ir::AttrKey::Implementation,
+                               static_cast<std::uint64_t>(
+                                   ir::Int8RowQuantization::H256F32SylvesterConvRot))}},
+      };
+    }
     program.operations.at(linear_index) = std::move(rewritten);
     program.operations.insert(
         program.operations.begin() + static_cast<std::ptrdiff_t>(linear_index),

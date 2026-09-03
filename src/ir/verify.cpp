@@ -1009,14 +1009,17 @@ void verify_operation(const Program &program, const Operation &op) {
         implementation != Int8RowQuantization::H4096SignedConvRot &&
         implementation != Int8RowQuantization::H256F32ConvRot &&
         implementation != Int8RowQuantization::H256F32SignedConvRot &&
-        implementation != Int8RowQuantization::H4096F32SignedConvRot)
+        implementation != Int8RowQuantization::H4096F32SignedConvRot &&
+        implementation != Int8RowQuantization::H256F32SylvesterConvRot)
       fail("quantize_int8_rows implementation must be direct, H256 ConvRot, "
            "H256 F32 ConvRot, H256 signed ConvRot, H256 F32 signed ConvRot, "
-           "H4096 signed ConvRot, or H4096 F32 signed ConvRot");
+           "H4096 signed ConvRot, H4096 F32 signed ConvRot, or H256 F32 "
+           "Sylvester ConvRot");
     if ((implementation == Int8RowQuantization::H256ConvRot ||
          implementation == Int8RowQuantization::H256F32ConvRot ||
          implementation == Int8RowQuantization::H256SignedConvRot ||
-         implementation == Int8RowQuantization::H256F32SignedConvRot) &&
+         implementation == Int8RowQuantization::H256F32SignedConvRot ||
+         implementation == Int8RowQuantization::H256F32SylvesterConvRot) &&
         combined_width % 256U != 0U)
       fail("H256 ConvRot row quantization requires a last dimension divisible "
            "by 256");
@@ -1051,9 +1054,16 @@ void verify_operation(const Program &program, const Operation &op) {
         out.dims.back() != columns)
       fail("linear_int8_scaled shapes must flatten as [M,K] x [N,K] with "
            "row [M], column [N], and BF16 [M,N]");
-    if (!weight.has_role(TensorRole::Constant) ||
-        !column_scales.has_role(TensorRole::Constant))
-      fail("linear_int8_scaled weight and column scales must be constants");
+    // Weight and column scales are either prepared constants (offline
+    // quantization) or internal tensors materialized by earlier operations
+    // in the same run (a quantized-storage weight reconstructed and
+    // row-quantized on device); an Input/Output role is neither.
+    for (const auto *operand : {&weight, &column_scales})
+      if (operand->has_role(TensorRole::Input) ||
+          operand->has_role(TensorRole::Output) ||
+          operand->has_role(TensorRole::Parameter))
+        fail("linear_int8_scaled weight and column scales must be constants "
+             "or internal tensors");
     return;
   }
 

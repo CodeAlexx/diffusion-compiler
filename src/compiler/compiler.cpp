@@ -681,16 +681,14 @@ void emit_quantize_int8_rows(std::ostringstream &out,
   const auto clip_ratio_source =
       dynamic_clip ? std::string{"dif_load_f32(clip_ratio,0ULL)"}
                    : clip_ratio_literal.str() + "f";
-  if (implementation == ir::Int8RowQuantization::H256ConvRot ||
-      implementation == ir::Int8RowQuantization::H256F32ConvRot ||
-      implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
-      implementation == ir::Int8RowQuantization::H256SignedConvRot ||
-      implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
-      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot) {
+  const auto sylvester =
+      implementation == ir::Int8RowQuantization::H256F32SylvesterConvRot;
+  if (ir::is_convrot_int8_row_quantization(implementation)) {
     const auto f32_convrot =
         implementation == ir::Int8RowQuantization::H256F32ConvRot ||
         implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
-        implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+        implementation == ir::Int8RowQuantization::H4096F32SignedConvRot ||
+        sylvester;
     const auto signed_rotation =
         implementation == ir::Int8RowQuantization::H256SignedConvRot ||
         implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
@@ -734,10 +732,17 @@ void emit_quantize_int8_rows(std::ostringstream &out,
         << "ULL);unsigned offset=(lane%stride)+"
            "(lane/stride)*(4U*stride);unsigned long long i=group+offset;"
            "float x0=values[i],x1=values[i+stride],x2=values[i+2U*stride],"
-           "x3=values[i+3U*stride];values[i]=0.5f*(x0+x1+x2-x3);"
-           "values[i+stride]=0.5f*(x0+x1-x2+x3);"
-           "values[i+2U*stride]=0.5f*(x0-x1+x2+x3);"
-           "values[i+3U*stride]=0.5f*(-x0+x1+x2+x3);}__syncthreads();}"
+           "x3=values[i+3U*stride];"
+        << (sylvester
+                ? "values[i]=0.5f*(x0+x1+x2+x3);"
+                  "values[i+stride]=0.5f*(x0-x1+x2-x3);"
+                  "values[i+2U*stride]=0.5f*(x0+x1-x2-x3);"
+                  "values[i+3U*stride]=0.5f*(x0-x1-x2+x3);"
+                : "values[i]=0.5f*(x0+x1+x2-x3);"
+                  "values[i+stride]=0.5f*(x0+x1-x2+x3);"
+                  "values[i+2U*stride]=0.5f*(x0-x1+x2+x3);"
+                  "values[i+3U*stride]=0.5f*(-x0+x1+x2+x3);")
+        << "}__syncthreads();}"
            "float maximum=0.0f;for(unsigned long long column=tid;column<"
         << columns
         << "ULL;column+=256ULL)maximum=fmaxf(maximum,fabsf(values[column]));"

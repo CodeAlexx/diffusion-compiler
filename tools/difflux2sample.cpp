@@ -100,6 +100,8 @@ struct Arguments {
   // --squareq-w4-slab DIR: SquareQ v3 W4 slab (index + squareq-plan.json)
   // replacing every planned transformer Linear weight (dequant-first).
   fs::path squareq_w4_slab;
+  // --squareq-w4-mode dequant|int8 (see dif::frontend::SquareQW4Mode).
+  std::string squareq_w4_mode{"dequant"};
   bool int8_weight_only_row_scaled_all_linears{};
   std::uint32_t int8_weight_only_group_size{64U};
   std::vector<std::string> int8_weight_only_exclude_names;
@@ -358,6 +360,8 @@ Arguments parse(int argc, char **argv) {
       result.int8_weight_only_all_linears = true;
     else if (option == "--squareq-w4-slab")
       result.squareq_w4_slab = value();
+    else if (option == "--squareq-w4-mode")
+      result.squareq_w4_mode = value();
     else if (option == "--int8-weight-only-row-scaled-all-linears")
       result.int8_weight_only_row_scaled_all_linears = true;
     else if (option == "--int8-weight-only-group-size")
@@ -3337,10 +3341,16 @@ DenoiseResult denoise(const Arguments &arguments,
     bindings.emplace(id, std::move(tensor));
   }
   if (!arguments.squareq_w4_slab.empty()) {
+    if (arguments.squareq_w4_mode != "dequant" && arguments.squareq_w4_mode != "int8")
+      dif::fail("--squareq-w4-mode must be dequant or int8");
     result.squareq_w4 = dif::frontend::rewrite_linear_weights_squareq_w4(
         transformer.program, bindings, transformer.checkpoint_tensors,
-        transformer.checkpoint_names, arguments.squareq_w4_slab);
-    std::cerr << "FLUX2_SQUAREQ_W4 format=" << result.squareq_w4.format
+        transformer.checkpoint_names, arguments.squareq_w4_slab,
+        arguments.squareq_w4_mode == "int8"
+            ? dif::frontend::SquareQW4Mode::Int8Compute
+            : dif::frontend::SquareQW4Mode::DequantBf16);
+    std::cerr << "FLUX2_SQUAREQ_W4 mode=" << arguments.squareq_w4_mode
+              << " format=" << result.squareq_w4.format
               << " rank=" << result.squareq_w4.rank
               << " linears=" << result.squareq_w4.linear_count
               << " slab_bytes=" << result.squareq_w4.quantized_bytes

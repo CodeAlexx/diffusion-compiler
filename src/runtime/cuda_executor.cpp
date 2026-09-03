@@ -7680,12 +7680,7 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     const auto implementation = static_cast<ir::Int8RowQuantization>(op.u64(
         ir::AttrKey::Implementation,
         static_cast<std::uint64_t>(ir::Int8RowQuantization::Direct)));
-    if (implementation == ir::Int8RowQuantization::H256ConvRot ||
-        implementation == ir::Int8RowQuantization::H256F32ConvRot ||
-        implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
-        implementation == ir::Int8RowQuantization::H256SignedConvRot ||
-        implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
-        implementation == ir::Int8RowQuantization::H4096F32SignedConvRot)
+    if (ir::is_convrot_int8_row_quantization(implementation))
       shared = static_cast<unsigned>(quantized->dims.back() * sizeof(float));
   } else if (op.opcode == ir::Opcode::QuantizeFp8Rows) {
     const auto *input = program.tensor(op.inputs[0]);
@@ -9184,12 +9179,7 @@ public:
                         static_cast<std::uint64_t>(
                             ir::Int8RowQuantization::Direct)));
       if (operation.opcode != ir::Opcode::QuantizeInt8Rows ||
-          (implementation != ir::Int8RowQuantization::H256ConvRot &&
-           implementation != ir::Int8RowQuantization::H256F32ConvRot &&
-           implementation != ir::Int8RowQuantization::H256F32SignedConvRot &&
-           implementation != ir::Int8RowQuantization::H256SignedConvRot &&
-           implementation != ir::Int8RowQuantization::H4096SignedConvRot &&
-           implementation != ir::Int8RowQuantization::H4096F32SignedConvRot))
+          !ir::is_convrot_int8_row_quantization(implementation))
         continue;
       const auto found = functions_.find(operation.id);
       const auto *quantized = program_.tensor(operation.outputs.front());

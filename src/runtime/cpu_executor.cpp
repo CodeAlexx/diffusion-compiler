@@ -155,17 +155,21 @@ void quantize_int8_rows(const ir::Operation &op, TensorMap &tensors) {
       op.u64(ir::AttrKey::Implementation,
              static_cast<std::uint64_t>(
                  ir::Int8RowQuantization::Direct)));
+  const auto sylvester =
+      implementation == ir::Int8RowQuantization::H256F32SylvesterConvRot;
   const auto convrot =
       implementation == ir::Int8RowQuantization::H256ConvRot ||
       implementation == ir::Int8RowQuantization::H256F32ConvRot ||
       implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
       implementation == ir::Int8RowQuantization::H256SignedConvRot ||
       implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
-      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot ||
+      sylvester;
   const auto f32_convrot =
       implementation == ir::Int8RowQuantization::H256F32ConvRot ||
       implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
-      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
+      implementation == ir::Int8RowQuantization::H4096F32SignedConvRot ||
+      sylvester;
   const auto signed_convrot =
       implementation == ir::Int8RowQuantization::H256SignedConvRot ||
       implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
@@ -216,6 +220,18 @@ void quantize_int8_rows(const ir::Operation &op, TensorMap &tensors) {
                 transformed[static_cast<std::size_t>(index + 2U * stride)];
             const auto x3 =
                 transformed[static_cast<std::size_t>(index + 3U * stride)];
+            if (sylvester) {
+              // H2 (x) H2 on (x0,x1,x2,x3) at index bits (stride, 2*stride)
+              transformed[static_cast<std::size_t>(index)] =
+                  0.5F * (x0 + x1 + x2 + x3);
+              transformed[static_cast<std::size_t>(index + stride)] =
+                  0.5F * (x0 - x1 + x2 - x3);
+              transformed[static_cast<std::size_t>(index + 2U * stride)] =
+                  0.5F * (x0 + x1 - x2 - x3);
+              transformed[static_cast<std::size_t>(index + 3U * stride)] =
+                  0.5F * (x0 - x1 - x2 + x3);
+              continue;
+            }
             transformed[static_cast<std::size_t>(index)] =
                 0.5F * (x0 + x1 + x2 - x3);
             transformed[static_cast<std::size_t>(index + stride)] =

@@ -34,6 +34,17 @@
 
 namespace dif::frontend {
 
+// How the slab is consumed.
+//   DequantBf16: reconstruct the BF16 weight on device each run and keep the
+//                ordinary Linear (capacity route; BF16 GEMM speed).
+//   Int8Compute: fold the rotated low-rank branch into the rotated residual,
+//                row-quantize the reconstructed rotated weight to INT8 on
+//                device each run and run the CUTLASS scaled INT8 GEMM on
+//                H256-rotated activations (QuantizeInt8Rows H256F32ConvRot).
+//                The Hadamard never leaves the weight path: with H the
+//                block-diagonal H256, y = x W^T = (xH)(R_rot + lora_up (H lora_down)^T)^T.
+enum class SquareQW4Mode { DequantBf16, Int8Compute };
+
 struct SquareQW4RewriteResult {
   std::string format;
   std::uint32_t rank{};
@@ -41,6 +52,7 @@ struct SquareQW4RewriteResult {
   std::uint64_t quantized_bytes{};    // slab bytes bound (q + scales + low-rank)
   std::uint64_t bf16_bytes_replaced{}; // BF16 weight bytes no longer bound
   double plan_cos_w_min{};
+  SquareQW4Mode mode{SquareQW4Mode::DequantBf16};
   std::vector<std::string> names;
 };
 
@@ -52,6 +64,7 @@ SquareQW4RewriteResult rewrite_linear_weights_squareq_w4(
     ir::Program &program, runtime::TensorMap &bindings,
     std::span<const std::uint32_t> checkpoint_tensors,
     std::span<const std::string> checkpoint_names,
-    const std::filesystem::path &slab_directory);
+    const std::filesystem::path &slab_directory,
+    SquareQW4Mode mode = SquareQW4Mode::DequantBf16);
 
 } // namespace dif::frontend

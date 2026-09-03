@@ -13,6 +13,7 @@
 #include "dif/support/error.hpp"
 #include "dif/weights/safetensors.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -212,6 +213,49 @@ int main(int argc, char **argv) {
     expect(once.outputs.at(3U).bytes == twice.outputs.at(3U).bytes, "CUDA run is repeat-bit-exact");
   } else {
     std::cout << "CUDA unavailable; CUDA half of the gate skipped\n";
+  }
+
+  // 4b. INT8 compute mode: rotated low-rank folded into the residual,
+  //     device row-quantized weight, H256-rotated INT8 activations. Looser
+  //     bar (INT8 activation + weight quantization), CPU vs CUDA agree,
+  //     CUDA repeat-bit-exact.
+  {
+    auto m = make_program(x, out_features, in_features);
+    const auto r8 = dif::frontend::rewrite_linear_weights_squareq_w4(
+        m.program, m.bindings, m.ids, m.names, fixture,
+        dif::frontend::SquareQW4Mode::Int8Compute);
+    expect(r8.mode == dif::frontend::SquareQW4Mode::Int8Compute && r8.linear_count == 1U,
+           "int8 mode rewrites the Linear");
+    const auto has_int8 = std::any_of(
+        m.program.operations.begin(), m.program.operations.end(),
+        [](const dif::ir::Operation &op) {
+          return op.opcode == dif::ir::Opcode::LinearInt8Scaled;
+        });
+    expect(has_int8, "int8 mode emits a scaled INT8 Linear");
+    const auto cpu8 = dif::runtime::make_cpu_executor()->run(m.program, m.bindings, options);
+    const auto cpu8_y = as_doubles(cpu8.outputs.at(3U));
+    const auto c8 = compare(ref, cpu8_y);
+    std::cout << "SQUAREQ_W4 int8-compute cpu cosine=" << c8.cosine << " max_abs=" << c8.max_abs
+              << " max_ref=" << c8.max_ref << "\n";
+    expect(c8.finite && c8.cosine >= 0.999 && c8.max_abs <= 0.06 * c8.max_ref,
+           "int8 compute output tracks y = x W_hat^T within INT8 tolerance");
+    if (dif::runtime::cuda_available()) {
+      auto n = make_program(x, out_features, in_features);
+      (void)dif::frontend::rewrite_linear_weights_squareq_w4(
+          n.program, n.bindings, n.ids, n.names, fixture,
+          dif::frontend::SquareQW4Mode::Int8Compute);
+      const auto once = dif::runtime::make_cuda_executor()->run(n.program, n.bindings, options);
+      const auto twice = dif::runtime::make_cuda_executor()->run(n.program, n.bindings, options);
+      const auto g8 = compare(ref, as_doubles(once.outputs.at(3U)));
+      const auto cross = compare(cpu8_y, as_doubles(once.outputs.at(3U)));
+      std::cout << "SQUAREQ_W4 int8-compute cuda cosine=" << g8.cosine << " max_abs=" << g8.max_abs
+                << " cpu_vs_cuda cosine=" << cross.cosine << " max_abs=" << cross.max_abs << "\n";
+      expect(g8.finite && g8.cosine >= 0.999 && g8.max_abs <= 0.06 * g8.max_ref,
+             "int8 compute CUDA output tracks y = x W_hat^T within INT8 tolerance");
+      expect(cross.cosine >= 0.9999, "int8 compute CPU and CUDA agree");
+      expect(once.outputs.at(3U).bytes == twice.outputs.at(3U).bytes,
+             "int8 compute CUDA run is repeat-bit-exact");
+    }
   }
 
   // 5. Fail closed: wrong format tag, wrong geometry, missing slab tensor,

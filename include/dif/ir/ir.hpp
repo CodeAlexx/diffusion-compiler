@@ -290,7 +290,30 @@ enum class Int8RowQuantization : std::uint64_t {
   H256F32ConvRot = 5,
   H256F32SignedConvRot = 6,
   H4096F32SignedConvRot = 7,
+  // Sylvester-ordered normalized H256 (H2^{x8}, the natural-order fast
+  // Walsh-Hadamard transform), F32 arithmetic, no sign flips. This is the
+  // rotation SquareQ v3 slabs (squareq_w4_v1) store their residual in, so a
+  // slab-derived INT8 weight needs no extra transform on the weight path.
+  // The H256 variants above use a different (H4-tuple) Hadamard ordering.
+  H256F32SylvesterConvRot = 8,
 };
+
+// True for every QuantizeInt8Rows implementation that applies a Hadamard
+// rotation before quantizing (shared-memory row kernel on CUDA).
+inline bool is_convrot_int8_row_quantization(Int8RowQuantization mode) {
+  switch (mode) {
+  case Int8RowQuantization::H256ConvRot:
+  case Int8RowQuantization::H256SignedConvRot:
+  case Int8RowQuantization::H4096SignedConvRot:
+  case Int8RowQuantization::H256F32ConvRot:
+  case Int8RowQuantization::H256F32SignedConvRot:
+  case Int8RowQuantization::H4096F32SignedConvRot:
+  case Int8RowQuantization::H256F32SylvesterConvRot:
+    return true;
+  default:
+    return false;
+  }
+}
 
 // RotaryApply names the channel pairing explicitly.  Interleaved rotates
 // adjacent pairs (2d,2d+1), which is the layout used by Krea 2 and several
