@@ -9,6 +9,11 @@
 #include "dif/weights/bundle.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <sstream>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -59,6 +64,13 @@ struct Options {
   std::filesystem::path h3_ck_attention_dso;
   bool h3_owned_attention{false};
   bool h3_owned_attention_center_k{false};
+  // Persistent denoiser: --serve SOCKET keeps this process alive after the
+  // first request and serves further requests over a Unix socket with the
+  // prepared denoiser and its resident weights kept on the device.
+  std::filesystem::path serve_socket;
+  // Every argv token that can change what prepare() builds, in order. A served
+  // request whose signature differs from the prepared one is refused.
+  std::string prepare_signature;
   std::filesystem::path h3_modulation_cache;
   std::filesystem::path h3_modulation_source_index;
   std::uint32_t h3_w8a8_resident_layers{
@@ -129,7 +141,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
+      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -233,8 +245,26 @@ h3_text_refiner_invariant_operations(const dif::ir::Program &program) {
 
 Options parse(int argc, char **argv) {
   Options options;
+  // Options that only shape one request (inputs, schedule, geometry validated
+  // against the prepared program, outputs, diagnostics). Everything else can
+  // change what prepare() builds and is folded into prepare_signature.
+  static const std::unordered_set<std::string> per_request_options = {
+      "--sampler",          "--vae-program",        "--vae-bundle",
+      "--text-tags",        "--all-text-tokens",    "--text",
+      "--video",            "--audio",              "--video-sigmas",
+      "--audio-sigmas",     "--schedule-points",    "--steps",
+      "--simple-steps",     "--latent-t",           "--latent-h",
+      "--latent-w",         "--audio-latents",      "--patch-h",
+      "--patch-w",          "--keyframes",          "--reference-geometry",
+      "--output-latent",    "--output-video-rows",  "--output-audio",
+      "--output-audio-latent", "--output-handoff",  "--output-raw",
+      "--output-decoded",   "--first-eval-input-dir", "--capture-denoiser-dir",
+      "--capture-denoiser-tensor", "--max-evaluations", "--verify-shards",
+      "--profile-pipeline", "--h3-modulation-first-step", "--denoise-only",
+      "--serve",            "--connect"};
   for (int index = 1; index < argc; ++index) {
     const std::string option = argv[index];
+    const int option_start = index;
     auto value = [&](const char *label) -> std::string {
       if (++index >= argc)
         dif::fail(std::string("missing value for ") + label);
@@ -525,9 +555,19 @@ Options parse(int argc, char **argv) {
       options.pinned_io = true;
     else if (option == "--denoise-only")
       options.denoise_only = true;
+    else if (option == "--serve")
+      options.serve_socket = value("--serve");
+    else if (option == "--connect")
+      dif::fail("--connect is handled by the client and cannot reach parse");
     else {
       usage();
       dif::fail("unknown difh3infer option: " + option);
+    }
+    if (!per_request_options.contains(option)) {
+      for (int token = option_start; token <= index; ++token) {
+        options.prepare_signature += argv[token];
+        options.prepare_signature += '\n';
+      }
     }
   }
   for (const auto *path : {&options.denoiser_program, &options.denoiser_bundle,
@@ -648,6 +688,21 @@ std::unique_ptr<dif::runtime::Executor> executor(const Options &options) {
   dif::fail("unknown backend: " + options.backend);
 }
 
+// Everything a served request reuses: the executor, the prepared denoiser
+// (resident weights, plans, scratch), the loaded bundle bindings, and the
+// signature of the flags that produced them.
+struct ServerState {
+  std::unique_ptr<dif::runtime::Executor> backend;
+  std::unique_ptr<dif::runtime::PreparedExecution> prepared;
+  dif::ir::Program program;
+  dif::runtime::TensorMap inputs;
+  std::string signature;
+  double bundle_map_ms{};
+  double prepare_ms{};
+  std::uint64_t resident{};
+  std::size_t requests{};
+};
+
 std::pair<std::uint32_t, std::uint32_t>
 denoiser_outputs(const dif::ir::Program &program) {
   std::uint32_t video = 0U;
@@ -733,10 +788,9 @@ double operation_sum(
 
 } // namespace
 
-int main(int argc, char **argv) {
-  try {
-    const auto command_wall_start = std::chrono::steady_clock::now();
-    const auto options = parse(argc, argv);
+int run_request(const Options &options, ServerState &state,
+                const std::chrono::steady_clock::time_point command_wall_start) {
+  {
     if (options.latent_height % options.patch_height != 0U ||
         options.latent_width % options.patch_width != 0U)
       dif::fail("latent geometry must be patch-divisible");
@@ -931,6 +985,7 @@ int main(int argc, char **argv) {
                    ? options.h3_modulation_steps
                    : options.schedule_points);
     double denoiser_prepare_ms = 0.0;
+    bool denoiser_reused = false;
     double denoiser_kernel_ms = 0.0;
     double denoiser_bundle_map_ms = 0.0;
     double denoiser_step_layout_ms = 0.0;
@@ -962,7 +1017,13 @@ int main(int argc, char **argv) {
     const auto denoiser_wall_start = std::chrono::steady_clock::now();
     {
       const auto bundle_map_start = std::chrono::steady_clock::now();
-      const auto program = dif::ir::read_file(options.denoiser_program);
+      const bool reuse = static_cast<bool>(state.prepared);
+      if (reuse && state.signature != options.prepare_signature)
+        dif::fail("persistent denoiser is prepared for a different "
+                  "configuration; restart the server with the new flags");
+      if (!reuse)
+        state.program = dif::ir::read_file(options.denoiser_program);
+      const auto &program = state.program;
       validate(program, 1U, video, "video input");
       validate(program, 2U, audio, "audio input");
       validate(program, 3U, text, "text conditioning");
@@ -975,10 +1036,14 @@ int main(int argc, char **argv) {
         denoiser_run_options.repeated_invariant_operations =
             h3_text_refiner_invariant_operations(program);
       const auto [video_output, audio_output] = denoiser_outputs(program);
-      auto inputs = dif::weights::load_weight_bundle(
-          dif::weights::read_weight_bundle(options.denoiser_bundle), program,
-          options.verify_shards);
-      denoiser_bundle_map_ms = elapsed_milliseconds(bundle_map_start);
+      if (!reuse) {
+        state.inputs = dif::weights::load_weight_bundle(
+            dif::weights::read_weight_bundle(options.denoiser_bundle), program,
+            options.verify_shards);
+        state.bundle_map_ms = elapsed_milliseconds(bundle_map_start);
+      }
+      auto &inputs = state.inputs;
+      denoiser_bundle_map_ms = reuse ? 0.0 : state.bundle_map_ms;
       inputs.insert_or_assign(1U, video);
       inputs.insert_or_assign(2U, audio);
       inputs.insert_or_assign(3U, text);
@@ -994,10 +1059,19 @@ int main(int argc, char **argv) {
           11U, i32_tensor({layout.audio_indices.size()}, layout.audio_indices));
       inputs.insert_or_assign(
           12U, f32_tensor({layout.sequence_length, 3U}, layout.position_ids));
-      auto backend = executor(options);
-      auto prepared = backend->prepare(program, inputs, denoiser_run_options);
-      denoiser_prepare_ms = prepared->preparation_milliseconds();
-      denoiser_resident = prepared->resident_bytes();
+      if (!reuse) {
+        state.backend = executor(options);
+        state.prepared =
+            state.backend->prepare(program, inputs, denoiser_run_options);
+        state.prepare_ms = state.prepared->preparation_milliseconds();
+        state.resident = state.prepared->resident_bytes();
+        state.signature = options.prepare_signature;
+      }
+      auto &prepared = state.prepared;
+      denoiser_prepare_ms = reuse ? 0.0 : state.prepare_ms;
+      denoiser_resident = state.resident;
+      denoiser_reused = reuse;
+      ++state.requests;
       dif::sampling::H3ResMultistepState video_res_multistep;
       dif::sampling::H3ResMultistepState audio_res_multistep;
       for (std::size_t step = 0U; step < evaluations; ++step) {
@@ -1341,6 +1415,8 @@ int main(int argc, char **argv) {
                         : (options.keyframes.empty() ? "t2va" : "fl2va"))
                 << " sampler=" << options.sampler
                 << " sequence=" << layout.sequence_length
+                << " persistent_reuse=" << (denoiser_reused ? 1 : 0)
+                << " persistent_request=" << state.requests
                 << " attention_class=" << attention_class
                 << " projection_class="
                 << (!options.h3_groupwise_cache.empty()
@@ -1548,6 +1624,219 @@ int main(int argc, char **argv) {
               << " vae_wall_ms=" << vae_wall_ms
               << " vae_resident_bytes=" << vae_resident << "\n";
     return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent denoiser protocol over a Unix stream socket. Request: u32 token
+// count, then per token u32 length + bytes (the difh3infer argv without the
+// program name). Reply: i32 status, u32 length, the request's stdout text.
+// A request consisting of the single token --shutdown stops the server.
+// ---------------------------------------------------------------------------
+void write_all(int descriptor, const void *data, std::size_t bytes) {
+  const auto *cursor = static_cast<const std::uint8_t *>(data);
+  while (bytes != 0U) {
+    const auto written = ::write(descriptor, cursor, bytes);
+    if (written < 0) {
+      if (errno == EINTR)
+        continue;
+      dif::fail(std::string("socket write failed: ") + std::strerror(errno));
+    }
+    cursor += written;
+    bytes -= static_cast<std::size_t>(written);
+  }
+}
+
+void read_all(int descriptor, void *data, std::size_t bytes) {
+  auto *cursor = static_cast<std::uint8_t *>(data);
+  while (bytes != 0U) {
+    const auto received = ::read(descriptor, cursor, bytes);
+    if (received < 0) {
+      if (errno == EINTR)
+        continue;
+      dif::fail(std::string("socket read failed: ") + std::strerror(errno));
+    }
+    if (received == 0)
+      dif::fail("socket closed before the message was complete");
+    cursor += received;
+    bytes -= static_cast<std::size_t>(received);
+  }
+}
+
+void write_u32(int descriptor, std::uint32_t value) {
+  write_all(descriptor, &value, sizeof(value));
+}
+
+std::uint32_t read_u32(int descriptor) {
+  std::uint32_t value = 0;
+  read_all(descriptor, &value, sizeof(value));
+  return value;
+}
+
+void write_blob(int descriptor, const std::string &text) {
+  if (text.size() > std::numeric_limits<std::uint32_t>::max())
+    dif::fail("socket message exceeds the protocol size");
+  write_u32(descriptor, static_cast<std::uint32_t>(text.size()));
+  write_all(descriptor, text.data(), text.size());
+}
+
+std::string read_blob(int descriptor) {
+  const auto length = read_u32(descriptor);
+  if (length > 64U * 1024U * 1024U)
+    dif::fail("socket message exceeds 64 MiB");
+  std::string text(length, '\0');
+  read_all(descriptor, text.data(), length);
+  return text;
+}
+
+int connect_socket(const std::filesystem::path &socket_path) {
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const auto path = socket_path.string();
+  if (path.size() >= sizeof(address.sun_path))
+    dif::fail("socket path is too long for AF_UNIX: " + path);
+  std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path) - 1U);
+  const int descriptor = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (descriptor < 0)
+    dif::fail(std::string("cannot create socket: ") + std::strerror(errno));
+  if (::connect(descriptor, reinterpret_cast<const sockaddr *>(&address),
+                sizeof(address)) != 0) {
+    const auto reason = std::string(std::strerror(errno));
+    ::close(descriptor);
+    dif::fail("cannot connect to persistent denoiser " + path + ": " + reason);
+  }
+  return descriptor;
+}
+
+int run_client(const std::filesystem::path &socket_path,
+               const std::vector<std::string> &arguments) {
+  const int descriptor = connect_socket(socket_path);
+  write_u32(descriptor, static_cast<std::uint32_t>(arguments.size()));
+  for (const auto &argument : arguments)
+    write_blob(descriptor, argument);
+  std::int32_t status = 0;
+  read_all(descriptor, &status, sizeof(status));
+  const auto text = read_blob(descriptor);
+  ::close(descriptor);
+  std::cout << text << std::flush;
+  return static_cast<int>(status);
+}
+
+int serve(const std::filesystem::path &socket_path, ServerState &state) {
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const auto path = socket_path.string();
+  if (path.size() >= sizeof(address.sun_path))
+    dif::fail("socket path is too long for AF_UNIX: " + path);
+  std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path) - 1U);
+  ::unlink(path.c_str());
+  const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (listener < 0)
+    dif::fail(std::string("cannot create socket: ") + std::strerror(errno));
+  if (::bind(listener, reinterpret_cast<const sockaddr *>(&address),
+             sizeof(address)) != 0 ||
+      ::listen(listener, 4) != 0) {
+    const auto reason = std::string(std::strerror(errno));
+    ::close(listener);
+    dif::fail("cannot listen on " + path + ": " + reason);
+  }
+  std::cout << "H3_SERVE READY socket=" << path << " pid=" << ::getpid()
+            << " prepared_requests=" << state.requests
+            << " resident_bytes=" << state.resident << "\n"
+            << std::flush;
+  std::size_t served = 0U;
+  for (;;) {
+    const int connection = ::accept(listener, nullptr, nullptr);
+    if (connection < 0) {
+      if (errno == EINTR)
+        continue;
+      ::close(listener);
+      dif::fail(std::string("accept failed: ") + std::strerror(errno));
+    }
+    std::vector<std::string> arguments;
+    std::int32_t status = 0;
+    std::string reply;
+    try {
+      const auto count = read_u32(connection);
+      if (count > 4096U)
+        dif::fail("request carries too many tokens");
+      arguments.reserve(count);
+      for (std::uint32_t token = 0U; token < count; ++token)
+        arguments.push_back(read_blob(connection));
+    } catch (const std::exception &error) {
+      std::cerr << "difh3infer: bad request: " << error.what() << "\n";
+      ::close(connection);
+      continue;
+    }
+    if (arguments.size() == 1U && arguments.front() == "--shutdown") {
+      reply = "H3_SERVE SHUTDOWN served=" + std::to_string(served) + "\n";
+      write_all(connection, &status, sizeof(status));
+      write_blob(connection, reply);
+      ::close(connection);
+      break;
+    }
+    const auto request_start = std::chrono::steady_clock::now();
+    std::ostringstream captured;
+    auto *previous = std::cout.rdbuf(captured.rdbuf());
+    try {
+      std::vector<std::string> storage;
+      storage.reserve(arguments.size() + 1U);
+      storage.emplace_back("difh3infer");
+      for (const auto &argument : arguments)
+        storage.push_back(argument);
+      std::vector<char *> pointers;
+      pointers.reserve(storage.size());
+      for (auto &token : storage)
+        pointers.push_back(token.data());
+      const auto options = parse(static_cast<int>(pointers.size()),
+                                 pointers.data());
+      if (!options.serve_socket.empty())
+        dif::fail("a served request cannot carry --serve");
+      status = run_request(options, state, request_start);
+    } catch (const std::exception &error) {
+      captured << "difh3infer: " << error.what() << "\n";
+      status = 1;
+    }
+    std::cout.rdbuf(previous);
+    ++served;
+    reply = captured.str();
+    try {
+      write_all(connection, &status, sizeof(status));
+      write_blob(connection, reply);
+    } catch (const std::exception &error) {
+      std::cerr << "difh3infer: reply failed: " << error.what() << "\n";
+    }
+    ::close(connection);
+    std::cout << "H3_SERVE REQUEST index=" << served << " status=" << status
+              << " wall_ms=" << elapsed_milliseconds(request_start) << "\n"
+              << std::flush;
+  }
+  ::close(listener);
+  ::unlink(path.c_str());
+  std::cout << "H3_SERVE STOPPED served=" << served << "\n" << std::flush;
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  try {
+    std::vector<std::string> arguments(argv + 1, argv + argc);
+    for (std::size_t index = 0U; index < arguments.size(); ++index) {
+      if (arguments[index] != "--connect")
+        continue;
+      if (index + 1U >= arguments.size())
+        dif::fail("missing value for --connect");
+      const std::filesystem::path socket_path = arguments[index + 1U];
+      arguments.erase(arguments.begin() + static_cast<std::ptrdiff_t>(index),
+                      arguments.begin() + static_cast<std::ptrdiff_t>(index) + 2);
+      return run_client(socket_path, arguments);
+    }
+    const auto command_wall_start = std::chrono::steady_clock::now();
+    const auto options = parse(argc, argv);
+    ServerState state;
+    const auto status = run_request(options, state, command_wall_start);
+    if (status != 0 || options.serve_socket.empty())
+      return status;
+    return serve(options.serve_socket, state);
   } catch (const std::exception &error) {
     std::cerr << "difh3infer: " << error.what() << "\n";
     return 1;

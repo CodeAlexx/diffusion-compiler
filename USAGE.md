@@ -672,7 +672,7 @@ difh3infer --backend cpu|cuda --sampler euler|res_multistep
            [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline]
            [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--keep-resident-host-pages]
            [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N]
-           [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]
+           [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]
 ```
 
 Runs the H3 sampler over the prepared denoiser and writes the video latent,
@@ -703,6 +703,19 @@ reuses it across evaluations. `--h3-step-residual-cache` is an experimental,
 opt-in cross-step residual reuse and is reported separately.
 `--max-evaluations` truncates the sampler for diagnostics; `--capture-denoiser-*`
 copies named tensors during the first evaluation for `difbisect`.
+
+Persistent denoiser: `--serve SOCKET` runs the request on the command line,
+keeps the prepared denoiser (plans, scratch, resident weights) alive, prints
+`H3_SERVE READY socket=... pid=...`, and then serves further requests on the
+Unix socket. `difh3infer --connect SOCKET <the same difh3infer arguments>`
+sends one request and prints its output; only inputs, schedule, geometry
+(validated against the prepared program), outputs, and diagnostics may differ
+between requests. A request whose prepare-affecting flags differ from the
+prepared ones is refused; a single `--shutdown` token stops the server. Served
+outputs are bit-identical to a fresh process; the receipt carries
+`persistent_reuse=1`. The server holds the denoiser's resident bytes for its
+lifetime (22.6 GB on the H3 recipe), so other GPU stages cannot run alongside
+it on a 24 GB device.
 
 #### difvaedecode
 
