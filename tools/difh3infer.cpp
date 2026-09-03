@@ -69,6 +69,16 @@ struct Options {
   // --h3-int8-attention-first-step N: evaluations before N run exact cuDNN
   // attention, later ones the INT8 route.
   std::uint32_t h3_int8_attention_first_step{};
+  // EasyCache-style whole-model step skipping (experiment). On a full step the
+  // delta (model output minus model input) is cached per stream; a step is
+  // skipped, returning input plus the cached delta, while the accumulated
+  // estimated output change (transformation rate x input change / previous
+  // output norm) stays under the threshold, inside [start, end] of the
+  // sampling range. Mirrors ComfyUI's comfy_extras/nodes_easycache.py.
+  float h3_easycache_threshold{0.0F};
+  float h3_easycache_start{0.15F};
+  float h3_easycache_end{0.95F};
+  std::uint32_t h3_easycache_max_consecutive{0U};
   // Persistent denoiser: --serve SOCKET keeps this process alive after the
   // first request and serves further requests over a Unix socket with the
   // prepared denoiser and its resident weights kept on the device.
@@ -146,7 +156,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--h3-int8-attention-first-step N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--h3-resident-readahead-mib N] [--h3-resident-mapped-copy] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]\n";
+      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--h3-int8-attention-first-step N] [--h3-easycache F [--h3-easycache-start F] [--h3-easycache-end F] [--h3-easycache-max-consecutive N]] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--h3-resident-readahead-mib N] [--h3-resident-mapped-copy] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -468,6 +478,15 @@ Options parse(int argc, char **argv) {
       options.h3_owned_attention_center_k = true;
     else if (option == "--h3-resident-mapped-copy")
       options.h3_resident_mapped_copy = true;
+    else if (option == "--h3-easycache")
+      options.h3_easycache_threshold = std::stof(value("--h3-easycache"));
+    else if (option == "--h3-easycache-start")
+      options.h3_easycache_start = std::stof(value("--h3-easycache-start"));
+    else if (option == "--h3-easycache-end")
+      options.h3_easycache_end = std::stof(value("--h3-easycache-end"));
+    else if (option == "--h3-easycache-max-consecutive")
+      options.h3_easycache_max_consecutive = static_cast<std::uint32_t>(
+          number(value("--h3-easycache-max-consecutive"), "easycache max consecutive"));
     else if (option == "--h3-int8-attention-first-step")
       options.h3_int8_attention_first_step = static_cast<std::uint32_t>(
           number(value("--h3-int8-attention-first-step"), "INT8 attention first step"));
@@ -1009,6 +1028,7 @@ int run_request(const Options &options, ServerState &state,
                    : options.schedule_points);
     double denoiser_prepare_ms = 0.0;
     bool denoiser_reused = false;
+    std::uint32_t ec_skipped_total = 0U;
     double denoiser_kernel_ms = 0.0;
     double denoiser_bundle_map_ms = 0.0;
     double denoiser_step_layout_ms = 0.0;
@@ -1097,7 +1117,14 @@ int run_request(const Options &options, ServerState &state,
       ++state.requests;
       dif::sampling::H3ResMultistepState video_res_multistep;
       dif::sampling::H3ResMultistepState audio_res_multistep;
-      for (std::size_t step = 0U; step < evaluations; ++step) {
+      // EasyCache state (host side; the model is not run on a skipped step).
+    std::vector<float> ec_x_prev_video, ec_diff_video, ec_diff_audio;
+    std::vector<float> ec_output_prev_video;
+    double ec_output_prev_norm = 0.0, ec_rate = 0.0, ec_cumulative = 0.0;
+    double ec_input_change = 0.0, ec_output_change = 0.0;
+    bool ec_have_prev_output = false;
+    std::uint32_t ec_consecutive = 0U;
+    for (std::size_t step = 0U; step < evaluations; ++step) {
         const auto video_timestep = 1.0F - video_sigmas[step];
         const auto audio_timestep = 1.0F - audio_sigmas[step];
         const auto step_layout_start = std::chrono::steady_clock::now();
@@ -1167,7 +1194,88 @@ int run_request(const Options &options, ServerState &state,
             static_cast<std::uint32_t>(step);
         denoiser_run_options.h3_int8_attention_active =
             step >= options.h3_int8_attention_first_step;
-        auto result = prepared->run(inputs, denoiser_run_options);
+        bool ec_skip = false;
+        if (options.h3_easycache_threshold > 0.0F) {
+          const auto current = video.f32();
+          const auto fraction =
+              static_cast<double>(step) / static_cast<double>(steps);
+          const bool in_window = fraction >= options.h3_easycache_start &&
+                                 fraction <= options.h3_easycache_end;
+          if (ec_x_prev_video.size() == current.size()) {
+            double change = 0.0;
+            for (std::size_t i = 0; i < current.size(); ++i)
+              change += std::fabs(static_cast<double>(current[i]) -
+                                  ec_x_prev_video[i]);
+            ec_input_change = change / static_cast<double>(current.size());
+            if (ec_have_prev_output && ec_output_prev_norm > 0.0 && ec_rate > 0.0)
+              ec_cumulative +=
+                  ec_rate * ec_input_change / ec_output_prev_norm;
+            ec_skip = in_window && ec_have_prev_output &&
+                      !ec_diff_video.empty() &&
+                      ec_cumulative <
+                          static_cast<double>(options.h3_easycache_threshold) &&
+                      (options.h3_easycache_max_consecutive == 0U ||
+                       ec_consecutive < options.h3_easycache_max_consecutive);
+          }
+        }
+        dif::runtime::RunResult result;
+        if (ec_skip) {
+          // Skipped step: output = input + cached delta, per stream.
+          ++ec_consecutive;
+          ++ec_skipped_total;
+          dif::runtime::Tensor synthetic_video{dif::ir::DType::F32, video.dims, {}};
+          synthetic_video.bytes.resize(video.byte_size());
+          auto out_v = synthetic_video.f32();
+          const auto in_v = video.f32();
+          for (std::size_t i = 0; i < out_v.size(); ++i)
+            out_v[i] = in_v[i] + ec_diff_video[i];
+          dif::runtime::Tensor synthetic_audio{dif::ir::DType::F32,
+                                               audio_model_input.dims, {}};
+          synthetic_audio.bytes.resize(audio_model_input.byte_size());
+          auto out_a = synthetic_audio.f32();
+          const auto in_a = audio_model_input.f32();
+          for (std::size_t i = 0; i < out_a.size(); ++i)
+            out_a[i] = in_a[i] + ec_diff_audio[i];
+          result.outputs.emplace(video_output, std::move(synthetic_video));
+          result.outputs.emplace(audio_output, std::move(synthetic_audio));
+          result.mean_milliseconds = 0.0;
+          result.backend_name = backend_name;
+          result.device_name = device_name;
+        } else {
+          result = prepared->run(inputs, denoiser_run_options);
+        }
+        if (options.h3_easycache_threshold > 0.0F) {
+          const auto current = video.f32();
+          const auto out_v = result.outputs.at(video_output).f32();
+          const auto out_a = result.outputs.at(audio_output).f32();
+          const auto in_a = audio_model_input.f32();
+          if (!ec_skip) {
+            ec_consecutive = 0U;
+            ec_cumulative = 0.0;
+            double norm = 0.0;
+            for (const auto v : out_v)
+              norm += std::fabs(static_cast<double>(v));
+            norm /= static_cast<double>(out_v.size());
+            if (ec_have_prev_output && ec_input_change > 0.0) {
+              double change = 0.0;
+              for (std::size_t i = 0; i < out_v.size(); ++i)
+                change += std::fabs(static_cast<double>(out_v[i]) -
+                                    ec_output_prev_video[i]);
+              ec_output_change = change / static_cast<double>(out_v.size());
+              ec_rate = ec_output_change / ec_input_change;
+            }
+            ec_output_prev_video.assign(out_v.begin(), out_v.end());
+            ec_output_prev_norm = norm;
+            ec_have_prev_output = true;
+            ec_diff_video.resize(out_v.size());
+            for (std::size_t i = 0; i < out_v.size(); ++i)
+              ec_diff_video[i] = out_v[i] - current[i];
+            ec_diff_audio.resize(out_a.size());
+            for (std::size_t i = 0; i < out_a.size(); ++i)
+              ec_diff_audio[i] = out_a[i] - in_a[i];
+          }
+          ec_x_prev_video.assign(current.begin(), current.end());
+        }
         for (const auto tensor_id : options.capture_denoiser_tensors) {
           const auto captured = result.captured_intermediates.find(tensor_id);
           if (captured == result.captured_intermediates.end())
@@ -1320,6 +1428,12 @@ int run_request(const Options &options, ServerState &state,
         }
         scheduler_update_ms += elapsed_milliseconds(scheduler_start);
         std::cout << "H3_STEP index=" << step
+                  << (options.h3_easycache_threshold > 0.0F
+                          ? std::string(" easycache=") + (ec_skip ? "skip" : "full") +
+                                " input_change=" + std::to_string(ec_input_change) +
+                                " rate=" + std::to_string(ec_rate) +
+                                " cumulative=" + std::to_string(ec_cumulative)
+                          : std::string())
                   << " video_t=" << video_timestep
                   << " audio_t=" << audio_timestep
                   << " denoiser_ms=" << result.mean_milliseconds
@@ -1454,6 +1568,7 @@ int run_request(const Options &options, ServerState &state,
                 << " sequence=" << layout.sequence_length
                 << " int8_attention_first_step="
                 << options.h3_int8_attention_first_step
+                << " easycache_skipped=" << ec_skipped_total
                 << " persistent_reuse=" << (denoiser_reused ? 1 : 0)
                 << " persistent_request=" << state.requests
                 << " attention_class=" << attention_class
