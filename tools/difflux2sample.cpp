@@ -66,6 +66,11 @@ struct Arguments {
   std::string prompt;
   std::uint64_t seed{20260901U};
   std::uint32_t steps{50U};
+  // --flux2-model klein9b|dev. dev = FLUX.2 [dev] geometry (8 + 48 blocks,
+  // hidden 6144, Mistral context 15360, guidance embedding, no CFG batch);
+  // its conditioning must come from --positive-conditioning until the Mistral
+  // conditioner frontend lands.
+  std::string flux2_model{"klein9b"};
   std::uint32_t start_step{};
   std::uint32_t stop_after{};
   std::uint32_t capture_every{};
@@ -254,6 +259,8 @@ Arguments parse(int argc, char **argv) {
       result.prompt = value();
     else if (option == "--seed")
       result.seed = std::stoull(value());
+    else if (option == "--flux2-model")
+      result.flux2_model = value();
     else if (option == "--steps")
       result.steps = static_cast<std::uint32_t>(std::stoul(value()));
     else if (option == "--start-step")
@@ -782,6 +789,11 @@ Arguments parse(int argc, char **argv) {
   if (result.resident_plan_mib >
       std::numeric_limits<std::uint64_t>::max() / (1024ULL * 1024ULL))
     usage_error("resident plan MiB overflows bytes");
+  if (result.flux2_model != "klein9b" && result.flux2_model != "dev")
+    usage_error("--flux2-model must be klein9b or dev");
+  if (result.flux2_model == "dev" && result.positive_conditioning.empty())
+    usage_error("--flux2-model dev needs --positive-conditioning FILE (the "
+                "Mistral conditioner frontend is not in this build yet)");
   if (result.transformer_checkpoint.empty())
     result.transformer_checkpoint =
         result.model_directory / "flux-2-klein-base-9b.safetensors";
@@ -940,12 +952,19 @@ ConditioningResult condition(const Arguments &arguments) {
   if (!arguments.positive_conditioning.empty()) {
     const auto positive_file =
         dif::weights::read_safetensors(arguments.positive_conditioning);
-    const auto negative_file =
-        dif::weights::read_safetensors(arguments.negative_conditioning);
     result.positive =
         dif::weights::map_safetensor(positive_file, "conditioning");
-    result.negative =
-        dif::weights::map_safetensor(negative_file, "conditioning");
+    if (arguments.negative_conditioning.empty()) {
+      if (arguments.flux2_model != "dev")
+        dif::fail("--negative-conditioning is required with "
+                  "--positive-conditioning for the CFG (klein) path");
+      result.negative = result.positive; // unused by the dev path
+    } else {
+      const auto negative_file =
+          dif::weights::read_safetensors(arguments.negative_conditioning);
+      result.negative =
+          dif::weights::map_safetensor(negative_file, "conditioning");
+    }
     const auto canonicalize = [](dif::runtime::Tensor &tensor) {
       if (tensor.dims.size() == 3U && tensor.dims.front() == 1U)
         tensor.dims.erase(tensor.dims.begin());
@@ -3244,10 +3263,15 @@ DenoiseResult denoise(const Arguments &arguments,
                        std::uint64_t latent_width) {
   DenoiseResult result;
   const auto image_tokens = latent.dims.at(0);
+  const bool dev = arguments.flux2_model == "dev";
   dif::frontend::Flux2KleinTransformerConfig config;
-  config.batch_size = 2U;
+  if (dev)
+    config.geometry = dif::frontend::flux2_dev_geometry();
+  // [dev] is guidance-distilled: one conditional pass with the guidance
+  // embedded, no CFG batch. Klein runs the CFG pair as before.
+  config.batch_size = dev ? 1U : 2U;
   config.image_tokens = image_tokens;
-  config.text_tokens = 512U;
+  config.text_tokens = dev ? conditioning.positive.dims.at(0) : 512U;
   config.streamed_constants = true;
   config.attention_implementation =
       arguments.transformer_attention_implementation;
@@ -3256,11 +3280,18 @@ DenoiseResult denoise(const Arguments &arguments,
   const auto checkpoint =
       dif::weights::read_safetensors(arguments.transformer_checkpoint);
   dif::runtime::TensorMap bindings = transformer.generated_constants;
-  bindings.emplace(transformer.latent_input, batch_pair(latent, latent));
+  bindings.emplace(transformer.latent_input,
+                   dev ? latent : batch_pair(latent, latent));
   bindings.emplace(transformer.conditioning_input,
-                   batch_pair(conditioning.negative, conditioning.positive));
+                   dev ? conditioning.positive
+                       : batch_pair(conditioning.negative,
+                                    conditioning.positive));
   bindings.emplace(transformer.timestep_input,
-                   repeated_scalar(dif::ir::DType::BF16, 1.0F, 2U));
+                   repeated_scalar(dif::ir::DType::BF16, 1.0F,
+                                   config.batch_size));
+  if (transformer.guidance_input != 0U)
+    bindings.emplace(transformer.guidance_input,
+                     scalar(dif::ir::DType::BF16, arguments.guidance));
   bindings.emplace(transformer.position_ids_input,
                    position_ids(image_tokens, 512U, latent_width, 2U));
   for (std::size_t index = 0U;
@@ -3980,8 +4011,11 @@ DenoiseResult denoise(const Arguments &arguments,
   cfg_bindings.emplace(cfg.sample_input, latent);
   cfg_bindings.emplace(cfg.conditional_velocity_input, latent);
   cfg_bindings.emplace(cfg.unconditional_velocity_input, latent);
+  // dev: both velocity inputs receive the single prediction and the CFG
+  // scale is 1, so the Euler update sees exactly that prediction.
   cfg_bindings.emplace(cfg.guidance_input,
-                       scalar(dif::ir::DType::BF16, arguments.guidance));
+                       scalar(dif::ir::DType::BF16,
+                              dev ? 1.0F : arguments.guidance));
   cfg_bindings.emplace(cfg.current_timestep_input,
                        scalar(dif::ir::DType::F32, 1.0F));
   cfg_bindings.emplace(cfg.next_timestep_input,
@@ -4009,10 +4043,10 @@ DenoiseResult denoise(const Arguments &arguments,
     const auto current = schedule.at(absolute_step);
     const auto next = schedule.at(absolute_step + 1U);
     bindings.insert_or_assign(transformer.latent_input,
-                              batch_pair(latent, latent));
+                              dev ? latent : batch_pair(latent, latent));
     bindings.insert_or_assign(transformer.timestep_input,
                               repeated_scalar(dif::ir::DType::BF16, current,
-                                              2U));
+                                              config.batch_size));
     if (dynamic_clip_input)
       bindings.insert_or_assign(
           *dynamic_clip_input,
@@ -4110,8 +4144,10 @@ DenoiseResult denoise(const Arguments &arguments,
     }
     const auto velocity_batch =
         prediction.outputs.at(transformer.prediction_output);
-    const auto unconditional = batch_row(velocity_batch, 0U);
-    const auto conditional = batch_row(velocity_batch, 1U);
+    const auto unconditional =
+        dev ? velocity_batch : batch_row(velocity_batch, 0U);
+    const auto conditional =
+        dev ? velocity_batch : batch_row(velocity_batch, 1U);
 
     cfg_bindings.insert_or_assign(cfg.sample_input, latent);
     cfg_bindings.insert_or_assign(
@@ -4351,6 +4387,7 @@ int main(int argc, char **argv) {
            << ",\n  \"steps\": " << arguments.steps
            << ",\n  \"start_step\": " << arguments.start_step
            << ",\n  \"executed_steps\": " << executed
+           << ",\n  \"flux2_model\": " << std::quoted(arguments.flux2_model)
            << ",\n  \"guidance\": " << arguments.guidance
            << ",\n  \"scheduler\": \"creator generalized-time Euler\",\n"
            << "  \"denoiser_mode\": \"creator batch-two CFG\",\n"
