@@ -53,21 +53,34 @@ void verify_case(const dif::text::QwenBpeTokenizer &tokenizer,
 
 int main() {
   try {
+    // The pinned Qwen3 tokenizer: DIF_FLUX2_QWEN_TOKENIZER, else the intake
+    // cache, else the tokenizer/ directory of the HF FLUX.2 Klein snapshot
+    // (identical tokenizer.json; the intake cache lived on a drive that died).
     const char *root_env = std::getenv("DIF_FLUX2_QWEN_TOKENIZER");
-    const std::filesystem::path root =
-        root_env != nullptr
-            ? std::filesystem::path(root_env)
-            : std::filesystem::path(
-                  "/mnt/disk1/diffusion-compiler-cache/flux2-intake/"
-                  "qwen3-8b-fp8");
-    const auto tokenizer_json = root / "tokenizer.json";
-    const auto tokenizer_config = root / "tokenizer_config.json";
-    if (!std::filesystem::exists(tokenizer_json) ||
-        !std::filesystem::exists(tokenizer_config)) {
-      std::cout << "SKIP: pinned FLUX.2 Qwen tokenizer not found under "
-                << root << "\n";
+    std::vector<std::filesystem::path> candidates;
+    if (root_env != nullptr)
+      candidates.emplace_back(root_env);
+    candidates.emplace_back(
+        "/mnt/disk1/diffusion-compiler-cache/flux2-intake/qwen3-8b-fp8");
+    if (const char *home = std::getenv("HOME"); home != nullptr)
+      candidates.emplace_back(
+          std::filesystem::path(home) /
+          ".cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-9B/"
+          "snapshots/32773329fbe7e81a90ef971740e8ba4b0364ecf3/tokenizer");
+    std::filesystem::path root;
+    for (const auto &candidate : candidates)
+      if (std::filesystem::exists(candidate / "tokenizer.json") &&
+          std::filesystem::exists(candidate / "tokenizer_config.json")) {
+        root = candidate;
+        break;
+      }
+    if (root.empty()) {
+      std::cout << "SKIP: pinned FLUX.2 Qwen tokenizer not found under any of "
+                << candidates.size() << " candidate paths\n";
       return 77;
     }
+    const auto tokenizer_json = root / "tokenizer.json";
+    const auto tokenizer_config = root / "tokenizer_config.json";
 
     const auto tokenizer = dif::text::QwenBpeTokenizer::load(
         tokenizer_json, tokenizer_config);
