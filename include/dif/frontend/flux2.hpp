@@ -18,7 +18,26 @@ namespace dif::frontend {
 Qwen3VlConditionerConfig
 make_flux2_klein_9b_conditioner_config(std::uint64_t executed_layers = 27U);
 
+// FLUX.2 transformer geometry. Defaults are FLUX.2 [klein] Base 9B, which
+// keeps every existing Klein program byte-identical; flux2_dev_geometry()
+// selects FLUX.2 [dev] (32B: hidden 6144, 48 heads, MLP 18432, 8 + 48
+// blocks, Mistral context width 15360, guidance embedding added to the
+// timestep vector). Verified against the checkpoint headers 2026-09-03.
+struct Flux2Geometry {
+  std::uint64_t hidden{4096U};
+  std::uint64_t heads{32U};
+  std::uint64_t head_dim{128U};
+  std::uint64_t mlp{12288U};
+  std::uint64_t double_depth{8U};
+  std::uint64_t single_depth{24U};
+  std::uint64_t context_width{12288U};
+  bool guidance_embedding{false};
+};
+Flux2Geometry flux2_klein_9b_geometry();
+Flux2Geometry flux2_dev_geometry();
+
 struct Flux2KleinDoubleBlockConfig {
+  Flux2Geometry geometry{};
   std::uint64_t batch_size{1U};
   std::uint64_t image_tokens{4096U};
   std::uint64_t text_tokens{512U};
@@ -48,6 +67,7 @@ Flux2KleinDoubleBlockBuild make_flux2_klein_9b_double_block(
     const Flux2KleinDoubleBlockConfig &config = {});
 
 struct Flux2KleinSingleBlockConfig {
+  Flux2Geometry geometry{};
   std::uint64_t batch_size{1U};
   std::uint64_t tokens{4608U};
   std::uint64_t block_index{};
@@ -71,6 +91,7 @@ Flux2KleinSingleBlockBuild make_flux2_klein_9b_single_block(
     const Flux2KleinSingleBlockConfig &config = {});
 
 struct Flux2KleinTransformerConfig {
+  Flux2Geometry geometry{};
   std::uint64_t batch_size{1U};
   std::uint64_t image_tokens{4096U};
   std::uint64_t text_tokens{512U};
@@ -88,6 +109,9 @@ struct Flux2KleinTransformerBuild {
   std::uint32_t latent_input{};
   std::uint32_t conditioning_input{};
   std::uint32_t timestep_input{};
+  // Nonzero only for a geometry with guidance_embedding: BF16 [batch]
+  // guidance value embedded like the timestep and added to the vector.
+  std::uint32_t guidance_input{};
   std::uint32_t position_ids_input{};
   std::uint32_t prediction_output{};
   std::vector<std::uint32_t> checkpoint_tensors;

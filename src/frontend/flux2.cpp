@@ -61,20 +61,49 @@ runtime::Tensor i32_tensor(std::vector<std::int32_t> values) {
 
 } // namespace
 
+Flux2Geometry flux2_klein_9b_geometry() { return Flux2Geometry{}; }
+
+Flux2Geometry flux2_dev_geometry() {
+  Flux2Geometry geometry;
+  geometry.hidden = 6144U;
+  geometry.heads = 48U;
+  geometry.head_dim = 128U;
+  geometry.mlp = 18432U;
+  geometry.double_depth = 8U;
+  geometry.single_depth = 48U;
+  geometry.context_width = 15360U;
+  geometry.guidance_embedding = true;
+  return geometry;
+}
+
+namespace {
+void check_geometry(const Flux2Geometry &geometry) {
+  if (geometry.hidden == 0U || geometry.heads == 0U ||
+      geometry.head_dim == 0U || geometry.mlp == 0U ||
+      geometry.hidden != geometry.heads * geometry.head_dim ||
+      geometry.double_depth == 0U || geometry.single_depth == 0U ||
+      geometry.context_width == 0U)
+    fail("FLUX.2 geometry is inconsistent (hidden must equal heads x head_dim)");
+}
+} // namespace
+
 Flux2KleinDoubleBlockBuild make_flux2_klein_9b_double_block(
     const Flux2KleinDoubleBlockConfig &config) {
   using namespace ir;
-  constexpr std::uint64_t hidden = 4096U;
-  constexpr std::uint64_t heads = 32U;
-  constexpr std::uint64_t head_dim = 128U;
-  constexpr std::uint64_t mlp = 12288U;
-  constexpr std::uint64_t qkv = hidden * 3U;
-  constexpr std::uint64_t packed_mlp = mlp * 2U;
+  check_geometry(config.geometry);
+  const std::uint64_t hidden = config.geometry.hidden;
+  const std::uint64_t heads = config.geometry.heads;
+  const std::uint64_t head_dim = config.geometry.head_dim;
+  const std::uint64_t mlp = config.geometry.mlp;
+  const std::uint64_t qkv = hidden * 3U;
+  const std::uint64_t packed_mlp = mlp * 2U;
   if (config.batch_size == 0U || config.image_tokens == 0U ||
       config.text_tokens == 0U ||
-      config.block_index >= 8U || config.attention_implementation < 1U ||
+      config.block_index >= config.geometry.double_depth ||
+      config.attention_implementation < 1U ||
       config.attention_implementation > 4U)
-    fail("FLUX.2 double block requires nonzero batch/tokens and block index < 8");
+    fail("FLUX.2 double block requires nonzero batch/tokens and a block index "
+         "below the geometry's double depth");
   const auto total = config.text_tokens + config.image_tokens;
   const bool batched = config.batch_size != 1U;
   const auto token_axis = batched ? 1U : 0U;
@@ -447,16 +476,19 @@ Flux2KleinDoubleBlockBuild make_flux2_klein_9b_double_block(
 Flux2KleinSingleBlockBuild make_flux2_klein_9b_single_block(
     const Flux2KleinSingleBlockConfig &config) {
   using namespace ir;
-  constexpr std::uint64_t hidden = 4096U;
-  constexpr std::uint64_t heads = 32U;
-  constexpr std::uint64_t head_dim = 128U;
-  constexpr std::uint64_t mlp = 12288U;
-  constexpr std::uint64_t qkv = hidden * 3U;
-  constexpr std::uint64_t packed_mlp = mlp * 2U;
+  check_geometry(config.geometry);
+  const std::uint64_t hidden = config.geometry.hidden;
+  const std::uint64_t heads = config.geometry.heads;
+  const std::uint64_t head_dim = config.geometry.head_dim;
+  const std::uint64_t mlp = config.geometry.mlp;
+  const std::uint64_t qkv = hidden * 3U;
+  const std::uint64_t packed_mlp = mlp * 2U;
   if (config.batch_size == 0U || config.tokens == 0U ||
-      config.block_index >= 24U || config.attention_implementation < 1U ||
+      config.block_index >= config.geometry.single_depth ||
+      config.attention_implementation < 1U ||
       config.attention_implementation > 4U)
-    fail("FLUX.2 single block requires nonzero batch/tokens and block index < 24");
+    fail("FLUX.2 single block requires nonzero batch/tokens and a block index "
+         "below the geometry's single depth");
   const bool batched = config.batch_size != 1U;
   const auto token_axis = batched ? 1U : 0U;
   const auto feature_axis = batched ? 2U : 1U;
@@ -705,14 +737,17 @@ Flux2KleinSingleBlockBuild make_flux2_klein_9b_single_block(
 Flux2KleinTransformerBuild make_flux2_klein_9b_transformer(
     const Flux2KleinTransformerConfig &config) {
   using namespace ir;
+  check_geometry(config.geometry);
   constexpr std::uint64_t latent_channels = 128U;
-  constexpr std::uint64_t context_width = 12288U;
-  constexpr std::uint64_t hidden = 4096U;
+  const std::uint64_t context_width = config.geometry.context_width;
+  const std::uint64_t hidden = config.geometry.hidden;
   constexpr std::uint64_t timestep_width = 256U;
+  const auto full_double = config.geometry.double_depth;
+  const auto full_single = config.geometry.single_depth;
   if (config.batch_size == 0U || config.image_tokens == 0U ||
       config.text_tokens == 0U ||
-      config.double_depth > 8U || config.single_depth > 24U ||
-      (config.double_depth < 8U && config.single_depth != 0U))
+      config.double_depth > full_double || config.single_depth > full_single ||
+      (config.double_depth < full_double && config.single_depth != 0U))
     fail("invalid FLUX.2 transformer parity depth or token geometry");
 
   Flux2KleinTransformerBuild build;
@@ -838,8 +873,47 @@ Flux2KleinTransformerBuild make_flux2_klein_9b_transformer(
             {time_hidden});
   const auto time_activated = bf16({config.batch_size, hidden});
   operation(Opcode::SiLU, {time_hidden}, {time_activated});
-  const auto vector = bf16({config.batch_size, hidden});
+  auto vector = bf16({config.batch_size, hidden});
   operation(Opcode::Linear, {time_activated, time_out_weight}, {vector});
+  if (config.geometry.guidance_embedding) {
+    // FLUX.2 [dev]: vec = time_in(emb(t)) + guidance_in(emb(guidance)),
+    // the guidance embedded exactly like the timestep (x1000, sinusoidal 256).
+    build.guidance_input =
+        add_tensor(DType::BF16, TensorRole::Input, {config.batch_size});
+    const auto scaled_guidance_bf16 = bf16({config.batch_size});
+    operation(Opcode::Multiply, {build.guidance_input, thousand},
+              {scaled_guidance_bf16});
+    const auto scaled_guidance_f32 =
+        add_tensor(DType::F32, TensorRole::Internal, {config.batch_size});
+    operation(Opcode::Cast, {scaled_guidance_bf16}, {scaled_guidance_f32});
+    const auto guidance_embedding_f32 =
+        add_tensor(DType::F32, TensorRole::Internal,
+                   {config.batch_size, timestep_width});
+    operation(Opcode::SinusoidalTimestep, {scaled_guidance_f32},
+              {guidance_embedding_f32},
+              {Attribute::boolean(AttrKey::FlipSinToCos, true),
+               Attribute::f64(AttrKey::DownscaleFreqShift, 0.0),
+               Attribute::f64(AttrKey::Scale, 1.0),
+               Attribute::f64(AttrKey::MaxPeriod, 10000.0)});
+    const auto guidance_embedding =
+        bf16({config.batch_size, timestep_width});
+    operation(Opcode::Cast, {guidance_embedding_f32}, {guidance_embedding});
+    const auto guidance_in_weight =
+        checkpoint("guidance_in.in_layer.weight", {hidden, timestep_width});
+    const auto guidance_out_weight =
+        checkpoint("guidance_in.out_layer.weight", {hidden, hidden});
+    const auto guidance_hidden = bf16({config.batch_size, hidden});
+    operation(Opcode::Linear, {guidance_embedding, guidance_in_weight},
+              {guidance_hidden});
+    const auto guidance_activated = bf16({config.batch_size, hidden});
+    operation(Opcode::SiLU, {guidance_hidden}, {guidance_activated});
+    const auto guidance_vector = bf16({config.batch_size, hidden});
+    operation(Opcode::Linear, {guidance_activated, guidance_out_weight},
+              {guidance_vector});
+    const auto summed = bf16({config.batch_size, hidden});
+    operation(Opcode::Add, {vector, guidance_vector}, {summed});
+    vector = summed;
+  }
   capture("time_vector", vector);
   const auto modulation_input = bf16({config.batch_size, hidden});
   operation(Opcode::SiLU, {vector}, {modulation_input});
@@ -934,6 +1008,7 @@ Flux2KleinTransformerBuild make_flux2_klein_9b_transformer(
     block_config.image_tokens = config.image_tokens;
     block_config.text_tokens = config.text_tokens;
     block_config.block_index = depth;
+    block_config.geometry = config.geometry;
     block_config.attention_implementation =
         config.attention_implementation;
     block_config.capture_boundaries =
@@ -956,7 +1031,7 @@ Flux2KleinTransformerBuild make_flux2_klein_9b_transformer(
     capture("double_" + std::to_string(depth + 1U) + "_text", text);
   }
 
-  if (config.double_depth < 8U) {
+  if (config.double_depth < full_double) {
     build.prediction_output = image;
   } else {
     auto sequence = bf16(stream_shape(total, hidden));
@@ -967,6 +1042,7 @@ Flux2KleinTransformerBuild make_flux2_klein_9b_transformer(
       block_config.batch_size = config.batch_size;
       block_config.tokens = total;
       block_config.block_index = depth;
+      block_config.geometry = config.geometry;
       block_config.attention_implementation =
           config.attention_implementation;
       block_config.capture_boundaries =
@@ -984,7 +1060,7 @@ Flux2KleinTransformerBuild make_flux2_klein_9b_transformer(
           capture("single_1_" + name, mapping.at(id));
       capture("single_" + std::to_string(depth + 1U), sequence);
     }
-    if (config.single_depth < 24U) {
+    if (config.single_depth < full_single) {
       build.prediction_output = sequence;
     } else {
       const auto image_hidden =

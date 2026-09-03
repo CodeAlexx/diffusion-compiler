@@ -191,6 +191,60 @@ int main() {
              "FLUX.2 CFG policy ends at the generic eager Euler semantic");
     }
 
+    {
+      // Geometry: the Klein default stays what it was, and the [dev]
+      // geometry builds a verified 8 + 48 block program with the guidance
+      // embedding and Dev-width checkpoint tensors.
+      dif::frontend::Flux2KleinTransformerConfig klein;
+      klein.image_tokens = 64U;
+      klein.text_tokens = 16U;
+      const auto klein_build =
+          dif::frontend::make_flux2_klein_9b_transformer(klein);
+      expect(klein_build.guidance_input == 0U,
+             "klein geometry has no guidance embedding input");
+      expect(std::none_of(klein_build.checkpoint_names.begin(),
+                          klein_build.checkpoint_names.end(),
+                          [](const std::string &name) {
+                            return name.rfind("guidance_in", 0) == 0;
+                          }),
+             "klein geometry binds no guidance_in weights");
+      dif::frontend::Flux2KleinTransformerConfig dev;
+      dev.geometry = dif::frontend::flux2_dev_geometry();
+      dev.image_tokens = 64U;
+      dev.text_tokens = 16U;
+      dev.double_depth = 8U;
+      dev.single_depth = 48U;
+      const auto dev_build =
+          dif::frontend::make_flux2_klein_9b_transformer(dev);
+      expect(dev_build.guidance_input != 0U,
+             "dev geometry exposes the guidance input");
+      const auto has = [&](const char *name) {
+        return std::find(dev_build.checkpoint_names.begin(),
+                         dev_build.checkpoint_names.end(),
+                         std::string(name)) != dev_build.checkpoint_names.end();
+      };
+      expect(has("guidance_in.in_layer.weight") &&
+                 has("guidance_in.out_layer.weight") &&
+                 has("single_blocks.47.linear2.weight") &&
+                 has("double_blocks.7.txt_mlp.2.weight"),
+             "dev geometry binds guidance_in and all 8 + 48 blocks");
+      const auto qkv = std::find(dev_build.checkpoint_names.begin(),
+                                 dev_build.checkpoint_names.end(),
+                                 std::string("double_blocks.0.img_attn.qkv.weight"));
+      expect(qkv != dev_build.checkpoint_names.end(),
+             "dev geometry binds the first double-block qkv");
+      if (qkv != dev_build.checkpoint_names.end()) {
+        const auto id = dev_build.checkpoint_tensors.at(static_cast<std::size_t>(
+            std::distance(dev_build.checkpoint_names.begin(), qkv)));
+        const auto *desc = dev_build.program.tensor(id);
+        expect(desc && desc->dims == std::vector<std::uint64_t>{18432U, 6144U},
+               "dev qkv weight is [18432, 6144]");
+      }
+      const auto *conditioning = dev_build.program.tensor(dev_build.conditioning_input);
+      expect(conditioning && conditioning->dims.back() == 15360U,
+             "dev conditioning input is 15360 wide");
+      dif::ir::verify(dev_build.program);
+    }
     if (failures != 0) {
       std::cerr << failures << " failure(s)\n";
       return 1;
