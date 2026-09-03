@@ -2905,31 +2905,12 @@ struct H3W8A8AttentionPlan {
   H3CompactAdaLNBinding compact_adaln;
 };
 
-struct H3StepResidualPlan {
-  bool enabled{};
-  std::uint32_t front_blocks{};
-  std::uint32_t back_blocks{};
-  std::size_t front_execute_index{};
-  std::size_t middle_execute_index{};
-  std::size_t skip_begin_index{};
-  std::size_t skip_end_index{};
-  std::uint32_t front_tensor{};
-  std::uint32_t middle_tensor{};
-  std::uint64_t elements{};
-  std::uint64_t cache_bytes{};
-};
-
 struct H3W8A8Functions {
   CUfunction rowscale{};
   CUfunction encode{};
   CUfunction qkv{};
   CUfunction swiglu{};
   CUfunction residual{};
-};
-
-struct H3StepResidualFunctions {
-  CUfunction store{};
-  CUfunction apply{};
 };
 
 struct H3ConvRotFunctions {
@@ -4986,87 +4967,6 @@ extern "C" __global__ void dif_h3_w8a8_residual(
     float projected=dif_round_bf16((float)accumulator[i]*x_scale[row]*w_scale[col]);
     float result=dif_load_bf16(residual,oi)+dif_load_bf16(gate,oi)*projected;
     dif_store_bf16(output,oi,result);i+=stride;}}
-)CUDA";
-}
-
-H3StepResidualPlan find_h3_step_residual_plan(
-    const ir::Program &program, const RunOptions &options,
-    const std::vector<H3W8A8MlpPlan> &mlp_plans) {
-  H3StepResidualPlan result;
-  if (!options.h3_step_residual_cache)
-    return result;
-  constexpr std::size_t h3_transformer_blocks = 50U;
-  if (mlp_plans.size() != h3_transformer_blocks ||
-      !std::all_of(mlp_plans.begin(), mlp_plans.end(),
-                   [](const auto &plan) { return plan.convrot; }))
-    fail("H3 step residual cache requires a complete 50-block ConvRot INT8 MLP plan");
-  for (std::size_t index = 0U; index < mlp_plans.size(); ++index)
-    if (mlp_plans[index].layer != index)
-      fail("H3 step residual cache requires canonical zero-based block order");
-  const auto front = static_cast<std::size_t>(
-      options.h3_step_residual_front_blocks);
-  const auto back = static_cast<std::size_t>(
-      options.h3_step_residual_back_blocks);
-  if (front == 0U || back == 0U || front + back >= mlp_plans.size())
-    fail("H3 step residual cache requires positive front/back bands with a nonempty middle band");
-  const auto &front_plan = mlp_plans.at(front - 1U);
-  const auto &middle_plan = mlp_plans.at(mlp_plans.size() - back - 1U);
-  const auto operation_index = [&](std::uint32_t operation_id) {
-    const auto found = std::find_if(
-        program.operations.begin(), program.operations.end(),
-        [&](const auto &operation) { return operation.id == operation_id; });
-    if (found == program.operations.end())
-      fail("H3 step residual boundary operation is missing");
-    return static_cast<std::size_t>(
-        std::distance(program.operations.begin(), found));
-  };
-  const auto *front_tensor = program.tensor(front_plan.output_tensor);
-  const auto *middle_tensor = program.tensor(middle_plan.output_tensor);
-  if (!front_tensor || !middle_tensor ||
-      front_tensor->dtype != ir::DType::BF16 ||
-      middle_tensor->dtype != ir::DType::BF16 ||
-      front_tensor->dims != middle_tensor->dims ||
-      front_tensor->byte_count() == 0U)
-    fail("H3 step residual boundaries require matching nonempty BF16 tensors");
-  result.enabled = true;
-  result.front_blocks = options.h3_step_residual_front_blocks;
-  result.back_blocks = options.h3_step_residual_back_blocks;
-  result.front_execute_index = operation_index(front_plan.fc1_operation);
-  result.middle_execute_index = operation_index(middle_plan.fc1_operation);
-  result.skip_begin_index = result.front_execute_index + 1U;
-  result.skip_end_index = operation_index(middle_plan.residual_operation);
-  if (result.front_execute_index >= result.middle_execute_index ||
-      result.middle_execute_index > result.skip_end_index ||
-      result.skip_end_index >= program.operations.size())
-    fail("H3 step residual boundary operations are not in canonical order");
-  result.front_tensor = front_plan.output_tensor;
-  result.middle_tensor = middle_plan.output_tensor;
-  result.elements = front_tensor->element_count();
-  const auto one_cache_bytes = align_256(front_tensor->byte_count());
-  if (one_cache_bytes > std::numeric_limits<std::uint64_t>::max() / 2U)
-    fail("H3 step residual cache storage overflows U64");
-  result.cache_bytes = 2U * one_cache_bytes;
-  return result;
-}
-
-std::string h3_step_residual_source(bool enabled) {
-  if (!enabled)
-    return {};
-  return R"CUDA(
-extern "C" __global__ void dif_h3_step_residual_store(
-    const dif_bf16* middle,const dif_bf16* front,dif_bf16* residual,
-    unsigned long long elements){
-  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
-  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
-  while(i<elements){dif_store_bf16(residual,i,
-    dif_load_bf16(middle,i)-dif_load_bf16(front,i));i+=stride;}}
-extern "C" __global__ void dif_h3_step_residual_apply(
-    const dif_bf16* front,const dif_bf16* residual,dif_bf16* middle,
-    unsigned long long elements){
-  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
-  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
-  while(i<elements){dif_store_bf16(middle,i,
-    dif_load_bf16(front,i)+dif_load_bf16(residual,i));i+=stride;}}
 )CUDA";
 }
 
@@ -8042,11 +7942,6 @@ public:
     h3_w8a8_mlp_plans_ = find_h3_w8a8_mlp_plans(program_, options);
     h3_w8a8_attention_plans_ =
         find_h3_w8a8_attention_plans(program_, options);
-    h3_step_residual_plan_ =
-        find_h3_step_residual_plan(program_, options, h3_w8a8_mlp_plans_);
-    if (h3_step_residual_plan_.enabled &&
-        !capture_intermediate_tensors_.empty())
-      fail("H3 step residual cache does not support intermediate capture");
     convrot_int8_linear_plans_ =
         find_convrot_int8_linear_plans(program_, options);
     if (options.convrot_int8_resident &&
@@ -8304,8 +8199,6 @@ public:
     generated.source += h3_w8a8_source(
         !h3_w8a8_mlp_plans_.empty() ||
         !h3_w8a8_attention_plans_.empty());
-    generated.source +=
-        h3_step_residual_source(h3_step_residual_plan_.enabled);
     const auto has_h3_convrot =
         std::any_of(h3_w8a8_mlp_plans_.begin(), h3_w8a8_mlp_plans_.end(),
                     [](const auto &plan) { return plan.convrot; }) ||
@@ -8540,9 +8433,6 @@ public:
             workspace_bytes_ * (maximum_width - 1U);
       }
     }
-    if (h3_step_residual_plan_.enabled &&
-        !parallel_linear_groups_.empty())
-      fail("H3 step residual cache does not support parallel Linear groups");
     cudnn_workspace_bytes_ = 0U;
 #if DIF_HAS_CUDNN
     std::unordered_map<CudnnAttentionKey,
@@ -8905,22 +8795,15 @@ public:
       fail("DiffIR allocation plus repeated-invariant cache overflow");
     const auto base_with_repeated =
         base_with_promoted + repeated_invariant_cache_bytes_;
-    const auto h3_step_residual_bytes = h3_step_residual_plan_.cache_bytes;
-    if (base_with_repeated > std::numeric_limits<std::uint64_t>::max() -
-                                 h3_step_residual_bytes)
-      fail("DiffIR allocation plus H3 step residual cache overflow");
-    const auto base_with_step_residual =
-        base_with_repeated + h3_step_residual_bytes;
     const auto h3_convrot_correction_bytes =
         h3_convrot_bf16_correction_
             ? h3_convrot_bf16_correction_->storage_bytes
             : 0U;
-    if (base_with_step_residual >
-        std::numeric_limits<std::uint64_t>::max() -
-            h3_convrot_correction_bytes)
+    if (base_with_repeated > std::numeric_limits<std::uint64_t>::max() -
+                                 h3_convrot_correction_bytes)
       fail("DiffIR allocation plus H3 ConvRot correction storage overflow");
     const auto required =
-        base_with_step_residual + h3_convrot_correction_bytes;
+        base_with_repeated + h3_convrot_correction_bytes;
     if (options.profile_pipeline) {
       std::cerr << "CUDA_MEMORY_PLAN tensor_bytes=" << tensor_bytes
                 << " linear_workspace_bytes=" << workspace_bytes_
@@ -8944,8 +8827,6 @@ public:
                 << promoted_constant_bytes_
                 << " repeated_invariant_cache_bytes="
                 << repeated_invariant_cache_bytes_
-                << " h3_step_residual_cache_bytes="
-                << h3_step_residual_bytes
                 << " h3_convrot_correction_bytes="
                 << h3_convrot_correction_bytes
                 << " required_bytes=" << required
@@ -9077,16 +8958,6 @@ public:
       check(cuModuleGetFunction(&h3_w8a8_functions_.residual, module_->get(),
                                 "dif_h3_w8a8_residual"),
             "cuModuleGetFunction H3 W8A8 residual");
-    }
-    if (h3_step_residual_plan_.enabled) {
-      check(cuModuleGetFunction(&h3_step_residual_functions_.store,
-                                module_->get(),
-                                "dif_h3_step_residual_store"),
-            "cuModuleGetFunction H3 step residual store");
-      check(cuModuleGetFunction(&h3_step_residual_functions_.apply,
-                                module_->get(),
-                                "dif_h3_step_residual_apply"),
-            "cuModuleGetFunction H3 step residual apply");
     }
     if (has_convrot) {
       check(cuModuleGetFunction(&h3_convrot_functions_.generic_encode,
@@ -9261,14 +9132,6 @@ public:
     buffers_.allocate(program_, memory_plan_, excluded_tensors, arena_.get());
     repeated_invariant_cache_storage_ = std::make_unique<Workspace>(
         repeated_invariant_cache_bytes_, arena_.get());
-    h3_step_residual_storage_ = std::make_unique<Workspace>(
-        static_cast<std::size_t>(h3_step_residual_plan_.cache_bytes),
-        arena_.get());
-    if (h3_step_residual_plan_.enabled) {
-      h3_step_front_snapshot_ = h3_step_residual_storage_->pointer();
-      h3_step_middle_residual_ =
-          h3_step_front_snapshot_ + h3_step_residual_plan_.cache_bytes / 2U;
-    }
     workspace_ = std::make_unique<Workspace>(workspace_bytes_, arena_.get());
     if (parallel_workspace_bytes_ != 0U) {
       const auto auxiliary_count =
@@ -10182,22 +10045,6 @@ public:
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
     if (options.iterations == 0)
       fail("run iterations must be nonzero");
-    if (options.h3_step_residual_cache != h3_step_residual_plan_.enabled ||
-        (h3_step_residual_plan_.enabled &&
-         (options.h3_step_residual_front_blocks !=
-              h3_step_residual_plan_.front_blocks ||
-          options.h3_step_residual_back_blocks !=
-              h3_step_residual_plan_.back_blocks)))
-      fail("H3 step residual policy is fixed when the plan is prepared");
-    if (!h3_step_residual_plan_.enabled &&
-        options.h3_step_residual_reuse_current)
-      fail("H3 step residual reuse requested without a prepared cache");
-    if (h3_step_residual_plan_.enabled &&
-        (options.warmups != 0U || options.iterations != 1U))
-      fail("H3 step residual cache requires zero warmups and one iteration per prepared run");
-    if (options.h3_step_residual_reuse_current &&
-        !h3_step_residual_valid_)
-      fail("H3 step residual reuse requested before a refresh run");
     if (options.streamed_keep_mapped_pages_between_runs &&
         options.streamed_release_mapped_pages_per_copy)
       fail("streamed mapped pages cannot be kept between runs and released per copy");
@@ -10285,12 +10132,6 @@ public:
     }
     if (options.pinned_io_staging && !pinned_io_)
       fail("pinned I/O staging must be requested when the plan is prepared");
-    for (const auto id : options.requested_output_tensors) {
-      const auto *description = program_.tensor(id);
-      if (!description || !description->has_role(ir::TensorRole::Output))
-        fail("requested host output is not a semantic Output tensor: " +
-             std::to_string(id));
-    }
     if (options.pinned_io_staging) {
       auto *base = static_cast<std::uint8_t *>(pinned_io_->data());
       std::size_t offset = 0U;
@@ -10820,56 +10661,6 @@ public:
                   "cuMemcpyDtoDAsync preserve repeated-invariant output");
           }
         };
-    const auto reuse_step_residual =
-        h3_step_residual_plan_.enabled &&
-        options.h3_step_residual_reuse_current;
-    const auto h3_step_residual_after_operation =
-        [&](std::size_t operation_index) {
-          if (!h3_step_residual_plan_.enabled)
-            return;
-          constexpr unsigned threads = 256U;
-          const auto grid = h3_w8a8_grid(h3_step_residual_plan_.elements);
-          auto elements = static_cast<unsigned long long>(
-              h3_step_residual_plan_.elements);
-          if (operation_index == h3_step_residual_plan_.front_execute_index) {
-            if (reuse_step_residual) {
-              auto front = buffers_.at(h3_step_residual_plan_.front_tensor);
-              auto residual = h3_step_middle_residual_;
-              auto middle = buffers_.at(h3_step_residual_plan_.middle_tensor);
-              std::array<void *, 4> arguments = {
-                  &front, &residual, &middle, &elements};
-              check(counted_launch_kernel(
-                        h3_step_residual_functions_.apply, grid, 1U, 1U,
-                        threads, 1U, 1U, 0U, context_.stream(),
-                        arguments.data(), nullptr),
-                    "cuLaunchKernel H3 step residual apply");
-            } else {
-              const auto bytes =
-                  program_.tensor(h3_step_residual_plan_.front_tensor)
-                      ->byte_count();
-              check(counted_memcpy_dtod(
-                        h3_step_front_snapshot_,
-                        buffers_.at(h3_step_residual_plan_.front_tensor),
-                        bytes, context_.stream()),
-                    "cuMemcpyDtoDAsync H3 step front snapshot");
-            }
-          }
-          if (!reuse_step_residual &&
-              operation_index ==
-                  h3_step_residual_plan_.middle_execute_index) {
-            auto middle = buffers_.at(h3_step_residual_plan_.middle_tensor);
-            auto front = h3_step_front_snapshot_;
-            auto residual = h3_step_middle_residual_;
-            std::array<void *, 4> arguments = {
-                &middle, &front, &residual, &elements};
-            check(counted_launch_kernel(
-                      h3_step_residual_functions_.store, grid, 1U, 1U,
-                      threads, 1U, 1U, 0U, context_.stream(),
-                      arguments.data(), nullptr),
-                  "cuLaunchKernel H3 step residual store");
-            h3_step_residual_valid_ = true;
-          }
-        };
     auto execute_parallel_group = [&](std::size_t first,
                                       std::uint32_t iteration,
                                       bool profile,
@@ -10954,14 +10745,8 @@ public:
         }
       }
       const auto reused = [&](std::size_t index) {
-        const auto invariant =
-            reuse_invariants && repeated_invariant_operations_.contains(
-                                    program_.operations.at(index).id);
-        const auto step_residual =
-            reuse_step_residual &&
-            index >= h3_step_residual_plan_.skip_begin_index &&
-            index <= h3_step_residual_plan_.skip_end_index;
-        return invariant || step_residual;
+        return reuse_invariants && repeated_invariant_operations_.contains(
+                                       program_.operations.at(index).id);
       };
       const auto mark_reused = [&](std::size_t index) {
         if (profile)
@@ -10994,10 +10779,8 @@ public:
           const auto ready = prefetch(index);
           streamed_prefetcher_->wait(index, ready);
           if (execute_parallel_group(index, iteration, profile, nullptr,
-                                     !reuse_invariants)) {
-            h3_step_residual_after_operation(index);
+                                     !reuse_invariants))
             continue;
-          }
           OperationEventPair *timing = nullptr;
           if (profile && !skipped_operations_.contains(op.id)) {
             timing = &profile_operation_events.at(
@@ -11008,7 +10791,6 @@ public:
                   "cuEventRecord profiled operation start");
           }
           execute_operation(op, profile);
-          h3_step_residual_after_operation(index);
           capture_intermediate_outputs(op.id, context_.stream());
           if (!reuse_invariants)
             preserve_repeated_invariant_outputs(op.id, context_.stream());
@@ -11046,7 +10828,6 @@ public:
         streamed_prefetcher_->wait(index, prefetched[index]);
         if (execute_parallel_group(index, iteration, profile, &prefetched,
                                    !reuse_invariants)) {
-          h3_step_residual_after_operation(index);
           continue;
         }
         OperationEventPair *timing = nullptr;
@@ -11059,7 +10840,6 @@ public:
                 "cuEventRecord profiled operation start");
         }
         execute_operation(op, profile);
-        h3_step_residual_after_operation(index);
         capture_intermediate_outputs(op.id, context_.stream());
         if (!reuse_invariants)
           preserve_repeated_invariant_outputs(op.id, context_.stream());
@@ -11091,11 +10871,6 @@ public:
             : 1U;
     if (options.profile_pipeline) {
       auto profiled_reused_operations = repeated_invariant_operations_;
-      if (reuse_step_residual)
-        for (auto index = h3_step_residual_plan_.skip_begin_index;
-             index <= h3_step_residual_plan_.skip_end_index; ++index)
-          profiled_reused_operations.insert(
-              program_.operations.at(index).id);
       streamed_prefetcher_->begin_profile(
           options.iterations, profiled_reused_operations,
           repeated_invariant_executions);
@@ -11114,20 +10889,6 @@ public:
         static_cast<std::uint32_t>(repeated_invariant_operations_.size());
     result.repeated_invariant_persistent_bytes =
         repeated_invariant_persistent_bytes_;
-    result.h3_step_residual_cache_enabled = h3_step_residual_plan_.enabled;
-    result.h3_step_residual_cache_reused = reuse_step_residual;
-    result.h3_step_residual_front_blocks =
-        h3_step_residual_plan_.front_blocks;
-    result.h3_step_residual_back_blocks =
-        h3_step_residual_plan_.back_blocks;
-    result.h3_step_residual_skipped_operations =
-        reuse_step_residual
-            ? static_cast<std::uint32_t>(
-                  h3_step_residual_plan_.skip_end_index -
-                  h3_step_residual_plan_.skip_begin_index + 1U)
-            : 0U;
-    result.h3_step_residual_cache_bytes =
-        h3_step_residual_plan_.cache_bytes;
     result.linear_tuning_results = linear_tuning_results_;
     result.selected_linear_algorithms = selected_linear_algorithms_;
     result.primitive_fusions.reserve(fused_linear_swiglu_plans_.size());
@@ -11411,13 +11172,7 @@ public:
       std::size_t offset = 0U;
       std::vector<std::pair<const ir::TensorDesc *, std::size_t>> staged;
       for (const auto &desc : program_.tensors) {
-        const auto requested = options.requested_output_tensors.empty() ||
-                               std::find(
-                                   options.requested_output_tensors.begin(),
-                                   options.requested_output_tensors.end(),
-                                   desc.id) !=
-                                   options.requested_output_tensors.end();
-        if (!desc.has_role(ir::TensorRole::Output) || !requested)
+        if (!desc.has_role(ir::TensorRole::Output))
           continue;
         check(counted_memcpy_dtoh(base + offset, buffers_.at(desc.id),
                                   desc.byte_count(), context_.stream()),
@@ -11435,13 +11190,7 @@ public:
       }
     } else {
       for (const auto &desc : program_.tensors) {
-        const auto requested = options.requested_output_tensors.empty() ||
-                               std::find(
-                                   options.requested_output_tensors.begin(),
-                                   options.requested_output_tensors.end(),
-                                   desc.id) !=
-                                   options.requested_output_tensors.end();
-        if (!desc.has_role(ir::TensorRole::Output) || !requested)
+        if (!desc.has_role(ir::TensorRole::Output))
           continue;
         auto tensor = zeros(desc);
         check(counted_memcpy_dtoh(tensor.mutable_data(), buffers_.at(desc.id),
@@ -11636,7 +11385,6 @@ private:
   std::unique_ptr<Workspace> h3_groupwise_scratch_storage_;
   std::unique_ptr<Workspace> h3_modulation_storage_;
   std::unique_ptr<Workspace> repeated_invariant_cache_storage_;
-  std::unique_ptr<Workspace> h3_step_residual_storage_;
   std::unique_ptr<StreamedPrefetcher> streamed_prefetcher_;
   std::unordered_map<std::uint32_t, CUfunction> functions_;
   std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>
@@ -11690,12 +11438,10 @@ private:
 #endif
   std::vector<H3GroupwiseBlockPlan> h3_groupwise_plans_;
   std::vector<H3ModulationCachePlan> h3_modulation_cache_plans_;
-  H3StepResidualPlan h3_step_residual_plan_;
   Tensor h3_modulation_expected_input_;
   std::filesystem::path h3_modulation_input_path_;
   std::uint32_t h3_modulation_slices_{};
   H3W8A8Functions h3_w8a8_functions_;
-  H3StepResidualFunctions h3_step_residual_functions_;
   H3ConvRotFunctions h3_convrot_functions_;
   std::unique_ptr<H3ConvRotBf16Correction> h3_convrot_bf16_correction_;
   std::unique_ptr<Workspace> convrot_weight_storage_;
@@ -11707,8 +11453,6 @@ private:
   CUdeviceptr convrot_activation_device_{};
   CUdeviceptr convrot_activation_scale_device_{};
   CUdeviceptr convrot_quality_weight_device_{};
-  CUdeviceptr h3_step_front_snapshot_{};
-  CUdeviceptr h3_step_middle_residual_{};
   bool convrot_weight_only_quality_{};
   bool resident_evict_host_pages_{true};
   bool preparation_reported_{false};
@@ -11759,7 +11503,6 @@ private:
   std::unordered_map<std::uint32_t, std::uint32_t> reshape_aliases_;
   bool lazy_resident_upload_{};
   bool repeated_invariant_valid_{};
-  bool h3_step_residual_valid_{};
   std::unique_ptr<Workspace> promoted_constant_storage_;
   std::uint64_t promoted_constant_bytes_{};
   LaunchTelemetry preparation_telemetry_;
