@@ -1160,6 +1160,20 @@ void emit_rotary_apply(std::ostringstream &out, const ir::Program &program,
   const auto heads = input->dims[2];
   const auto dim = input->dims[3];
   const auto pairs = cosine->dims[2];
+  const bool half_split =
+      op.u64(ir::AttrKey::RotaryLayout, 0U) ==
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit);
+  // Interleaved: element d belongs to pair d/2, partner (d^1); HalfSplit:
+  // pair d % pairs, partner d +- pairs. `second` selects the imaginary half.
+  const std::string pair_expression =
+      half_split ? "d%" + std::to_string(pairs) + "ULL" : "d/2ULL";
+  const std::string even_index =
+      half_split ? "base+pair" : "base+2ULL*pair";
+  const std::string odd_index =
+      half_split ? "base+pair+" + std::to_string(pairs) + "ULL"
+                 : "base+2ULL*pair+1ULL";
+  const std::string is_second =
+      half_split ? "(d>=" + std::to_string(pairs) + "ULL)" : "(d&1ULL)";
   out << "extern \"C\" __global__ void " << function_name(op) << "(const "
       << typed_scalar(input->dtype)
       << "* x,const dif_f32* cosine,const dif_f32* sine,"
@@ -1170,13 +1184,14 @@ void emit_rotary_apply(std::ostringstream &out, const ir::Program &program,
       << "ULL,outer=i/" << dim << "ULL,token=(outer/" << heads << "ULL)%"
       << sequence << "ULL,batch=outer/(" << heads << "ULL*" << sequence
       << "ULL);if(d<" << 2U * pairs
-      << "ULL){unsigned long long pair=d/2ULL,base=i-d,table=(batch*"
+      << "ULL){unsigned long long pair=" << pair_expression
+      << ",base=i-d,table=(batch*"
       << sequence << "ULL+token)*" << pairs << "ULL+pair;float even="
-      << typed_load(input->dtype) << "(x,base+2ULL*pair),odd="
+      << typed_load(input->dtype) << "(x," << even_index << "),odd="
       << typed_load(input->dtype)
-      << "(x,base+2ULL*pair+1ULL),c=dif_load_f32(cosine,table),"
+      << "(x," << odd_index << "),c=dif_load_f32(cosine,table),"
          "s=dif_load_f32(sine,table),first,second,result;"
-         "if(d&1ULL){asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(first):"
+         "if(" << is_second << "){asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(first):"
          "\"f\"(even),\"f\"(s));"
          "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(second):"
          "\"f\"(odd),\"f\"(c));"

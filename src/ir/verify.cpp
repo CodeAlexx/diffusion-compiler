@@ -219,9 +219,11 @@ void verify_operation(const Program &program, const Operation &op) {
         cosine.dims[0] != input.dims[0] ||
         cosine.dims[1] != input.dims[1] ||
         cosine.dims[2] * 2U > input.dims[3] ||
-        op.u64(AttrKey::RotaryLayout, 0U) !=
-            static_cast<std::uint64_t>(RotaryLayout::Interleaved))
-      fail("rotary_apply currently requires [B,L,H,D], f32 cos/sin [B,L,P], and explicit interleaved layout");
+        (op.u64(AttrKey::RotaryLayout, 0U) !=
+             static_cast<std::uint64_t>(RotaryLayout::Interleaved) &&
+         op.u64(AttrKey::RotaryLayout, 0U) !=
+             static_cast<std::uint64_t>(RotaryLayout::HalfSplit)))
+      fail("rotary_apply requires [B,L,H,D], f32 cos/sin [B,L,P], and an explicit interleaved or half-split layout");
     return;
   }
 

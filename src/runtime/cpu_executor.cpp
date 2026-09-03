@@ -604,18 +604,25 @@ void rotary_apply(const ir::Operation &op, TensorMap &tensors) {
   const auto heads = input.dims[2];
   const auto dim = input.dims[3];
   const auto pairs = cosine.dims[2];
+  // HalfSplit (rotate-half, Llama/Mistral/Qwen convention): pair p is
+  // (p, p + pairs). Interleaved: pair p is (2p, 2p + 1).
+  const bool half_split =
+      op.u64(ir::AttrKey::RotaryLayout, 0U) ==
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit);
   for (std::uint64_t b = 0; b < batch; ++b) {
     for (std::uint64_t token = 0; token < sequence; ++token) {
       const auto table_base = (b * sequence + token) * pairs;
       for (std::uint64_t head = 0; head < heads; ++head) {
         const auto base = ((b * sequence + token) * heads + head) * dim;
         for (std::uint64_t pair = 0; pair < pairs; ++pair) {
-          const auto even = load_float(input, base + 2U * pair);
-          const auto odd = load_float(input, base + 2U * pair + 1U);
+          const auto first_index = half_split ? pair : 2U * pair;
+          const auto second_index = half_split ? pair + pairs : 2U * pair + 1U;
+          const auto even = load_float(input, base + first_index);
+          const auto odd = load_float(input, base + second_index);
           const auto c = load_float(cosine, table_base + pair);
           const auto s = load_float(sine, table_base + pair);
-          store_float(out, base + 2U * pair, even * c - odd * s);
-          store_float(out, base + 2U * pair + 1U, even * s + odd * c);
+          store_float(out, base + first_index, even * c - odd * s);
+          store_float(out, base + second_index, even * s + odd * c);
         }
         for (std::uint64_t d = 2U * pairs; d < dim; ++d)
           store_float(out, base + d, load_float(input, base + d));
