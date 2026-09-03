@@ -670,7 +670,7 @@ difh3infer --backend cpu|cuda --sampler euler|res_multistep
            [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor]
            [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...]
            [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline]
-           [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--keep-resident-host-pages]
+           [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--h3-resident-readahead-mib N] [--h3-resident-mapped-copy] [--keep-resident-host-pages]
            [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N]
            [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]
 ```
@@ -934,6 +934,8 @@ by removing run-to-run variance.
 | Knob | Flag | Behavior |
 |---|---|---|
 | Deterministic Linear | `--deterministic-linear` (`difh3vision run`) | Require a cuBLASLt algorithm with no cross-CTA split-K reduction for ordinary Linears. Fails closed when the heuristics expose none. |
+| Direct-IO weight staging | on by default; `--h3-resident-mapped-copy` (`difh3infer`) turns it off | Resident H3 INT8 checkpoint weights and streamed constants whose mapped pages are cold (under 90% resident by `mincore`) are staged into pinned memory with O_DIRECT reads, sixteen MiB chunks, sixteen in flight, bypassing the page cache; warm pages take the mapping copy. Measured on the H3 checkpoint drive (1909 extents): cold first evaluation 18.1 s -> 8.9 s, page-cache paths cap at about 1 GB/s there. Reported as `denoiser_resident_direct_read_bytes` / `denoiser_streamed_direct_read_bytes`. |
+| Resident read-ahead window | `--h3-resident-readahead-mib N` (`difh3infer`), default 0 | Page-cache read-ahead issued ahead of the resident checkpoint upload in file order. Measured no gain on this host (buffered reads cap at about 1 GB/s); kept as an experiment knob. Reported as `denoiser_resident_readahead_bytes`. |
 | Owned INT8 attention | `--h3-owned-attention` (`difh3infer`) | In-tree owned H3 dense INT8 attention (sm_86, head dim 128, noncausal BF16 [S,H,128]) bound in place of the attention DSO for the selected transformer layer range; approximate class, reported in the run receipt as `owned_h3_dense_int8_v4_in_tree`. Mutually exclusive with `--h3-ck-attention-dso`; fails closed off sm_86. |
 | Owned attention K centering | `--h3-owned-attention-center-k` (`difh3infer`) | Subtracts the per-head K mean over the sequence before INT8 quantization (softmax-invariant; deterministic two-stage mean). Separate receipt identity `owned_h3_dense_int8_v4_in_tree_center_k`; requires `--h3-owned-attention`. |
 | Deterministic convolution | `--deterministic-conv` (`difvaedecode`) | Require cuDNN convolution algorithms reported `CUDNN_DETERMINISTIC`. Fails closed when none fits the workspace limit. Motivated by the H3 video decode not being bit-reproducible from an identical latent. |

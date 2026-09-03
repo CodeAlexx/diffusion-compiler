@@ -306,6 +306,29 @@ struct RunOptions {
   // overlap this one-time upload with model compute; later executions reuse
   // the populated storage without another transfer.
   bool lazy_resident_upload{false};
+  // Host read-ahead window (bytes) issued ahead of the resident H3 INT8
+  // checkpoint upload, in the checkpoint's physical order, on both the
+  // prepare-time and the lazy first-use upload paths. A cold page cache
+  // otherwise feeds the staging copies one page fault at a time (measured
+  // 0.3-1.0 GB/s on the H3 checkpoint: 13-57 s per fresh process under the
+  // evict policy); the kernel read-ahead runs at device queue depth (3.3 GB/s
+  // measured with eight readers). Zero disables. Reported in
+  // PipelineProfile::resident_readahead_bytes.
+  // Measured no gain on the H3 checkpoint drive: every page-cache path caps
+  // at about 1 GB/s there, so the default is off and h3_resident_direct_io
+  // is the effective policy. Kept as an explicit experiment knob.
+  std::uint64_t h3_resident_readahead_bytes{0U};
+  // Stage the resident H3 INT8 checkpoint into pinned host memory with
+  // O_DIRECT reads (sixteen MiB chunks, eight in flight) instead of copying
+  // from the mapping through the page cache. Falls back to the mapping copy
+  // per tensor when direct IO is unavailable. Reported in
+  // PipelineProfile::resident_direct_read_bytes.
+  bool h3_resident_direct_io{true};
+  // Same policy for the streamed-constant prefetcher (every program's
+  // streamed weights): a tensor whose mapped pages are cold is staged with
+  // direct IO instead of faulted through the page cache. Reported in
+  // PipelineProfile::streamed_direct_read_bytes.
+  bool streamed_direct_io{true};
   // Host file-cache policy for weights that became GPU resident. Default
   // (true) preserves the historical behavior: after a resident upload the
   // mapped range is released with posix_fadvise(DONTNEED), so every fresh
@@ -547,6 +570,13 @@ struct PipelineProfile {
   std::uint64_t resident_major_page_faults{};
   double resident_h2d_milliseconds{};
   double resident_upload_milliseconds{};
+  // Bytes of resident checkpoint weights advised into the page cache ahead of
+  // their staging copy (RunOptions::h3_resident_readahead_bytes).
+  std::uint64_t resident_readahead_bytes{};
+  // Bytes of resident checkpoint weights staged with direct IO
+  // (RunOptions::h3_resident_direct_io) rather than copied from the mapping.
+  std::uint64_t resident_direct_read_bytes{};
+  std::uint64_t streamed_direct_read_bytes{};
   std::uint64_t streamed_weight_bytes{};
   double streamed_host_stage_milliseconds{};
   double streamed_host_wait_milliseconds{};

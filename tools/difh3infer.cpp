@@ -64,6 +64,8 @@ struct Options {
   std::filesystem::path h3_ck_attention_dso;
   bool h3_owned_attention{false};
   bool h3_owned_attention_center_k{false};
+  std::uint64_t h3_resident_readahead_mib{std::numeric_limits<std::uint64_t>::max()};
+  bool h3_resident_mapped_copy{false}; // --h3-resident-mapped-copy: no direct IO
   // Persistent denoiser: --serve SOCKET keeps this process alive after the
   // first request and serves further requests over a Unix socket with the
   // prepared denoiser and its resident weights kept on the device.
@@ -141,7 +143,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]\n";
+      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--h3-resident-readahead-mib N] [--h3-resident-mapped-copy] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -461,6 +463,11 @@ Options parse(int argc, char **argv) {
       options.h3_owned_attention = true;
     else if (option == "--h3-owned-attention-center-k")
       options.h3_owned_attention_center_k = true;
+    else if (option == "--h3-resident-mapped-copy")
+      options.h3_resident_mapped_copy = true;
+    else if (option == "--h3-resident-readahead-mib")
+      options.h3_resident_readahead_mib =
+          number(value("--h3-resident-readahead-mib"), "resident read-ahead MiB");
     else if (option == "--h3-int8-attention-first-layer") {
       const auto layer = number(value("--h3-int8-attention-first-layer"),
                                 "first H3 INT8 attention layer");
@@ -971,6 +978,12 @@ int run_request(const Options &options, ServerState &state,
     denoiser_run_options.h3_owned_attention = options.h3_owned_attention;
     denoiser_run_options.h3_owned_attention_center_k =
         options.h3_owned_attention_center_k;
+    denoiser_run_options.h3_resident_direct_io = !options.h3_resident_mapped_copy;
+    denoiser_run_options.streamed_direct_io = !options.h3_resident_mapped_copy;
+    if (options.h3_resident_readahead_mib !=
+        std::numeric_limits<std::uint64_t>::max())
+      denoiser_run_options.h3_resident_readahead_bytes =
+          options.h3_resident_readahead_mib * 1024ULL * 1024ULL;
     denoiser_run_options.h3_int8_attention_first_layer =
         options.h3_int8_attention_first_layer;
     denoiser_run_options.h3_int8_attention_layers =
@@ -1230,6 +1243,12 @@ int run_request(const Options &options, ServerState &state,
               result.pipeline_profile.resident_h2d_milliseconds;
           denoiser_profile.resident_upload_milliseconds =
               result.pipeline_profile.resident_upload_milliseconds;
+          denoiser_profile.resident_readahead_bytes +=
+              result.pipeline_profile.resident_readahead_bytes;
+          denoiser_profile.resident_direct_read_bytes +=
+              result.pipeline_profile.resident_direct_read_bytes;
+          denoiser_profile.streamed_direct_read_bytes +=
+              result.pipeline_profile.streamed_direct_read_bytes;
           denoiser_profile.streamed_weight_bytes +=
               result.pipeline_profile.streamed_weight_bytes;
           denoiser_profile.streamed_host_stage_milliseconds +=
@@ -1381,6 +1400,12 @@ int run_request(const Options &options, ServerState &state,
                   << denoiser_profile.resident_h2d_milliseconds
                   << " denoiser_resident_upload_ms="
                   << denoiser_profile.resident_upload_milliseconds
+                  << " denoiser_resident_readahead_bytes="
+                  << denoiser_profile.resident_readahead_bytes
+                  << " denoiser_resident_direct_read_bytes="
+                  << denoiser_profile.resident_direct_read_bytes
+                  << " denoiser_streamed_direct_read_bytes="
+                  << denoiser_profile.streamed_direct_read_bytes
                   << " denoiser_streamed_weight_bytes="
                   << denoiser_profile.streamed_weight_bytes
                   << " denoiser_streamed_host_stage_ms="

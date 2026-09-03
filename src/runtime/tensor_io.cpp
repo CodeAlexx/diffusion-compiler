@@ -11,19 +11,32 @@
 #include <limits>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <cerrno>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <condition_variable>
+#include <deque>
+#include <fcntl.h>
+#include <mutex>
+#include <thread>
 #include <sys/stat.h>
 #include <unistd.h>
 
 namespace dif::runtime {
 
-MappedStorage::MappedStorage(void *address, std::size_t size, int descriptor)
-    : address_(address), size_(size), descriptor_(descriptor) {}
+MappedStorage::MappedStorage(void *address, std::size_t size, int descriptor,
+                             int direct_descriptor)
+    : address_(address), size_(size), descriptor_(descriptor),
+      direct_descriptor_(direct_descriptor) {}
 
 MappedStorage::~MappedStorage() {
   if (address_ && address_ != MAP_FAILED)
     (void)munmap(address_, size_);
   if (descriptor_ >= 0)
     (void)close(descriptor_);
+  if (direct_descriptor_ >= 0)
+    (void)close(direct_descriptor_);
 }
 
 const std::uint8_t *MappedStorage::data() const {
@@ -68,6 +81,222 @@ void MappedStorage::evict(std::size_t offset, std::size_t bytes) const {
                        static_cast<off_t>(end - begin), POSIX_FADV_DONTNEED);
 }
 
+namespace {
+
+// Parallel file IO pool: sixteen workers running queued jobs FIFO. Used for
+// page-cache read-ahead and for O_DIRECT staging reads. The checkpoint drive
+// delivers 2.45 GB/s to sixteen large direct readers across its 1909
+// extents (1.5 GB/s to eight) but only 0.36-1.2 GB/s through the page cache,
+// so direct reads are the only host path that keeps up with the device.
+class FileIoPool {
+public:
+  static FileIoPool &instance() {
+    static FileIoPool pool(16U);
+    return pool;
+  }
+
+  void submit(std::function<void()> job) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      jobs_.push_back(std::move(job));
+    }
+    ready_.notify_one();
+  }
+
+private:
+  explicit FileIoPool(unsigned threads) {
+    for (unsigned index = 0U; index < threads; ++index)
+      workers_.emplace_back([this] { loop(); });
+  }
+
+  ~FileIoPool() {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      stop_ = true;
+    }
+    ready_.notify_all();
+    for (auto &worker : workers_)
+      worker.join();
+  }
+
+  void loop() {
+    for (;;) {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [&] { return stop_ || !jobs_.empty(); });
+        if (jobs_.empty())
+          return;
+        job = std::move(jobs_.front());
+        jobs_.pop_front();
+      }
+      job();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::function<void()>> jobs_;
+  std::vector<std::thread> workers_;
+  bool stop_{false};
+};
+
+// Completion latch for one read_direct() request spread over many jobs.
+struct DirectReadRequest {
+  std::mutex mutex;
+  std::condition_variable done;
+  std::size_t pending{};
+  bool failed{false};
+};
+
+constexpr std::size_t kDirectAlignment = 4096U;
+
+// Per-worker 4 KiB-aligned bounce buffer: O_DIRECT needs aligned offsets,
+// lengths, and addresses, while tensor slices start anywhere in the file.
+struct DirectBounce {
+  void *data{};
+  std::size_t bytes{};
+  ~DirectBounce() { std::free(data); }
+  void *acquire(std::size_t wanted) {
+    if (bytes >= wanted)
+      return data;
+    std::free(data);
+    data = nullptr;
+    bytes = 0U;
+    if (posix_memalign(&data, kDirectAlignment, wanted) != 0) {
+      data = nullptr;
+      return nullptr;
+    }
+    bytes = wanted;
+    return data;
+  }
+};
+
+constexpr std::size_t kReadaheadChunkBytes = 16U * 1024U * 1024U;
+
+}  // namespace
+
+void MappedStorage::prefetch(std::size_t offset, std::size_t bytes) const {
+  if (!address_ || address_ == MAP_FAILED || bytes == 0U || offset > size_ ||
+      bytes > size_ - offset)
+    return;
+  const auto page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return;
+  const auto page = static_cast<std::size_t>(page_size);
+  const auto begin = offset - (offset % page);
+  const auto end_unaligned = offset + bytes;
+  const auto end = std::min(
+      size_, end_unaligned + (page - end_unaligned % page) % page);
+  if (descriptor_ < 0) {
+    (void)madvise(static_cast<std::uint8_t *>(address_) + begin, end - begin,
+                  MADV_WILLNEED);
+    return;
+  }
+  for (auto cursor = begin; cursor < end; cursor += kReadaheadChunkBytes) {
+    const auto descriptor = descriptor_;
+    const auto chunk_offset = static_cast<off_t>(cursor);
+    const auto chunk_bytes = std::min(kReadaheadChunkBytes, end - cursor);
+    FileIoPool::instance().submit([descriptor, chunk_offset, chunk_bytes] {
+      (void)readahead(descriptor, chunk_offset, chunk_bytes);
+    });
+  }
+}
+
+double MappedStorage::resident_fraction(std::size_t offset,
+                                        std::size_t bytes) const {
+  if (!address_ || address_ == MAP_FAILED || bytes == 0U || offset > size_ ||
+      bytes > size_ - offset)
+    return 0.0;
+  const auto page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return 0.0;
+  const auto page = static_cast<std::size_t>(page_size);
+  const auto begin = offset - (offset % page);
+  const auto end_unaligned = offset + bytes;
+  const auto end = std::min(
+      size_, end_unaligned + (page - end_unaligned % page) % page);
+  const auto pages = (end - begin) / page;
+  if (pages == 0U)
+    return 0.0;
+  std::vector<unsigned char> flags(pages);
+  if (mincore(static_cast<std::uint8_t *>(address_) + begin, end - begin,
+              flags.data()) != 0)
+    return 0.0;
+  std::size_t resident = 0U;
+  for (const auto flag : flags)
+    resident += (flag & 1U) != 0U ? 1U : 0U;
+  return static_cast<double>(resident) / static_cast<double>(pages);
+}
+
+bool MappedStorage::read_direct(std::size_t offset, std::size_t bytes,
+                                void *destination) const {
+  if (direct_descriptor_ < 0 || !destination || bytes == 0U ||
+      offset > size_ || bytes > size_ - offset)
+    return false;
+  auto request = std::make_shared<DirectReadRequest>();
+  const auto end = offset + bytes;
+  std::size_t chunks = 0U;
+  for (auto cursor = offset; cursor < end; cursor += kReadaheadChunkBytes)
+    ++chunks;
+  request->pending = chunks;
+  auto *out = static_cast<std::uint8_t *>(destination);
+  const auto descriptor = direct_descriptor_;
+  const auto file_size = size_;
+  for (auto cursor = offset; cursor < end; cursor += kReadaheadChunkBytes) {
+    const auto chunk_begin = cursor;
+    const auto chunk_end = std::min(end, cursor + kReadaheadChunkBytes);
+    auto *chunk_out = out + (chunk_begin - offset);
+    FileIoPool::instance().submit([=] {
+      static thread_local DirectBounce bounce;
+      bool ok = false;
+      const auto aligned_begin = chunk_begin - (chunk_begin % kDirectAlignment);
+      auto aligned_end =
+          chunk_end + (kDirectAlignment - chunk_end % kDirectAlignment) %
+                          kDirectAlignment;
+      const auto wanted = aligned_end - aligned_begin;
+      if (auto *buffer = bounce.acquire(wanted)) {
+        // O_DIRECT past EOF returns short: only the bytes inside the file are
+        // required, and chunk_end never exceeds it.
+        std::size_t received = 0U;
+        ok = true;
+        while (received < wanted) {
+          const auto want = wanted - received;
+          const auto got = pread(descriptor,
+                                 static_cast<std::uint8_t *>(buffer) + received,
+                                 want, static_cast<off_t>(aligned_begin + received));
+          if (got < 0) {
+            if (errno == EINTR)
+              continue;
+            ok = false;
+            break;
+          }
+          if (got == 0) {
+            ok = aligned_begin + received >= chunk_end ||
+                 aligned_begin + received >= file_size;
+            break;
+          }
+          received += static_cast<std::size_t>(got);
+          if (aligned_begin + received >= chunk_end)
+            break;
+        }
+        if (ok)
+          std::memcpy(chunk_out,
+                      static_cast<std::uint8_t *>(buffer) +
+                          (chunk_begin - aligned_begin),
+                      chunk_end - chunk_begin);
+      }
+      std::lock_guard<std::mutex> guard(request->mutex);
+      if (!ok)
+        request->failed = true;
+      if (--request->pending == 0U)
+        request->done.notify_all();
+    });
+  }
+  std::unique_lock<std::mutex> lock(request->mutex);
+  request->done.wait(lock, [&] { return request->pending == 0U; });
+  return !request->failed;
+}
 namespace {
 
 constexpr std::array<std::uint8_t, 8> kMagic = {'D', 'I', 'F', 'T', 'N', 'S', '0', '1'};
@@ -210,6 +439,24 @@ void Tensor::evict_mapped_pages() const {
   mapping->evict(mapping_offset, mapping_bytes);
 }
 
+void Tensor::prefetch_mapped_pages() const {
+  if (!mapping || mapping_bytes == 0U)
+    return;
+  mapping->prefetch(mapping_offset, mapping_bytes);
+}
+
+double Tensor::mapped_resident_fraction() const {
+  if (!mapping || mapping_bytes == 0U)
+    return 0.0;
+  return mapping->resident_fraction(mapping_offset, mapping_bytes);
+}
+
+bool Tensor::read_direct_into(void *destination) const {
+  if (!mapping || mapping_bytes == 0U)
+    return false;
+  return mapping->read_direct(mapping_offset, mapping_bytes, destination);
+}
+
 std::span<float> Tensor::f32() {
   validate();
   if (dtype != ir::DType::F32)
@@ -266,8 +513,12 @@ map_readonly_file(const std::filesystem::path &path) {
     (void)close(descriptor);
     fail("cannot mmap tensor file: " + path.string());
   }
+  // A second descriptor with O_DIRECT serves read_direct(); it is optional
+  // (some filesystems refuse it) and never affects the mapping.
+  const int direct_descriptor =
+      open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   return std::shared_ptr<const MappedStorage>(
-      new MappedStorage(address, size, descriptor));
+      new MappedStorage(address, size, descriptor, direct_descriptor));
 }
 
 Tensor map_tensor_slice(std::shared_ptr<const MappedStorage> storage,

@@ -22,15 +22,30 @@ public:
   std::size_t size() const;
   void discard(std::size_t offset, std::size_t bytes) const;
   void evict(std::size_t offset, std::size_t bytes) const;
+  // Asynchronous read-ahead of a file range into the page cache
+  // (posix_fadvise/madvise WILLNEED). A later memcpy from the mapping then
+  // finds warm pages instead of faulting them in one page at a time.
+  void prefetch(std::size_t offset, std::size_t bytes) const;
+  // Copy a file range into `destination` with O_DIRECT reads, sixteen MiB
+  // chunks, eight in flight, bypassing the page cache. Returns false (and
+  // writes nothing) when the file has no direct descriptor or a read fails,
+  // so the caller can fall back to copying from the mapping.
+  bool read_direct(std::size_t offset, std::size_t bytes,
+                   void *destination) const;
+  // Fraction of the range's pages currently in the page cache (mincore),
+  // 0.0 when unknown.
+  double resident_fraction(std::size_t offset, std::size_t bytes) const;
 
 private:
   friend std::shared_ptr<const MappedStorage>
   map_readonly_file(const std::filesystem::path &path);
-  MappedStorage(void *address, std::size_t size, int descriptor);
+  MappedStorage(void *address, std::size_t size, int descriptor,
+                int direct_descriptor);
 
   void *address_{};
   std::size_t size_{};
   int descriptor_{-1};
+  int direct_descriptor_{-1};
 };
 
 struct Tensor {
@@ -55,6 +70,11 @@ struct Tensor {
   bool is_mapped() const { return static_cast<bool>(mapping); }
   void discard_mapped_pages() const;
   void evict_mapped_pages() const;
+  void prefetch_mapped_pages() const;
+  // Stage this tensor's bytes into host memory: direct IO from the mapped
+  // file when available (page cache bypassed), else false.
+  bool read_direct_into(void *destination) const;
+  double mapped_resident_fraction() const;
 
   std::span<float> f32();
   std::span<const float> f32() const;

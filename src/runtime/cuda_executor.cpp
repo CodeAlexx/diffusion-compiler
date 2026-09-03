@@ -2823,6 +2823,9 @@ struct H3W8A8MlpPlan {
   std::uint64_t packed_ffn{};
   std::vector<std::uint32_t> excluded_tensors;
   std::vector<std::uint32_t> replaced_constant_tensors;
+  // Position in the merged resident upload order (attention then MLP per
+  // layer, the checkpoint's physical order); drives the read-ahead window.
+  std::size_t upload_order{};
   Tensor fc1_weight;
   Tensor fc1_scale;
   std::uint32_t fc1_weight_scale_groups{1U};
@@ -2873,6 +2876,7 @@ struct H3W8A8AttentionPlan {
   std::uint32_t output_tensor{};
   std::vector<std::uint32_t> excluded_tensors;
   std::vector<std::uint32_t> replaced_constant_tensors;
+  std::size_t upload_order{};
   std::uint32_t layer{};
   std::uint64_t rows{};
   std::uint64_t hidden{};
@@ -5771,8 +5775,8 @@ void upload_h3_w8a8_weights(const H3W8A8MlpPlan &plan, CUstream stream) {
   upload(plan.fc2_scale_device, plan.fc2_scale);
 }
 
-using H3HostCopy =
-    std::function<void(std::uint8_t *, const std::uint8_t *, std::size_t)>;
+// Stages one mapped weight tensor into host staging memory.
+using H3HostCopy = std::function<void(std::uint8_t *, const Tensor &)>;
 
 template <class T>
 void release_resident_host_pages(const T &tensor, bool evict) {
@@ -5799,7 +5803,7 @@ std::uint64_t stage_h3_w8a8_weights(const H3W8A8MlpPlan &plan,
   const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
     if (tensor.byte_size() > staging_bytes - cursor)
       fail("H3 W8A8 MLP tail staging overflow");
-    host_copy(base + cursor, tensor.data(), tensor.byte_size());
+    host_copy(base + cursor, tensor);
     check(counted_memcpy_htod(destination, base + cursor, tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 MLP tail weight");
@@ -5913,6 +5917,38 @@ void evict_h3_w8a8_weights(const H3W8A8AttentionPlan &plan, bool evict) {
   }
 }
 
+std::uint64_t h3_w8a8_weight_bytes(const H3W8A8MlpPlan &plan) {
+  return plan.fc1_weight.byte_size() + plan.fc1_scale.byte_size() +
+         plan.fc2_weight.byte_size() + plan.fc2_scale.byte_size();
+}
+
+std::uint64_t h3_w8a8_weight_bytes(const H3W8A8AttentionPlan &plan) {
+  auto bytes = std::uint64_t{0U};
+  if (plan.has_qkv_projection)
+    bytes += plan.qkv_weight.byte_size() + plan.qkv_scale.byte_size();
+  if (plan.has_output_projection)
+    bytes += plan.output_weight.byte_size() + plan.output_scale.byte_size();
+  return bytes;
+}
+
+void prefetch_h3_w8a8_weights(const H3W8A8MlpPlan &plan) {
+  plan.fc1_weight.prefetch_mapped_pages();
+  plan.fc1_scale.prefetch_mapped_pages();
+  plan.fc2_weight.prefetch_mapped_pages();
+  plan.fc2_scale.prefetch_mapped_pages();
+}
+
+void prefetch_h3_w8a8_weights(const H3W8A8AttentionPlan &plan) {
+  if (plan.has_qkv_projection) {
+    plan.qkv_weight.prefetch_mapped_pages();
+    plan.qkv_scale.prefetch_mapped_pages();
+  }
+  if (plan.has_output_projection) {
+    plan.output_weight.prefetch_mapped_pages();
+    plan.output_scale.prefetch_mapped_pages();
+  }
+}
+
 std::uint64_t stage_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
                                     void *staging,
                                     std::uint64_t staging_bytes,
@@ -5923,7 +5959,7 @@ std::uint64_t stage_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
   const auto upload = [&](CUdeviceptr destination, const Tensor &tensor) {
     if (tensor.byte_size() > staging_bytes - cursor)
       fail("H3 W8A8 attention tail staging overflow");
-    host_copy(base + cursor, tensor.data(), tensor.byte_size());
+    host_copy(base + cursor, tensor);
     check(counted_memcpy_htod(destination, base + cursor, tensor.byte_size(),
                             stream),
           "cuMemcpyHtoDAsync H3 W8A8 attention tail weight");
@@ -7211,11 +7247,13 @@ public:
                      std::uint64_t pinned_budget_bytes,
                      std::unordered_set<std::uint32_t> resident_overrides,
                      std::unordered_set<std::uint32_t> lazy_resident_overrides,
+                     bool direct_io,
                      bool describe_plan)
       : program_(program), constants_(constants), plan_(plan), buffers_(buffers),
         context_(context), staging_pool_(stage_threads),
         resident_overrides_(std::move(resident_overrides)),
-        lazy_resident_overrides_(std::move(lazy_resident_overrides)) {
+        lazy_resident_overrides_(std::move(lazy_resident_overrides)),
+        direct_io_(direct_io) {
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
@@ -7353,6 +7391,7 @@ public:
     }
     profile.streamed_weight_bytes = streamed_bytes_;
     profile.streamed_host_stage_milliseconds = host_stage_milliseconds_;
+    profile.streamed_direct_read_bytes = direct_read_bytes_;
     profile.streamed_host_wait_milliseconds = host_wait_milliseconds_;
     profile.streamed_h2d_milliseconds = h2d_milliseconds;
     std::vector<std::pair<std::uint32_t, std::size_t>> copied;
@@ -7430,7 +7469,11 @@ public:
       const auto host_stage_start = std::chrono::steady_clock::now();
       const auto trace_stage_start =
           active_tracer ? active_tracer->now_ms() : 0.0;
-      staging_pool_.copy(destination, tensor.data(), tensor.byte_size());
+      if (direct_io_ && tensor.mapped_resident_fraction() < 0.9 &&
+          tensor.read_direct_into(destination))
+        direct_read_bytes_ += tensor.byte_size();
+      else
+        staging_pool_.copy(destination, tensor.data(), tensor.byte_size());
       if (active_tracer)
         active_tracer->record(telemetry::category::staging,
                               "streamed-constant:host-stage",
@@ -7528,6 +7571,8 @@ private:
   StagingPool staging_pool_;
   std::unordered_set<std::uint32_t> resident_overrides_;
   std::unordered_set<std::uint32_t> lazy_resident_overrides_;
+  bool direct_io_{true};
+  std::uint64_t direct_read_bytes_{};
   std::unordered_set<std::uint32_t> loaded_lazy_residents_;
   std::vector<std::unique_ptr<PinnedHostWorkspace>> staging_;
   std::vector<std::unique_ptr<Event>> copy_done_;
@@ -9539,7 +9584,7 @@ public:
                   promoted_streamed_constants_.begin(),
                   promoted_streamed_constants_.end())
             : std::unordered_set<std::uint32_t>{},
-        options.profile_pipeline);
+        options.streamed_direct_io, options.profile_pipeline);
     if (options.pinned_io_staging) {
       auto input_bytes = std::uint64_t{0U};
       auto output_bytes = std::uint64_t{0U};
@@ -9877,9 +9922,17 @@ public:
     }
     auto h3_resident_turn = std::size_t{0U};
     const H3HostCopy h3_resident_host_copy =
-        [&](std::uint8_t *destination, const std::uint8_t *source,
-            std::size_t bytes) {
-          h3_w8a8_staging_pool_->copy(destination, source, bytes);
+        [&](std::uint8_t *destination, const Tensor &tensor) {
+          // Direct IO only when the pages are cold: a warm mapping copies at
+          // 2-4 s per checkpoint, a fresh disk read costs 8-9 s.
+          if (h3_resident_direct_io_ &&
+              tensor.mapped_resident_fraction() < 0.9 &&
+              tensor.read_direct_into(destination)) {
+            h3_resident_direct_read_bytes_ += tensor.byte_size();
+            return;
+          }
+          h3_w8a8_staging_pool_->copy(destination, tensor.data(),
+                                      tensor.byte_size());
         };
     const auto upload_h3_resident = [&](auto &plan) {
       if (!plan.resident)
@@ -9910,18 +9963,44 @@ public:
     // prepared plan lists by layer so a cold upload walks the file once in
     // physical order instead of seeking through all MLPs and then all
     // attention projections.
-    auto attention_index = std::size_t{0U};
-    auto mlp_index = std::size_t{0U};
-    while (attention_index < h3_w8a8_attention_plans_.size() ||
-           mlp_index < h3_w8a8_mlp_plans_.size()) {
-      if (attention_index < h3_w8a8_attention_plans_.size() &&
-          (mlp_index == h3_w8a8_mlp_plans_.size() ||
-           h3_w8a8_attention_plans_[attention_index].layer <=
-               h3_w8a8_mlp_plans_[mlp_index].layer))
-        upload_h3_resident(h3_w8a8_attention_plans_[attention_index++]);
-      else
-        upload_h3_resident(h3_w8a8_mlp_plans_[mlp_index++]);
+    h3_resident_readahead_bytes_ = options.h3_resident_readahead_bytes;
+    h3_resident_direct_io_ = options.h3_resident_direct_io;
+    h3_w8a8_upload_order_.clear();
+    {
+      auto attention_index = std::size_t{0U};
+      auto mlp_index = std::size_t{0U};
+      while (attention_index < h3_w8a8_attention_plans_.size() ||
+             mlp_index < h3_w8a8_mlp_plans_.size()) {
+        if (attention_index < h3_w8a8_attention_plans_.size() &&
+            (mlp_index == h3_w8a8_mlp_plans_.size() ||
+             h3_w8a8_attention_plans_[attention_index].layer <=
+                 h3_w8a8_mlp_plans_[mlp_index].layer)) {
+          auto &plan = h3_w8a8_attention_plans_[attention_index++];
+          if (plan.resident) {
+            plan.upload_order = h3_w8a8_upload_order_.size();
+            h3_w8a8_upload_order_.emplace_back(true, attention_index - 1U);
+          }
+        } else {
+          auto &plan = h3_w8a8_mlp_plans_[mlp_index++];
+          if (plan.resident) {
+            plan.upload_order = h3_w8a8_upload_order_.size();
+            h3_w8a8_upload_order_.emplace_back(false, mlp_index - 1U);
+          }
+        }
+      }
     }
+    for (std::size_t order = 0U; order < h3_w8a8_upload_order_.size();
+         ++order) {
+      const auto [attention, slot] = h3_w8a8_upload_order_[order];
+      if (!options.lazy_resident_upload)
+        advise_h3_resident_readahead(order);
+      if (attention)
+        upload_h3_resident(h3_w8a8_attention_plans_[slot]);
+      else
+        upload_h3_resident(h3_w8a8_mlp_plans_[slot]);
+    }
+    if (options.lazy_resident_upload && !h3_w8a8_upload_order_.empty())
+      advise_h3_resident_readahead(0U); // first window before evaluation 0
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
@@ -10240,9 +10319,17 @@ public:
     auto convrot_streamed_bytes = std::uint64_t{0U};
     auto convrot_host_stage_milliseconds = 0.0;
     const H3HostCopy h3_tail_host_copy =
-        [&](std::uint8_t *destination, const std::uint8_t *source,
-            std::size_t bytes) {
-          h3_w8a8_staging_pool_->copy(destination, source, bytes);
+        [&](std::uint8_t *destination, const Tensor &tensor) {
+          // Direct IO only when the pages are cold: a warm mapping copies at
+          // 2-4 s per checkpoint, a fresh disk read costs 8-9 s.
+          if (h3_resident_direct_io_ &&
+              tensor.mapped_resident_fraction() < 0.9 &&
+              tensor.read_direct_into(destination)) {
+            h3_resident_direct_read_bytes_ += tensor.byte_size();
+            return;
+          }
+          h3_w8a8_staging_pool_->copy(destination, tensor.data(),
+                                      tensor.byte_size());
         };
     auto stage_h3_w8a8_tail = [&](auto &plan, bool profile) {
       const auto populate_resident = plan.resident && !plan.uploaded;
@@ -10274,6 +10361,8 @@ public:
               "cuStreamWaitEvent H3 W8A8 tail upload order");
       }
       const auto stage_start = std::chrono::steady_clock::now();
+      if (populate_resident)
+        advise_h3_resident_readahead(plan.upload_order);
       auto *staging = static_cast<std::uint8_t *>(
           h3_w8a8_tail_stage_->data()) +
           half * h3_w8a8_tail_stage_half_bytes_;
@@ -11146,6 +11235,10 @@ public:
           resident_major_page_faults_;
       result.pipeline_profile.resident_h2d_milliseconds =
           resident_h2d_milliseconds_;
+      result.pipeline_profile.resident_readahead_bytes =
+          h3_resident_readahead_advised_bytes_;
+      result.pipeline_profile.resident_direct_read_bytes =
+          h3_resident_direct_read_bytes_;
       result.pipeline_profile.resident_upload_milliseconds =
           resident_upload_milliseconds_;
       double kernel_total = 0.0;
@@ -11539,6 +11632,46 @@ private:
   CUdeviceptr convrot_quality_weight_device_{};
   bool convrot_weight_only_quality_{};
   bool resident_evict_host_pages_{true};
+  // Resident checkpoint read-ahead: merged upload order (is_attention, slot),
+  // the next order index to advise, bytes advised but not yet staged, the
+  // window, and the receipt count.
+  std::vector<std::pair<bool, std::size_t>> h3_w8a8_upload_order_;
+  std::size_t h3_w8a8_readahead_cursor_{};
+  std::uint64_t h3_w8a8_readahead_ahead_bytes_{};
+  std::uint64_t h3_resident_readahead_bytes_{};
+  std::uint64_t h3_resident_readahead_advised_bytes_{};
+  bool h3_resident_direct_io_{true};
+  std::uint64_t h3_resident_direct_read_bytes_{};
+
+  std::uint64_t h3_w8a8_order_bytes(std::size_t order) const {
+    const auto [attention, slot] = h3_w8a8_upload_order_[order];
+    return attention ? h3_w8a8_weight_bytes(h3_w8a8_attention_plans_[slot])
+                     : h3_w8a8_weight_bytes(h3_w8a8_mlp_plans_[slot]);
+  }
+
+  // Called right before the plan at `order` is staged from its mapping:
+  // retire that plan's bytes from the in-flight window, then advise plans
+  // further along the checkpoint until the window is full again.
+  void advise_h3_resident_readahead(std::size_t order) {
+    if (h3_resident_readahead_bytes_ == 0U || h3_w8a8_upload_order_.empty())
+      return;
+    if (order < h3_w8a8_readahead_cursor_)
+      h3_w8a8_readahead_ahead_bytes_ -=
+          std::min(h3_w8a8_order_bytes(order), h3_w8a8_readahead_ahead_bytes_);
+    while (h3_w8a8_readahead_cursor_ < h3_w8a8_upload_order_.size() &&
+           h3_w8a8_readahead_ahead_bytes_ < h3_resident_readahead_bytes_) {
+      const auto [attention, slot] =
+          h3_w8a8_upload_order_[h3_w8a8_readahead_cursor_];
+      if (attention)
+        prefetch_h3_w8a8_weights(h3_w8a8_attention_plans_[slot]);
+      else
+        prefetch_h3_w8a8_weights(h3_w8a8_mlp_plans_[slot]);
+      const auto bytes = h3_w8a8_order_bytes(h3_w8a8_readahead_cursor_);
+      h3_w8a8_readahead_ahead_bytes_ += bytes;
+      h3_resident_readahead_advised_bytes_ += bytes;
+      ++h3_w8a8_readahead_cursor_;
+    }
+  }
   bool preparation_reported_{false};
   std::unordered_map<std::uint32_t, std::string> operation_plan_labels_;
   bool convrot_resident_{};
