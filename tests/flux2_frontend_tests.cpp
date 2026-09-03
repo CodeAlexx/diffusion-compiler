@@ -245,6 +245,48 @@ int main() {
              "dev conditioning input is 15360 wide");
       dif::ir::verify(dev_build.program);
     }
+    {
+      // [dev] conditioner: Mistral tower, no QK-norm, language_model.model
+      // keys, three hidden states concatenated to 15360.
+      const auto config = dif::frontend::make_flux2_dev_conditioner_config();
+      expect(config.executed_layers == 30U && !config.qk_norm &&
+                 config.selected_hidden_states ==
+                     std::vector<std::uint64_t>{10U, 20U, 30U} &&
+                 config.concatenate_selected_hidden_states,
+             "dev conditioner config selects states 10/20/30 without QK-norm");
+      const auto build = dif::frontend::build_qwen3vl_conditioner_program(512U, config);
+      expect(std::none_of(build.bindings.begin(), build.bindings.end(),
+                          [](const auto &b) {
+                            return b.name.find("q_norm") != std::string::npos ||
+                                   b.name.find("k_norm") != std::string::npos;
+                          }),
+             "dev conditioner binds no QK-norm weights");
+      expect(std::any_of(build.bindings.begin(), build.bindings.end(),
+                         [](const auto &b) {
+                           return b.name ==
+                                  "language_model.model.layers.29.mlp.down_proj.weight";
+                         }),
+             "dev conditioner binds layer 29 under language_model.model");
+      expect(build.attention_operations == 30U,
+             "dev conditioner executes 30 attention layers");
+      const auto concat = std::find_if(
+          build.program.operations.begin(), build.program.operations.end(),
+          [](const dif::ir::Operation &op) {
+            return op.opcode == dif::ir::Opcode::Concat;
+          });
+      const auto *output = concat == build.program.operations.end()
+                               ? nullptr
+                               : build.program.tensor(concat->outputs.front());
+      expect(output != nullptr && output->dims.back() == 15360U,
+             "dev conditioning output is 15360 wide");
+      const auto rotary = std::count_if(
+          build.program.operations.begin(), build.program.operations.end(),
+          [](const dif::ir::Operation &op) {
+            return op.opcode == dif::ir::Opcode::RotaryApply;
+          });
+      expect(rotary == 60U, "dev conditioner applies plain RoPE to Q and K of every layer");
+      dif::ir::verify(build.program);
+    }
     if (failures != 0) {
       std::cerr << failures << " failure(s)\n";
       return 1;

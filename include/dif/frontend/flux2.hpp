@@ -17,6 +17,15 @@ namespace dif::frontend {
 // the frontend without changing semantics.
 Qwen3VlConditionerConfig
 make_flux2_klein_9b_conditioner_config(std::uint64_t executed_layers = 27U);
+// FLUX.2 [dev] conditioner: the Mistral Small 3.1 24B language tower
+// (40 layers, hidden 5120, 32/8 heads, head_dim 128, MLP 32768, vocab
+// 131072, eps 1e-5, rope theta 1e9, no QK-norm, keys under
+// language_model.model.). The pipeline takes hidden states 10, 20 and 30
+// (outputs after layers 9, 19, 29) concatenated to 15360, so 30 executed
+// layers suffice. Prompt = system message + user prompt through the Mistral
+// chat template, 512 tokens.
+Qwen3VlConditionerConfig
+make_flux2_dev_conditioner_config(std::uint64_t executed_layers = 30U);
 
 // FLUX.2 transformer geometry. Defaults are FLUX.2 [klein] Base 9B, which
 // keeps every existing Klein program byte-identical; flux2_dev_geometry()

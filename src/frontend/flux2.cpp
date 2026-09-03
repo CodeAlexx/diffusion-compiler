@@ -61,6 +61,38 @@ runtime::Tensor i32_tensor(std::vector<std::int32_t> values) {
 
 } // namespace
 
+Qwen3VlConditionerConfig
+make_flux2_dev_conditioner_config(std::uint64_t executed_layers) {
+  if (executed_layers == 0U || executed_layers > 40U)
+    fail("FLUX.2 [dev] Mistral executed depth must be in [1,40]");
+  Qwen3VlConditionerConfig config;
+  config.hidden_size = 5120U;
+  config.executed_layers = executed_layers;
+  config.attention_heads = 32U;
+  config.key_value_heads = 8U;
+  config.head_dim = 128U;
+  config.intermediate_size = 32768U;
+  config.vocabulary = 131072U;
+  config.rms_norm_epsilon = 1.0e-5;
+  config.rope_theta = 1.0e9;
+  config.attention_implementation = 2U;
+  for (const std::uint64_t state : {10U, 20U, 30U})
+    if (executed_layers >= state)
+      config.selected_hidden_states.push_back(state);
+  if (config.selected_hidden_states.empty())
+    config.selected_hidden_states.push_back(executed_layers);
+  config.output_slice_start = 0U;
+  config.output_sequence_length = 512U;
+  config.use_attention_mask = true;
+  config.dynamic_position_ids = true;
+  config.mask_padding_queries = false;
+  config.checkpoint_prefix = "language_model.model.";
+  config.concatenate_selected_hidden_states =
+      config.selected_hidden_states.size() > 1U;
+  config.qk_norm = false;
+  return config;
+}
+
 Flux2Geometry flux2_klein_9b_geometry() { return Flux2Geometry{}; }
 
 Flux2Geometry flux2_dev_geometry() {

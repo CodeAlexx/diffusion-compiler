@@ -61,6 +61,10 @@ struct Qwen3VlConditionerConfig {
 
   // Parity-only observability. This changes tensor roles, not computation.
   bool capture_first_layer_boundaries{false};
+  // Qwen3 applies a per-head RMSNorm to Q and K before RoPE (fused
+  // QkNormPartialRope). Llama/Mistral towers have no QK-norm: RoPE is the
+  // plain rotate-half RotaryApply and no q_norm/k_norm weights are bound.
+  bool qk_norm{true};
 };
 
 // One checkpoint tensor the program consumes. `name` is the literal

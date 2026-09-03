@@ -59,7 +59,7 @@ struct Builder {
   }
   std::uint32_t generated(runtime::Tensor tensor) {
     const auto id = add_tensor(
-        DType::F32, static_cast<std::uint32_t>(TensorRole::Constant),
+        tensor.dtype, static_cast<std::uint32_t>(TensorRole::Constant),
         tensor.dims);
     build.generated_constants.emplace(id, std::move(tensor));
     return id;
@@ -202,6 +202,43 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
   const auto sine_id = builder.internal({sequence, head_dim});
   builder.operation(Opcode::RotaryPosition, {positions_id, inverse_frequency_id},
                     {cosine_id, sine_id});
+  std::uint32_t rope_cosine_id = 0U;
+  std::uint32_t rope_sine_id = 0U;
+  if (!config.qk_norm) {
+    // Plain RoPE needs F32 per-pair tables [1,S,half_dim]; RotaryFrequency
+    // produces them from the same positions with angle = pos * theta^(-2i/D),
+    // the formula behind inverse_frequency above.
+    const auto i32_tensor = [](std::vector<std::uint64_t> dims,
+                               const std::vector<std::int32_t> &values) {
+      std::vector<std::uint8_t> bytes(values.size() * 4U);
+      std::memcpy(bytes.data(), values.data(), bytes.size());
+      return runtime::Tensor{DType::I32, std::move(dims), std::move(bytes)};
+    };
+    std::vector<std::int32_t> pair_axes(half_dim, 0);
+    std::vector<std::int32_t> pair_indices(half_dim);
+    for (std::uint64_t index = 0U; index < half_dim; ++index)
+      pair_indices[index] = static_cast<std::int32_t>(index);
+    const auto pair_axes_id = builder.generated(i32_tensor({half_dim}, pair_axes));
+    const auto pair_indices_id =
+        builder.generated(i32_tensor({half_dim}, pair_indices));
+    const auto axis_dims_id = builder.generated(
+        i32_tensor({1U}, {static_cast<std::int32_t>(head_dim)}));
+    const auto batched_positions = builder.add_tensor(
+        DType::F32, static_cast<std::uint32_t>(TensorRole::Internal),
+        {1U, sequence, 1U});
+    builder.operation(Opcode::Reshape, {positions_id}, {batched_positions});
+    rope_cosine_id = builder.add_tensor(
+        DType::F32, static_cast<std::uint32_t>(TensorRole::Internal),
+        {1U, sequence, half_dim});
+    rope_sine_id = builder.add_tensor(
+        DType::F32, static_cast<std::uint32_t>(TensorRole::Internal),
+        {1U, sequence, half_dim});
+    builder.operation(Opcode::RotaryFrequency,
+                      {batched_positions, pair_axes_id, pair_indices_id,
+                       axis_dims_id},
+                      {rope_cosine_id, rope_sine_id},
+                      {Attribute::f64(AttrKey::Theta, config.rope_theta)});
+  }
 
   // ---- embedding ----------------------------------------------------------
   const auto embedding_id = builder.streamed(
@@ -277,32 +314,58 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     capture(layer, "v_proj", value_id);
     build.linear_operations += 3U;
 
-    // Qwen3 per-head QK RMSNorm followed by full-width rotate-half RoPE:
-    // exactly QkNormPartialRope with RotaryDim == head_dim. Every shape
-    // attribute is stamped so no consumer can resolve a different default.
-    const auto query_norm_weight_id =
-        builder.streamed(prefix + "self_attn.q_norm.weight", {head_dim});
-    const auto rotated_query_id = builder.internal({sequence, heads, head_dim});
-    builder.operation(
-        Opcode::QkNormPartialRope,
-        {query_id, query_norm_weight_id, cosine_id, sine_id},
-        {rotated_query_id},
-        {Attribute::u64(AttrKey::Heads, heads),
-         Attribute::u64(AttrKey::HeadDim, head_dim),
-         Attribute::u64(AttrKey::RotaryDim, head_dim),
-         Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)});
-    capture(layer, "rotated_q", rotated_query_id);
-    const auto key_norm_weight_id =
-        builder.streamed(prefix + "self_attn.k_norm.weight", {head_dim});
-    const auto rotated_key_id = builder.internal({sequence, kv_heads, head_dim});
-    builder.operation(
-        Opcode::QkNormPartialRope,
-        {key_id, key_norm_weight_id, cosine_id, sine_id}, {rotated_key_id},
-        {Attribute::u64(AttrKey::Heads, kv_heads),
-         Attribute::u64(AttrKey::HeadDim, head_dim),
-         Attribute::u64(AttrKey::RotaryDim, head_dim),
-         Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)});
-    capture(layer, "rotated_k", rotated_key_id);
+    std::uint32_t rotated_query_id = 0U;
+    std::uint32_t rotated_key_id = 0U;
+    if (config.qk_norm) {
+      // Qwen3 per-head QK RMSNorm followed by full-width rotate-half RoPE:
+      // exactly QkNormPartialRope with RotaryDim == head_dim. Every shape
+      // attribute is stamped so no consumer can resolve a different default.
+      const auto query_norm_weight_id =
+          builder.streamed(prefix + "self_attn.q_norm.weight", {head_dim});
+      rotated_query_id = builder.internal({sequence, heads, head_dim});
+      builder.operation(
+          Opcode::QkNormPartialRope,
+          {query_id, query_norm_weight_id, cosine_id, sine_id},
+          {rotated_query_id},
+          {Attribute::u64(AttrKey::Heads, heads),
+           Attribute::u64(AttrKey::HeadDim, head_dim),
+           Attribute::u64(AttrKey::RotaryDim, head_dim),
+           Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)});
+      capture(layer, "rotated_q", rotated_query_id);
+      const auto key_norm_weight_id =
+          builder.streamed(prefix + "self_attn.k_norm.weight", {head_dim});
+      rotated_key_id = builder.internal({sequence, kv_heads, head_dim});
+      builder.operation(
+          Opcode::QkNormPartialRope,
+          {key_id, key_norm_weight_id, cosine_id, sine_id}, {rotated_key_id},
+          {Attribute::u64(AttrKey::Heads, kv_heads),
+           Attribute::u64(AttrKey::HeadDim, head_dim),
+           Attribute::u64(AttrKey::RotaryDim, head_dim),
+           Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)});
+      capture(layer, "rotated_k", rotated_key_id);
+    } else {
+      // No QK-norm (Mistral/Llama): plain full-width rotate-half RoPE. The
+      // RotaryPosition table duplicates each angle over both halves, so its
+      // first half_dim columns are exactly the per-pair cos/sin RotaryApply
+      // wants; the 4D views alias the [S,H,D] projections.
+      const auto rotate = [&](std::uint32_t input_id, std::uint64_t head_count,
+                              const char *name) {
+        const auto batched = builder.internal({1U, sequence, head_count, head_dim});
+        builder.operation(Opcode::Reshape, {input_id}, {batched});
+        const auto rotated = builder.internal({1U, sequence, head_count, head_dim});
+        builder.operation(
+            Opcode::RotaryApply, {batched, rope_cosine_id, rope_sine_id},
+            {rotated},
+            {Attribute::u64(AttrKey::RotaryLayout,
+                            static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit))});
+        const auto flat = builder.internal({sequence, head_count, head_dim});
+        builder.operation(Opcode::Reshape, {rotated}, {flat});
+        capture(layer, name, flat);
+        return flat;
+      };
+      rotated_query_id = rotate(query_id, heads, "rotated_q");
+      rotated_key_id = rotate(key_id, kv_heads, "rotated_k");
+    }
 
     // Causal grouped-query attention: K/V keep their 8 heads and the KvHeads
     // attribute maps query head h to kv head h/(H/KvHeads) — no materialized
