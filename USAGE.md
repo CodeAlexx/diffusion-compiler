@@ -711,8 +711,8 @@ difvaedecode --backend cpu|cuda --program TILE.difir --weight-bundle FILE.difbin
              --latent-id ID --raw-id ID (--output-raw FILE.diftensor --output-decoded FILE.diftensor | --output-rgb FILE.rgb)
              [--backend-plugin FILE.so] [--verify-shards] [--clip-length N] [--token-drop N]
              [--tile-size N] [--tile-overlap N] [--warmups N] [--iterations N] [--min-free-mib N] [--cache-dir DIR]
-             [--pinned-io] [--convrot-int8-checkpoint FILE] [--convrot-int8-linear-count N] [--convrot-int8-resident]
-             [--deterministic-conv] [--trace-ops]
+             [--convrot-int8-checkpoint FILE] [--convrot-int8-linear-count N] [--convrot-int8-resident]
+             [--deterministic-conv] [--trace-ops] [--workers N] [--tile-digests FILE] [--digest-tensor ID ...]
 ```
 
 Tiled video VAE decode from the video latent to decoded frames
@@ -720,6 +720,14 @@ Tiled video VAE decode from the video latent to decoded frames
 `--clip-length` and `--token-drop` set the temporal clip and dropped leading
 tokens. The `--convrot-int8-*` flags lower the decoder's Linears through a
 generic ConvRot cache kept resident with `--convrot-int8-resident`.
+`--trace-ops` aggregates per-operation device timings over every tile
+execution and prints them by opcode as `H3_VAE_DECODE_OP` lines.
+`--tile-digests FILE` appends the SHA-256 of every raw tile output exactly as
+the executor returned it, before stitching, so GPU-side and host-side
+differences can be told apart; `--digest-tensor ID` (repeatable) captures an
+intermediate tensor into the same file. `--workers N` caps the host stitching
+threads. `--deterministic-conv` restricts cuDNN convolutions to algorithms
+reported deterministic and fails when none fits the workspace limit.
 
 #### difaudiodecode
 
