@@ -666,7 +666,7 @@ difh3infer --backend cpu|cuda --sampler euler|res_multistep
            [--h3-step-residual-cache --h3-step-residual-front-blocks N --h3-step-residual-back-blocks N --h3-step-residual-reuse-step N ...]
            [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune]
            [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]]
-           [--h3-ck-attention-dso FILE.so --h3-int8-attention-first-layer N --h3-int8-attention-layers N]
+           [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N]
            [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor]
            [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...]
            [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline]
@@ -921,6 +921,8 @@ by removing run-to-run variance.
 | Knob | Flag | Behavior |
 |---|---|---|
 | Deterministic Linear | `--deterministic-linear` (`difh3vision run`) | Require a cuBLASLt algorithm with no cross-CTA split-K reduction for ordinary Linears. Fails closed when the heuristics expose none. |
+| Owned INT8 attention | `--h3-owned-attention` (`difh3infer`) | In-tree owned H3 dense INT8 attention (sm_86, head dim 128, noncausal BF16 [S,H,128]) bound in place of the attention DSO for the selected transformer layer range; approximate class, reported in the run receipt as `owned_h3_dense_int8_v4_in_tree`. Mutually exclusive with `--h3-ck-attention-dso`; fails closed off sm_86. |
+| Owned attention K centering | `--h3-owned-attention-center-k` (`difh3infer`) | Subtracts the per-head K mean over the sequence before INT8 quantization (softmax-invariant; deterministic two-stage mean). Separate receipt identity `owned_h3_dense_int8_v4_in_tree_center_k`; requires `--h3-owned-attention`. |
 | Deterministic convolution | `--deterministic-conv` (`difvaedecode`) | Require cuDNN convolution algorithms reported `CUDNN_DETERMINISTIC`. Fails closed when none fits the workspace limit. Motivated by the H3 video decode not being bit-reproducible from an identical latent. |
 | Deterministic attention heuristic | `--cudnn-attention-heuristic deterministic` (`difh3vision run`) | Restrict cuDNN SDPA engine discovery to deterministic engines. Elsewhere `a`, `b`, `fallback`, `autotune` select the discovery heuristic only. |
 | Resident host page cache | `--keep-resident-host-pages` (`difh3infer`) | Default evicts each resident weight's mapped range with `posix_fadvise(DONTNEED)` after upload, so every fresh process rereads from storage. The flag keeps the clean, reclaimable file-cache pages so a later process stages them from cache. The runtime reads the process's cgroup-v2 memory limit and charge and fails closed to eviction, printing a `RESIDENT_HOST_PAGES` line, when the limit cannot hold the resident bytes. |

@@ -57,6 +57,8 @@ struct Options {
   std::filesystem::path h3_convrot_int8_checkpoint;
   std::filesystem::path h3_groupwise_cache;
   std::filesystem::path h3_ck_attention_dso;
+  bool h3_owned_attention{false};
+  bool h3_owned_attention_center_k{false};
   std::filesystem::path h3_modulation_cache;
   std::filesystem::path h3_modulation_source_index;
   std::uint32_t h3_w8a8_resident_layers{
@@ -127,7 +129,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [--h3-ck-attention-dso FILE.so --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
+      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -425,6 +427,10 @@ Options parse(int argc, char **argv) {
     }
     else if (option == "--h3-ck-attention-dso")
       options.h3_ck_attention_dso = value("--h3-ck-attention-dso");
+    else if (option == "--h3-owned-attention")
+      options.h3_owned_attention = true;
+    else if (option == "--h3-owned-attention-center-k")
+      options.h3_owned_attention_center_k = true;
     else if (option == "--h3-int8-attention-first-layer") {
       const auto layer = number(value("--h3-int8-attention-first-layer"),
                                 "first H3 INT8 attention layer");
@@ -908,6 +914,9 @@ int main(int argc, char **argv) {
     denoiser_run_options.cudnn_attention_heuristic =
         options.cudnn_attention_heuristic;
     denoiser_run_options.h3_ck_attention_dso = options.h3_ck_attention_dso;
+    denoiser_run_options.h3_owned_attention = options.h3_owned_attention;
+    denoiser_run_options.h3_owned_attention_center_k =
+        options.h3_owned_attention_center_k;
     denoiser_run_options.h3_int8_attention_first_layer =
         options.h3_int8_attention_first_layer;
     denoiser_run_options.h3_int8_attention_layers =
@@ -1115,9 +1124,10 @@ int main(int argc, char **argv) {
           if (!options.h3_groupwise_cache.empty() &&
               h3_groupwise_count == 0U)
             dif::fail("requested H3 groupwise cache was not admitted");
-          if (!options.h3_ck_attention_dso.empty() &&
+          if ((!options.h3_ck_attention_dso.empty() ||
+               options.h3_owned_attention) &&
               h3_ck_attention_count == 0U)
-            dif::fail("requested H3 CK attention DSO was not admitted");
+            dif::fail("requested H3 INT8 attention route was not admitted");
           if (!options.h3_modulation_cache.empty() &&
               h3_modulation_cache_count == 0U)
             dif::fail("requested H3 modulation schedule cache was not admitted");

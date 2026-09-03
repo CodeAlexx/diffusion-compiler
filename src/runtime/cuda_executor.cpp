@@ -12,6 +12,9 @@
 #include "dif/runtime/cutlass_gemm.hpp"
 #include "dif/runtime/device_probe.hpp"
 #endif
+#if DIF_HAS_H3_OWNED_ATTENTION
+#include "dif/runtime/h3_owned_attention.hpp"
+#endif
 #if DIF_HAS_FLASH_ATTENTION
 #include "dif/runtime/flash_attention.hpp"
 #endif
@@ -3009,6 +3012,37 @@ public:
       void *, int, int, int, int, float, std::int64_t, std::int64_t,
       std::int64_t, std::int64_t, std::int64_t, std::int64_t, void *);
   using OwnedError = const char *(*)(int);
+  using OwnedQuantKvCentered = int (*)(
+      const void *, const void *, void *, void *, void *, void *, void *,
+      void *, int, int, int, int, std::int64_t, std::int64_t, std::int64_t,
+      std::int64_t, std::int64_t, std::int64_t, void *);
+
+  struct InTree {};
+  // In-tree owned kernel: no dlopen, the same ABI v4 entry points bound
+  // directly. Fails closed when the build carries no CUDA sources or the
+  // running device is not the kernel's SM.
+  CkAttentionLibrary(InTree, int current_sm, bool center_k)
+      : path_("in-tree"), center_k_(center_k) {
+#if DIF_HAS_H3_OWNED_ATTENTION
+    owned_abi_version_ = h3_owned_attention::abi_version();
+    target_sm_ = h3_owned_attention::target_sm();
+    if (owned_abi_version_ != 4 || target_sm_ != current_sm)
+      fail("owned H3 attention kernel admission failed: ABI=" +
+           std::to_string(owned_abi_version_) + " target_sm=" +
+           std::to_string(target_sm_) + " current_sm=" +
+           std::to_string(current_sm));
+    owned_quant_kv_ = &h3_owned_attention::quantize_kv_bf16;
+    owned_attend_ = &h3_owned_attention::attention_bf16;
+    owned_error_ = &h3_owned_attention::cuda_error;
+    owned_quant_kv_centered_ = &h3_owned_attention::quantize_kv_centered_bf16;
+    owned_dense_ = true;
+    in_tree_ = true;
+#else
+    (void)current_sm;
+    fail("this build has no in-tree owned H3 attention kernel (CUDA sources "
+         "compile only when a CUDA compiler and CUTLASS are configured)");
+#endif
+  }
 
   CkAttentionLibrary(const std::filesystem::path &path, int current_sm)
       : path_(path) {
@@ -3107,7 +3141,8 @@ public:
               CUdeviceptr output, CUdeviceptr q_int8, CUdeviceptr q_scale,
               CUdeviceptr k_int8, CUdeviceptr k_scale, CUdeviceptr v_int8,
               CUdeviceptr v_scale, CUdeviceptr anchor_indices, int sequence,
-              int heads, float scale, CUstream stream) const {
+              int heads, float scale, CUstream stream,
+              CUdeviceptr k_mean_partials = 0, CUdeviceptr k_mean = 0) const {
     constexpr int head_dim = 128;
     constexpr int cta_q = 128;
     constexpr int warp_q = 32;
@@ -3126,11 +3161,19 @@ public:
     if (owned_dense_) {
       const auto padded_sequence =
           (sequence + cta_k - 1) / cta_k * cta_k;
-      auto status = owned_quant_kv_(
-          pointer(key), pointer(value), pointer(k_int8), pointer(k_scale),
-          pointer(v_int8), pointer(v_scale), batch, heads, sequence,
-          padded_sequence, in_sb, in_sh, in_sn, in_sb, in_sh, in_sn,
-          reinterpret_cast<void *>(stream));
+      auto status =
+          center_k_
+              ? owned_quant_kv_centered_(
+                    pointer(key), pointer(value), pointer(k_int8),
+                    pointer(k_scale), pointer(v_int8), pointer(v_scale),
+                    pointer(k_mean_partials), pointer(k_mean), batch, heads,
+                    sequence, padded_sequence, in_sb, in_sh, in_sn, in_sb,
+                    in_sh, in_sn, reinterpret_cast<void *>(stream))
+              : owned_quant_kv_(
+                    pointer(key), pointer(value), pointer(k_int8),
+                    pointer(k_scale), pointer(v_int8), pointer(v_scale), batch,
+                    heads, sequence, padded_sequence, in_sb, in_sh, in_sn,
+                    in_sb, in_sh, in_sn, reinterpret_cast<void *>(stream));
       if (status == 0)
         status = owned_attend_(
             pointer(query), pointer(k_int8), pointer(k_scale), pointer(v_int8),
@@ -3179,10 +3222,15 @@ public:
                ? "approximate_codealexx_ck_int8_established_h3_gate"
                : "approximate_ck_int8_established_h3_gate";
   }
+  bool in_tree() const { return in_tree_; }
+  bool center_k() const { return center_k_; }
   std::string implementation() const {
     return owned_dense_
-               ? "codealexx_h3_dense_int8_v" +
-                     std::to_string(owned_abi_version_)
+               ? (in_tree_ ? (center_k_
+                                  ? "owned_h3_dense_int8_v4_in_tree_center_k"
+                                  : "owned_h3_dense_int8_v4_in_tree")
+                           : "codealexx_h3_dense_int8_v" +
+                                 std::to_string(owned_abi_version_))
            : codealexx_ck_int8_
                ? "codealexx_ck_int8_comfy_kitchen_sage_bf16"
                : "serenity_comfy_kitchen_sage_bf16";
@@ -3202,6 +3250,9 @@ private:
   int owned_abi_version_{};
   bool owned_dense_{};
   bool codealexx_ck_int8_{};
+  bool in_tree_{};
+  bool center_k_{};
+  OwnedQuantKvCentered owned_quant_kv_centered_{};
 };
 
 class CkAttentionPlan {
@@ -3239,18 +3290,28 @@ public:
             ? heads * (padded_sequence / 128U) * 128U
             : heads * 128U;
     const auto v_elements = heads * 128U * padded_sequence;
-    if (library_->owned_dense())
-      scratch_bytes_ = align_256(elements) +
+    // The owned kernels write K as [B,H,S_pad,128]: every padded row is
+    // stored (zero-filled past the sequence), so the INT8 K scratch is sized
+    // by the padded sequence. The DSO route's K stays [B,H,S,128].
+    const auto k_elements =
+        library_->owned_dense() ? heads * 128U * padded_sequence : elements;
+    if (library_->owned_dense()) {
+      scratch_bytes_ = align_256(k_elements) +
                        align_256(k_scale_elements * sizeof(float)) +
                        align_256(v_elements) +
                        align_256(v_scale_elements * sizeof(float));
-    else
+      if (library_->center_k())
+        scratch_bytes_ +=
+            align_256(heads * (padded_sequence / 128U) * 128U * sizeof(float)) +
+            align_256(heads * 128U * sizeof(float));
+    } else {
       scratch_bytes_ = align_256(elements) + align_256(elements) +
                        align_256(q_scale_elements * sizeof(float)) +
                        align_256(k_scale_elements * sizeof(float)) +
                        align_256(v_elements) +
                        align_256(heads * 128U * sizeof(float)) +
                        align_256(heads * sizeof(std::int32_t));
+    }
   }
 
   void allocate(DeviceArena *arena) {
@@ -3272,6 +3333,8 @@ public:
             ? heads * (padded_sequence / 128U) * 128U
             : heads * 128U;
     const auto v_elements = heads * 128U * padded_sequence;
+    const auto k_elements =
+        library_->owned_dense() ? heads * 128U * padded_sequence : elements;
     storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(scratch_bytes_), arena);
     auto offset = std::uint64_t{0U};
@@ -3280,10 +3343,15 @@ public:
       offset += align_256(bytes);
     };
     if (library_->owned_dense()) {
-      assign(k_int8_, elements);
+      assign(k_int8_, k_elements);
       assign(k_scale_, k_scale_elements * sizeof(float));
       assign(v_int8_, v_elements);
       assign(v_scale_, v_scale_elements * sizeof(float));
+      if (library_->center_k()) {
+        assign(k_mean_partials_,
+               heads * (padded_sequence / 128U) * 128U * sizeof(float));
+        assign(k_mean_, heads * 128U * sizeof(float));
+      }
     } else {
       assign(q_int8_, elements);
       assign(k_int8_, elements);
@@ -3304,7 +3372,8 @@ public:
                      buffers.at(operation.inputs.at(2)),
                      buffers.at(operation.outputs.at(0)), q_int8_, q_scale_,
                      k_int8_, k_scale_, v_int8_, v_scale_, anchor_indices_,
-                     sequence_, heads_, scale_, stream);
+                     sequence_, heads_, scale_, stream, k_mean_partials_,
+                     k_mean_);
   }
 
   bool compatible(const ir::Program &program,
@@ -3339,6 +3408,8 @@ private:
   CUdeviceptr k_int8_{};
   CUdeviceptr k_scale_{};
   CUdeviceptr v_int8_{};
+  CUdeviceptr k_mean_partials_{};
+  CUdeviceptr k_mean_{};
   CUdeviceptr v_scale_{};
   CUdeviceptr anchor_indices_{};
   int sequence_{};
@@ -7779,6 +7850,9 @@ public:
         note(!options.h3_groupwise_cache.empty(), "h3_groupwise_cache");
         note(!options.h3_modulation_cache.empty(), "h3_modulation_cache");
         note(!options.h3_ck_attention_dso.empty(), "h3_ck_attention_dso");
+        note(options.h3_owned_attention, "h3_owned_attention");
+        note(options.h3_owned_attention_center_k,
+             "h3_owned_attention_center_k");
         if (!fused.empty())
           fail(std::string("training program (contains ") + training_opcode +
                ") requested fused inference plans (" + fused +
@@ -8109,9 +8183,19 @@ public:
           align_256(correction->auxiliary_bytes);
       h3_convrot_bf16_correction_ = std::move(correction);
     }
-    if (!options.h3_ck_attention_dso.empty()) {
-      auto library = std::make_shared<CkAttentionLibrary>(
-          options.h3_ck_attention_dso, major * 10 + minor);
+    if (options.h3_owned_attention && !options.h3_ck_attention_dso.empty())
+      fail("h3_owned_attention and h3_ck_attention_dso select two H3 attention "
+           "routes; choose one");
+    if (options.h3_owned_attention_center_k && !options.h3_owned_attention)
+      fail("h3_owned_attention_center_k requires h3_owned_attention");
+    if (options.h3_owned_attention || !options.h3_ck_attention_dso.empty()) {
+      auto library =
+          options.h3_owned_attention
+              ? std::make_shared<CkAttentionLibrary>(
+                    CkAttentionLibrary::InTree{}, major * 10 + minor,
+                    options.h3_owned_attention_center_k)
+              : std::make_shared<CkAttentionLibrary>(
+                    options.h3_ck_attention_dso, major * 10 + minor);
       std::uint64_t maximum_sequence = 0U;
       for (const auto &operation : program_.operations) {
         if (operation.opcode != ir::Opcode::Attention ||
@@ -8145,7 +8229,7 @@ public:
         h3_ck_attention_plans_.emplace(operation.id, h3_ck_attention_plan_);
       }
       if (h3_ck_attention_plans_.empty())
-        fail("H3 INT8 attention DSO requested but no transformer Attention "
+        fail("H3 INT8 attention route requested but no transformer Attention "
              "operation was selected");
       ck_attention_scratch_bytes_ =
           h3_ck_attention_plan_->scratch_bytes();

@@ -106,6 +106,10 @@ struct RunOptions {
   // parity-harness policy and is never enabled by a production plan because
   // the readback intentionally perturbs timing.
   std::vector<std::uint32_t> capture_intermediate_tensors;
+  // Optional subset of semantic Output tensors to deliver to the host. Empty
+  // preserves the historical all-output contract. Execution semantics are
+  // unchanged; this only avoids unused device-to-host copies at delivery.
+  std::vector<std::uint32_t> requested_output_tensors;
   // Exact cuDNN attention engine heuristic selected by the compiler plan:
   // 0=A (default), 1=B, 2=FALLBACK. This changes only plan discovery; the
   // semantic Attention operation, dtype, accumulation, and outputs remain
@@ -185,6 +189,16 @@ struct RunOptions {
   // semantics. Off by default until exact boundary and decoded quality gates
   // admit it.
   bool h3_int8_compact_adaln{false};
+  // Experimental MiniMax-H3 step-band residual reuse. Preparation records a
+  // BF16 residual across the middle transformer band after a refresh run;
+  // a later explicitly selected run applies that residual to the current
+  // front-band output and skips the middle band. The policy is opt-in,
+  // fixed at prepare time, and reported separately because it approximates
+  // cross-step model execution rather than changing DiffIR semantics.
+  bool h3_step_residual_cache{false};
+  std::uint32_t h3_step_residual_front_blocks{8U};
+  std::uint32_t h3_step_residual_back_blocks{8U};
+  bool h3_step_residual_reuse_current{false};
   // Accepted MiniMax-H3 groupwise INT8 weight-only route. The Serenity cache
   // stores transformed I8 projection weights with compact F16 group scales;
   // the backend dequantizes each projection into shared BF16 scratch below
@@ -212,6 +226,15 @@ struct RunOptions {
   // run receipt; an empty path retains the exact DiffIR-selected
   // implementation. A production admission must use project-owned code.
   std::filesystem::path h3_ck_attention_dso;
+  // In-tree owned H3 dense INT8 attention (ABI v4 shapes, sm_86) bound in
+  // place of the DSO route. Same layer-range policy, same approximate
+  // classification, no dlopen. Mutually exclusive with h3_ck_attention_dso.
+  bool h3_owned_attention{false};
+  // With h3_owned_attention: subtract the per-head K mean over the sequence
+  // before INT8 quantization. Softmax-invariant by construction; changes only
+  // the approximate route's quantization error, so it is a separate identity
+  // in the run receipt and re-gated on its own.
+  bool h3_owned_attention_center_k{false};
   // Contiguous transformer-block Attention range replaced in program order by
   // the selected H3 INT8 DSO. Operations before and after the range remain on
   // exact cuDNN. This is explicit compiler policy for quality/performance
@@ -583,6 +606,12 @@ struct RunResult {
   std::uint32_t repeated_invariant_operation_count{};
   std::uint64_t repeated_invariant_persistent_bytes{};
   bool repeated_invariant_cache_hit{};
+  bool h3_step_residual_cache_enabled{};
+  bool h3_step_residual_cache_reused{};
+  std::uint32_t h3_step_residual_front_blocks{};
+  std::uint32_t h3_step_residual_back_blocks{};
+  std::uint32_t h3_step_residual_skipped_operations{};
+  std::uint64_t h3_step_residual_cache_bytes{};
   PipelineProfile pipeline_profile;
   // CUDA backend only; other executors leave these zeroed. The preparation
   // phase counters describe the one-time prepare() of the executing plan;

@@ -159,6 +159,10 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
     target_include_directories(difcore SYSTEM PRIVATE "${DIF_CUTLASS_INCLUDE_DIR}")
     target_link_libraries(difcore PRIVATE CUDA::cudart)
     target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=1)
+    # In-tree owned H3 dense INT8 attention (sm_86 kernel; admitted at prepare
+    # only on that SM). Compiled whenever the CUDA language is enabled.
+    target_sources(difcore PRIVATE src/runtime/h3_owned_attention.cu)
+    target_compile_definitions(difcore PUBLIC DIF_HAS_H3_OWNED_ATTENTION=1)
     set_property(TARGET difcore PROPERTY CUDA_ARCHITECTURES
                                          "${DIF_CUDA_ARCHITECTURES}")
     set_property(TARGET difcore PROPERTY CUDA_STANDARD 17)
@@ -426,6 +430,9 @@ if(DIF_BUILD_TESTS)
   target_link_libraries(dif_fusion_tests PRIVATE difcore)
   add_test(NAME dif_fusion_tests COMMAND dif_fusion_tests)
 
+  add_executable(dif_owned_attention_tests tests/owned_attention_tests.cpp)
+  target_link_libraries(dif_owned_attention_tests PRIVATE difcore)
+  add_test(NAME dif_owned_attention_tests COMMAND dif_owned_attention_tests)
   add_executable(dif_epilogue_tests tests/epilogue_tests.cpp)
   target_link_libraries(dif_epilogue_tests PRIVATE difcore)
   add_test(NAME dif_epilogue_tests COMMAND dif_epilogue_tests)

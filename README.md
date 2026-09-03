@@ -143,9 +143,9 @@ cmake --build build-cpu -j2
 ctest --test-dir build-cpu --output-on-failure -j1
 ```
 
-`ctest` runs 21 gates: IR and runtime tests, FLUX.2 frontend and prompt
+`ctest` runs 22 gates: IR and runtime tests, FLUX.2 frontend and prompt
 tests, LoRA and DiT backward tests, fusion and epilogue byte-identity tests,
-optimizer, target, telemetry, quality, bench, noise, format, bisect, difopt
+optimizer, owned-attention, target, telemetry, quality, bench, noise, format, bisect, difopt
 CLI, plugin ABI, OpenCL plugin, and tokenizer tests. The tiered regression
 suite in `perf/regress/suite.json` adds smoke checks and the model-level
 prompt-to-output recipes; run it with `difregress`.
