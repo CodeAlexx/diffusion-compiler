@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -313,7 +314,11 @@ void test_oracle_protocol() {
   std::vector<dif::weights::SafeTensorWriteSpec> specs = {
       {"step_1", dif::ir::DType::F32, {4U}}, {"step_2", dif::ir::DType::F32, {4U}}};
   dif::weights::SafeTensorWriter writer(payload, specs);
-  std::vector<std::uint8_t> bytes(16U, 0U);
+  // Non-degenerate values: an all-zero or constant oracle boundary is
+  // rejected by the validity check below, as it should be.
+  const std::vector<float> values = {0.25F, -1.5F, 3.0F, 0.125F};
+  std::vector<std::uint8_t> bytes(16U);
+  std::memcpy(bytes.data(), values.data(), bytes.size());
   writer.append("step_1", std::span<const std::uint8_t>(bytes.data(), bytes.size()));
   writer.append("step_2", std::span<const std::uint8_t>(bytes.data(), bytes.size()));
   (void)writer.finish();
@@ -356,6 +361,42 @@ void test_oracle_protocol() {
 })");
   const auto invalid = run(DIF_DIFBISECT_PATH, {"validate-oracle", manifest.string(), "--json"});
   expect(invalid.exit_code == 1, "a wrong payload hash and missing tensor invalidate");
+  {
+    // Harness validity: a degenerate (all-zero) boundary must not validate.
+    const auto zero_payload = workspace() / "oracle-zero.safetensors";
+    std::vector<dif::weights::SafeTensorWriteSpec> zero_specs = {
+        {"step_1", dif::ir::DType::F32, {4U}}};
+    dif::weights::SafeTensorWriter zero_writer(zero_payload, zero_specs);
+    std::vector<std::uint8_t> zeros(16U, 0U);
+    zero_writer.append("step_1", std::span<const std::uint8_t>(zeros.data(), zeros.size()));
+    (void)zero_writer.finish();
+    const auto zero_digest = dif::hex_digest(dif::sha256_file(zero_payload));
+    const auto zero_manifest = workspace() / "oracle-zero.json";
+    write_text(zero_manifest, R"({
+  "kind": "diffusion-compiler-oracle-fixture",
+  "version": 1,
+  "creator": {"repository": "creator/repo", "revision": "abc123"},
+  "model": {"name": "synthetic"},
+  "semantic_boundary": "step outputs",
+  "dtype": "f32",
+  "fixture_version": "v1",
+  "inputs": [{"name": "prompt", "sha256": ")" + std::string(64U, 'a') + R"("}],
+  "payload": {"path": "oracle-zero.safetensors", "sha256": ")" + zero_digest + R"("},
+  "boundaries": [{"name": "step_1", "tensor": "step_1", "shape": [4], "dtype": "f32"}]
+})");
+    const auto degenerate = run(DIF_DIFBISECT_PATH, {"validate-oracle", zero_manifest.string(), "--json"});
+    expect(degenerate.exit_code == 1, "an all-zero oracle boundary does not validate");
+    try {
+      const auto document = dif::json::parse(degenerate.output);
+      bool flagged = false;
+      for (const auto &check : required(document, "checks").array())
+        if (required(check, "check").string() == "boundary step_1 validity")
+          flagged = !required(check, "ok").boolean();
+      expect(flagged, "the degenerate boundary is named by the validity check");
+    } catch (const std::exception &error) {
+      expect(false, std::string("validate-oracle degenerate JSON: ") + error.what());
+    }
+  }
   try {
     const auto document = dif::json::parse(invalid.output);
     expect(!required(document, "valid").boolean(), "invalid flag set");

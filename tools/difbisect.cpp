@@ -818,6 +818,34 @@ int command_validate_oracle(int argc, char **argv) {
         record("boundary " + name->string(), shape_ok && dtype_ok,
                shape_ok && dtype_ok ? "tensor " + tensor->string() + " present with declared shape and dtype"
                                     : "declared shape or dtype differs from the payload");
+        // Harness validity (Flame lesson: a reference generator with an
+        // all-zero conditioning input faked a 4.2% divergence): an oracle
+        // boundary must be finite and non-degenerate before it can convict.
+        if (shape_ok && dtype_ok && payload_file->mapping &&
+            (entry->dtype == dif::ir::DType::F32 ||
+             entry->dtype == dif::ir::DType::BF16 ||
+             entry->dtype == dif::ir::DType::F16)) {
+          const auto *base = payload_file->mapping->data() + entry->file_offset;
+          std::vector<std::uint8_t> bytes(base, base + entry->byte_count);
+          dif::runtime::Tensor values(entry->dtype, entry->dims, std::move(bytes));
+          const auto count = values.element_count();
+          std::uint64_t nonfinite = 0U;
+          bool constant = count > 0U;
+          const float first = count > 0U ? dif::runtime::load_float(values, 0U) : 0.0F;
+          for (std::uint64_t index = 0U; index < count; ++index) {
+            const auto value = dif::runtime::load_float(values, index);
+            if (!std::isfinite(value))
+              ++nonfinite;
+            else if (value != first)
+              constant = false;
+          }
+          const bool degenerate = nonfinite != 0U || constant;
+          record("boundary " + name->string() + " validity", !degenerate,
+                 nonfinite != 0U ? std::to_string(nonfinite) + " non-finite values"
+                 : constant       ? "constant tensor (every value " +
+                                        std::to_string(first) + "); a degenerate oracle cannot convict"
+                                  : "finite and non-constant");
+        }
       }
     } else {
       record("boundaries", false, "missing or empty 'boundaries' array");

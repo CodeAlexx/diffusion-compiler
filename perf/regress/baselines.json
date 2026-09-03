@@ -7,18 +7,34 @@
   "provenance": {
     "compiler": "diffusion-compiler",
     "version": "0.1.0",
-    "revision": "9c8412f5e53aca2159f1e2b8547cf4690c19ed0f",
-    "generated_at": "2026-09-02T18:35:52Z"
+    "revision": "7cdd70014ba15627cb451e71ac7495b8f05f05f8",
+    "generated_at": "2026-09-03T09:19:04Z"
   },
   "suite": "diffusion-compiler",
   "checks": {
     "formats-table-cuda": {
-      "samples": [0.209019493, 0.21060838700000001, 0.20848472300000001],
-      "median": 0.209019493,
-      "min": 0.20848472300000001,
-      "max": 0.21060838700000001,
-      "recorded_at": "2026-09-02T18:35:52Z",
-      "revision": "9c8412f5e53aca2159f1e2b8547cf4690c19ed0f"
+      "samples": [0.20084526, 0.21502695499999999, 0.19968488000000001],
+      "median": 0.20084526,
+      "min": 0.19968488000000001,
+      "max": 0.21502695499999999,
+      "recorded_at": "2026-09-03T09:19:04Z",
+      "revision": "7cdd70014ba15627cb451e71ac7495b8f05f05f8"
+    },
+    "rms-run-device-allocs": {
+      "samples": [0, 0, 0],
+      "median": 0,
+      "min": 0,
+      "max": 0,
+      "recorded_at": "2026-09-03T09:19:04Z",
+      "revision": "7cdd70014ba15627cb451e71ac7495b8f05f05f8"
+    },
+    "rms-run-host-stream-syncs": {
+      "samples": [2, 2, 2],
+      "median": 2,
+      "min": 2,
+      "max": 2,
+      "recorded_at": "2026-09-03T09:19:04Z",
+      "revision": "7cdd70014ba15627cb451e71ac7495b8f05f05f8"
     }
   }
 }
