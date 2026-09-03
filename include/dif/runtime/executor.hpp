@@ -57,6 +57,12 @@ struct RunOptions {
   // ordinary Linear operations. The runtime fails closed when heuristics do
   // not expose one; this is compiler execution policy, not a hidden fallback.
   bool deterministic_linear_algorithms{false};
+  // Require cuDNN convolution algorithms whose determinism is reported as
+  // CUDNN_DETERMINISTIC (the v7 heuristic winner is otherwise chosen on
+  // status and workspace alone). Fails closed when none fits the workspace
+  // limit. Motivated by the H3 video decode not being bit-reproducible from
+  // an identical latent (2026-09-03). Candidate identity for difopt.
+  bool deterministic_convolution_algorithms{false};
   // Explicit compiler-selected streamed constants to promote into persistent
   // device storage for the lifetime of this prepared execution. The runtime
   // validates and executes this list but never chooses it heuristically.

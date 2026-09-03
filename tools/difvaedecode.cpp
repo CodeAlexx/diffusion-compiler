@@ -4,6 +4,7 @@
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
 #include "dif/runtime/tensor.hpp"
+#include "dif/support/sha256.hpp"
 #include "dif/support/error.hpp"
 #include "dif/weights/bundle.hpp"
 
@@ -18,7 +19,9 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <map>
 #include <numeric>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -48,11 +51,16 @@ struct Options {
   std::uint64_t tile_size{256U};
   std::uint64_t tile_overlap{64U};
   bool verify_shards{false};
+  std::filesystem::path tile_digests; // --tile-digests FILE
   dif::runtime::RunOptions run;
 };
 
+std::size_t g_worker_override = 0U; // --workers N (0 = hardware concurrency)
+
 std::size_t parallel_worker_count(std::size_t count) {
-  const auto hardware = std::thread::hardware_concurrency();
+  const auto hardware = g_worker_override != 0U
+                            ? static_cast<unsigned>(g_worker_override)
+                            : std::thread::hardware_concurrency();
   return std::min<std::size_t>(count, hardware == 0U ? 1U : hardware);
 }
 
@@ -94,7 +102,7 @@ void usage() {
          " [--tile-size N] [--tile-overlap N] [--warmups N]"
          " [--iterations N] [--min-free-mib N] [--cache-dir DIR]"
          " [--convrot-int8-checkpoint FILE]"
-         " [--convrot-int8-linear-count N] [--convrot-int8-resident]\n";
+         " [--convrot-int8-linear-count N] [--convrot-int8-resident] [--deterministic-conv] [--trace-ops] [--workers N] [--tile-digests FILE] [--digest-tensor ID ...]\n";
 }
 
 Options parse(int argc, char **argv) {
@@ -151,6 +159,17 @@ Options parse(int argc, char **argv) {
           number(argv[++i], "ConvRot INT8 Linear count"));
     else if (option == "--convrot-int8-resident")
       options.run.convrot_int8_resident = true;
+    else if (option == "--deterministic-conv")
+      options.run.deterministic_convolution_algorithms = true;
+    else if (option == "--workers" && i + 1 < argc)
+      g_worker_override = static_cast<std::size_t>(number(argv[++i], "workers"));
+    else if (option == "--tile-digests" && i + 1 < argc)
+      options.tile_digests = argv[++i];
+    else if (option == "--digest-tensor" && i + 1 < argc)
+      options.run.capture_intermediate_tensors.push_back(
+          static_cast<std::uint32_t>(number(argv[++i], "digest tensor")));
+    else if (option == "--trace-ops")
+      options.run.trace_operations = true;
     else if (option == "--verify-shards")
       options.verify_shards = true;
     else {
@@ -835,6 +854,9 @@ int main(int argc, char **argv) {
     else
       dif::fail("unknown backend: " + options.backend);
     auto prepared = executor->prepare(program, bindings, options.run);
+    // --trace-ops: per-operation device timings aggregated over every tile
+    // execution, printed by opcode so the decode's launch mix is attributable.
+    std::map<std::string, std::pair<std::uint64_t, double>> opcode_timings;
 
     const auto decoded_tile_count = temporal_chunks * y_plan.starts.size() *
                                     x_plan.starts.size();
@@ -873,6 +895,29 @@ int main(int argc, char **argv) {
           inputs[options.latent_id] = std::move(tile);
           const auto execution_start = std::chrono::steady_clock::now();
           auto result = prepared->run(inputs, options.run);
+          if (!options.tile_digests.empty()) {
+            // SHA-256 of every raw tile output exactly as the executor returned
+            // it, before any host-side stitching: separates GPU-side from
+            // host-side nondeterminism.
+            std::ofstream digests(options.tile_digests, std::ios::app);
+            for (const auto &[id, tensor] : result.outputs)
+              digests << "chunk=" << temporal << " tile_offset=" << tiles.size() << " output=" << id
+                      << " sha256=" << dif::hex_digest(dif::sha256(
+                             std::span<const std::uint8_t>(tensor.data(), tensor.byte_size())))
+                      << "\n";
+            for (const auto &[id, tensor] : result.captured_intermediates)
+              digests << "chunk=" << temporal << " tile_offset=" << tiles.size() << " intermediate=" << id
+                      << " sha256=" << dif::hex_digest(dif::sha256(
+                             std::span<const std::uint8_t>(tensor.data(), tensor.byte_size())))
+                      << "\n";
+          }
+          for (const auto &timing : result.operation_timings) {
+            auto &slot = opcode_timings[timing.plan.empty()
+                                            ? std::string(dif::ir::opcode_name(timing.opcode))
+                                            : timing.plan];
+            slot.first += 1U;
+            slot.second += timing.mean_milliseconds;
+          }
           execution_wall_milliseconds +=
               std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - execution_start)
@@ -1073,6 +1118,22 @@ int main(int argc, char **argv) {
         options.output_rgb.empty() ? raw.dims[3] : rgb.height;
     const auto delivered_width =
         options.output_rgb.empty() ? raw.dims[4] : rgb.width;
+    if (!opcode_timings.empty()) {
+      std::vector<std::pair<std::string, std::pair<std::uint64_t, double>>> rows(
+          opcode_timings.begin(), opcode_timings.end());
+      std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
+        return a.second.second > b.second.second;
+      });
+      double total = 0.0;
+      for (const auto &row : rows)
+        total += row.second.second;
+      for (const auto &row : rows)
+        std::cout << "H3_VAE_DECODE_OP opcode=" << row.first
+                  << " launches=" << row.second.first
+                  << " total_ms=" << row.second.second
+                  << " share=" << (total > 0.0 ? row.second.second / total : 0.0)
+                  << '\n';
+    }
     std::cout << "H3_VAE_DECODE PASS backend=" << backend_name << " device=\""
               << device_name << "\" latent=[1,24," << latent.dims[2] << ','
               << latent.dims[3] << ',' << latent.dims[4] << "] decoded=[1,3,"

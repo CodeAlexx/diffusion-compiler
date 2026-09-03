@@ -77,7 +77,8 @@ CudnnConv2dPlan::CudnnConv2dPlan(
     const ir::TensorDesc &output, std::uint64_t stride_h,
     std::uint64_t stride_w, std::uint64_t pad_h, std::uint64_t pad_w,
     std::uint64_t dilation_h, std::uint64_t dilation_w,
-    std::uint64_t groups, bool biased, std::size_t workspace_limit_bytes)
+    std::uint64_t groups, bool biased, std::size_t workspace_limit_bytes,
+    bool deterministic)
     : impl_(std::make_unique<Impl>()) {
   if (input.dims.size() != 4U || weight.dims.size() != 4U ||
       output.dims.size() != 4U || input.dtype != weight.dtype ||
@@ -148,10 +149,14 @@ CudnnConv2dPlan::CudnnConv2dPlan(
       candidates.begin(), candidates.begin() + returned,
       [&](const cudnnConvolutionFwdAlgoPerf_t &candidate) {
         return candidate.status == CUDNN_STATUS_SUCCESS &&
-               candidate.memory <= workspace_limit_bytes;
+               candidate.memory <= workspace_limit_bytes &&
+               (!deterministic ||
+                candidate.determinism == CUDNN_DETERMINISTIC);
       });
   if (selected == candidates.begin() + returned)
-    fail("cuDNN Conv2d has no algorithm within its workspace limit");
+    fail(deterministic
+             ? "cuDNN Conv2d has no deterministic algorithm within its workspace limit"
+             : "cuDNN Conv2d has no algorithm within its workspace limit");
   impl_->algorithm = selected->algo;
   impl_->workspace = selected->memory;
   impl_->biased = biased;
@@ -222,7 +227,8 @@ CudnnConv3dPlan::CudnnConv3dPlan(
     std::uint64_t stride_h, std::uint64_t stride_w, std::uint64_t pad_t,
     std::uint64_t pad_h, std::uint64_t pad_w, std::uint64_t dilation_t,
     std::uint64_t dilation_h, std::uint64_t dilation_w,
-    std::uint64_t groups, bool biased, std::size_t workspace_limit_bytes)
+    std::uint64_t groups, bool biased, std::size_t workspace_limit_bytes,
+    bool deterministic)
     : impl_(std::make_unique<Impl>()) {
   if (input.dims.size() != 5U || weight.dims.size() != 5U ||
       output.dims.size() != 5U || input.dtype != weight.dtype ||
@@ -307,10 +313,14 @@ CudnnConv3dPlan::CudnnConv3dPlan(
       candidates.begin(), candidates.begin() + returned,
       [&](const cudnnConvolutionFwdAlgoPerf_t &candidate) {
         return candidate.status == CUDNN_STATUS_SUCCESS &&
-               candidate.memory <= workspace_limit_bytes;
+               candidate.memory <= workspace_limit_bytes &&
+               (!deterministic ||
+                candidate.determinism == CUDNN_DETERMINISTIC);
       });
   if (selected == candidates.begin() + returned)
-    fail("cuDNN Conv3d has no algorithm within its workspace limit");
+    fail(deterministic
+             ? "cuDNN Conv3d has no deterministic algorithm within its workspace limit"
+             : "cuDNN Conv3d has no algorithm within its workspace limit");
   impl_->algorithm = selected->algo;
   impl_->workspace = selected->memory;
   impl_->biased = biased;

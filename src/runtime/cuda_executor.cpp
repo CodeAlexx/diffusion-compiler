@@ -857,6 +857,7 @@ struct CudnnConv2dKey {
   std::uint64_t groups{};
   std::uint64_t workspace_limit{};
   bool biased{};
+  bool deterministic{};
 
   bool operator==(const CudnnConv2dKey &) const = default;
 };
@@ -875,6 +876,7 @@ struct CudnnConv2dKeyHash {
     mix(key.stride_h); mix(key.stride_w); mix(key.pad_h); mix(key.pad_w);
     mix(key.dilation_h); mix(key.dilation_w); mix(key.groups);
     mix(key.workspace_limit); mix(key.biased ? 1U : 0U);
+    mix(key.deterministic ? 1U : 0U);
     return result;
   }
 };
@@ -890,6 +892,7 @@ struct CudnnConv3dKey {
   std::uint64_t groups{};
   std::uint64_t workspace_limit{};
   bool biased{};
+  bool deterministic{};
 
   bool operator==(const CudnnConv3dKey &) const = default;
 };
@@ -909,6 +912,7 @@ struct CudnnConv3dKeyHash {
     mix(key.pad_t); mix(key.pad_h); mix(key.pad_w);
     mix(key.dilation_t); mix(key.dilation_h); mix(key.dilation_w);
     mix(key.groups); mix(key.workspace_limit); mix(key.biased ? 1U : 0U);
+    mix(key.deterministic ? 1U : 0U);
     return result;
   }
 };
@@ -8627,13 +8631,14 @@ public:
           op.u64(ir::AttrKey::Groups, 1U),
           limit,
           op.inputs.size() == 3U,
+          options.deterministic_convolution_algorithms,
       };
       auto found = cudnn_conv_plan_cache.find(key);
       if (found == cudnn_conv_plan_cache.end()) {
         auto plan = std::make_shared<CudnnConv2dPlan>(
             *input, *weight, *output, key.stride_h, key.stride_w, key.pad_h,
             key.pad_w, key.dilation_h, key.dilation_w, key.groups, key.biased,
-            static_cast<std::size_t>(key.workspace_limit));
+            static_cast<std::size_t>(key.workspace_limit), key.deterministic);
         found = cudnn_conv_plan_cache.emplace(key, std::move(plan)).first;
       }
       cudnn_conv_plans_.emplace(op.id, found->second);
@@ -8682,6 +8687,7 @@ public:
           op.u64(ir::AttrKey::Groups, 1U),
           limit,
           op.inputs.size() == 3U,
+          options.deterministic_convolution_algorithms,
       };
       auto found = cudnn_conv3d_plan_cache.find(key);
       if (found == cudnn_conv3d_plan_cache.end()) {
@@ -8689,7 +8695,8 @@ public:
             *input, *weight, *output, key.stride_t, key.stride_h,
             key.stride_w, key.pad_t, key.pad_h, key.pad_w,
             key.dilation_t, key.dilation_h, key.dilation_w, key.groups,
-            key.biased, static_cast<std::size_t>(key.workspace_limit));
+            key.biased, static_cast<std::size_t>(key.workspace_limit),
+            key.deterministic);
         found = cudnn_conv3d_plan_cache.emplace(key, std::move(plan)).first;
       }
       cudnn_conv3d_plans_.emplace(op.id, found->second);

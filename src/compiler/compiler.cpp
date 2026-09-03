@@ -1925,7 +1925,7 @@ void emit_layer_norm(std::ostringstream &out, const ir::Program &program,
          "reduction[threadIdx.x]+=reduction[threadIdx.x+stride];__syncthreads();}"
          "float mean=reduction[0]/"
       << columns
-      << ".0f;local=0.0f;for(unsigned long long col=threadIdx.x;col<"
+      << ".0f;__syncthreads();local=0.0f;for(unsigned long long col=threadIdx.x;col<"
       << columns << "ULL;col+=blockDim.x){float centered=dif_load(x,row*"
       << columns
       << "ULL+col)-mean;local+=centered*centered;}reduction[threadIdx.x]=local;"
@@ -2045,7 +2045,7 @@ void emit_layer_norm_modulate(std::ostringstream &out,
          "reduction[threadIdx.x]+=reduction[threadIdx.x+stride];"
          "__syncthreads();}float mean=reduction[0]/"
       << columns
-      << ".0f;local=0.0f;for(unsigned long long col=threadIdx.x;col<"
+      << ".0f;__syncthreads();local=0.0f;for(unsigned long long col=threadIdx.x;col<"
       << columns
       << "ULL;col+=blockDim.x){float centered=dif_load(x,row*" << columns
       << "ULL+col)-mean;local+=centered*centered;}reduction[threadIdx.x]=local;"

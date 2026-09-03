@@ -16,7 +16,8 @@ public:
                   std::uint64_t stride_w, std::uint64_t pad_h,
                   std::uint64_t pad_w, std::uint64_t dilation_h,
                   std::uint64_t dilation_w, std::uint64_t groups,
-                  bool biased, std::size_t workspace_limit_bytes);
+                  bool biased, std::size_t workspace_limit_bytes,
+                  bool deterministic = false);
   ~CudnnConv2dPlan();
 
   CudnnConv2dPlan(const CudnnConv2dPlan &) = delete;
@@ -44,7 +45,8 @@ public:
                   std::uint64_t pad_w, std::uint64_t dilation_t,
                   std::uint64_t dilation_h, std::uint64_t dilation_w,
                   std::uint64_t groups, bool biased,
-                  std::size_t workspace_limit_bytes);
+                  std::size_t workspace_limit_bytes,
+                  bool deterministic = false);
   ~CudnnConv3dPlan();
 
   CudnnConv3dPlan(const CudnnConv3dPlan &) = delete;

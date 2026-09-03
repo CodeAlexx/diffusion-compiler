@@ -14,6 +14,7 @@
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/tensor.hpp"
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -179,6 +180,198 @@ dif::runtime::TensorMap full_family_bindings(dif::ir::DType dtype) {
   bindings.emplace(2, make_tensor(dtype, {64, 128}, 23));
   bindings.emplace(3, make_tensor(dtype, {128}, 37));
   return bindings;
+}
+
+// Shared-reduction reuse must be barrier-separated. The generic two-pass
+// layer_norm kernels once read `reduction[0]` (the mean) and then let thread 0
+// overwrite `reduction[0]` with its second-pass partial before a delayed warp
+// had read the mean: a timing-dependent race that only surfaced under GPU
+// contention (H3 VAE decode, one tile per ~600 executions). This scans every
+// emitted kernel: a write to the shared reduction buffer that may alias a read
+// made since the last __syncthreads() fails. Two integer-literal indices alias
+// only when equal; any variable index may alias anything. A full-mask warp
+// shuffle also clears the reads: the emitters only shuffle inside warp-confined
+// tail reductions (`if(warp==0U){...}`), where the shuffle's data dependency
+// orders the reads before the lane-0 write.
+bool is_integer_literal(const std::string &text) {
+  if (text.empty())
+    return false;
+  for (const auto character : text)
+    if (!std::isdigit(static_cast<unsigned char>(character)) &&
+        character != 'U' && character != 'L')
+      return false;
+  return true;
+}
+
+bool reduction_reuse_is_barrier_separated(const std::string &kernel,
+                                          std::string *violation) {
+  static const char *const buffers[] = {"reduction[", "means[", "sigmas[",
+                                        "counts[", "meansigma["};
+  static const char *const clears[] = {"__syncthreads()", "__shfl_down_sync(",
+                                       "__shfl_xor_sync(", "__shfl_sync("};
+  std::vector<std::string> reads_since_barrier;
+  std::size_t position = 0;
+  while (position < kernel.size()) {
+    std::size_t clear = std::string::npos;
+    for (const auto *token : clears) {
+      const auto found = kernel.find(token, position);
+      if (found != std::string::npos && found < clear)
+        clear = found;
+    }
+    std::size_t next_access = std::string::npos;
+    const char *buffer_name = nullptr;
+    for (const auto *buffer : buffers) {
+      const auto found = kernel.find(buffer, position);
+      if (found != std::string::npos && found < next_access) {
+        next_access = found;
+        buffer_name = buffer;
+      }
+    }
+    if (next_access == std::string::npos)
+      return true;
+    if (clear != std::string::npos && clear < next_access) {
+      reads_since_barrier.clear();
+      position = clear + 1U;
+      continue;
+    }
+    if (next_access > 0U &&
+        (std::isalnum(static_cast<unsigned char>(kernel[next_access - 1U])) ||
+         kernel[next_access - 1U] == '_')) {
+      position = next_access + 1U;
+      continue;
+    }
+    const auto open = kernel.find('[', next_access);
+    const auto close = kernel.find(']', open);
+    if (close == std::string::npos)
+      return true;
+    position = close + 1U;
+    if (close == open + 1U)
+      continue; // `extern __shared__ float reduction[];` declaration
+    const auto index = std::string(buffer_name) + kernel.substr(open + 1U, close - open - 1U);
+    auto after = close + 1U;
+    while (after < kernel.size() && kernel[after] == ' ')
+      ++after;
+    const bool assignment = after < kernel.size() && kernel[after] == '=' &&
+                            !(after + 1U < kernel.size() && kernel[after + 1U] == '=');
+    const bool compound = after + 1U < kernel.size() && kernel[after + 1U] == '=' &&
+                          (kernel[after] == '+' || kernel[after] == '-' ||
+                           kernel[after] == '*');
+    if (!(assignment || compound)) {
+      reads_since_barrier.push_back(index);
+      continue;
+    }
+    const auto write_offset = index.substr(std::strlen(buffer_name));
+    for (const auto &read : reads_since_barrier) {
+      if (read.compare(0, std::strlen(buffer_name), buffer_name) != 0)
+        continue;
+      const auto read_offset = read.substr(std::strlen(buffer_name));
+      if (is_integer_literal(read_offset) && is_integer_literal(write_offset) &&
+          read_offset != write_offset)
+        continue;
+      *violation = "read " + read + " then wrote " + index + ": `" +
+                   kernel.substr(next_access, 40U) + "`";
+      return false;
+    }
+  }
+  return true;
+}
+
+void test_shared_reduction_reuse_has_barrier() {
+  using namespace dif::ir;
+  constexpr std::uint64_t rows = 64U;
+  constexpr std::uint64_t columns = 2048U;
+  Program program;
+  program.tensors = {
+      {1U, DType::F32, TensorRole::Input, {rows, columns}},
+      {2U, DType::F32, TensorRole::Constant, {columns}},
+      {3U, DType::F32, TensorRole::Constant, {columns}},
+      {4U, DType::F32, TensorRole::Output, {rows, columns}},
+      {5U, DType::F32, TensorRole::Constant, {1U, columns}},
+      {6U, DType::F32, TensorRole::Constant, {1U, columns}},
+      {7U, DType::F32, TensorRole::Output, {rows, columns}},
+      {8U, DType::F32, TensorRole::Output, {rows, columns}},
+      {9U, DType::BF16, TensorRole::Input, {rows, columns}},
+      {10U, DType::BF16, TensorRole::Constant, {columns}},
+      {11U, DType::BF16, TensorRole::Constant, {columns}},
+      {12U, DType::BF16, TensorRole::Output, {rows, columns}},
+      {13U, DType::BF16, TensorRole::Output, {rows, columns}},
+      {14U, DType::BF16, TensorRole::Input, {rows, 6144U}},
+      {15U, DType::BF16, TensorRole::Constant, {6144U}},
+      {16U, DType::BF16, TensorRole::Output, {rows, 6144U}},
+      {17U, DType::BF16, TensorRole::Output, {rows, 6144U}},
+      {18U, DType::BF16, TensorRole::Input, {rows, 128U}},
+      {19U, DType::BF16, TensorRole::Constant, {128U}},
+      {20U, DType::BF16, TensorRole::Output, {rows, 128U}},
+      {21U, DType::BF16, TensorRole::Output, {rows, 128U}},
+  };
+  program.operations = {
+      {1U, Opcode::LayerNorm, {1U, 2U, 3U}, {4U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 256U)}},
+      {2U, Opcode::LayerNormModulate, {1U, 2U, 3U, 5U, 6U}, {7U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 256U)}},
+      {3U, Opcode::RmsNorm, {1U, 2U}, {8U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 256U)}},
+      {4U, Opcode::LayerNorm, {9U, 10U, 11U}, {12U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 128U)}},
+      {5U, Opcode::RmsNorm, {9U, 10U}, {13U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 128U)}},
+      {6U, Opcode::RmsNorm, {14U, 15U}, {16U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 512U),
+        Attribute::u64(AttrKey::ReductionTileSize, 8192U)}},
+      {7U, Opcode::RmsNorm, {14U, 15U}, {17U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 512U),
+        Attribute::u64(AttrKey::ReductionTileSize, 2048U)}},
+      {8U, Opcode::RmsNorm, {18U, 19U}, {20U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 128U)}},
+      {9U, Opcode::RmsNorm, {18U, 19U}, {21U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::BlockSize, 128U),
+        Attribute::u64(AttrKey::Implementation, 2U)}},
+  };
+  dif::ir::verify(program);
+  const auto generated = dif::compiler::emit_cuda(program);
+  const auto &source = generated.source;
+  std::size_t kernels = 0;
+  std::size_t begin = source.find("__global__ void");
+  while (begin != std::string::npos) {
+    const auto end = source.find("__global__ void", begin + 1U);
+    const auto kernel = source.substr(begin, end == std::string::npos
+                                                 ? std::string::npos
+                                                 : end - begin);
+    ++kernels;
+    std::string violation;
+    const bool separated = reduction_reuse_is_barrier_separated(kernel, &violation);
+    expect(separated, "shared reduction buffer may be rewritten after a read with "
+                      "no barrier in kernel " + kernel.substr(16U, 32U) + ": " +
+                      violation);
+    begin = end;
+  }
+  expect(kernels >= 9U, "norm program emitted one kernel per norm op");
+  // The checker itself must catch the original defect text.
+  std::string bad_kernel =
+      "__global__ void k(){extern __shared__ float reduction[];"
+      "reduction[threadIdx.x]=local;__syncthreads();"
+      "float mean=reduction[0]/2048.0f;local=0.0f;"
+      "reduction[threadIdx.x]=local;__syncthreads();}";
+  std::string violation;
+  expect(!reduction_reuse_is_barrier_separated(bad_kernel, &violation),
+         "checker flags a read-then-rewrite of the reduction buffer without a barrier");
+  std::string good_kernel =
+      "__global__ void k(){extern __shared__ float reduction[];"
+      "reduction[threadIdx.x]=local;__syncthreads();"
+      "float mean=reduction[0]/2048.0f;__syncthreads();local=0.0f;"
+      "reduction[threadIdx.x]=local;__syncthreads();"
+      "if(threadIdx.x<stride)reduction[threadIdx.x]+=reduction[threadIdx.x+stride];__syncthreads();}";
+  expect(reduction_reuse_is_barrier_separated(good_kernel, &violation),
+         "checker accepts barrier-separated reuse and in-loop tree reductions");
 }
 
 void test_detection_and_emission() {
@@ -547,6 +740,7 @@ int main() {
   test_byte_identity_contraction_hazard();
   test_byte_identity_swiglu_and_cast();
   test_composed_dit_block_program();
+  test_shared_reduction_reuse_has_barrier();
   if (!dif::runtime::cuda_available())
     std::cout << "NOTE: CUDA unavailable; GPU byte-identity gates skipped\n";
   if (failures != 0) {
