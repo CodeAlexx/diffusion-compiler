@@ -175,6 +175,8 @@ Array operation_timings_section(
     entry.set("mean_ms", timing.mean_milliseconds);
     entry.set("min_ms", timing.minimum_milliseconds);
     entry.set("max_ms", timing.maximum_milliseconds);
+    if (!timing.plan.empty())
+      entry.set("plan", timing.plan);
     out.push_back(std::move(entry));
   }
   return out;
@@ -264,6 +266,7 @@ Object runtime_trace_document(const runtime::RunResult &result,
   execution.set("warmups", options.warmups);
   execution.set("iterations", options.iterations);
   execution.set("preparation_ms", result.preparation_milliseconds);
+  execution.set("preparation_reported", result.preparation_reported);
   execution.set("mean_ms", result.mean_milliseconds);
   execution.set("min_ms", result.minimum_milliseconds);
   execution.set("max_ms", result.maximum_milliseconds);

@@ -5674,11 +5674,19 @@ void upload_h3_w8a8_weights(const H3W8A8MlpPlan &plan, CUstream stream) {
 using H3HostCopy =
     std::function<void(std::uint8_t *, const std::uint8_t *, std::size_t)>;
 
-void evict_h3_w8a8_weights(const H3W8A8MlpPlan &plan) {
-  plan.fc1_weight.evict_mapped_pages();
-  plan.fc1_scale.evict_mapped_pages();
-  plan.fc2_weight.evict_mapped_pages();
-  plan.fc2_scale.evict_mapped_pages();
+template <class T>
+void release_resident_host_pages(const T &tensor, bool evict) {
+  if (evict)
+    tensor.evict_mapped_pages();
+  else
+    tensor.discard_mapped_pages();
+}
+
+void evict_h3_w8a8_weights(const H3W8A8MlpPlan &plan, bool evict) {
+  release_resident_host_pages(plan.fc1_weight, evict);
+  release_resident_host_pages(plan.fc1_scale, evict);
+  release_resident_host_pages(plan.fc2_weight, evict);
+  release_resident_host_pages(plan.fc2_scale, evict);
 }
 
 std::uint64_t stage_h3_w8a8_weights(const H3W8A8MlpPlan &plan,
@@ -5794,14 +5802,14 @@ void upload_h3_w8a8_weights(const H3W8A8AttentionPlan &plan,
   }
 }
 
-void evict_h3_w8a8_weights(const H3W8A8AttentionPlan &plan) {
+void evict_h3_w8a8_weights(const H3W8A8AttentionPlan &plan, bool evict) {
   if (plan.has_qkv_projection) {
-    plan.qkv_weight.evict_mapped_pages();
-    plan.qkv_scale.evict_mapped_pages();
+    release_resident_host_pages(plan.qkv_weight, evict);
+    release_resident_host_pages(plan.qkv_scale, evict);
   }
   if (plan.has_output_projection) {
-    plan.output_weight.evict_mapped_pages();
-    plan.output_scale.evict_mapped_pages();
+    release_resident_host_pages(plan.output_weight, evict);
+    release_resident_host_pages(plan.output_scale, evict);
   }
 }
 
@@ -9805,32 +9813,83 @@ public:
             options.linear_tuning_sessions));
       }
     }
+    // Fused plans execute at the slot of an operation whose own opcode no
+    // longer describes the work; label those timings so consumers do not
+    // classify a projection GEMM as a layout op.
+    operation_plan_labels_.clear();
+    for (const auto &plan : h3_w8a8_attention_plans_)
+      if (plan.has_qkv_projection)
+        operation_plan_labels_[plan.qkv_layout_operation] =
+            "h3-int8-qkv-projection";
+    // Host file-cache policy for the weights that are now GPU resident.
+    // The bytes below are what a later fresh process would otherwise reread
+    // from storage; keeping them is only admitted when the process' cgroup
+    // memory limit can hold the charge (page cache is charged to the cgroup).
+    resident_evict_host_pages_ = options.resident_evict_host_pages;
+    if (!resident_evict_host_pages_) {
+      std::uint64_t resident_host_bytes = 0U;
+      for (const auto &description : program_.tensors)
+        if (description.has_role(ir::TensorRole::Constant) &&
+            !description.has_role(ir::TensorRole::Streamed))
+          resident_host_bytes += constants_.at(description.id).byte_size();
+      for (const auto id : promoted_streamed_constants_)
+        resident_host_bytes += constants_.at(id).byte_size();
+      for (const auto &plan : h3_w8a8_mlp_plans_)
+        if (plan.resident)
+          resident_host_bytes += plan.fc1_weight.byte_size() +
+                                 plan.fc2_weight.byte_size();
+      for (const auto &plan : h3_w8a8_attention_plans_)
+        if (plan.resident)
+          resident_host_bytes +=
+              (plan.has_qkv_projection ? plan.qkv_weight.byte_size() : 0U) +
+              (plan.has_output_projection ? plan.output_weight.byte_size()
+                                          : 0U);
+      const auto cgroup = probe_host_cgroup_memory();
+      constexpr std::uint64_t margin = 512ULL * 1024ULL * 1024ULL;
+      const bool admitted =
+          cgroup.limit_bytes == 0U ||
+          cgroup.limit_bytes >= cgroup.current_bytes + resident_host_bytes +
+                                    margin;
+      if (!admitted)
+        resident_evict_host_pages_ = true;
+      std::cerr << "RESIDENT_HOST_PAGES policy=keep decision="
+                << (admitted ? "keep" : "evict")
+                << " reason=" << (admitted ? "admitted" : "cgroup_limit")
+                << " resident_host_bytes=" << resident_host_bytes
+                << " cgroup_limit_bytes=" << cgroup.limit_bytes
+                << " cgroup_current_bytes=" << cgroup.current_bytes << '\n';
+    }
     for (const auto &description : program_.tensors) {
       if (description.has_role(ir::TensorRole::Constant) &&
           !description.has_role(ir::TensorRole::Streamed))
-        constants_.at(description.id).evict_mapped_pages();
+        release_resident_host_pages(constants_.at(description.id),
+                                    resident_evict_host_pages_);
     }
     if (!options.lazy_resident_upload)
       for (const auto id : promoted_streamed_constants_)
-        constants_.at(id).evict_mapped_pages();
+        release_resident_host_pages(constants_.at(id),
+                                    resident_evict_host_pages_);
     for (auto &plan : h3_w8a8_mlp_plans_) {
       if (!plan.uploaded)
         continue;
-      evict_h3_w8a8_weights(plan);
+      evict_h3_w8a8_weights(plan, resident_evict_host_pages_);
     }
     for (auto &plan : h3_w8a8_attention_plans_) {
       if (!plan.uploaded)
         continue;
-      evict_h3_w8a8_weights(plan);
+      evict_h3_w8a8_weights(plan, resident_evict_host_pages_);
     }
     for (auto &plan : h3_groupwise_plans_) {
       for (auto &projection : plan.projections) {
-        projection.weight.evict_mapped_pages();
-        projection.scale.evict_mapped_pages();
+        release_resident_host_pages(projection.weight,
+                                    resident_evict_host_pages_);
+        release_resident_host_pages(projection.scale,
+                                    resident_evict_host_pages_);
       }
     }
     for (auto &plan : h3_modulation_cache_plans_)
-      plan.modulation.evict_mapped_pages();
+      release_resident_host_pages(plan.modulation,
+                                  resident_evict_host_pages_);
     const auto preparation_stop = std::chrono::steady_clock::now();
     preparation_milliseconds_ =
         std::chrono::duration<double, std::milli>(preparation_stop -
@@ -9996,7 +10055,7 @@ public:
           plan, staging, h3_w8a8_tail_stage_half_bytes_, tail_stream,
           h3_tail_host_copy);
       if (populate_resident) {
-        evict_h3_w8a8_weights(plan);
+        evict_h3_w8a8_weights(plan, resident_evict_host_pages_);
         plan.uploaded = true;
       }
       if (profile) {
@@ -10870,7 +10929,7 @@ public:
                 program_.operations[operation_index].id)) {
           result.operation_timings.push_back(
               {program_.operations[operation_index].id,
-               program_.operations[operation_index].opcode, 0.0, 0.0, 0.0});
+               program_.operations[operation_index].opcode, 0.0, 0.0, 0.0, std::string{}});
           continue;
         }
         std::vector<double> operation_elapsed;
@@ -10907,7 +10966,7 @@ public:
              *std::min_element(operation_elapsed.begin(),
                                operation_elapsed.end()),
              *std::max_element(operation_elapsed.begin(),
-                               operation_elapsed.end())});
+                               operation_elapsed.end()), std::string{}});
       }
       result.pipeline_profile.operation_kernel_milliseconds = kernel_total;
       result.pipeline_profile.attention_kernel_milliseconds = attention_total;
@@ -10960,7 +11019,7 @@ public:
                *std::min_element(operation_elapsed.begin(),
                                  operation_elapsed.end()),
                *std::max_element(operation_elapsed.begin(),
-                                 operation_elapsed.end())});
+                                 operation_elapsed.end()), std::string{}});
       }
     }
 
@@ -11038,11 +11097,20 @@ public:
       print("run", run_telemetry);
     }
     nvtx_pop();
+    for (auto &timing : result.operation_timings)
+      if (const auto label = operation_plan_labels_.find(timing.operation_id);
+          label != operation_plan_labels_.end())
+        timing.plan = label->second;
+    result.preparation_reported = !preparation_reported_;
+    preparation_reported_ = true;
     if (tracing) {
       result.trace_milliseconds = run_tracer.now_ms();
       result.trace_events = std::move(run_tracer.events);
-      result.preparation_trace_events = preparation_tracer_.events;
-      result.preparation_trace_milliseconds = preparation_trace_milliseconds_;
+      if (result.preparation_reported) {
+        result.preparation_trace_events = preparation_tracer_.events;
+        result.preparation_trace_milliseconds =
+            preparation_trace_milliseconds_;
+      }
     }
     telemetry::append_runtime_trace(result, program_, options);
     return result;
@@ -11238,6 +11306,9 @@ private:
   CUdeviceptr convrot_activation_scale_device_{};
   CUdeviceptr convrot_quality_weight_device_{};
   bool convrot_weight_only_quality_{};
+  bool resident_evict_host_pages_{true};
+  bool preparation_reported_{false};
+  std::unordered_map<std::uint32_t, std::string> operation_plan_labels_;
   bool convrot_resident_{};
   std::uint64_t convrot_weight_slot_bytes_{};
   std::uint64_t convrot_weight_bytes_{};

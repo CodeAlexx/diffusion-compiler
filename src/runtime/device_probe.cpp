@@ -47,6 +47,18 @@ std::uint64_t available_host_memory() {
   return checked_scale(info.freeram + info.bufferram, info.mem_unit);
 }
 
+std::uint64_t read_cgroup_value(const std::string &path) {
+  std::ifstream input(path);
+  std::string token;
+  if (!(input >> token) || token == "max")
+    return 0U;
+  try {
+    return static_cast<std::uint64_t>(std::stoull(token));
+  } catch (...) {
+    return 0U;
+  }
+}
+
 std::uint64_t total_host_memory() {
   struct sysinfo info {};
   if (sysinfo(&info) != 0)
@@ -105,6 +117,37 @@ CUdevice cuda_device(int ordinal) {
 #endif
 
 } // namespace
+
+HostCgroupMemory probe_host_cgroup_memory() {
+  HostCgroupMemory result;
+  std::ifstream input("/proc/self/cgroup");
+  std::string line;
+  std::string relative;
+  while (std::getline(input, line)) {
+    if (line.rfind("0::", 0) == 0) {
+      relative = line.substr(3);
+      break;
+    }
+  }
+  if (relative.empty())
+    return result;
+  const std::string root = "/sys/fs/cgroup";
+  result.current_bytes = read_cgroup_value(root + relative + "/memory.current");
+  auto path = relative;
+  while (!path.empty()) {
+    for (const char *file : {"/memory.max", "/memory.high"}) {
+      const auto value = read_cgroup_value(root + path + file);
+      if (value != 0U &&
+          (result.limit_bytes == 0U || value < result.limit_bytes))
+        result.limit_bytes = value;
+    }
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0U)
+      break;
+    path.resize(slash);
+  }
+  return result;
+}
 
 target::TargetProfile probe_target(ProbeBackend backend, int device_ordinal) {
   target::TargetProfile profile;

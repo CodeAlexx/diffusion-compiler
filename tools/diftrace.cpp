@@ -25,6 +25,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <variant>
 #include <unistd.h>
 #include <vector>
 
@@ -161,8 +162,17 @@ void accumulate_launches(dif::runtime::LaunchTelemetry &into,
 void accumulate_document(StageAggregate &aggregate,
                          const dif::json::Value &document) {
   ++aggregate.documents;
+  // A prepared execution that runs many times emits one document per run,
+  // each describing the same one-time preparation; count it once. Documents
+  // without the flag (older writers) keep the historical per-document sum.
+  bool preparation_reported = true;
   if (const auto *execution = document.find("execution")) {
-    aggregate.preparation_ms += number_or_zero(*execution, "preparation_ms");
+    if (const auto *flag = execution->find("preparation_reported");
+        flag && std::holds_alternative<bool>(flag->storage))
+      preparation_reported = flag->boolean();
+    if (preparation_reported)
+      aggregate.preparation_ms +=
+          number_or_zero(*execution, "preparation_ms");
     aggregate.mean_ms_sum += number_or_zero(*execution, "mean_ms");
     aggregate.iterations += count_or_zero(*execution, "iterations");
   }
@@ -170,8 +180,9 @@ void accumulate_document(StageAggregate &aggregate,
     aggregate.run_wall_ms += number_or_zero(*trace, "run_wall_ms");
     accumulate_buckets(aggregate.run_attribution,
                        trace->find("run_attribution"));
-    accumulate_buckets(aggregate.preparation_attribution,
-                       trace->find("preparation_attribution"));
+    if (preparation_reported)
+      accumulate_buckets(aggregate.preparation_attribution,
+                         trace->find("preparation_attribution"));
     if (const auto *events = trace->find("run_events");
         events && events->is_array()) {
       for (const auto &event : events->array()) {

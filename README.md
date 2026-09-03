@@ -122,7 +122,25 @@ attribution vocabulary (`include/dif/telemetry/vocabulary.hpp`).
   submitted them, and pushes NVTX ranges (`dif::prepare`, `dif::run`,
   `op<id> <opcode>`) for Nsight Systems correlation. Any tool can be traced
   without new flags: `DIF_TRACE_FILE=path` appends one `runtime-trace`
-  document per execution; `DIF_NVTX=1` enables the ranges.
+  document per execution; `DIF_NVTX=1` enables the ranges. A prepared
+  execution that runs many times emits one document per run; only the first
+  carries `execution.preparation_reported = true`, and `diftrace` counts the
+  one-time preparation once. Operation timings carry a `plan` label when a
+  fused backend plan executed at that operation's slot (for example the H3
+  INT8 QKV projection at the QKV weight layout op), so consumers do not
+  classify a projection GEMM as layout.
+- Host file-cache policy for GPU-resident weights is explicit runtime policy,
+  not an accident of the loader. The historical default releases each
+  resident weight's mapped range with `posix_fadvise(DONTNEED)` after the
+  upload, so every fresh process rereads those bytes from storage.
+  `RunOptions::resident_evict_host_pages = false` (`difh3infer
+  --keep-resident-host-pages`) keeps the clean, reclaimable pages so a later
+  process on the same host stages them from cache, the way a warm server
+  keeps weights in RAM; outputs are byte-identical. The runtime discovers the
+  process' effective cgroup-v2 memory limit and charge
+  (`probe_host_cgroup_memory`) and fails closed to eviction when the limit
+  cannot hold the resident bytes, printing a `RESIDENT_HOST_PAGES` line with
+  the facts it used. The choice is candidate identity for `difopt`.
 - `difplan show|diff|residency|explain tensor|op` reads `.difplan` files and
   the decisions the compiler recorded while planning: streamed-residency
   admission arithmetic from the residency planner, every measured candidate's

@@ -277,6 +277,17 @@ struct RunOptions {
   // overlap this one-time upload with model compute; later executions reuse
   // the populated storage without another transfer.
   bool lazy_resident_upload{false};
+  // Host file-cache policy for weights that became GPU resident. Default
+  // (true) preserves the historical behavior: after a resident upload the
+  // mapped range is released with posix_fadvise(DONTNEED), so every fresh
+  // process rereads those bytes from storage. False keeps the clean,
+  // reclaimable file-cache pages (the mapping itself is still dropped), so
+  // a later process on the same host stages them from cache. Outputs are
+  // byte-identical either way; only host paging changes. The runtime fails
+  // closed to eviction when the process' cgroup memory limit cannot hold the
+  // resident bytes (RESIDENT_HOST_PAGES diagnostic on stderr). Any
+  // non-default choice must enter difopt candidate identity.
+  bool resident_evict_host_pages{true};
   // Upper bound on pinned host memory the streamed staging ring may
   // allocate. The historical two-buffer footprint is always admitted; a
   // larger ring that would exceed the budget fails closed. This host has
@@ -300,6 +311,11 @@ struct OperationTiming {
   double mean_milliseconds{};
   double minimum_milliseconds{};
   double maximum_milliseconds{};
+  // Non-empty when the backend executed a fused plan at this operation's
+  // slot instead of the operation's own opcode (for example the H3 INT8 QKV
+  // projection launched where the QKV weight layout op sits). Consumers
+  // must not classify such a timing by opcode alone.
+  std::string plan;
 };
 
 struct LinearAlgorithmTiming {
@@ -573,6 +589,11 @@ struct RunResult {
   std::vector<TraceEvent> trace_events;
   double preparation_trace_milliseconds{};
   double trace_milliseconds{};
+  // True for the first run() result after prepare(); later results of the
+  // same prepared execution describe the same one-time preparation, so
+  // report consumers must count preparation once. CPU executors leave this
+  // true on every result.
+  bool preparation_reported{true};
 };
 
 class PreparedExecution {
