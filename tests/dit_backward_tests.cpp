@@ -741,11 +741,18 @@ void test_kv_heads_fingerprint_stability() {
   dif::frontend::DitBlockTrainingConfig config;
   config.blocks = 2U;
   const auto build = dif::frontend::make_dit_block_training(config);
-  expect(dif::hex_digest(dif::ir::fingerprint(build.program)) ==
-             "364d809dd3f8098b5fd8a1074e4fd0f6be96ea6e49108cdf1b311d442a3"
-             "99c91",
-         "KvHeads-absent programs keep the recorded pre-GQA fingerprint "
-         "(2026-08-31 composed-gate constant)");
+  const auto actual_fingerprint =
+      dif::hex_digest(dif::ir::fingerprint(build.program));
+  // Recorded 2026-08-31 as 364d809d...99c91; re-recorded 2026-09-03 after the
+  // deterministic gradient fan-in (8fc5283) changed the order in which the
+  // backward emits its multi-use Add chains (consumer-id order). The GQA
+  // change itself left KvHeads-absent programs untouched, which this still
+  // checks against the post-fan-in constant.
+  expect(actual_fingerprint ==
+             "8a2f5d800026b3b5f81443c8acf35814dc02bc0bf9d58abe882c7aafb6dc"
+             "969f",
+         "KvHeads-absent programs keep the recorded fingerprint "
+         "(2026-09-03 composed-gate constant) actual=" + actual_fingerprint);
 }
 
 void test_dit_block_builder() {

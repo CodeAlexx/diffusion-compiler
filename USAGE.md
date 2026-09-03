@@ -674,7 +674,6 @@ difh3infer --backend cpu|cuda --sampler euler|res_multistep
            [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune]
            [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N]
            [--h3-int8-compact-adaln] [--h3-cache-text-refiner]
-           [--h3-step-residual-cache --h3-step-residual-front-blocks N --h3-step-residual-back-blocks N --h3-step-residual-reuse-step N ...]
            [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune]
            [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]]
            [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--h3-int8-attention-first-step N]
@@ -710,8 +709,7 @@ blocks from `--h3-int8-attention-first-layer` with the project-owned INT8
 attention library; blocks outside the range stay on exact cuDNN.
 `--h3-modulation-cache` uses a `difmodcache` file instead of running the
 timestep MLP. `--h3-cache-text-refiner` runs the text refiner once and
-reuses it across evaluations. `--h3-step-residual-cache` is an experimental,
-opt-in cross-step residual reuse and is reported separately.
+reuses it across evaluations.
 `--max-evaluations` truncates the sampler for diagnostics; `--capture-denoiser-*`
 copies named tensors during the first evaluation for `difbisect`.
 
