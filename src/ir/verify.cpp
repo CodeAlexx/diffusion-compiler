@@ -27,7 +27,7 @@ bool valid_opcode(Opcode opcode) {
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::MaskQueries;
+  return key >= AttrKey::Epsilon && key <= AttrKey::ClipScale;
 }
 
 bool valid_attr_kind(AttrKind kind) {
@@ -460,11 +460,12 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto beta2 = op.f64(AttrKey::Beta2, 0.999);
     const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-8);
     const auto weight_decay = op.f64(AttrKey::WeightDecay, 0.0);
+    const auto clip_scale = op.f64(AttrKey::ClipScale, 1.0);
     if (step.dtype != DType::I32 ||
         step.dims != std::vector<std::uint64_t>{1U} ||
         !(learning_rate > 0.0) || beta1 < 0.0 || beta1 >= 1.0 ||
         beta2 < 0.0 || beta2 >= 1.0 || !(epsilon > 0.0) ||
-        weight_decay < 0.0)
+        weight_decay < 0.0 || !(clip_scale > 0.0) || clip_scale > 1.0)
       fail("adamw_update has an invalid step or hyperparameters");
     return;
   }

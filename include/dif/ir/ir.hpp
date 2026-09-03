@@ -253,6 +253,11 @@ enum class AttrKey : std::uint32_t {
   // invalid query and key rows; false masks keys only, matching causal language
   // model padding where padded query states remain observable.
   MaskQueries = 73,
+  // AdamWUpdate: multiplier applied to the gradient before the moment
+  // updates (gradient clipping folded into the optimizer kernel, Mojo
+  // lora_adamw_plain_fused lesson: a free per-element multiply instead of a
+  // host pass). Default 1.0 is a provable no-op.
+  ClipScale = 74,
 };
 
 // Gelu carries an explicit approximation because exact-erf and tanh GELU are

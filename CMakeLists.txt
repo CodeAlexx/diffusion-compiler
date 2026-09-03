@@ -474,6 +474,10 @@ if(DIF_BUILD_TESTS)
   add_dependencies(dif_quality_tests difquality difregress difbisect)
   add_test(NAME dif_quality_tests COMMAND dif_quality_tests)
 
+  add_executable(dif_optimizer_tests tests/optimizer_tests.cpp)
+  target_link_libraries(dif_optimizer_tests PRIVATE difcore)
+  add_test(NAME dif_optimizer_tests COMMAND dif_optimizer_tests)
+
   add_executable(dif_bench_tests tests/bench_tests.cpp)
   target_link_libraries(dif_bench_tests PRIVATE difcore)
   add_test(NAME dif_bench_tests COMMAND dif_bench_tests)

@@ -1341,6 +1341,8 @@ void emit_adamw_update(std::ostringstream &out, const ir::Program &program,
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-8));
   const auto weight_decay =
       static_cast<float>(op.f64(ir::AttrKey::WeightDecay, 0.0));
+  const auto clip_scale =
+      static_cast<float>(op.f64(ir::AttrKey::ClipScale, 1.0));
   // Parameter and gradient storage are typed independently (verifier admits
   // F32/BF16 for each); moments are F32 always.  Every intermediate is an
   // F32 register; the decoupled decay multiplies the parameter BEFORE the
@@ -1359,7 +1361,8 @@ void emit_adamw_update(std::ostringstream &out, const ir::Program &program,
       << count << "ULL){float step=(float)(completed_steps[0]+1),beta1="
       << beta1 << "f,beta2=" << beta2
       << "f;float grad=" << typed_load(gradient->dtype)
-      << "(gradient,i);float m=beta1*dif_load_f32(first,i)+(1.0f-beta1)*grad;"
+      << "(gradient,i)*" << clip_scale
+      << "f;float m=beta1*dif_load_f32(first,i)+(1.0f-beta1)*grad;"
          "float v=beta2*dif_load_f32(second,i)+(1.0f-beta2)*grad*grad;float bias1=1.0f-powf(beta1,step);"
          "float bias2_sqrt=sqrtf(1.0f-powf(beta2,step));float decayed="
       << typed_load(parameter->dtype) << "(parameter,i)*(1.0f-"

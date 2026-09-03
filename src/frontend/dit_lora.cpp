@@ -316,6 +316,17 @@ make_dit_lora_training(const DitLoraTrainingConfig &config) {
     build.optimizer_bindings.push_back(binding);
   }
   ir::verify(build.program);
+  // Flame lesson (FLUX_SKEPTIC: 152 adapters shipped against 418 canonical,
+  // a 64% miss): the adapter set is a declarative contract, asserted here.
+  constexpr std::size_t sites_per_block = 6U;
+  if (build.adapters.size() != config.blocks * sites_per_block ||
+      build.optimizer_bindings.size() != build.adapters.size() * 2U)
+    fail("DiT LoRA builder produced " + std::to_string(build.adapters.size()) +
+         " adapters and " + std::to_string(build.optimizer_bindings.size()) +
+         " optimizer bindings; the canonical contract is " +
+         std::to_string(config.blocks * sites_per_block) + " adapters (" +
+         std::to_string(sites_per_block) + " sites x " +
+         std::to_string(config.blocks) + " blocks) and two bindings each");
   return build;
 }
 

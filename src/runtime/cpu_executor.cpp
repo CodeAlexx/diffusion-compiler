@@ -762,10 +762,12 @@ void adamw_update(const ir::Operation &op, TensorMap &tensors) {
       static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-8));
   const auto weight_decay =
       static_cast<float>(op.f64(ir::AttrKey::WeightDecay, 0.0));
+  const auto clip_scale =
+      static_cast<float>(op.f64(ir::AttrKey::ClipScale, 1.0));
   const auto bias1 = 1.0F - std::pow(beta1, step);
   const auto bias2_sqrt = std::sqrt(1.0F - std::pow(beta2, step));
   for (std::uint64_t index = 0U; index < parameter.element_count(); ++index) {
-    const auto grad = load_float(gradient, index);
+    const auto grad = load_float(gradient, index) * clip_scale;
     const auto first_value =
         beta1 * load_float(first, index) + (1.0F - beta1) * grad;
     const auto second_value = beta2 * load_float(second, index) +
