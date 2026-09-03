@@ -8585,10 +8585,12 @@ public:
     std::unordered_map<CudnnConv3dKey, std::shared_ptr<CudnnConv3dPlan>,
                        CudnnConv3dKeyHash>
         cudnn_conv3d_plan_cache;
+    h3_int8_attention_hybrid_ = options.h3_int8_attention_hybrid;
     for (const auto &op : program_.operations) {
       if (op.opcode != ir::Opcode::Attention ||
           op.u64(ir::AttrKey::Implementation, 1U) != 2U ||
-          h3_ck_attention_plans_.contains(op.id))
+          (h3_ck_attention_plans_.contains(op.id) &&
+           !options.h3_int8_attention_hybrid))
         continue;
       const auto *query = program_.tensor(op.inputs.at(0));
       if (!query)
@@ -10830,7 +10832,14 @@ public:
                 : op,
             buffers_, context_.cublas_lt(), *workspace_, context_.stream());
       } else if (op.opcode == ir::Opcode::Attention &&
-               h3_ck_attention_plans_.contains(op.id)) {
+               h3_ck_attention_plans_.contains(op.id) &&
+               (options.h3_int8_attention_active ||
+                (!h3_int8_attention_hybrid_ &&
+                 [&] {
+                   fail("exact attention for this run requires "
+                        "h3_int8_attention_hybrid at prepare");
+                   return false;
+                 }()))) {
         count_ck_attention_dispatch();
         h3_ck_attention_plans_.at(op.id)->execute(op, buffers_,
                                                   context_.stream());
@@ -11905,6 +11914,7 @@ private:
   std::size_t cudnn_workspace_bytes_{};
   std::uint64_t materialized_f32_attention_score_bytes_{};
   std::uint64_t ck_attention_scratch_bytes_{};
+  bool h3_int8_attention_hybrid_{false};
   std::uint64_t h3_w8a8_tail_attention_bytes_{};
   std::uint64_t h3_w8a8_tail_mlp_bytes_{};
   std::uint64_t h3_w8a8_tail_weight_bytes_{};

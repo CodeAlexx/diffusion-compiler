@@ -242,6 +242,14 @@ struct RunOptions {
   std::uint32_t h3_int8_attention_first_layer{};
   std::uint32_t h3_int8_attention_layers{
       std::numeric_limits<std::uint32_t>::max()};
+  // Prepare-time: also build the exact cuDNN plan for every Attention the
+  // INT8 route replaces, so a run can choose the route. Run-time:
+  // h3_int8_attention_active false sends those operations to the exact
+  // plan for that run (fails closed unless the hybrid was prepared). Lets a
+  // sampler run exact attention on the trajectory-setting early evaluations
+  // and the approximate route on the rest.
+  bool h3_int8_attention_hybrid{false};
+  bool h3_int8_attention_active{true};
   std::uint32_t linear_tuning_warmups{3};
   std::uint32_t linear_tuning_iterations{10};
   std::uint32_t linear_tuning_sessions{3};

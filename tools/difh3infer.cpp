@@ -66,6 +66,9 @@ struct Options {
   bool h3_owned_attention_center_k{false};
   std::uint64_t h3_resident_readahead_mib{std::numeric_limits<std::uint64_t>::max()};
   bool h3_resident_mapped_copy{false}; // --h3-resident-mapped-copy: no direct IO
+  // --h3-int8-attention-first-step N: evaluations before N run exact cuDNN
+  // attention, later ones the INT8 route.
+  std::uint32_t h3_int8_attention_first_step{};
   // Persistent denoiser: --serve SOCKET keeps this process alive after the
   // first request and serves further requests over a Unix socket with the
   // prepared denoiser and its resident weights kept on the device.
@@ -143,7 +146,7 @@ std::uint64_t number(const std::string &text, const char *label) {
 
 void usage() {
   std::cerr
-      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--h3-resident-readahead-mib N] [--h3-resident-mapped-copy] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]\n";
+      << "usage: difh3infer --backend cpu|cuda --sampler euler|res_multistep --denoiser-program FILE.difir --denoiser-bundle FILE.difbind (--text-tags FILE.diftensor | --all-text-tokens N) --text FILE.diftensor --video FILE.diftensor --audio FILE.diftensor (--simple-steps N | --schedule-points N | --video-sigmas FILE.diftensor --audio-sigmas FILE.diftensor) --latent-t N --latent-h N --latent-w N --audio-latents N [--keyframes none|first|last|first-last | --reference-geometry KIND:T:H:W:A ...] --output-latent FILE.diftensor [--output-video-rows FILE.diftensor] --output-audio FILE.diftensor [--output-audio-latent FILE.diftensor] [--output-handoff latents.safetensors] [--h3-w8a8-cache FILE.safetensors --h3-w8a8-resident-layers N | --h3-convrot-int8-checkpoint FILE.safetensors [--h3-convrot-int8-layers N | --h3-convrot-int8-attention-layers N --h3-convrot-int8-mlp-layers N] --h3-convrot-int8-resident-layers N [--h3-convrot-bf16-audio-rows] | --h3-groupwise-cache FILE.safetensors --h3-groupwise-layers N] [--h3-int8-mlp-chunk-rows N] [--h3-int8-cublaslt --h3-int8-cublaslt-rank N --h3-int8-cublaslt-tune] [--h3-int8-cutlass-scaled-fc1] [--h3-int8-cutlass-scaled-all | --h3-int8-convrot-scale-chunk N] [--h3-int8-compact-adaln] [--h3-cache-text-refiner] [--resident-streamed-constant TENSOR_ID ...] [--cudnn-attention-heuristic a|b|fallback|autotune] [--h3-modulation-cache FILE.safetensors --h3-modulation-source-index FILE.index.json [--h3-modulation-steps N]] [(--h3-ck-attention-dso FILE.so | --h3-owned-attention [--h3-owned-attention-center-k]) --h3-int8-attention-first-layer N --h3-int8-attention-layers N] [--h3-int8-attention-first-step N] [--denoise-only | --vae-program FILE.difir --vae-bundle FILE.difbind --output-raw FILE.diftensor --output-decoded FILE.diftensor] [--first-eval-input-dir DIR] [--capture-denoiser-dir DIR --capture-denoiser-tensor ID ...] [--max-evaluations N] [--patch-h N] [--patch-w N] [--backend-plugin FILE.so] [--verify-shards] [--profile-pipeline] [--streamed-keep-pages] [--pipelined-resident-upload | --lazy-resident-upload] [--h3-resident-readahead-mib N] [--h3-resident-mapped-copy] [--keep-resident-host-pages] [--streamed-staging-buffers N] [--streamed-prefetch-depth N] [--streamed-stage-threads N] [--streamed-pinned-budget-mib N] [--pinned-io] [--cache-dir DIR] [--min-free-mib N] [--serve SOCKET | --connect SOCKET]\n";
 }
 
 std::vector<dif::frontend::H3KeyframeAnchor>
@@ -465,6 +468,9 @@ Options parse(int argc, char **argv) {
       options.h3_owned_attention_center_k = true;
     else if (option == "--h3-resident-mapped-copy")
       options.h3_resident_mapped_copy = true;
+    else if (option == "--h3-int8-attention-first-step")
+      options.h3_int8_attention_first_step = static_cast<std::uint32_t>(
+          number(value("--h3-int8-attention-first-step"), "INT8 attention first step"));
     else if (option == "--h3-resident-readahead-mib")
       options.h3_resident_readahead_mib =
           number(value("--h3-resident-readahead-mib"), "resident read-ahead MiB");
@@ -990,6 +996,8 @@ int run_request(const Options &options, ServerState &state,
         options.h3_int8_attention_first_layer;
     denoiser_run_options.h3_int8_attention_layers =
         options.h3_int8_attention_layers;
+    denoiser_run_options.h3_int8_attention_hybrid =
+        options.h3_int8_attention_first_step != 0U;
     denoiser_run_options.h3_modulation_cache = options.h3_modulation_cache;
     denoiser_run_options.h3_modulation_source_index =
         options.h3_modulation_source_index;
@@ -1157,6 +1165,8 @@ int run_request(const Options &options, ServerState &state,
         denoiser_run_options.h3_modulation_slice =
             options.h3_modulation_first_step +
             static_cast<std::uint32_t>(step);
+        denoiser_run_options.h3_int8_attention_active =
+            step >= options.h3_int8_attention_first_step;
         auto result = prepared->run(inputs, denoiser_run_options);
         for (const auto tensor_id : options.capture_denoiser_tensors) {
           const auto captured = result.captured_intermediates.find(tensor_id);
@@ -1442,6 +1452,8 @@ int run_request(const Options &options, ServerState &state,
                         : (options.keyframes.empty() ? "t2va" : "fl2va"))
                 << " sampler=" << options.sampler
                 << " sequence=" << layout.sequence_length
+                << " int8_attention_first_step="
+                << options.h3_int8_attention_first_step
                 << " persistent_reuse=" << (denoiser_reused ? 1 : 0)
                 << " persistent_request=" << state.requests
                 << " attention_class=" << attention_class
