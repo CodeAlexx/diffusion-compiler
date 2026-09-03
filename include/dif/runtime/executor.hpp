@@ -329,6 +329,13 @@ struct RunOptions {
   // direct IO instead of faulted through the page cache. Reported in
   // PipelineProfile::streamed_direct_read_bytes.
   bool streamed_direct_io{true};
+  // After a tensor was staged with direct IO, queue a background page-cache
+  // read of the same range (streamed constants at once; resident checkpoint
+  // weights after the run that uploaded them). Direct IO never populates the
+  // cache, so without this every later run or evaluation reads the drive
+  // again (measured 11.4 s versus 7.5 s first evaluations on the H3 chain);
+  // with it the next use finds warm pages and takes the mapping copy.
+  bool direct_io_warm_page_cache{true};
   // Host file-cache policy for weights that became GPU resident. Default
   // (true) preserves the historical behavior: after a resident upload the
   // mapped range is released with posix_fadvise(DONTNEED), so every fresh

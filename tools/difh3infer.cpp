@@ -980,6 +980,8 @@ int run_request(const Options &options, ServerState &state,
         options.h3_owned_attention_center_k;
     denoiser_run_options.h3_resident_direct_io = !options.h3_resident_mapped_copy;
     denoiser_run_options.streamed_direct_io = !options.h3_resident_mapped_copy;
+    denoiser_run_options.direct_io_warm_page_cache =
+        !options.h3_resident_mapped_copy;
     if (options.h3_resident_readahead_mib !=
         std::numeric_limits<std::uint64_t>::max())
       denoiser_run_options.h3_resident_readahead_bytes =

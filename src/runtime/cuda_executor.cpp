@@ -7247,13 +7247,19 @@ public:
                      std::uint64_t pinned_budget_bytes,
                      std::unordered_set<std::uint32_t> resident_overrides,
                      std::unordered_set<std::uint32_t> lazy_resident_overrides,
-                     bool direct_io,
+                     bool direct_io, bool warm_page_cache,
                      bool describe_plan)
       : program_(program), constants_(constants), plan_(plan), buffers_(buffers),
         context_(context), staging_pool_(stage_threads),
         resident_overrides_(std::move(resident_overrides)),
         lazy_resident_overrides_(std::move(lazy_resident_overrides)),
-        direct_io_(direct_io) {
+        direct_io_(direct_io), warm_page_cache_(warm_page_cache) {
+    if (warm_page_cache_) {
+      const auto cgroup = probe_host_cgroup_memory();
+      warm_page_cache_ = cgroup.limit_bytes == 0U ||
+                         cgroup.limit_bytes >
+                             cgroup.current_bytes + (4ULL << 30U);
+    }
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
@@ -7471,10 +7477,13 @@ public:
       const auto trace_stage_start =
           active_tracer ? active_tracer->now_ms() : 0.0;
       if (direct_io_ && tensor.mapped_resident_fraction() < 0.9 &&
-          tensor.read_direct_into(destination))
+          tensor.read_direct_into(destination)) {
         direct_read_bytes_ += tensor.byte_size();
-      else
+        if (warm_page_cache_)
+          tensor.prefetch_mapped_pages();
+      } else {
         staging_pool_.copy(destination, tensor.data(), tensor.byte_size());
+      }
       if (active_tracer)
         active_tracer->record(telemetry::category::staging,
                               "streamed-constant:host-stage",
@@ -7573,6 +7582,7 @@ private:
   std::unordered_set<std::uint32_t> resident_overrides_;
   std::unordered_set<std::uint32_t> lazy_resident_overrides_;
   bool direct_io_{true};
+  bool warm_page_cache_{true};
   std::uint64_t direct_read_bytes_{};
   std::unordered_set<std::uint32_t> loaded_lazy_residents_;
   std::vector<std::unique_ptr<PinnedHostWorkspace>> staging_;
@@ -9585,7 +9595,8 @@ public:
                   promoted_streamed_constants_.begin(),
                   promoted_streamed_constants_.end())
             : std::unordered_set<std::uint32_t>{},
-        options.streamed_direct_io, options.profile_pipeline);
+        options.streamed_direct_io, options.direct_io_warm_page_cache,
+        options.profile_pipeline);
     if (options.pinned_io_staging) {
       auto input_bytes = std::uint64_t{0U};
       auto output_bytes = std::uint64_t{0U};
@@ -9930,6 +9941,8 @@ public:
               tensor.mapped_resident_fraction() < 0.9 &&
               tensor.read_direct_into(destination)) {
             h3_resident_direct_read_bytes_ += tensor.byte_size();
+            if (direct_io_warm_page_cache_)
+              h3_resident_warm_list_.push_back(&tensor);
             return;
           }
           h3_w8a8_staging_pool_->copy(destination, tensor.data(),
@@ -9966,6 +9979,7 @@ public:
     // attention projections.
     h3_resident_readahead_bytes_ = options.h3_resident_readahead_bytes;
     h3_resident_direct_io_ = options.h3_resident_direct_io;
+    direct_io_warm_page_cache_ = options.direct_io_warm_page_cache;
     h3_w8a8_upload_order_.clear();
     {
       auto attention_index = std::size_t{0U};
@@ -10005,15 +10019,65 @@ public:
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
-    if (convrot_resident_)
+    if (convrot_resident_) {
+      // Cold mapped weights go through pinned staging with direct IO (the
+      // mapping copy would fault them in at page-cache speed); warm ones are
+      // copied from the mapping as before.
+      std::unique_ptr<PinnedHostWorkspace> convrot_stage;
+      std::unique_ptr<Event> convrot_stage_done;
+      bool convrot_stage_armed = false;
+      const auto upload_convrot = [&](CUdeviceptr device, const Tensor &tensor,
+                                      const char *label) {
+        if (!(h3_resident_direct_io_ &&
+              tensor.mapped_resident_fraction() < 0.9)) {
+          check(counted_memcpy_htod(device, tensor.data(), tensor.byte_size(),
+                                    context_.stream()),
+                label);
+          return;
+        }
+        if (!convrot_stage || convrot_stage->size() < tensor.byte_size()) {
+          if (convrot_stage_armed)
+            check(counted_event_synchronize(convrot_stage_done->get()),
+                  "cuEventSynchronize generic ConvRot staging reuse");
+          convrot_stage_armed = false;
+          convrot_stage = std::make_unique<PinnedHostWorkspace>(
+              std::max<std::size_t>(tensor.byte_size(), 256U << 20U));
+          if (!convrot_stage_done)
+            convrot_stage_done = std::make_unique<Event>();
+        } else if (convrot_stage_armed) {
+          check(counted_event_synchronize(convrot_stage_done->get()),
+                "cuEventSynchronize generic ConvRot staging reuse");
+          convrot_stage_armed = false;
+        }
+        auto *staging = static_cast<std::uint8_t *>(convrot_stage->data());
+        if (!tensor.read_direct_into(staging)) {
+          check(counted_memcpy_htod(device, tensor.data(), tensor.byte_size(),
+                                    context_.stream()),
+                label);
+          return;
+        }
+        h3_resident_direct_read_bytes_ += tensor.byte_size();
+        if (direct_io_warm_page_cache_)
+          h3_resident_warm_list_.push_back(&tensor);
+        check(counted_memcpy_htod(device, staging, tensor.byte_size(),
+                                  context_.stream()),
+              label);
+        check(counted_event_record(convrot_stage_done->get(), context_.stream()),
+              "cuEventRecord generic ConvRot staging copy");
+        convrot_stage_armed = true;
+      };
       for (const auto &plan : convrot_int8_linear_plans_) {
-        check(counted_memcpy_htod(plan.weight_device, plan.weight.data(),
-                                  plan.weight.byte_size(), context_.stream()),
-              "cuMemcpyHtoDAsync resident generic ConvRot weight");
-        check(counted_memcpy_htod(plan.scale_device, plan.scale.data(),
-                                  plan.scale.byte_size(), context_.stream()),
-              "cuMemcpyHtoDAsync resident generic ConvRot scale");
+        upload_convrot(plan.weight_device, plan.weight,
+                       "cuMemcpyHtoDAsync resident generic ConvRot weight");
+        upload_convrot(plan.scale_device, plan.scale,
+                       "cuMemcpyHtoDAsync resident generic ConvRot scale");
       }
+      if (convrot_stage_armed)
+        check(counted_event_synchronize(convrot_stage_done->get()),
+              "cuEventSynchronize generic ConvRot staging drain");
+      // Prepare-time uploads: warm the cache now, the plan is ready.
+      warm_h3_resident_pages();
+    }
     if (options.lazy_resident_upload) {
       // Dedicated storage is populated at first semantic use by the prepared
       // prefetcher, then remains valid for the lifetime of this execution.
@@ -10334,6 +10398,8 @@ public:
               tensor.mapped_resident_fraction() < 0.9 &&
               tensor.read_direct_into(destination)) {
             h3_resident_direct_read_bytes_ += tensor.byte_size();
+            if (direct_io_warm_page_cache_)
+              h3_resident_warm_list_.push_back(&tensor);
             return;
           }
           h3_w8a8_staging_pool_->copy(destination, tensor.data(),
@@ -11243,6 +11309,7 @@ public:
           resident_major_page_faults_;
       result.pipeline_profile.resident_h2d_milliseconds =
           resident_h2d_milliseconds_;
+      warm_h3_resident_pages();
       result.pipeline_profile.resident_readahead_bytes =
           h3_resident_readahead_advised_bytes_;
       result.pipeline_profile.resident_direct_read_bytes =
@@ -11651,6 +11718,29 @@ private:
   bool h3_resident_direct_io_{true};
   std::uint64_t h3_resident_direct_read_bytes_{};
   bool h3_resident_counters_reported_{false};
+  bool direct_io_warm_page_cache_{true};
+  std::vector<const Tensor *> h3_resident_warm_list_;
+
+  // Background page-cache read of everything staged with direct IO since the
+  // last call, so the next process (or evaluation) takes the mapping copy.
+  void warm_h3_resident_pages() {
+    if (h3_resident_warm_list_.empty())
+      return;
+    // Same admission as the keep policy: page cache is charged to the
+    // process' cgroup, so warm only when its limit can hold the bytes.
+    std::uint64_t bytes = 0U;
+    for (const auto *tensor : h3_resident_warm_list_)
+      bytes += tensor->byte_size();
+    const auto cgroup = probe_host_cgroup_memory();
+    constexpr std::uint64_t margin = 512ULL * 1024ULL * 1024ULL;
+    const bool admitted =
+        cgroup.limit_bytes == 0U ||
+        cgroup.limit_bytes >= cgroup.current_bytes + bytes + margin;
+    if (admitted)
+      for (const auto *tensor : h3_resident_warm_list_)
+        tensor->prefetch_mapped_pages();
+    h3_resident_warm_list_.clear();
+  }
 
   std::uint64_t h3_w8a8_order_bytes(std::size_t order) const {
     const auto [attention, slot] = h3_w8a8_upload_order_[order];

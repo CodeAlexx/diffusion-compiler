@@ -109,10 +109,14 @@ private:
       workers_.emplace_back([this] { loop(); });
   }
 
+  // Exit drops queued background work (page-cache warming) rather than
+  // extending the process; read_direct() requests always wait for their own
+  // jobs before returning, so none of those can be pending here.
   ~FileIoPool() {
     {
       std::lock_guard<std::mutex> guard(mutex_);
       stop_ = true;
+      jobs_.clear();
     }
     ready_.notify_all();
     for (auto &worker : workers_)
@@ -125,7 +129,7 @@ private:
       {
         std::unique_lock<std::mutex> lock(mutex_);
         ready_.wait(lock, [&] { return stop_ || !jobs_.empty(); });
-        if (jobs_.empty())
+        if (stop_ || jobs_.empty())
           return;
         job = std::move(jobs_.front());
         jobs_.pop_front();
@@ -193,12 +197,30 @@ void MappedStorage::prefetch(std::size_t offset, std::size_t bytes) const {
                   MADV_WILLNEED);
     return;
   }
+  // posix_fadvise(WILLNEED) and readahead(2) are no-ops on this host (ext4,
+  // kernel 6.8: both return at once and populate nothing), so the warm is a
+  // real buffered read of each chunk into a per-worker scratch buffer. It is
+  // background work: queued behind any direct reads, dropped at exit.
   for (auto cursor = begin; cursor < end; cursor += kReadaheadChunkBytes) {
     const auto descriptor = descriptor_;
     const auto chunk_offset = static_cast<off_t>(cursor);
     const auto chunk_bytes = std::min(kReadaheadChunkBytes, end - cursor);
     FileIoPool::instance().submit([descriptor, chunk_offset, chunk_bytes] {
-      (void)readahead(descriptor, chunk_offset, chunk_bytes);
+      static thread_local std::vector<std::uint8_t> scratch;
+      if (scratch.size() < chunk_bytes)
+        scratch.resize(chunk_bytes);
+      std::size_t received = 0U;
+      while (received < chunk_bytes) {
+        const auto got = pread(descriptor, scratch.data() + received,
+                               chunk_bytes - received,
+                               chunk_offset + static_cast<off_t>(received));
+        if (got <= 0) {
+          if (got < 0 && errno == EINTR)
+            continue;
+          break;
+        }
+        received += static_cast<std::size_t>(got);
+      }
     });
   }
 }
