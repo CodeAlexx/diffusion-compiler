@@ -44,7 +44,7 @@ checkpoint + frontend  ->  verified DiffIR  ->  compiler / optimizer / memory pl
 
 | Model | Task | GPU | Precision route |
 |---|---|---|---|
-| MiniMax-H3 | FL2VA: prompt + two keyframes to H.264/AAC MP4 with audio | RTX 3090 Ti | ConvRot INT8 projections, INT8 attention |
+| MiniMax-H3 | FL2VA: prompt + two keyframes to H.264/AAC MP4 with audio | RTX 3090 Ti | ConvRot INT8 projections; exact attention on the first three of seven evaluations, INT8 attention on the rest |
 | Krea 2 Turbo | Prompt to 1024x1024 PNG | RTX 3090 Ti | BF16, bit-identical trajectory |
 | FLUX.2 [klein] Base 9B | Prompt to 1024x1024 PNG | RTX 5080 | ConvRot W8A8 plus INT8 weight-only, MXFP8 hooks |
 
@@ -103,15 +103,21 @@ timings, memory, and comparator disclosures.
 |---|---|---:|---:|---:|
 | FLUX.2 [klein] Base 9B, prompt to PNG | RTX 5080 | **52.809 s** | 99.242 s ComfyUI | **1.879x faster** |
 | Krea 2 Turbo, prompt to PNG | RTX 3090 Ti | **26.58 s** | 59.14 s framework | **2.225x faster** |
-| MiniMax-H3 FL2VA, prompt to MP4 | RTX 3090 Ti | **78.88 s** | 81.095 s ComfyUI | **1.028x faster** |
+| MiniMax-H3 FL2VA, prompt to MP4 | RTX 3090 Ti | **89.77 s** | 81.095 s ComfyUI | **1.107x slower** |
 
 FLUX.2 saves 46.433 seconds (46.788%) on the frozen 1024x1024, 50-step
 workload and passes the unchanged numerical and visual gates. It meets the
 approved near-55-second target; it is not labeled 2x.
 
-The H3 result saves 2.215 seconds (2.732%) on the complete seven-evaluation
-FL2VA chain. Decoded parity is not fully accepted and the result remains far
-from the 2x ceiling, so no H3 2x or final-quality claim is made.
+The H3 recipe runs exact attention on the first three of its seven
+evaluations and INT8 attention on the rest. Decoded against exact attention
+on every evaluation, same inputs, the INT8-only route (which the ComfyUI
+comparator also runs) measured worst-frame PSNR 24.5 dB, SSIM 0.850, audio
+SNR 1.7 dB; the mix measures 32.3 dB, 0.958, 12.9 dB, passes the video bars,
+and passed the owner's listening review. It costs 10.9 seconds over the
+retired INT8-only recipe (78.88 s, 1.028x faster than the comparator) and is
+8.7 seconds (10.7%) slower than that comparator, which has not been measured
+at matched exactness. No H3 speed claim is made.
 
 ## Build and test
 

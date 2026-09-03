@@ -156,6 +156,7 @@
       "--h3-modulation-source-index", "${CKPT}/transformer/model.safetensors.index.json",
       "--h3-modulation-steps", "8", "--h3-ck-attention-dso", "${CK_ATTENTION}",
       "--h3-int8-attention-first-layer", "0", "--h3-int8-attention-layers", "50",
+      "--h3-int8-attention-first-step", "3",
       "--lazy-resident-upload", "--streamed-keep-pages", "--streamed-stage-threads", "4",
       "--denoise-only", "--profile-pipeline", "--cache-dir", "${CACHE}", "--min-free-mib", "512"]},
     {"name": "video-decode", "after": ["denoise"], "argv": [

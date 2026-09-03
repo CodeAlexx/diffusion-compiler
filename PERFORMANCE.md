@@ -11,7 +11,7 @@ matched framework baseline on the same GPU and workload.
 |---|---|---:|---:|---:|
 | FLUX.2 [klein] Base 9B, prompt to PNG | RTX 5080 | **52.809 s** | 99.242 s | **1.879x faster** |
 | Krea 2 Turbo, prompt to PNG | RTX 3090 Ti | **26.58 s** | 59.14 s | **2.225x faster** |
-| MiniMax-H3 FL2VA, prompt to MP4 | RTX 3090 Ti | **78.88 s** | 81.095 s | **1.028x faster** |
+| MiniMax-H3 FL2VA, prompt to MP4 | RTX 3090 Ti | **89.77 s** | 81.095 s | **1.107x slower** |
 
 The model rows are different workloads and hardware targets. Compare native
 with baseline within a row; do not compare raw seconds across rows.
@@ -43,7 +43,7 @@ xychart-beta
     title "MiniMax-H3 FL2VA on RTX 3090 Ti — lower is better"
     x-axis ["Native C++", "Stock ComfyUI"]
     y-axis "Seconds" 0 --> 85
-    bar [78.88, 81.095]
+    bar [89.77, 81.095]
 ```
 
 ## FLUX.2 [klein] Base 9B — RTX 5080
@@ -133,20 +133,48 @@ through the saved H.264/AAC MP4.
 
 | Complete-wall measurement | Time |
 |---|---:|
-| Native Compiler ConvRot INT8 + CK | **78.88 s** |
-| Matched stock ComfyUI ConvRot INT8 | 81.095 s |
+| Native Compiler ConvRot INT8, exact attention on evaluations 1-3, INT8 attention on 4-7 | **89.77 s** (runs 89.77, 102.44, 88.54; median) |
+| Native Compiler ConvRot INT8 + INT8 attention on every evaluation (2026-09-01, retired for quality) | 78.88 s |
+| Matched stock ComfyUI ConvRot INT8, INT8 attention on every evaluation | 81.095 s |
 | Strict 2x ceiling | <40.548 s |
 
-Native is **1.028x faster**, saving **2.215 seconds** or **2.732%**. It remains
-38.332 seconds above the strict 2x ceiling; no 2x H3 result is claimed.
+Native is **1.107x slower** than the comparator, 8.675 seconds or 10.7%, and
+49.2 seconds above the strict 2x ceiling; no H3 speed result is claimed. The
+comparator has not been measured at matched exactness.
+
+Why the recipe changed (2026-09-03): the seven-evaluation latents were
+decoded with the INT8 attention route on every evaluation, with exact cuDNN
+attention on every evaluation, and with exact attention on the first two,
+three, and four evaluations, all from identical inputs, and gated with
+`difquality` against the exact decode (bars PSNR 30 dB, SSIM 0.90, audio SNR
+20 dB, eight sampled frames):
+
+| attention route | worst frame PSNR | worst SSIM | audio SNR | denoise cost |
+|---|---:|---:|---:|---:|
+| INT8 on all 7 (former recipe; also the comparator's route) | 24.5 dB | 0.850 | 1.7 dB | 0 |
+| exact on 1-2 | 27.1 dB | 0.908 | 3.1 dB | +7 s |
+| exact on 1-3 (recipe) | 32.3 dB | 0.958 | 12.9 dB | +10.5 s |
+| exact on 1-4 | 37.5 dB | 0.978 | 14.7 dB | +14 s |
+| exact on all 7 | reference | | | +24.4 s |
+
+The INT8 route's per-evaluation error is amplified along the sampler
+trajectory; the comparator produces the same off-reference output because it
+dispatches the same INT8 kernel. The video bars pass from three exact
+evaluations; the audio stays under the 20 dB bar and was accepted on a
+listening review, which the recorded `difquality` verdict does not replace
+(it stays FAIL on the audio bar). Each exact evaluation costs about 3.5 s
+(10.6-10.8 s versus 7.2-7.6 s).
 
 The native chain includes presentation, Qwen3-VL vision/text conditioning,
 both keyframe encodes, seven denoiser evaluations, video/audio decode, and mux.
 The saved 832x480 MP4 contains 124 H.264 frames at 24 fps plus 32 kHz stereo AAC
 and passed visual inspection. Its SHA-256 is
 `cfb0c6b8110ff2dda9a0a240e57b5a16476cff0b3c5c41872f131e2ebc21e64f`.
-Decoded video/audio numerical parity with the stock competitor is not fully
-accepted, so this remains an approximate quality checkpoint.
+The saved MP4 from the current recipe (run 2 of the protocol) has SHA-256
+`63c2551ef666c130df09341f599c94fa9974afd295683d9cc336654d1d2dccea`. Decoded
+parity with exact attention is as tabulated above; parity with the stock
+competitor is not the bar any more, since the competitor's output is the
+INT8-only one.
 
 An exact-output QKV/RMSNorm/RoPE fusion improved isolated hot denoiser timing
 but regressed complete wall to 84.49 seconds warm and 92.05 seconds cold. It was
