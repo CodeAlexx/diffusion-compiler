@@ -63,35 +63,72 @@ AutodiffResult differentiate(const ir::Program &forward,
          std::move(attributes)});
   };
 
+  // Multi-use gradients: every consumer's contribution is recorded with the
+  // consumer's operation id and folded only when the gradient is read, in
+  // ascending consumer-id order. The fold order is then a property of the
+  // graph, not of the position of the consumers in the operation list, so
+  // two topological orderings of the same forward program produce
+  // bit-identical gradients (a Flame-era lesson: arrival-order folds
+  // mismatched 1.3M of 4.8M bf16 elements across rewrites).
+  struct Contribution {
+    std::uint32_t consumer;
+    std::uint32_t tensor;
+  };
+  std::unordered_map<std::uint32_t, std::vector<Contribution>> pending;
   std::unordered_map<std::uint32_t, std::uint32_t> gradients;
   const auto seed = add_tensor(*loss);
   add_operation(ir::Opcode::Fill, {}, {seed},
                 {ir::Attribute::f64(ir::AttrKey::Value, 1.0)});
   gradients.emplace(loss_tensor, seed);
 
+  std::uint32_t current_consumer = 0U;
   auto accumulate = [&](std::uint32_t primal, std::uint32_t contribution) {
-    const auto found = gradients.find(primal);
-    if (found == gradients.end()) {
-      gradients.emplace(primal, contribution);
-      return;
+    pending[primal].push_back({current_consumer, contribution});
+  };
+  // Folds a tensor's pending contributions (sorted by consumer id) into its
+  // gradient; returns 0 when nothing contributes to it.
+  auto resolve = [&](std::uint32_t primal) -> std::uint32_t {
+    auto waiting = pending.find(primal);
+    if (waiting != pending.end() && !waiting->second.empty()) {
+      auto contributions = std::move(waiting->second);
+      pending.erase(waiting);
+      std::sort(contributions.begin(), contributions.end(),
+                [](const Contribution &a, const Contribution &b) {
+                  return a.consumer < b.consumer ||
+                         (a.consumer == b.consumer && a.tensor < b.tensor);
+                });
+      auto running = gradients.find(primal);
+      std::uint32_t total =
+          running == gradients.end() ? 0U : running->second;
+      const auto *description = result.program.tensor(primal);
+      for (const auto &contribution : contributions) {
+        if (total == 0U) {
+          total = contribution.tensor;
+          continue;
+        }
+        const auto sum = add_tensor(*description);
+        add_operation(ir::Opcode::Add, {total, contribution.tensor}, {sum});
+        total = sum;
+      }
+      gradients[primal] = total;
+      return total;
     }
-    const auto *description = result.program.tensor(primal);
-    const auto sum = add_tensor(*description);
-    add_operation(ir::Opcode::Add, {found->second, contribution}, {sum});
-    found->second = sum;
+    const auto found = gradients.find(primal);
+    return found == gradients.end() ? 0U : found->second;
   };
 
   for (auto iterator = forward.operations.rbegin();
        iterator != forward.operations.rend(); ++iterator) {
     const auto &operation = *iterator;
+    current_consumer = operation.id;
     std::uint32_t grad_output = 0U;
     for (const auto output : operation.outputs) {
-      const auto found = gradients.find(output);
-      if (found == gradients.end())
+      const auto resolved = resolve(output);
+      if (resolved == 0U)
         continue;
       if (grad_output != 0U)
         fail("autodiff does not yet support active multi-output operations");
-      grad_output = found->second;
+      grad_output = resolved;
     }
     if (grad_output == 0U)
       continue;
@@ -383,15 +420,14 @@ AutodiffResult differentiate(const ir::Program &forward,
   }
 
   for (const auto primal : with_respect_to) {
-    const auto found = gradients.find(primal);
-    if (found == gradients.end())
+    const auto gradient = resolve(primal);
+    if (gradient == 0U)
       fail("autodiff target is disconnected from the loss");
     auto tensor = std::find_if(result.program.tensors.begin(),
-                               result.program.tensors.end(), [&](const auto &v) {
-                                 return v.id == found->second;
-                               });
+                               result.program.tensors.end(),
+                               [&](const auto &v) { return v.id == gradient; });
     tensor->roles |= ir::TensorRole::Output;
-    result.gradients.emplace(primal, found->second);
+    result.gradients.emplace(primal, gradient);
   }
   ir::verify(result.program);
   return result;
