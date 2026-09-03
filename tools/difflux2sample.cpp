@@ -3264,10 +3264,33 @@ W8A8RewriteResult rewrite_single_packed_tail_w8a8(
   return result;
 }
 
+std::string checkpoint_identity_tag(const fs::path &checkpoint) {
+  std::error_code error;
+  const auto canonical = fs::weakly_canonical(checkpoint, error);
+  const auto size = fs::file_size(checkpoint, error);
+  const auto mtime = fs::last_write_time(checkpoint, error)
+                         .time_since_epoch()
+                         .count();
+  const std::string identity = (error ? checkpoint : canonical).string() + "|" +
+                               std::to_string(size) + "|" + std::to_string(mtime);
+  return dif::hex_digest(dif::sha256(std::span<const std::uint8_t>(
+                             reinterpret_cast<const std::uint8_t *>(identity.data()),
+                             identity.size())))
+      .substr(0U, 16U);
+}
+
 DenoiseResult denoise(const Arguments &arguments,
                        const ConditioningResult &conditioning,
                        dif::runtime::Tensor latent,
                        std::uint64_t latent_width) {
+  // Quantized-weight caches are keyed by the transformer checkpoint identity
+  // (path, size, mtime), not only by tensor name: a different checkpoint with
+  // the same layout must never reuse another checkpoint's INT8/FP8 caches.
+  const auto weight_cache_directory =
+      arguments.cache_directory /
+      ("weights-" + checkpoint_identity_tag(arguments.transformer_checkpoint));
+  fs::create_directories(weight_cache_directory);
+
   DenoiseResult result;
   const auto image_tokens = latent.dims.at(0);
   const bool dev = arguments.flux2_model == "dev";
@@ -3446,7 +3469,7 @@ DenoiseResult denoise(const Arguments &arguments,
   const auto single_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, w8a8_blocks,
       arguments.w8a8_quantization, "single_blocks.", ".linear1.weight",
-      "single-block", arguments.cache_directory, false,
+      "single-block", weight_cache_directory, false,
       arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
           arguments.w8a8_activation_residual2_single_linear1);
@@ -3455,81 +3478,81 @@ DenoiseResult denoise(const Arguments &arguments,
       arguments.w8a8_single_mlp_h256_convrot
           ? dif::ir::Int8RowQuantization::H256ConvRot
           : arguments.w8a8_quantization,
-      arguments.cache_directory,
+      weight_cache_directory,
       arguments.w8a8_weight_equalization, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2);
   const auto single_qk_w8a8 = rewrite_single_packed_tail_w8a8(
       transformer.program, bindings, transformer, single_qk_w8a8_blocks,
-      arguments.w8a8_quantization, arguments.cache_directory,
+      arguments.w8a8_quantization, weight_cache_directory,
       arguments.w8a8_weight_equalization, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2, true);
   const auto single_linear2_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, single_linear2_w8a8_blocks,
       arguments.w8a8_quantization, "single_blocks.", ".linear2.weight",
-      "single-linear2-block", arguments.cache_directory,
+      "single-linear2-block", weight_cache_directory,
       arguments.w8a8_weight_equalization, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
           arguments.w8a8_activation_residual2_single_linear2);
   const auto double_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, double_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".img_mlp.0.weight",
-      "double-image-mlp-block", arguments.cache_directory, false,
+      "double-image-mlp-block", weight_cache_directory, false,
       arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_mlp_image_0_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, double_mlp_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".img_mlp.0.weight",
-      "double-image-mlp-block", arguments.cache_directory,
+      "double-image-mlp-block", weight_cache_directory,
       arguments.w8a8_weight_equalization, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_mlp_image_2_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, double_mlp_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".img_mlp.2.weight",
-      "double-image-mlp2-block", arguments.cache_directory,
+      "double-image-mlp2-block", weight_cache_directory,
       arguments.w8a8_weight_equalization, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_mlp_text_0_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, double_mlp_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".txt_mlp.0.weight",
-      "double-text-mlp-block", arguments.cache_directory,
+      "double-text-mlp-block", weight_cache_directory,
       arguments.w8a8_weight_equalization, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_mlp_text_2_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, double_mlp_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".txt_mlp.2.weight",
-      "double-text-mlp2-block", arguments.cache_directory,
+      "double-text-mlp2-block", weight_cache_directory,
       arguments.w8a8_weight_equalization, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_image_qkv_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, full_double_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".img_attn.qkv.weight",
-      "double-image-qkv-block", arguments.cache_directory, false,
+      "double-image-qkv-block", weight_cache_directory, false,
       arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_image_projection_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, full_double_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".img_attn.proj.weight",
-      "double-image-proj-block", arguments.cache_directory, false,
+      "double-image-proj-block", weight_cache_directory, false,
       arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_image_mlp0_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, full_double_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".img_mlp.0.weight",
-      "double-image-mlp-block", arguments.cache_directory, false,
+      "double-image-mlp-block", weight_cache_directory, false,
       arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_image_mlp2_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer, full_double_w8a8_blocks,
       arguments.w8a8_quantization, "double_blocks.", ".img_mlp.2.weight",
-      "double-image-mlp2-block", arguments.cache_directory, false,
+      "double-image-mlp2-block", weight_cache_directory, false,
       arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
@@ -3537,35 +3560,35 @@ DenoiseResult denoise(const Arguments &arguments,
       transformer.program, bindings, transformer,
       full_double_text_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".txt_attn.qkv.weight", "double-text-qkv-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_text_projection_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       full_double_text_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".txt_attn.proj.weight", "double-text-proj-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_text_mlp0_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       full_double_text_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".txt_mlp.0.weight", "double-text-mlp-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto double_text_mlp2_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       full_double_text_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".txt_mlp.2.weight", "double-text-mlp2-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto complete_double_image_qkv_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       complete_double_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".img_attn.qkv.weight", "double-image-qkv-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto complete_double_image_projection_w8a8 =
@@ -3573,7 +3596,7 @@ DenoiseResult denoise(const Arguments &arguments,
           transformer.program, bindings, transformer,
           complete_double_w8a8_blocks, arguments.w8a8_quantization,
           "double_blocks.", ".img_attn.proj.weight",
-          "double-image-proj-block", arguments.cache_directory, false,
+          "double-image-proj-block", weight_cache_directory, false,
           arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
@@ -3581,21 +3604,21 @@ DenoiseResult denoise(const Arguments &arguments,
       transformer.program, bindings, transformer,
       complete_double_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".img_mlp.0.weight", "double-image-mlp-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto complete_double_image_mlp2_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       complete_double_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".img_mlp.2.weight", "double-image-mlp2-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto complete_double_text_qkv_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       complete_double_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".txt_attn.qkv.weight", "double-text-qkv-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto complete_double_text_projection_w8a8 =
@@ -3603,102 +3626,102 @@ DenoiseResult denoise(const Arguments &arguments,
           transformer.program, bindings, transformer,
           complete_double_w8a8_blocks, arguments.w8a8_quantization,
           "double_blocks.", ".txt_attn.proj.weight", "double-text-proj-block",
-          arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+          weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto complete_double_text_mlp0_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       complete_double_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".txt_mlp.0.weight", "double-text-mlp-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto complete_double_text_mlp2_w8a8 = rewrite_named_linear_w8a8(
       transformer.program, bindings, transformer,
       complete_double_w8a8_blocks, arguments.w8a8_quantization,
       "double_blocks.", ".txt_mlp.2.weight", "double-text-mlp2-block",
-      arguments.cache_directory, false, arguments.w8a8_mse_weight_scale,
+      weight_cache_directory, false, arguments.w8a8_mse_weight_scale,
       arguments.w8a8_activation_residual2 ||
       arguments.w8a8_activation_residual2_double);
   const auto single_linear1_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, single_linear1_fp8_blocks,
       "single_blocks.", ".linear1.weight", "single-linear1-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto single_mlp_fp8 = rewrite_single_mlp_fp8(
       transformer.program, bindings, transformer, single_mlp_fp8_blocks,
-      arguments.cache_directory);
+      weight_cache_directory);
   const auto single_linear2_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, single_linear2_fp8_blocks,
       "single_blocks.", ".linear2.weight", "single-linear2-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, double_fp8_blocks,
       "double_blocks.", ".img_mlp.0.weight", "double-image-mlp-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_image_qkv_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_fp8_blocks,
       "double_blocks.", ".img_attn.qkv.weight", "double-image-qkv-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_image_projection_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_fp8_blocks,
       "double_blocks.", ".img_attn.proj.weight", "double-image-proj-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_image_mlp0_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_fp8_blocks,
       "double_blocks.", ".img_mlp.0.weight", "double-image-mlp-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_image_mlp2_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_fp8_blocks,
       "double_blocks.", ".img_mlp.2.weight", "double-image-mlp2-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_text_qkv_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_text_fp8_blocks,
       "double_blocks.", ".txt_attn.qkv.weight", "double-text-qkv-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_text_projection_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_text_fp8_blocks,
       "double_blocks.", ".txt_attn.proj.weight", "double-text-proj-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_text_mlp0_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_text_fp8_blocks,
       "double_blocks.", ".txt_mlp.0.weight", "double-text-mlp-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto double_text_mlp2_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, full_double_text_fp8_blocks,
       "double_blocks.", ".txt_mlp.2.weight", "double-text-mlp2-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_image_qkv_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".img_attn.qkv.weight", "double-image-qkv-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_image_projection_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".img_attn.proj.weight", "double-image-proj-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_image_mlp0_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".img_mlp.0.weight", "double-image-mlp-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_image_mlp2_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".img_mlp.2.weight", "double-image-mlp2-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_text_qkv_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".txt_attn.qkv.weight", "double-text-qkv-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_text_projection_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".txt_attn.proj.weight", "double-text-proj-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_text_mlp0_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".txt_mlp.0.weight", "double-text-mlp-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   const auto complete_double_text_mlp2_fp8 = rewrite_named_linear_fp8(
       transformer.program, bindings, transformer, complete_double_fp8_blocks,
       "double_blocks.", ".txt_mlp.2.weight", "double-text-mlp2-block",
-      arguments.cache_directory, arguments.fp8_row_scaled);
+      weight_cache_directory, arguments.fp8_row_scaled);
   result.w8a8_linear_count = single_w8a8.linear_count +
       single_mlp_w8a8.linear_count +
       single_qk_w8a8.linear_count +
@@ -3837,17 +3860,17 @@ DenoiseResult denoise(const Arguments &arguments,
           ? W8A8RewriteResult{}
           : rewrite_all_linear_weights_int8(
                 transformer.program, bindings, transformer,
-                arguments.cache_directory, 32U, {},
+                weight_cache_directory, 32U, {},
                 arguments.int8_weight_only_group32_names);
   const auto weight_only =
       arguments.int8_weight_only_row_scaled_all_linears
           ? rewrite_all_linear_weights_int8_row_scaled(
                 transformer.program, bindings, transformer,
-                arguments.cache_directory)
+                weight_cache_directory)
           : arguments.int8_weight_only_all_linears
                 ? rewrite_all_linear_weights_int8(
                       transformer.program, bindings, transformer,
-                      arguments.cache_directory,
+                      weight_cache_directory,
                       arguments.int8_weight_only_group_size,
                       arguments.int8_weight_only_exclude_names)
                 : W8A8RewriteResult{};
