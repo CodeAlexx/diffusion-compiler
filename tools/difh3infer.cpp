@@ -88,6 +88,11 @@ struct Options {
   // "-int8" infix, results discarded), then exact attention, whose outputs
   // advance the trajectory. Requires --capture-denoiser-dir.
   bool atlas_shadow{false};
+  // --h3-easycache-skip-step N (repeatable): force the EasyCache-style skip
+  // (output = input + the last full evaluation's cached delta) at these
+  // evaluation indices regardless of the threshold. Requires
+  // --h3-easycache > 0 to arm the delta cache; index 0 can never skip.
+  std::vector<std::uint32_t> h3_easycache_skip_steps;
   // EasyCache-style whole-model step skipping (experiment). On a full step the
   // delta (model output minus model input) is cached per stream; a step is
   // skipped, returning input plus the cached delta, while the accumulated
@@ -523,6 +528,9 @@ Options parse(int argc, char **argv) {
       options.profile_operations_json = value("--profile-operations-json");
     else if (option == "--h3-atlas-shadow")
       options.atlas_shadow = true;
+    else if (option == "--h3-easycache-skip-step")
+      options.h3_easycache_skip_steps.push_back(static_cast<std::uint32_t>(
+          number(value("--h3-easycache-skip-step"), "easycache skip step")));
     else if (option == "--h3-resident-readahead-mib")
       options.h3_resident_readahead_mib =
           number(value("--h3-resident-readahead-mib"), "resident read-ahead MiB");
@@ -1330,6 +1338,14 @@ int run_request(const Options &options, ServerState &state,
                           static_cast<double>(options.h3_easycache_threshold) &&
                       (options.h3_easycache_max_consecutive == 0U ||
                        ec_consecutive < options.h3_easycache_max_consecutive);
+          }
+          if (!options.h3_easycache_skip_steps.empty()) {
+            // Forced schedule: exactly the listed evaluations skip.
+            ec_skip = std::find(options.h3_easycache_skip_steps.begin(),
+                                options.h3_easycache_skip_steps.end(),
+                                static_cast<std::uint32_t>(step)) !=
+                          options.h3_easycache_skip_steps.end() &&
+                      ec_have_prev_output && !ec_diff_video.empty();
           }
         }
         dif::runtime::RunResult result;
