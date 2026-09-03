@@ -19,6 +19,7 @@
 #include "dif/frontend/qwen3vl_conditioner.hpp"
 #include "dif/frontend/qwen3vl_vision.hpp"
 #include "dif/frontend/training.hpp"
+#include "dif/runtime/device_probe.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/runtime/scalar.hpp"
 #include "dif/runtime/tensor.hpp"
@@ -4424,6 +4425,25 @@ void test_generic_scaled_fp8_linear() {
          "generic scaled FP8 Linear CPU output is finite");
   if (!dif::runtime::cuda_available())
     return;
+  if (!dif::runtime::probe_target(dif::runtime::ProbeBackend::Cuda)
+           .precision.fp8_tensor_cores) {
+    // Target without FP8 tensor cores: the format is illegal there and the
+    // CUDA backend must fail closed from the probed facts, not emit PTX the
+    // driver rejects.
+    bool refused = false;
+    std::string message;
+    try {
+      (void)dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    } catch (const std::exception &error) {
+      refused = true;
+      message = error.what();
+    }
+    expect(refused && message.find("FP8 physical format") != std::string::npos,
+           "generic scaled FP8 Linear fails closed on a target without FP8 tensor cores");
+    std::cout << "GATE test_generic_scaled_fp8_linear skipped=fp8_illegal_on_target message=" << message
+              << '\n';
+    return;
+  }
   const auto cuda =
       dif::runtime::make_cuda_executor()->run(program, bindings, options);
   expect(cuda.outputs.at(2U).bytes == cpu.outputs.at(2U).bytes &&
@@ -4513,6 +4533,25 @@ void test_generic_mxfp8_linear() {
       dif::runtime::make_cpu_executor()->run(program, bindings, options);
   if (!dif::runtime::cuda_available())
     return;
+  if (!dif::runtime::probe_target(dif::runtime::ProbeBackend::Cuda)
+           .precision.fp8_tensor_cores) {
+    // Target without FP8 tensor cores: the format is illegal there and the
+    // CUDA backend must fail closed from the probed facts, not emit PTX the
+    // driver rejects.
+    bool refused = false;
+    std::string message;
+    try {
+      (void)dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    } catch (const std::exception &error) {
+      refused = true;
+      message = error.what();
+    }
+    expect(refused && message.find("FP8 physical format") != std::string::npos,
+           "generic MXFP8 Linear fails closed on a target without FP8 tensor cores");
+    std::cout << "GATE test_generic_mxfp8_linear skipped=fp8_illegal_on_target message=" << message
+              << '\n';
+    return;
+  }
   const auto cuda =
       dif::runtime::make_cuda_executor()->run(program, bindings, options);
   expect(cuda.outputs.at(2U).bytes == cpu.outputs.at(2U).bytes &&

@@ -1025,6 +1025,21 @@ std::string generate_source(const dif::ir::Program &program) {
       dif::fail("OpenCL reference backend does not implement the Krea-required "
                 "generic opcodes");
       break;
+    case Opcode::LayerNormModulate:
+    case Opcode::QuantizeInt8Rows:
+    case Opcode::LinearInt8Scaled:
+    case Opcode::QuantizeFp8Rows:
+    case Opcode::LinearFp8Scaled:
+    case Opcode::QuantizeFp8Blocks32:
+    case Opcode::LinearFp8BlockScaled:
+    case Opcode::DequantizeInt8Blocks:
+    case Opcode::LinearInt8WeightScaled:
+      // Quantized physical formats (INT8 rows, FP8 rows, MXFP8 blocks) are
+      // NVIDIA-backend execution formats chosen per target; the reference
+      // backend stays fail-closed rather than emulating them.
+      dif::fail("OpenCL reference backend does not implement quantized "
+                "physical-format opcodes");
+      break;
     }
     end_float_operation(source);
   }

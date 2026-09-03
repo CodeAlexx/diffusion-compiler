@@ -27,6 +27,15 @@
 #include <cuda.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
+
+// cuBLASLt block-scaled (MXFP8) matmul descriptors exist from cuBLAS 12.8.
+// Older toolkits compile without the plan; a program that carries
+// LinearFp8BlockScaled then fails closed at prepare with the library facts.
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 120800
+#define DIF_HAS_CUBLASLT_BLOCK_SCALE 1
+#else
+#define DIF_HAS_CUBLASLT_BLOCK_SCALE 0
+#endif
 #include <nvrtc.h>
 
 #include <algorithm>
@@ -504,8 +513,22 @@ private:
 class Module {
 public:
   explicit Module(const std::string &ptx) {
-    check(cuModuleLoadDataEx(&module_, ptx.data(), 0, nullptr, nullptr),
-          "cuModuleLoadDataEx");
+    // Capture the driver JIT log so an invalid-PTX failure names the
+    // instruction and line instead of only the error code.
+    std::array<char, 4096> error_log{};
+    std::array<CUjit_option, 2> option_keys = {CU_JIT_ERROR_LOG_BUFFER,
+                                              CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+    std::array<void *, 2> option_values = {
+        static_cast<void *>(error_log.data()),
+        reinterpret_cast<void *>(static_cast<std::uintptr_t>(error_log.size()))};
+    const auto status = cuModuleLoadDataEx(
+        &module_, ptx.data(), static_cast<unsigned>(option_keys.size()),
+        option_keys.data(), option_values.data());
+    if (status != CUDA_SUCCESS) {
+      const std::string what =
+          std::string("cuModuleLoadDataEx: ") + error_log.data();
+      check(status, what.c_str());
+    }
   }
   ~Module() {
     if (module_)
@@ -1899,6 +1922,7 @@ private:
   cublasLtMatmulHeuristicResult_t heuristic_{};
 };
 
+#if DIF_HAS_CUBLASLT_BLOCK_SCALE
 class Fp8BlockScaledLinearPlan {
 public:
   Fp8BlockScaledLinearPlan(const ir::Program &program,
@@ -2043,6 +2067,7 @@ private:
   cublasLtMatrixLayout_t output_{};
   cublasLtMatmulHeuristicResult_t heuristic_{};
 };
+#endif // DIF_HAS_CUBLASLT_BLOCK_SCALE
 
 #if DIF_HAS_CUTLASS
 struct CutlassInt8ScaledGemmDeleter {
@@ -8774,6 +8799,26 @@ public:
     }
     for (const auto &plan : h3_modulation_cache_plans_)
       skipped_operations_.insert(plan.linear_operation);
+    // FP8 physical formats need FP8 tensor cores (sm_89+): the generated
+    // e4m3 conversions do not assemble below that. Fail closed from the
+    // probed target facts before compiling, naming the format and target.
+    for (const auto &operation : program_.operations) {
+      const bool fp8_opcode =
+          operation.opcode == ir::Opcode::QuantizeFp8Rows ||
+          operation.opcode == ir::Opcode::LinearFp8Scaled ||
+          operation.opcode == ir::Opcode::QuantizeFp8Blocks32 ||
+          operation.opcode == ir::Opcode::LinearFp8BlockScaled;
+      if (fp8_opcode && !target_profile_.precision.fp8_tensor_cores)
+        fail(std::string("operation ") + std::to_string(operation.id) + " " +
+             std::string(ir::opcode_name(operation.opcode)) +
+             " uses an FP8 physical format that is illegal on target " +
+             std::string(target::architecture_name(
+                 target_profile_.architecture)) +
+             " (no FP8 tensor cores, compute " +
+             std::to_string(target_profile_.compute_major) + "." +
+             std::to_string(target_profile_.compute_minor) +
+             "); see difopt --formats-table");
+    }
     const auto ptx = compile_ptx(generated.source, major, minor,
                                  options.cache_directory, source_hash_);
     module_ = std::make_unique<Module>(ptx);
@@ -9472,10 +9517,29 @@ public:
     for (const auto &operation : program_.operations) {
       if (operation.opcode != ir::Opcode::LinearFp8BlockScaled)
         continue;
+      // Physical-format legality from discovered target facts, never from
+      // product names: FP8 tensor cores plus a cuBLASLt with block-scaled
+      // matmul (>= 12.8). Both are reported in the failure.
+      const auto linked = target_profile_.cublaslt_version;
+      const bool library_ok = DIF_HAS_CUBLASLT_BLOCK_SCALE && linked >= 120800U;
+      if (!library_ok || !target_profile_.precision.fp8_tensor_cores)
+        fail(std::string("LinearFp8BlockScaled (MXFP8) is illegal here: ") +
+             (library_ok ? "" : "needs cuBLASLt >= 120800 block-scaled matmul (build cuBLAS " +
+                                std::to_string(CUBLAS_VERSION) + ", linked cuBLASLt " +
+                                std::to_string(linked) + "); ") +
+             (target_profile_.precision.fp8_tensor_cores
+                  ? ""
+                  : std::string("target ") +
+                        std::string(target::architecture_name(
+                            target_profile_.architecture)) +
+                        " lacks FP8 tensor cores; ") +
+             "see difopt --formats-table (mxfp8-block-scaled)");
+#if DIF_HAS_CUBLASLT_BLOCK_SCALE
       fp8_block_scaled_linear_plans_.emplace(
           operation.id, std::make_unique<Fp8BlockScaledLinearPlan>(
                             program_, operation, buffers_, context_.cublas_lt(),
                             workspace_bytes_));
+#endif
     }
 #if DIF_HAS_CUTLASS
     for (const auto &operation : program_.operations) {
@@ -10346,10 +10410,12 @@ public:
         launch(program_, op, functions_.at(op.id), buffers_,
                context_.stream());
       }
+#if DIF_HAS_CUBLASLT_BLOCK_SCALE
       else if (const auto scaled = fp8_block_scaled_linear_plans_.find(op.id);
                scaled != fp8_block_scaled_linear_plans_.end())
         scaled->second->launch(op, buffers_, context_.cublas_lt(), *workspace_,
                                context_.stream());
+#endif
 #if DIF_HAS_CUTLASS
       else if (const auto scaled = int8_scaled_linear_plans_.find(op.id);
                scaled != int8_scaled_linear_plans_.end())
@@ -11122,8 +11188,10 @@ public:
       result += "-cublaslt";
     if (!fp8_scaled_linear_plans_.empty())
       result += "-scaled-fp8";
+#if DIF_HAS_CUBLASLT_BLOCK_SCALE
     if (!fp8_block_scaled_linear_plans_.empty())
       result += "-mxfp8";
+#endif
 #if DIF_HAS_CUTLASS
     if (!cutlass_linear_plans_.empty())
       result += "-cutlass";
@@ -11259,9 +11327,11 @@ private:
   std::unordered_map<std::uint32_t, std::shared_ptr<LinearPlan>> linear_plans_;
   std::unordered_map<std::uint32_t, std::unique_ptr<Fp8ScaledLinearPlan>>
       fp8_scaled_linear_plans_;
+#if DIF_HAS_CUBLASLT_BLOCK_SCALE
   std::unordered_map<std::uint32_t,
                      std::unique_ptr<Fp8BlockScaledLinearPlan>>
       fp8_block_scaled_linear_plans_;
+#endif
   std::unordered_map<std::size_t, std::vector<std::size_t>>
       parallel_linear_groups_;
   std::unordered_set<std::size_t> parallel_linear_followups_;

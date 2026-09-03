@@ -24,6 +24,8 @@ std::string_view physical_format_name(PhysicalFormat format) {
     return "squareq-w4";
   case PhysicalFormat::SquareQNvfp4:
     return "squareq-nvfp4";
+  case PhysicalFormat::Fp8BlockScaled:
+    return "mxfp8-block-scaled";
   }
   return "unknown";
 }
@@ -43,7 +45,8 @@ std::vector<PhysicalFormat> all_physical_formats() {
           PhysicalFormat::Fp16,        PhysicalFormat::Fp8E4M3,
           PhysicalFormat::Int8ConvRot, PhysicalFormat::Int4Group,
           PhysicalFormat::Int5Group,   PhysicalFormat::SquareQW8,
-          PhysicalFormat::SquareQW4,   PhysicalFormat::SquareQNvfp4};
+          PhysicalFormat::SquareQW4,   PhysicalFormat::SquareQNvfp4,
+          PhysicalFormat::Fp8BlockScaled};
 }
 
 std::string_view format_availability_name(FormatAvailability availability) {
@@ -67,7 +70,12 @@ struct Requirement {
   bool needs_int8{};
   bool needs_nvfp4{};
   bool needs_device{};
+  // Minimum linked cuBLASLt version (cublasLtGetVersion() form,
+  // major*10000 + minor*100 + patch); 0 = no library requirement.
+  std::uint64_t min_cublaslt_version{};
 };
+
+constexpr std::uint64_t kCublasLtBlockScaledMatmulVersion = 120800U;
 
 Requirement requirement(PhysicalFormat format) {
   switch (format) {
@@ -91,6 +99,10 @@ Requirement requirement(PhysicalFormat format) {
     return {.needs_bf16 = true, .needs_device = true};
   case PhysicalFormat::SquareQNvfp4:
     return {.needs_nvfp4 = true, .needs_device = true};
+  case PhysicalFormat::Fp8BlockScaled:
+    return {.needs_fp8 = true,
+            .needs_device = true,
+            .min_cublaslt_version = kCublasLtBlockScaledMatmulVersion};
   }
   return {};
 }
@@ -137,6 +149,14 @@ FormatStatus physical_format_status(PhysicalFormat format,
         "SquareQ physical format hook: identity and target requirements are "
         "registered; no backend implementation in this build";
     break;
+  case PhysicalFormat::Fp8BlockScaled:
+    status.availability = FormatAvailability::ExecutionPolicy;
+    status.availability_reason =
+        "MXFP8 lowering is an explicit per-block program rewrite selected by "
+        "the FLUX.2 sampler flags (QuantizeFp8BlockScaled + "
+        "LinearFp8BlockScaled) executed through cuBLASLt block-scaled matmul; "
+        "it is not a DiffIR search transform in this build";
+    break;
   }
   if (!target) {
     status.legal_on_target = false;
@@ -160,6 +180,13 @@ FormatStatus physical_format_status(PhysicalFormat format,
     missing += (missing.empty() ? "" : ", ") + std::string("INT8 tensor cores");
   if (need.needs_nvfp4 && !target->precision.nvfp4_tensor_cores)
     missing += (missing.empty() ? "" : ", ") + std::string("NVFP4 tensor cores");
+  if (need.min_cublaslt_version != 0U &&
+      target->cublaslt_version < need.min_cublaslt_version)
+    missing += (missing.empty() ? "" : ", ") +
+               std::string("cuBLASLt >= ") +
+               std::to_string(need.min_cublaslt_version) +
+               " (block-scaled matmul; linked " +
+               std::to_string(target->cublaslt_version) + ")";
   if (missing.empty()) {
     status.legal_on_target = true;
     status.legality_reason =

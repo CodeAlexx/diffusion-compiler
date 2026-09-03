@@ -128,7 +128,7 @@ dif::runtime::Tensor filled(float value) {
 
 void test_format_registry() {
   using dif::opt::PhysicalFormat;
-  expect(dif::opt::all_physical_formats().size() == 10U, "ten registered formats");
+  expect(dif::opt::all_physical_formats().size() == 11U, "eleven registered formats");
   PhysicalFormat parsed;
   expect(dif::opt::physical_format_from_name("squareq-nvfp4", parsed) &&
              parsed == PhysicalFormat::SquareQNvfp4,
@@ -161,6 +161,27 @@ void test_format_registry() {
   const auto blackwell = nvidia_profile(dif::target::ArchitectureFamily::Blackwell, true, true);
   expect(dif::opt::physical_format_status(PhysicalFormat::SquareQNvfp4, &blackwell).legal_on_target,
          "SquareQ NVFP4 is legal on an NVFP4-capable target");
+  const auto mxfp8_ampere =
+      dif::opt::physical_format_status(PhysicalFormat::Fp8BlockScaled, &ampere);
+  expect(!mxfp8_ampere.legal_on_target &&
+             mxfp8_ampere.legality_reason.find("FP8 tensor cores") != std::string::npos,
+         "MXFP8 is illegal without FP8 tensor cores");
+  auto old_library = blackwell;
+  old_library.cublaslt_version = 120403U;
+  const auto mxfp8_old = dif::opt::physical_format_status(PhysicalFormat::Fp8BlockScaled, &old_library);
+  expect(!mxfp8_old.legal_on_target &&
+             mxfp8_old.legality_reason.find("cuBLASLt >= 120800") != std::string::npos &&
+             mxfp8_old.legality_reason.find("linked 120403") != std::string::npos,
+         "MXFP8 is illegal with a cuBLASLt older than block-scaled matmul, naming both versions");
+  auto new_library = blackwell;
+  new_library.cublaslt_version = 130100U;
+  const auto mxfp8_new = dif::opt::physical_format_status(PhysicalFormat::Fp8BlockScaled, &new_library);
+  expect(mxfp8_new.legal_on_target && !mxfp8_new.competes &&
+             mxfp8_new.availability == dif::opt::FormatAvailability::ExecutionPolicy,
+         "MXFP8 is legal with FP8 tensor cores and cuBLASLt >= 12.8 but is execution policy");
+  expect(dif::opt::physical_format_from_name("mxfp8-block-scaled", parsed) &&
+             parsed == PhysicalFormat::Fp8BlockScaled,
+         "MXFP8 format name parses");
 
   const auto host = dif::runtime::probe_target(dif::runtime::ProbeBackend::Host);
   expect(!dif::opt::physical_format_status(PhysicalFormat::Int8ConvRot, &host).legal_on_target,
@@ -227,7 +248,7 @@ void test_difopt_formats_cli() {
     expect(required(document, "kind").string() == "physical-formats",
            "formats table kind");
     const auto &formats = required(document, "formats").array();
-    expect(formats.size() == 10U, "formats table lists every format");
+    expect(formats.size() == 11U, "formats table lists every format");
     bool fp8_illegal = false;
     bool bf16_competes = false;
     for (const auto &entry : formats) {

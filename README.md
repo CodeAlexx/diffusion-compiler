@@ -179,8 +179,13 @@ Phase D makes the optimizer's candidate space target-aware without adding a
 second search. `include/dif/opt/physical_format.hpp` registers the
 compiler-wide physical formats a generic `Linear` (or any uniform-float
 operation) may be lowered to: `fp32`, `bf16`, `fp16`, `fp8-e4m3`,
-`int8-convrot`, `int4-group`, `int5-group`, and the SquareQ hooks
-`squareq-w8`, `squareq-w4`, `squareq-nvfp4`. Each format carries the
+`int8-convrot`, `int4-group`, `int5-group`, the SquareQ hooks
+`squareq-w8`, `squareq-w4`, `squareq-nvfp4`, and `mxfp8-block-scaled` (the
+FLUX.2 Blackwell MXFP8 Linear: FP8 tensor cores plus a linked cuBLASLt with
+block-scaled matmul, 12.8 or newer, both discovered by the target probe; the
+CUDA backend compiles the plan only against such a toolkit and a program that
+carries `LinearFp8BlockScaled` fails closed at prepare on any other host with
+the library and capability facts in the message). Each format carries the
 architecture capabilities it requires and how this build can use it: a
 search candidate (a DiffIR transform the optimizer measures), execution
 policy (ConvRot INT8 over a prepared cache, reported but not searched), or a

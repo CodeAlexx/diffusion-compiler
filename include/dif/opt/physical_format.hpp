@@ -30,6 +30,12 @@ enum class PhysicalFormat : std::uint32_t {
   SquareQW8 = 8,
   SquareQW4 = 9,
   SquareQNvfp4 = 10,
+  // MXFP8: E4M3 values with one UE8M0 scale per 32-element block on both
+  // operands, F32 accumulation, BF16 output (DiffIR LinearFp8BlockScaled).
+  // Legal only where the target has FP8 tensor cores and the linked cuBLASLt
+  // provides block-scaled matmul (12.8 or newer); the CUDA backend compiles
+  // the plan only against such a toolkit and fails closed otherwise.
+  Fp8BlockScaled = 11,
 };
 
 std::string_view physical_format_name(PhysicalFormat format);
