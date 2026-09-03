@@ -116,6 +116,15 @@ int main() {
              valid.operations.front().opcode == Opcode::Add,
          "decode accepts a registered opcode");
 
+  // Attribute keys and kinds are bounded by sentinels, never by a hand-bumped
+  // last member: the sentinel must sit right after the last declared value.
+  expect(static_cast<std::uint32_t>(AttrKey::EndSentinel_) ==
+             static_cast<std::uint32_t>(AttrKey::ClipScale) + 1U,
+         "AttrKey sentinel follows the last key");
+  expect(static_cast<std::uint32_t>(AttrKind::EndSentinel_) ==
+             static_cast<std::uint32_t>(AttrKind::Bool) + 1U,
+         "AttrKind sentinel follows the last kind");
+
   if (failures != 0) {
     std::cerr << failures << " opcode registry assertion(s) failed\n";
     return 1;

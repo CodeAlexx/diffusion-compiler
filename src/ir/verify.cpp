@@ -27,11 +27,11 @@ bool valid_opcode(Opcode opcode) {
 }
 
 bool valid_attr_key(AttrKey key) {
-  return key >= AttrKey::Epsilon && key <= AttrKey::ClipScale;
+  return key >= AttrKey::Epsilon && key < AttrKey::EndSentinel_;
 }
 
 bool valid_attr_kind(AttrKind kind) {
-  return kind >= AttrKind::U64 && kind <= AttrKind::Bool;
+  return kind >= AttrKind::U64 && kind < AttrKind::EndSentinel_;
 }
 
 void expect_counts(const Operation &op, std::size_t inputs, std::size_t outputs) {

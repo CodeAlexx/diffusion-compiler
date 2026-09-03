@@ -173,6 +173,9 @@ enum class AttrKey : std::uint32_t {
   // lora_adamw_plain_fused lesson: a free per-element multiply instead of a
   // host pass). Default 1.0 is a provable no-op.
   ClipScale = 74,
+  // Sentinel: add new keys above this line with the next value; the verifier
+  // bounds the valid range by it, so nothing else needs updating.
+  EndSentinel_,
 };
 
 // Gelu carries an explicit approximation because exact-erf and tanh GELU are
@@ -236,7 +239,13 @@ inline bool is_convrot_int8_row_quantization(Int8RowQuantization mode) {
 // be inferred from tensor shape.
 enum class RotaryLayout : std::uint64_t { Interleaved = 1, HalfSplit = 2 };
 
-enum class AttrKind : std::uint32_t { U64 = 1, I64 = 2, F64 = 3, Bool = 4 };
+enum class AttrKind : std::uint32_t {
+  U64 = 1,
+  I64 = 2,
+  F64 = 3,
+  Bool = 4,
+  EndSentinel_, // add kinds above; the verifier bounds the range by it
+};
 
 struct Attribute {
   AttrKey key{};
