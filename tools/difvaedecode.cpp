@@ -6,6 +6,7 @@
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/support/error.hpp"
+#include "dif/support/serve_socket.hpp"
 #include "dif/weights/bundle.hpp"
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <map>
 #include <numeric>
 #include <span>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -53,6 +55,24 @@ struct Options {
   bool verify_shards{false};
   std::filesystem::path tile_digests; // --tile-digests FILE
   dif::runtime::RunOptions run;
+  // Persistent decoder: --serve SOCKET keeps this process alive after the
+  // first request and serves further requests over a Unix socket with the
+  // same prepared execution (resident VAE weights, plans, scratch).
+  std::filesystem::path serve_socket;
+  // Every argv token that can change what prepare() builds, in order. A
+  // served request whose signature differs is refused.
+  std::string prepare_signature;
+};
+
+// Everything a served request reuses.
+struct ServerState {
+  std::unique_ptr<dif::runtime::Executor> backend;
+  std::unique_ptr<dif::runtime::PreparedExecution> prepared;
+  dif::ir::Program program;
+  dif::runtime::TensorMap bindings;
+  std::string signature;
+  std::vector<std::uint64_t> latent_dims;
+  std::size_t requests{};
 };
 
 std::size_t g_worker_override = 0U; // --workers N (0 = hardware concurrency)
@@ -109,9 +129,48 @@ Options parse(int argc, char **argv) {
   Options options;
   options.run.warmups = 0U;
   options.run.iterations = 1U;
+  {
+    // Prepare signature: every token except the per-request ones.
+    static const char *const per_request_with_value[] = {
+        "--input",        "--output-raw",   "--output-decoded", "--output-rgb",
+        "--tile-digests", "--digest-tensor", "--serve",         "--connect"};
+    static const char *const flags_without_value[] = {
+        "--convrot-int8-resident", "--deterministic-conv", "--trace-ops",
+        "--verify-shards"};
+    for (int i = 1; i < argc; ++i) {
+      const std::string token = argv[i];
+      bool skip = false;
+      for (const auto *name : per_request_with_value)
+        if (token == name) {
+          skip = true;
+          break;
+        }
+      bool takes_value = token.rfind("--", 0) == 0;
+      for (const auto *name : flags_without_value)
+        if (token == name)
+          takes_value = false;
+      if (token == "--trace-ops")
+        skip = true;
+      if (!skip) {
+        options.prepare_signature += token;
+        options.prepare_signature += '\n';
+      }
+      if (takes_value && i + 1 < argc) {
+        ++i;
+        if (!skip) {
+          options.prepare_signature += argv[i];
+          options.prepare_signature += '\n';
+        }
+      }
+    }
+  }
   for (int i = 1; i < argc; ++i) {
     const std::string option = argv[i];
-    if (option == "--backend" && i + 1 < argc)
+    if (option == "--serve" && i + 1 < argc)
+      options.serve_socket = argv[++i];
+    else if (option == "--connect")
+      dif::fail("--connect is handled by the client and cannot reach parse");
+    else if (option == "--backend" && i + 1 < argc)
       options.backend = argv[++i];
     else if (option == "--backend-plugin" && i + 1 < argc)
       options.backend_plugin = argv[++i];
@@ -768,16 +827,21 @@ dif::frontend::H3Rgb24Video assemble_rgb24_fused(
 
 } // namespace
 
-int main(int argc, char **argv) {
-  try {
-    const auto options = parse(argc, argv);
+int run_request(const Options &options, ServerState &state) {
+  {
     constexpr std::uint64_t spatial_ratio = 16U;
     constexpr std::uint64_t temporal_ratio = 4U;
     if (options.tile_size % spatial_ratio != 0U ||
         options.tile_overlap % spatial_ratio != 0U)
       dif::fail("tile size and overlap must align to the VAE spatial ratio 16");
 
-    const auto program = dif::ir::read_file(options.program);
+    const bool reuse = static_cast<bool>(state.prepared);
+    if (reuse && state.signature != options.prepare_signature)
+      dif::fail("persistent decoder is prepared for a different "
+                "configuration; restart the server with the new flags");
+    if (!reuse)
+      state.program = dif::ir::read_file(options.program);
+    const auto &program = state.program;
     const auto *latent_desc = program.tensor(options.latent_id);
     const auto *raw_desc = program.tensor(options.raw_id);
     if (!latent_desc || !raw_desc)
@@ -796,6 +860,9 @@ int main(int argc, char **argv) {
         latent.dims[0] != 1U || latent.dims[1] != 24U ||
         latent.dims[2] == 0U || latent.dims[3] == 0U || latent.dims[4] == 0U)
       dif::fail("input latent must be F32 [1,24,T,H,W]");
+    if (reuse && latent.dims != state.latent_dims)
+      dif::fail("persistent decoder is prepared for a different latent "
+                "geometry; restart the server for this input");
 
     const auto tokens_per_chunk =
         (options.clip_length + temporal_ratio - 1U) / temporal_ratio;
@@ -833,27 +900,35 @@ int main(int argc, char **argv) {
         latent_desc->dims[4] != tile_latent_w)
       dif::fail("tile program spatial geometry does not match decode policy");
 
-    auto bindings = dif::weights::load_weight_bundle(
-        dif::weights::read_weight_bundle(options.weight_bundle), program,
-        options.verify_shards);
-    if (bindings.contains(options.latent_id))
-      dif::fail("weight bundle unexpectedly binds the dynamic latent");
-    auto representative = extract_tile(latent, 0U, tile_tokens,
-                                       y_plan.starts.front() / spatial_ratio,
-                                       x_plan.starts.front() / spatial_ratio,
-                                       tile_latent_h, tile_latent_w);
-    bindings.emplace(options.latent_id, representative);
+    if (!reuse) {
+      auto bindings = dif::weights::load_weight_bundle(
+          dif::weights::read_weight_bundle(options.weight_bundle), program,
+          options.verify_shards);
+      if (bindings.contains(options.latent_id))
+        dif::fail("weight bundle unexpectedly binds the dynamic latent");
+      auto representative = extract_tile(
+          latent, 0U, tile_tokens, y_plan.starts.front() / spatial_ratio,
+          x_plan.starts.front() / spatial_ratio, tile_latent_h, tile_latent_w);
+      bindings.emplace(options.latent_id, representative);
 
-    std::unique_ptr<dif::runtime::Executor> executor;
-    if (!options.backend_plugin.empty())
-      executor = dif::backend::make_plugin_executor(options.backend_plugin);
-    else if (options.backend == "cpu")
-      executor = dif::runtime::make_cpu_executor();
-    else if (options.backend == "cuda")
-      executor = dif::runtime::make_cuda_executor();
-    else
-      dif::fail("unknown backend: " + options.backend);
-    auto prepared = executor->prepare(program, bindings, options.run);
+      std::unique_ptr<dif::runtime::Executor> executor;
+      if (!options.backend_plugin.empty())
+        executor = dif::backend::make_plugin_executor(options.backend_plugin);
+      else if (options.backend == "cpu")
+        executor = dif::runtime::make_cpu_executor();
+      else if (options.backend == "cuda")
+        executor = dif::runtime::make_cuda_executor();
+      else
+        dif::fail("unknown backend: " + options.backend);
+      state.prepared = executor->prepare(program, bindings, options.run);
+      state.backend = std::move(executor);
+      state.bindings = std::move(bindings);
+      state.signature = options.prepare_signature;
+      state.latent_dims = latent.dims;
+    }
+    ++state.requests;
+    const auto &bindings = state.bindings;
+    auto &prepared = state.prepared;
     // --trace-ops: per-operation device timings aggregated over every tile
     // execution, printed by opcode so the decode's launch mix is attributable.
     std::map<std::string, std::pair<std::uint64_t, double>> opcode_timings;
@@ -1144,6 +1219,8 @@ int main(int argc, char **argv) {
               << y_plan.starts.size() * x_plan.starts.size()
               << " executions=" << decoded_tile_count
               << " prepare_ms=" << prepared->preparation_milliseconds()
+              << " persistent_reuse=" << (reuse ? 1 : 0)
+              << " persistent_request=" << state.requests
               << " kernel_sum_ms=" << kernel_milliseconds
               << " tile_extract_ms=" << tile_extract_milliseconds
               << " execution_wall_ms=" << execution_wall_milliseconds
@@ -1159,6 +1236,48 @@ int main(int argc, char **argv) {
               << " range=[" << minimum << ',' << maximum << "]"
               << " source_hash=" << source_hash << "\n";
     return 0;
+  }
+}
+
+int main(int argc, char **argv) {
+  try {
+    std::vector<std::string> arguments(argv + 1, argv + argc);
+    for (std::size_t index = 0U; index < arguments.size(); ++index) {
+      if (arguments[index] != "--connect")
+        continue;
+      if (index + 1U >= arguments.size())
+        dif::fail("missing value for --connect");
+      const std::filesystem::path socket_path = arguments[index + 1U];
+      arguments.erase(arguments.begin() + static_cast<std::ptrdiff_t>(index),
+                      arguments.begin() + static_cast<std::ptrdiff_t>(index) + 2);
+      return dif::serve::run_client(socket_path, arguments,
+                                    "persistent decoder");
+    }
+    const auto options = parse(argc, argv);
+    ServerState state;
+    const auto status = run_request(options, state);
+    if (status != 0 || options.serve_socket.empty())
+      return status;
+    return dif::serve::run_server(
+        options.serve_socket, "H3_VAE_SERVE", "difvaedecode",
+        "prepared_requests=" + std::to_string(state.requests) +
+            " resident_bytes=" + std::to_string(state.prepared->resident_bytes()),
+        [&](const std::vector<std::string> &request) {
+          std::vector<std::string> storage;
+          storage.reserve(request.size() + 1U);
+          storage.emplace_back("difvaedecode");
+          for (const auto &argument : request)
+            storage.push_back(argument);
+          std::vector<char *> pointers;
+          pointers.reserve(storage.size());
+          for (auto &token : storage)
+            pointers.push_back(token.data());
+          const auto request_options =
+              parse(static_cast<int>(pointers.size()), pointers.data());
+          if (!request_options.serve_socket.empty())
+            dif::fail("a served request cannot carry --serve");
+          return run_request(request_options, state);
+        });
   } catch (const std::exception &error) {
     std::cerr << "difvaedecode: " << error.what() << "\n";
     return 1;

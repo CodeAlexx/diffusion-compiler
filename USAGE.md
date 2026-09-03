@@ -726,6 +726,23 @@ outputs are bit-identical to a fresh process; the receipt carries
 lifetime (22.6 GB on the H3 recipe), so other GPU stages cannot run alongside
 it on a 24 GB device.
 
+Persistent decoder: `difvaedecode --serve SOCKET ...` and `--connect SOCKET`
+follow the same protocol (shared `dif/support/serve_socket.hpp`); the worker
+keeps the prepared tile program, resident ConvRot VAE weights and plans
+(about 3 GB of VRAM) and refuses a request whose prepare flags or latent
+geometry differ. Chain serve mode: `H3_SERVE_DIR=/short/path` makes
+`scripts/h3_fl2va_convrot_int8_prompt_to_mp4.sh` send the worker stages to
+live sockets under that directory and start missing workers with the first
+request (`H3_SERVE_WORKERS=vae` by default, `denoiser,vae` for cards with
+VRAM to spare; AF_UNIX limits the socket path to about 100 bytes).
+`scripts/h3_chain_workers.sh status|stop DIR` inspects or shuts the workers
+down. Measured 2026-09-03 on the 24 GB card: the resident denoiser
+(22.6 GB) leaves no room for either a resident decoder or the conditioner
+and keyframe encoders of the next prompt, and streaming blocks away to make
+room costs as much as the workers save, so serve mode is a no-gain
+configuration there; the decoder worker alone saves 1.2 s per decode when
+the denoiser is not resident.
+
 #### difvaedecode
 
 ```text

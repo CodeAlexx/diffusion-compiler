@@ -6,6 +6,7 @@
 #include "dif/runtime/tensor.hpp"
 #include "dif/sampling/rectified_flow.hpp"
 #include "dif/support/error.hpp"
+#include "dif/support/serve_socket.hpp"
 #include "dif/weights/bundle.hpp"
 
 #include <algorithm>
@@ -1993,193 +1994,32 @@ int run_request(const Options &options, ServerState &state,
 }
 
 // ---------------------------------------------------------------------------
-// Persistent denoiser protocol over a Unix stream socket. Request: u32 token
-// count, then per token u32 length + bytes (the difh3infer argv without the
-// program name). Reply: i32 status, u32 length, the request's stdout text.
-// A request consisting of the single token --shutdown stops the server.
-// ---------------------------------------------------------------------------
-void write_all(int descriptor, const void *data, std::size_t bytes) {
-  const auto *cursor = static_cast<const std::uint8_t *>(data);
-  while (bytes != 0U) {
-    const auto written = ::write(descriptor, cursor, bytes);
-    if (written < 0) {
-      if (errno == EINTR)
-        continue;
-      dif::fail(std::string("socket write failed: ") + std::strerror(errno));
-    }
-    cursor += written;
-    bytes -= static_cast<std::size_t>(written);
-  }
-}
-
-void read_all(int descriptor, void *data, std::size_t bytes) {
-  auto *cursor = static_cast<std::uint8_t *>(data);
-  while (bytes != 0U) {
-    const auto received = ::read(descriptor, cursor, bytes);
-    if (received < 0) {
-      if (errno == EINTR)
-        continue;
-      dif::fail(std::string("socket read failed: ") + std::strerror(errno));
-    }
-    if (received == 0)
-      dif::fail("socket closed before the message was complete");
-    cursor += received;
-    bytes -= static_cast<std::size_t>(received);
-  }
-}
-
-void write_u32(int descriptor, std::uint32_t value) {
-  write_all(descriptor, &value, sizeof(value));
-}
-
-std::uint32_t read_u32(int descriptor) {
-  std::uint32_t value = 0;
-  read_all(descriptor, &value, sizeof(value));
-  return value;
-}
-
-void write_blob(int descriptor, const std::string &text) {
-  if (text.size() > std::numeric_limits<std::uint32_t>::max())
-    dif::fail("socket message exceeds the protocol size");
-  write_u32(descriptor, static_cast<std::uint32_t>(text.size()));
-  write_all(descriptor, text.data(), text.size());
-}
-
-std::string read_blob(int descriptor) {
-  const auto length = read_u32(descriptor);
-  if (length > 64U * 1024U * 1024U)
-    dif::fail("socket message exceeds 64 MiB");
-  std::string text(length, '\0');
-  read_all(descriptor, text.data(), length);
-  return text;
-}
-
-int connect_socket(const std::filesystem::path &socket_path) {
-  sockaddr_un address{};
-  address.sun_family = AF_UNIX;
-  const auto path = socket_path.string();
-  if (path.size() >= sizeof(address.sun_path))
-    dif::fail("socket path is too long for AF_UNIX: " + path);
-  std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path) - 1U);
-  const int descriptor = ::socket(AF_UNIX, SOCK_STREAM, 0);
-  if (descriptor < 0)
-    dif::fail(std::string("cannot create socket: ") + std::strerror(errno));
-  if (::connect(descriptor, reinterpret_cast<const sockaddr *>(&address),
-                sizeof(address)) != 0) {
-    const auto reason = std::string(std::strerror(errno));
-    ::close(descriptor);
-    dif::fail("cannot connect to persistent denoiser " + path + ": " + reason);
-  }
-  return descriptor;
-}
-
-int run_client(const std::filesystem::path &socket_path,
-               const std::vector<std::string> &arguments) {
-  const int descriptor = connect_socket(socket_path);
-  write_u32(descriptor, static_cast<std::uint32_t>(arguments.size()));
-  for (const auto &argument : arguments)
-    write_blob(descriptor, argument);
-  std::int32_t status = 0;
-  read_all(descriptor, &status, sizeof(status));
-  const auto text = read_blob(descriptor);
-  ::close(descriptor);
-  std::cout << text << std::flush;
-  return static_cast<int>(status);
-}
-
+// Persistent denoiser over the shared worker protocol
+// (dif/support/serve_socket.hpp): a served request is the difh3infer argv
+// without the program name; the prepared execution is reused while the
+// prepare signature matches.
 int serve(const std::filesystem::path &socket_path, ServerState &state) {
-  sockaddr_un address{};
-  address.sun_family = AF_UNIX;
-  const auto path = socket_path.string();
-  if (path.size() >= sizeof(address.sun_path))
-    dif::fail("socket path is too long for AF_UNIX: " + path);
-  std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path) - 1U);
-  ::unlink(path.c_str());
-  const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
-  if (listener < 0)
-    dif::fail(std::string("cannot create socket: ") + std::strerror(errno));
-  if (::bind(listener, reinterpret_cast<const sockaddr *>(&address),
-             sizeof(address)) != 0 ||
-      ::listen(listener, 4) != 0) {
-    const auto reason = std::string(std::strerror(errno));
-    ::close(listener);
-    dif::fail("cannot listen on " + path + ": " + reason);
-  }
-  std::cout << "H3_SERVE READY socket=" << path << " pid=" << ::getpid()
-            << " prepared_requests=" << state.requests
-            << " resident_bytes=" << state.resident << "\n"
-            << std::flush;
-  std::size_t served = 0U;
-  for (;;) {
-    const int connection = ::accept(listener, nullptr, nullptr);
-    if (connection < 0) {
-      if (errno == EINTR)
-        continue;
-      ::close(listener);
-      dif::fail(std::string("accept failed: ") + std::strerror(errno));
-    }
-    std::vector<std::string> arguments;
-    std::int32_t status = 0;
-    std::string reply;
-    try {
-      const auto count = read_u32(connection);
-      if (count > 4096U)
-        dif::fail("request carries too many tokens");
-      arguments.reserve(count);
-      for (std::uint32_t token = 0U; token < count; ++token)
-        arguments.push_back(read_blob(connection));
-    } catch (const std::exception &error) {
-      std::cerr << "difh3infer: bad request: " << error.what() << "\n";
-      ::close(connection);
-      continue;
-    }
-    if (arguments.size() == 1U && arguments.front() == "--shutdown") {
-      reply = "H3_SERVE SHUTDOWN served=" + std::to_string(served) + "\n";
-      write_all(connection, &status, sizeof(status));
-      write_blob(connection, reply);
-      ::close(connection);
-      break;
-    }
-    const auto request_start = std::chrono::steady_clock::now();
-    std::ostringstream captured;
-    auto *previous = std::cout.rdbuf(captured.rdbuf());
-    try {
-      std::vector<std::string> storage;
-      storage.reserve(arguments.size() + 1U);
-      storage.emplace_back("difh3infer");
-      for (const auto &argument : arguments)
-        storage.push_back(argument);
-      std::vector<char *> pointers;
-      pointers.reserve(storage.size());
-      for (auto &token : storage)
-        pointers.push_back(token.data());
-      const auto options = parse(static_cast<int>(pointers.size()),
-                                 pointers.data());
-      if (!options.serve_socket.empty())
-        dif::fail("a served request cannot carry --serve");
-      status = run_request(options, state, request_start);
-    } catch (const std::exception &error) {
-      captured << "difh3infer: " << error.what() << "\n";
-      status = 1;
-    }
-    std::cout.rdbuf(previous);
-    ++served;
-    reply = captured.str();
-    try {
-      write_all(connection, &status, sizeof(status));
-      write_blob(connection, reply);
-    } catch (const std::exception &error) {
-      std::cerr << "difh3infer: reply failed: " << error.what() << "\n";
-    }
-    ::close(connection);
-    std::cout << "H3_SERVE REQUEST index=" << served << " status=" << status
-              << " wall_ms=" << elapsed_milliseconds(request_start) << "\n"
-              << std::flush;
-  }
-  ::close(listener);
-  ::unlink(path.c_str());
-  std::cout << "H3_SERVE STOPPED served=" << served << "\n" << std::flush;
-  return 0;
+  return dif::serve::run_server(
+      socket_path, "H3_SERVE", "difh3infer",
+      "prepared_requests=" + std::to_string(state.requests) +
+          " resident_bytes=" + std::to_string(state.resident),
+      [&](const std::vector<std::string> &arguments) {
+        const auto request_start = std::chrono::steady_clock::now();
+        std::vector<std::string> storage;
+        storage.reserve(arguments.size() + 1U);
+        storage.emplace_back("difh3infer");
+        for (const auto &argument : arguments)
+          storage.push_back(argument);
+        std::vector<char *> pointers;
+        pointers.reserve(storage.size());
+        for (auto &token : storage)
+          pointers.push_back(token.data());
+        const auto options =
+            parse(static_cast<int>(pointers.size()), pointers.data());
+        if (!options.serve_socket.empty())
+          dif::fail("a served request cannot carry --serve");
+        return run_request(options, state, request_start);
+      });
 }
 
 int main(int argc, char **argv) {
@@ -2193,7 +2033,8 @@ int main(int argc, char **argv) {
       const std::filesystem::path socket_path = arguments[index + 1U];
       arguments.erase(arguments.begin() + static_cast<std::ptrdiff_t>(index),
                       arguments.begin() + static_cast<std::ptrdiff_t>(index) + 2);
-      return run_client(socket_path, arguments);
+      return dif::serve::run_client(socket_path, arguments,
+                                    "persistent denoiser");
     }
     const auto command_wall_start = std::chrono::steady_clock::now();
     const auto options = parse(argc, argv);
