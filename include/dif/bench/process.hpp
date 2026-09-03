@@ -33,7 +33,27 @@ struct StageResult {
   std::uint64_t filesystem_output_blocks{};
   std::vector<std::string> concurrent_with;
   std::filesystem::path log;
+  // Stage cache outcome: "disabled" (no cache directory), "none" (stage has
+  // no cache declaration), "miss" (ran and stored), "hit" (outputs restored,
+  // process not started), "store-failed".
+  std::string cache_status{"disabled"};
+  std::string cache_key;
 };
+
+// Content-addressed stage cache. A stage's key is the SHA-256 of its name,
+// its argv, and the identity of every declared key file: path, size, mtime,
+// and the file's SHA-256 when it is at most `digest_limit_bytes` (larger
+// files, typically multi-GB model caches, contribute path+size+mtime only).
+struct StageCachePolicy {
+  std::filesystem::path directory; // empty = disabled
+  std::uint64_t digest_limit_bytes{64ULL * 1024ULL * 1024ULL};
+  bool enabled() const { return !directory.empty(); }
+};
+// `work_directory` is replaced by a placeholder in argv and key-file paths
+// so runs in different work directories share keys.
+std::string stage_cache_key(const ResolvedStage &stage,
+                            const StageCachePolicy &policy,
+                            const std::filesystem::path &work_directory);
 
 struct ChainResult {
   bool success{};
@@ -48,7 +68,8 @@ struct ChainResult {
 ChainResult run_chain(
     const ResolvedRecipe &resolved, const std::filesystem::path &log_directory,
     const std::function<std::vector<std::pair<std::string, std::string>>(
-        std::size_t)> &before_stage = {});
+        std::size_t)> &before_stage = {},
+    const StageCachePolicy &cache = {});
 
 struct CaptureResult {
   int exit_status{-1};

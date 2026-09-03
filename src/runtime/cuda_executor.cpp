@@ -7010,8 +7010,19 @@ void write_text(const std::filesystem::path &path, const std::string &text) {
 std::string compile_ptx(const std::string &source, int major, int minor,
                         const std::filesystem::path &cache_directory,
                         std::string &source_hash) {
-  const std::string key_material = source + "\ncompute_" + std::to_string(major) +
-                                   std::to_string(minor) + "\nnvrtc-v1";
+  // The cache key covers everything that changes the PTX: the source, the
+  // architecture, the NVRTC version (two toolkits coexist on this host), and
+  // the exact option list (Flame lesson: flags are part of the numerics
+  // contract; a cache keyed on name/arch alone served stale PTX).
+  int nvrtc_major = 0;
+  int nvrtc_minor = 0;
+  (void)nvrtcVersion(&nvrtc_major, &nvrtc_minor);
+  const std::string key_material =
+      source + "\ncompute_" + std::to_string(major) + std::to_string(minor) +
+      "\nnvrtc=" + std::to_string(nvrtc_major) + "." +
+      std::to_string(nvrtc_minor) +
+      "\noptions=--std=c++17;--gpu-architecture;--include-path;--restrict" +
+      "\nnvrtc-v2";
   const auto key_bytes = std::span<const std::uint8_t>(
       reinterpret_cast<const std::uint8_t *>(key_material.data()), key_material.size());
   source_hash = hex_digest(sha256(key_bytes));

@@ -22,6 +22,8 @@ struct RunSettings {
   bool drop_file_cache{};
   bool ffprobe{true};
   bool digest_model_files{};
+  // Stage cache (see StageCachePolicy); disabled unless a directory is set.
+  StageCachePolicy stage_cache;
   std::function<std::vector<std::pair<std::string, std::string>>(std::size_t)>
       before_stage;
 };

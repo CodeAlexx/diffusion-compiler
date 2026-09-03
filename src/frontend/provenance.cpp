@@ -49,6 +49,10 @@ std::string serialize_provenance(const ProvenanceTable &table) {
     weights.push_back(std::move(entry));
   }
   out.set("weights", std::move(weights));
+  telemetry::Object facts;
+  for (const auto &[key, value] : table.facts)
+    facts.set(key, value);
+  out.set("facts", std::move(facts));
   return telemetry::serialize(telemetry::Value(std::move(out)));
 }
 
@@ -103,6 +107,9 @@ ProvenanceTable parse_provenance(std::string_view text) {
     table.weight_names.emplace_back(
         integer_u32(required(entry, "tensor"), "tensor"),
         required(entry, "name").string());
+  if (const auto *facts = document.find("facts"); facts && facts->is_object())
+    for (const auto &[key, value] : facts->object())
+      table.facts.emplace_back(key, value.string());
   return table;
 }
 

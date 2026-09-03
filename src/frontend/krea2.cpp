@@ -637,6 +637,7 @@ Krea2BlockBuild make_krea2_block(const Krea2Config &config,
   // Record the creator section each operation was lowered from, driven by the
   // boundary tensors this builder itself produced (never by tensor names).
   build.provenance.frontend = "krea2";
+  build.provenance.facts.emplace_back("rope_table_dtype", "f32");
   build.provenance.creator = std::string(kKrea2Creator);
   build.provenance.creator_revision = std::string(kKrea2CreatorRevision);
   {
@@ -1130,6 +1131,7 @@ Krea2DenoiserBuild make_krea2_denoiser(const Krea2Config &config,
             {combined}, {Attribute::u64(AttrKey::Axis, 1U)});
 
   build.provenance.frontend = "krea2";
+  build.provenance.facts.emplace_back("rope_table_dtype", "f32");
   build.provenance.creator = std::string(kKrea2Creator);
   build.provenance.creator_revision = std::string(kKrea2CreatorRevision);
   // Operations lowered so far are the patch projection, the timestep tower,

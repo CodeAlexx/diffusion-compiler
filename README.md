@@ -115,6 +115,20 @@ attribution vocabulary (`include/dif/telemetry/vocabulary.hpp`).
   only acceptance metric; stage timings are diagnostics. The frozen H3 FL2VA
   and Krea 2 Turbo chains are transcribed as `perf/recipes/*.json` and are
   validation fixtures, not part of the tool.
+- Stage cache. A recipe stage may declare `"cache": {"key": [files...],
+  "outputs": [files...]}`; with `difbench run ... --stage-cache DIR` (also
+  `diftrace recipe --stage-cache DIR`) a stage whose key (its argv with the
+  work directory normalized, plus every key file's path, size, mtime outside
+  the work directory and SHA-256 up to 64 MiB) is already in DIR has its
+  outputs restored and its process never started. Every stage record carries
+  `cache_status` (`disabled`, `none`, `miss`, `hit`, `store-failed`) and
+  `cache_key`, and the run conditions list the hits, so a cached wall is
+  never mistaken for a cold one. Without `--stage-cache` the declarations are
+  inert. The H3 recipe caches presentation, vision and conditioner on the
+  prompt, keyframes, program files and the conditioner ConvRot cache;
+  measured on the 3090 Ti the three stages go from 9 s warm (240 s cold) to
+  0.06 s on a repeat prompt, and the cached conditioning makes the denoiser
+  bit-reproducible run to run.
 - `diftrace recipe|program|merge` attributes where total wait goes. The shared
   runtime now records attributed events at its centralized submission sites
   (GEMM, attention, convolution, generated kernels, H2D/D2H/D2D bytes, staging,
@@ -129,6 +143,11 @@ attribution vocabulary (`include/dif/telemetry/vocabulary.hpp`).
   fused backend plan executed at that operation's slot (for example the H3
   INT8 QKV projection at the QKV weight layout op), so consumers do not
   classify a projection GEMM as layout.
+- The on-disk PTX cache is keyed on the generated source, the compute
+  architecture, the NVRTC version and the option list, so two toolkits on one
+  host (12.4 and 12.6 here) never share an entry. Frontend provenance
+  sidecars carry `facts` (for example `rope_table_dtype`), creator numerics
+  the frontend asserted while building.
 - Two gates paid for elsewhere and adopted here. `dif_noise_tests` measures
   every shipped noise source (the torch-parity CPU generator and the H3 GPU
   generator behind `difh3noise --rng serenity`) for mean, std, sign balance

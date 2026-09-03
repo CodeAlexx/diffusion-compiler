@@ -130,6 +130,18 @@ Recipe parse_recipe(const std::filesystem::path &path) {
     stage.cwd = optional_string(entry, "cwd");
     if (const auto *environment = entry.find("environment"))
       stage.environment = string_map(*environment, "stage environment");
+    if (const auto *cache = entry.find("cache")) {
+      if (!cache->is_object())
+        fail("benchmark recipe stage '" + stage.name +
+             "' cache must be an object with key and outputs");
+      stage.cacheable = true;
+      stage.cache.key = string_list(required(*cache, "key"), "stage cache key");
+      stage.cache.outputs =
+          string_list(required(*cache, "outputs"), "stage cache outputs");
+      if (stage.cache.key.empty() || stage.cache.outputs.empty())
+        fail("benchmark recipe stage '" + stage.name +
+             "' cache needs at least one key file and one output");
+    }
     recipe.stages.push_back(std::move(stage));
   }
   recipe.output = required(document, "output").string();
@@ -265,6 +277,15 @@ ResolvedRecipe resolve_recipe(const Recipe &recipe,
       out.environment.emplace_back(key, substitute(value));
     for (const auto &[key, value] : stage.environment)
       out.environment.emplace_back(key, substitute(value));
+    out.cacheable = stage.cacheable;
+    for (const auto &file : stage.cache.key)
+      out.cache_key_files.emplace_back(substitute(file));
+    for (const auto &file : stage.cache.outputs) {
+      std::filesystem::path output(substitute(file));
+      if (!output.is_absolute())
+        output = resolved.work_directory / output;
+      out.cache_outputs.push_back(std::move(output));
+    }
     resolved.stages.push_back(std::move(out));
   }
   return resolved;

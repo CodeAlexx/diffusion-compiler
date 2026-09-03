@@ -40,6 +40,10 @@ struct ProvenanceTable {
   std::vector<ProvenanceRecord> records;
   // Constant tensor id -> creator checkpoint tensor name.
   std::vector<std::pair<std::uint32_t, std::string>> weight_names;
+  // Creator numerics facts the frontend asserted while building, as
+  // key/value strings (for example rope_table_dtype=f32: whether the
+  // reference runtime rounds its RoPE tables is a known parity trap).
+  std::vector<std::pair<std::string, std::string>> facts;
 
   const ProvenanceRecord *find(std::uint32_t operation_id) const;
   const std::string *weight_name(std::uint32_t tensor_id) const;

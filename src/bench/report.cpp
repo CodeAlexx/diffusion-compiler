@@ -41,7 +41,7 @@ RunRecord execute_run(const ResolvedRecipe &resolved,
   GpuSampler sampler;
   sampler.start();
   record.chain = run_chain(resolved, resolved.work_directory / "logs",
-                           settings.before_stage);
+                           settings.before_stage, settings.stage_cache);
   record.gpu = sampler.stop();
   record.wall_seconds = record.chain.wall_seconds;
   record.artifact = inspect_artifact(resolved.output);
@@ -168,6 +168,8 @@ telemetry::Object stage_section(const StageResult &stage,
   for (const auto &name : stage.concurrent_with)
     concurrent.push_back(name);
   out.set("concurrent_with", std::move(concurrent));
+  out.set("cache_status", stage.cache_status);
+  out.set("cache_key", telemetry::nullable_string(stage.cache_key));
   telemetry::Array after;
   for (const auto dependency : resolved.after)
     after.push_back(dependency);
@@ -210,6 +212,17 @@ telemetry::Object run_section(const RunRecord &record,
   conditions.set("process", telemetry::condition::fresh_process);
   conditions.set("filesystem", record.residency_before.condition);
   conditions.set("drop_file_cache", settings.drop_file_cache);
+  telemetry::Object stage_cache;
+  stage_cache.set("enabled", settings.stage_cache.enabled());
+  stage_cache.set("directory",
+                  telemetry::nullable_string(
+                      settings.stage_cache.directory.string()));
+  telemetry::Array hits;
+  for (const auto &stage : record.chain.stages)
+    if (stage.cache_status == "hit")
+      hits.push_back(telemetry::Value(stage.name));
+  stage_cache.set("hits", std::move(hits));
+  conditions.set("stage_cache", std::move(stage_cache));
   out.set("conditions", std::move(conditions));
   out.set("filesystem_before",
           residency_section(record.files_before, record.residency_before));

@@ -29,6 +29,19 @@ struct RecipeStage {
   std::vector<std::string> after;
   std::string cwd;
   std::vector<std::pair<std::string, std::string>> environment;
+  // Optional stage cache declaration. `key` lists the files whose identity
+  // (plus this stage's argv) determines the stage's outputs; `outputs` lists
+  // the files the stage produces. The cache only acts when the runner is
+  // given a cache directory (difbench/diftrace --stage-cache DIR); without
+  // one the declaration is inert and the historical fresh-process chain
+  // runs. A hit is recorded on the stage record and in the run conditions
+  // so a cached wall is never mistaken for a cold one.
+  struct Cache {
+    std::vector<std::string> key;
+    std::vector<std::string> outputs;
+  };
+  bool cacheable{};
+  Cache cache;
 };
 
 struct RecipeInput {
@@ -77,6 +90,9 @@ struct ResolvedStage {
   std::vector<std::size_t> after;
   std::filesystem::path cwd;
   std::vector<std::pair<std::string, std::string>> environment;
+  bool cacheable{};
+  std::vector<std::filesystem::path> cache_key_files;
+  std::vector<std::filesystem::path> cache_outputs;
 };
 
 struct ResolvedRecipe {

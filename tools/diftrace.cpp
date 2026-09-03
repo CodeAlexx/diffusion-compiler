@@ -36,6 +36,7 @@ void usage() {
       << "usage: diftrace recipe RECIPE.json --workdir DIR [--build DIR]\n"
          "                     [--prompt-file FILE] [--set VAR=VALUE ...]\n"
          "                     [--nvtx] [--no-ffprobe] [--json] [--report FILE]\n"
+         "                     [--stage-cache DIR]\n"
          "       diftrace program --backend cpu|cuda --program FILE.difir\n"
          "                     [--weight-bundle FILE.difbind] [--input ID=FILE ...]\n"
          "                     [--warmups N] [--iterations N] [--nvtx]\n"
@@ -298,6 +299,7 @@ struct RecipeOptions {
   std::map<std::string, std::string> overrides;
   bool nvtx{};
   bool ffprobe{true};
+  std::filesystem::path stage_cache;
   bool json{};
   std::filesystem::path report;
 };
@@ -340,6 +342,8 @@ int command_recipe(int argc, char **argv) {
       options.overrides[text.substr(0, split)] = text.substr(split + 1U);
     } else if (option == "--nvtx")
       options.nvtx = true;
+    else if (option == "--stage-cache")
+      options.stage_cache = std::filesystem::path(value());
     else if (option == "--no-ffprobe")
       options.ffprobe = false;
     else if (option == "--json")
@@ -376,6 +380,7 @@ int command_recipe(int argc, char **argv) {
   std::filesystem::create_directories(trace_directory);
   dif::bench::RunSettings settings;
   settings.ffprobe = options.ffprobe;
+  settings.stage_cache.directory = options.stage_cache;
   settings.before_stage = [&](std::size_t index) {
     std::vector<std::pair<std::string, std::string>> environment;
     environment.emplace_back(

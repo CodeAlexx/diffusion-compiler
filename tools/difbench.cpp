@@ -34,6 +34,7 @@ void usage() {
          "                    [--repeat N] [--cooldown-seconds S]\n"
          "                    [--drop-file-cache] [--digest-model-files]\n"
          "                    [--no-ffprobe] [--gpu-lock FILE] [--label TEXT]\n"
+         "                    [--stage-cache DIR]\n"
          "                    [--json] [--report FILE]\n"
          "       difbench show RECIPE.json [--workdir DIR] [--build DIR]\n"
          "                    [--prompt-file FILE] [--set VAR=VALUE ...] [--json]\n"
@@ -63,6 +64,7 @@ struct Options {
   std::uint32_t repeat{1U};
   double cooldown_seconds{10.0};
   bool drop_file_cache{};
+  std::filesystem::path stage_cache;
   bool digest_model_files{};
   bool ffprobe{true};
   std::filesystem::path gpu_lock;
@@ -112,6 +114,8 @@ Options parse(int argc, char **argv) {
       options.digest_model_files = true;
     else if (option == "--no-ffprobe")
       options.ffprobe = false;
+    else if (option == "--stage-cache")
+      options.stage_cache = std::filesystem::path(value());
     else if (option == "--gpu-lock")
       options.gpu_lock = value();
     else if (option == "--label")
@@ -355,6 +359,8 @@ int command_run(const Options &options) {
     conditions.set("cooldown_seconds", options.cooldown_seconds);
     conditions.set("drop_file_cache", options.drop_file_cache);
     conditions.set("gpu_lock", options.gpu_lock.string());
+    conditions.set("stage_cache",
+                   dif::telemetry::nullable_string(options.stage_cache.string()));
     document.set("conditions", std::move(conditions));
   }
 
@@ -362,6 +368,7 @@ int command_run(const Options &options) {
   settings.drop_file_cache = options.drop_file_cache;
   settings.ffprobe = options.ffprobe && ffprobe_available();
   settings.digest_model_files = options.digest_model_files;
+  settings.stage_cache.directory = options.stage_cache;
 
   dif::telemetry::Array runs;
   std::vector<double> completed_walls;
@@ -386,6 +393,9 @@ int command_run(const Options &options) {
                 << " wall=" << seconds(record.wall_seconds) << " s";
       if (!record.chain.failed_stage.empty())
         std::cerr << " failed_stage=" << record.chain.failed_stage;
+      for (const auto &stage : record.chain.stages)
+        if (stage.cache_status == "hit")
+          std::cerr << " cache_hit=" << stage.name;
       std::cerr << "\n";
     }
     runs.push_back(std::move(section));

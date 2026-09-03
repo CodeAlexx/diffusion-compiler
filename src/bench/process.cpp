@@ -1,10 +1,15 @@
 #include "dif/bench/process.hpp"
 
 #include "dif/support/error.hpp"
+#include "dif/support/sha256.hpp"
 
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <span>
+#include <string>
 #include <fcntl.h>
 #include <map>
 #include <sys/resource.h>
@@ -69,10 +74,118 @@ environment_for(const ResolvedStage &stage,
 
 } // namespace
 
+std::string stage_cache_key(const ResolvedStage &stage,
+                            const StageCachePolicy &policy,
+                            const std::filesystem::path &work_directory) {
+  const auto workdir = work_directory.string();
+  const auto normalize = [&](std::string text) {
+    if (workdir.empty())
+      return text;
+    for (auto at = text.find(workdir); at != std::string::npos;
+         at = text.find(workdir, at + 10U))
+      text.replace(at, workdir.size(), "${workdir}");
+    return text;
+  };
+  std::string material = "diffusion-compiler-stage-cache-v1\n";
+  material += "stage=" + stage.name + "\n";
+  for (const auto &argument : stage.argv)
+    material += "argv=" + normalize(argument) + "\n";
+  for (const auto &file : stage.cache_key_files) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(file, error);
+    if (error)
+      fail("stage cache key file is missing: " + file.string());
+    const auto written = std::filesystem::last_write_time(file, error);
+    const auto mtime = static_cast<long long>(
+        written.time_since_epoch().count());
+    material += "file=" + normalize(file.string()) +
+                " size=" + std::to_string(size);
+    // Files inside the work directory are per-run products: identify them
+    // by content only. Files outside it (models, prompts, keyframes) carry
+    // their mtime so a rewritten model file invalidates the key even when
+    // it is too large to digest.
+    if (file.string().rfind(workdir, 0U) != 0U)
+      material += " mtime=" + std::to_string(mtime);
+    if (size <= policy.digest_limit_bytes)
+      material += " sha256=" + hex_digest(sha256_file(file));
+    material += "\n";
+  }
+  return hex_digest(sha256(std::span<const std::uint8_t>(
+      reinterpret_cast<const std::uint8_t *>(material.data()),
+      material.size())));
+}
+
+namespace {
+
+std::filesystem::path cache_entry_path(const StageCachePolicy &policy,
+                                       const std::string &key,
+                                       const std::filesystem::path &output) {
+  return policy.directory / key / output.filename();
+}
+
+bool restore_from_cache(const ResolvedStage &stage,
+                        const StageCachePolicy &policy,
+                        const std::string &key) {
+  const auto entry = policy.directory / key;
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(entry / "manifest.json", error))
+    return false;
+  for (const auto &output : stage.cache_outputs)
+    if (!std::filesystem::is_regular_file(cache_entry_path(policy, key, output),
+                                          error))
+      return false;
+  for (const auto &output : stage.cache_outputs) {
+    std::filesystem::create_directories(output.parent_path(), error);
+    std::filesystem::copy_file(cache_entry_path(policy, key, output), output,
+                               std::filesystem::copy_options::overwrite_existing,
+                               error);
+    if (error)
+      fail("stage cache restore failed for " + output.string() + ": " +
+           error.message());
+  }
+  return true;
+}
+
+bool store_to_cache(const ResolvedStage &stage, const StageCachePolicy &policy,
+                    const std::string &key) {
+  const auto entry = policy.directory / key;
+  std::error_code error;
+  std::filesystem::create_directories(entry, error);
+  if (error)
+    return false;
+  for (const auto &output : stage.cache_outputs) {
+    if (!std::filesystem::is_regular_file(output, error))
+      return false;
+    std::filesystem::copy_file(output, cache_entry_path(policy, key, output),
+                               std::filesystem::copy_options::overwrite_existing,
+                               error);
+    if (error)
+      return false;
+  }
+  std::string manifest = "{\"kind\": \"diffusion-compiler-stage-cache\", "
+                         "\"version\": 1, \"stage\": \"" +
+                         stage.name + "\", \"key\": \"" + key +
+                         "\", \"outputs\": [";
+  for (std::size_t index = 0; index < stage.cache_outputs.size(); ++index)
+    manifest += std::string(index == 0U ? "" : ", ") + "\"" +
+                stage.cache_outputs[index].filename().string() + "\"";
+  manifest += "], \"key_files\": [";
+  for (std::size_t index = 0; index < stage.cache_key_files.size(); ++index)
+    manifest += std::string(index == 0U ? "" : ", ") + "\"" +
+                stage.cache_key_files[index].string() + "\"";
+  manifest += "]}\n";
+  std::ofstream out(entry / "manifest.json", std::ios::binary);
+  out << manifest;
+  return static_cast<bool>(out);
+}
+
+} // namespace
+
 ChainResult run_chain(
     const ResolvedRecipe &resolved, const std::filesystem::path &log_directory,
     const std::function<std::vector<std::pair<std::string, std::string>>(
-        std::size_t)> &before_stage) {
+        std::size_t)> &before_stage,
+    const StageCachePolicy &cache) {
   std::filesystem::create_directories(log_directory);
   ChainResult result;
   result.stages.resize(resolved.stages.size());
@@ -80,7 +193,12 @@ ChainResult run_chain(
     result.stages[index].name = resolved.stages[index].name;
     result.stages[index].log =
         log_directory / (resolved.stages[index].name + ".log");
+    result.stages[index].cache_status =
+        !cache.enabled() ? "disabled"
+        : resolved.stages[index].cacheable ? "miss" : "none";
   }
+  if (cache.enabled())
+    std::filesystem::create_directories(cache.directory);
   std::vector<bool> succeeded(resolved.stages.size(), false);
   std::vector<bool> failed(resolved.stages.size(), false);
   std::vector<Running> running;
@@ -102,6 +220,27 @@ ChainResult run_chain(
           ready = ready && succeeded[dependency];
         if (!ready)
           continue;
+        if (cache.enabled() && resolved.stages[index].cacheable) {
+          // Key files must exist by now (they are inputs or earlier
+          // outputs); a hit restores the outputs and never starts the
+          // process, and the stage wall is the restore time.
+          const auto start = std::chrono::steady_clock::now();
+          record.cache_key = stage_cache_key(resolved.stages[index], cache,
+                                             resolved.work_directory);
+          if (restore_from_cache(resolved.stages[index], cache,
+                                 record.cache_key)) {
+            record.started = true;
+            record.finished = true;
+            record.exit_status = 0;
+            record.cache_status = "hit";
+            record.start_offset_seconds = seconds_since(chain_start, start);
+            record.wall_seconds =
+                seconds_since(start, std::chrono::steady_clock::now());
+            succeeded[index] = true;
+            --remaining;
+            continue;
+          }
+        }
         const auto extra = before_stage ? before_stage(index)
                                         : std::vector<std::pair<std::string,
                                                                 std::string>>{};
@@ -159,6 +298,10 @@ ChainResult run_chain(
           static_cast<std::uint64_t>(usage.ru_oublock);
       if (record.exit_status == 0) {
         succeeded[it->index] = true;
+        if (cache.enabled() && resolved.stages[it->index].cacheable &&
+            !store_to_cache(resolved.stages[it->index], cache,
+                            record.cache_key))
+          record.cache_status = "store-failed";
       } else {
         failed[it->index] = true;
         if (!aborted) {

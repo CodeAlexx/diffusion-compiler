@@ -63,7 +63,8 @@
   ],
   "required_tools": ["ffmpeg", "ffprobe"],
   "stages": [
-    {"name": "presentation", "after": [], "argv": [
+    {"name": "presentation", "after": [], "cache": {"key": ["${prompt_file}", "${input:first_keyframe}", "${input:last_keyframe}", "${CKPT}/processor/preprocessor_config.json", "${CKPT}/processor/tokenizer.json"], "outputs": ["${workdir}/presentation.safetensors", "${workdir}/input-ids.diftensor", "${workdir}/token-tags.diftensor"]},
+      "argv": [
       "${build}/difh3vision", "inputs",
       "--checkpoint", "${CKPT}/text_encoder", "--processor", "${CKPT}/processor",
       "--image", "${input:first_keyframe}", "--image", "${input:last_keyframe}",
@@ -71,7 +72,8 @@
       "--grid-t", "1", "--grid-h", "30", "--grid-w", "52", "--strip-trailing-newline",
       "--output", "${workdir}/presentation.safetensors",
       "--ids-out", "${workdir}/input-ids.diftensor", "--tags-out", "${workdir}/token-tags.diftensor"]},
-    {"name": "vision", "after": ["presentation"], "argv": [
+    {"name": "vision", "after": ["presentation"], "cache": {"key": ["${prompt_file}", "${input:first_keyframe}", "${input:last_keyframe}", "${NATIVE}/vision/qwen3vl-vision-t1h30w52.difir", "${NATIVE}/vision/qwen3vl-vision-t1h30w52.difbind"], "outputs": ["${workdir}/vision.safetensors", "${workdir}/vision.json"]},
+      "argv": [
       "${build}/difh3vision", "run",
       "--program", "${NATIVE}/vision/qwen3vl-vision-t1h30w52.difir",
       "--bundle", "${NATIVE}/vision/qwen3vl-vision-t1h30w52.difbind",
@@ -99,7 +101,8 @@
       "--output-rows", "${workdir}/last-rows.diftensor",
       "--tile-size", "256", "--tile-overlap", "64", "--posterior-seed", "42",
       "--cache-dir", "${CACHE}", "--min-free-mib", "512"]},
-    {"name": "conditioner", "after": ["vision"], "argv": [
+    {"name": "conditioner", "after": ["vision"], "cache": {"key": ["${prompt_file}", "${input:first_keyframe}", "${input:last_keyframe}", "${NATIVE}/conditioner/qwen3vl-mm-s1256-v780-l50.difir", "${NATIVE}/conditioner/qwen3vl-mm-s1256-v780-l50.difbind", "${CONDITIONER_CONVROT}"], "outputs": ["${workdir}/conditioning.diftensor", "${workdir}/conditioner.json"]},
+      "argv": [
       "${build}/difcondition", "run", "--backend", "cuda",
       "--program", "${NATIVE}/conditioner/qwen3vl-mm-s1256-v780-l50.difir",
       "--bundle", "${NATIVE}/conditioner/qwen3vl-mm-s1256-v780-l50.difbind",
