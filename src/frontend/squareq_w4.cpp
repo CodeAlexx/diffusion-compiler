@@ -346,6 +346,9 @@ SquareQW4RewriteResult rewrite_linear_weights_squareq_w4(
                                    ir::Int8RowQuantization::H256F32SylvesterConvRot))}},
       };
     }
+    if (mode == SquareQW4Mode::Int8Compute)
+      for (std::size_t index = 0U; index + 1U < inserted.size(); ++index)
+        result.weight_chain_operations.push_back(inserted[index].id);
     program.operations.at(linear_index) = std::move(rewritten);
     program.operations.insert(
         program.operations.begin() + static_cast<std::ptrdiff_t>(linear_index),

@@ -54,6 +54,11 @@ struct SquareQW4RewriteResult {
   double plan_cos_w_min{};
   SquareQW4Mode mode{SquareQW4Mode::DequantBf16};
   std::vector<std::string> names;
+  // Int8Compute only: the per-linear weight chain (DequantizeInt4, low-rank
+  // Linear, Add, weight QuantizeInt8Rows). Every input is a slab constant, so
+  // a caller may hand these to RunOptions::repeated_invariant_operations to
+  // compute the INT8 weights once per prepared plan when device memory allows.
+  std::vector<std::uint32_t> weight_chain_operations;
 };
 
 // checkpoint_tensors[i] is the program tensor bound from checkpoint key

@@ -2690,9 +2690,9 @@ void test_cuda_repeated_invariant_execution_cache() {
              second.repeated_invariant_cache_hit &&
              second.repeated_invariant_operation_count == 1U &&
              second.repeated_invariant_persistent_bytes == 2U * sizeof(float) &&
-             second.run_telemetry.d2d_copies == 1U &&
-             second.run_telemetry.d2d_bytes == 2U * sizeof(float),
-         "repeated-invariant cache restores exact device bytes on reuse");
+             second.run_telemetry.d2d_copies == 0U &&
+             second.run_telemetry.d2d_bytes == 0U,
+         "repeated-invariant cache reuses its outputs in place (no restore copy)");
 
   dif::runtime::TensorMap changed_inputs = {
       {1, f32_tensor({2}, {3.0F, 4.0F})},

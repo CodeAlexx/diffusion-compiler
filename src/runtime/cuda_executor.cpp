@@ -8875,6 +8875,12 @@ public:
     // prefetch issued depth operations ahead can only overwrite a slot
     // whose previous tenant has already been submitted (safety argument
     // in the run loop below).
+    // Repeated-invariant outputs live in their dedicated cache storage for
+    // the life of the plan and are bound there directly (below), so they take
+    // no memory-plan slot: the cached region writes them in place once and
+    // every later run reads them where they were produced.
+    excluded_tensors.insert(repeated_invariant_persistent_tensors_.begin(),
+                            repeated_invariant_persistent_tensors_.end());
     memory_plan_ = compiler::plan_memory(
         program_, 256U,
         options.overlap_streaming ? streamed_prefetch_depth_ : 0U,
@@ -9389,6 +9395,9 @@ public:
     buffers_.allocate(program_, memory_plan_, excluded_tensors, arena_.get());
     repeated_invariant_cache_storage_ = std::make_unique<Workspace>(
         repeated_invariant_cache_bytes_, arena_.get());
+    for (const auto &[tensor_id, offset] : repeated_invariant_cache_offsets_)
+      buffers_.bind_external(
+          tensor_id, repeated_invariant_cache_storage_->pointer() + offset);
     workspace_ = std::make_unique<Workspace>(workspace_bytes_, arena_.get());
     if (parallel_workspace_bytes_ != 0U) {
       const auto auxiliary_count =
@@ -11093,19 +11102,12 @@ public:
               repeated_invariant_outputs_by_producer_.find(operation_id);
           if (outputs == repeated_invariant_outputs_by_producer_.end())
             return;
-          if (!repeated_invariant_cache_storage_ ||
-              repeated_invariant_cache_storage_->pointer() == 0U)
-            fail("repeated-invariant output cache is not allocated");
-          for (const auto tensor_id : outputs->second) {
-            const auto *description = program_.tensor(tensor_id);
-            if (!description)
-              fail("repeated-invariant output tensor is missing");
-            const auto offset = repeated_invariant_cache_offsets_.at(tensor_id);
-            check(counted_memcpy_dtod(
-                      repeated_invariant_cache_storage_->pointer() + offset,
-                      buffers_.at(tensor_id), description->byte_count(), stream),
-                  "cuMemcpyDtoDAsync preserve repeated-invariant output");
-          }
+          // Crossing outputs are produced directly in the cache storage
+          // (bound at prepare), so preservation is a bookkeeping check only.
+          (void)stream;
+          for (const auto tensor_id : outputs->second)
+            if (!repeated_invariant_cache_offsets_.contains(tensor_id))
+              fail("repeated-invariant output tensor is not cache-bound");
         };
     auto execute_parallel_group = [&](std::size_t first,
                                       std::uint32_t iteration,
@@ -11174,22 +11176,12 @@ public:
                        bool reuse_invariants) {
       if (program_.operations.empty())
         return;
-      if (reuse_invariants) {
-        if (!repeated_invariant_cache_storage_ ||
-            repeated_invariant_cache_storage_->pointer() == 0U)
-          fail("repeated-invariant output cache is not allocated");
-        for (const auto &[tensor_id, offset] :
-             repeated_invariant_cache_offsets_) {
-          const auto *description = program_.tensor(tensor_id);
-          if (!description)
-            fail("repeated-invariant output tensor is missing");
-          check(counted_memcpy_dtod(
-                    buffers_.at(tensor_id),
-                    repeated_invariant_cache_storage_->pointer() + offset,
-                    description->byte_count(), context_.stream()),
-                "cuMemcpyDtoDAsync restore repeated-invariant output");
-        }
-      }
+      if (reuse_invariants &&
+          (!repeated_invariant_cache_storage_ ||
+           repeated_invariant_cache_storage_->pointer() == 0U))
+        fail("repeated-invariant output cache is not allocated");
+      // Reuse needs no restore: the cached outputs are still where the
+      // region produced them, and their consumers are bound to that storage.
       const auto reused = [&](std::size_t index) {
         return reuse_invariants && repeated_invariant_operations_.contains(
                                        program_.operations.at(index).id);

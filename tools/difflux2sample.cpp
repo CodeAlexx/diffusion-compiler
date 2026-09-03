@@ -102,6 +102,7 @@ struct Arguments {
   fs::path squareq_w4_slab;
   // --squareq-w4-mode dequant|int8 (see dif::frontend::SquareQW4Mode).
   std::string squareq_w4_mode{"dequant"};
+  bool squareq_w4_hoist{false};
   bool int8_weight_only_row_scaled_all_linears{};
   std::uint32_t int8_weight_only_group_size{64U};
   std::vector<std::string> int8_weight_only_exclude_names;
@@ -362,6 +363,8 @@ Arguments parse(int argc, char **argv) {
       result.squareq_w4_slab = value();
     else if (option == "--squareq-w4-mode")
       result.squareq_w4_mode = value();
+    else if (option == "--squareq-w4-hoist")
+      result.squareq_w4_hoist = true;
     else if (option == "--int8-weight-only-row-scaled-all-linears")
       result.int8_weight_only_row_scaled_all_linears = true;
     else if (option == "--int8-weight-only-group-size")
@@ -4015,6 +4018,14 @@ DenoiseResult denoise(const Arguments &arguments,
   options.linear_tuning_sessions = arguments.linear_tuning_sessions;
   options.expand_linear_algorithms = arguments.expand_linear_algorithms;
   options.persist_linear_heuristics = arguments.persist_linear_heuristics;
+  if (arguments.squareq_w4_hoist) {
+    if (result.squareq_w4.weight_chain_operations.empty())
+      dif::fail("--squareq-w4-hoist needs --squareq-w4-mode int8 with a slab");
+    options.repeated_invariant_operations =
+        result.squareq_w4.weight_chain_operations;
+    std::cerr << "FLUX2_SQUAREQ_W4_HOIST operations="
+              << options.repeated_invariant_operations.size() << '\n';
+  }
   const auto reshape_aliases =
       dif::compiler::plan_reshape_aliases(transformer.program);
   options.alias_reshape_operations = reshape_aliases.operation_ids;
@@ -4475,6 +4486,8 @@ int main(int argc, char **argv) {
            << ",\n    \"slab_bytes\": " << denoised.squareq_w4.quantized_bytes
            << ",\n    \"bf16_bytes_replaced\": " << denoised.squareq_w4.bf16_bytes_replaced
            << ",\n    \"plan_cos_w_min\": " << denoised.squareq_w4.plan_cos_w_min
+           << ",\n    \"hoist_weight_chain\": " << (arguments.squareq_w4_hoist ? "true" : "false")
+           << ",\n    \"weight_chain_operations\": " << denoised.squareq_w4.weight_chain_operations.size()
            << "\n  },\n"
            << "  \"int8_weight_only_candidate\": {\n"
            << "    \"linear_count\": "
