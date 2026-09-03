@@ -7353,6 +7353,7 @@ public:
     profiling_ = true;
     streamed_bytes_ = 0U;
     host_stage_milliseconds_ = 0.0;
+    direct_read_bytes_ = 0U;
     host_wait_milliseconds_ = 0.0;
     profiled_copy_counts_.clear();
     next_copy_timing_ = 0U;
@@ -10316,6 +10317,13 @@ public:
 
     auto h3_w8a8_tail_streamed_bytes = std::uint64_t{0U};
     auto h3_w8a8_tail_host_stage_milliseconds = 0.0;
+    // Per-run receipt counters (the prepare-time upload's bytes are reported
+    // by the first run).
+    if (h3_resident_counters_reported_) {
+      h3_resident_direct_read_bytes_ = 0U;
+      h3_resident_readahead_advised_bytes_ = 0U;
+    }
+    h3_resident_counters_reported_ = true;
     auto convrot_streamed_bytes = std::uint64_t{0U};
     auto convrot_host_stage_milliseconds = 0.0;
     const H3HostCopy h3_tail_host_copy =
@@ -11642,6 +11650,7 @@ private:
   std::uint64_t h3_resident_readahead_advised_bytes_{};
   bool h3_resident_direct_io_{true};
   std::uint64_t h3_resident_direct_read_bytes_{};
+  bool h3_resident_counters_reported_{false};
 
   std::uint64_t h3_w8a8_order_bytes(std::size_t order) const {
     const auto [attention, slot] = h3_w8a8_upload_order_[order];
