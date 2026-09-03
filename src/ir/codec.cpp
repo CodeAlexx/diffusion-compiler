@@ -166,161 +166,7 @@ std::string_view dtype_name(DType dtype) {
   return "invalid";
 }
 
-std::string_view opcode_name(Opcode opcode) {
-  switch (opcode) {
-  case Opcode::Add:
-    return "add";
-  case Opcode::Multiply:
-    return "multiply";
-  case Opcode::RmsNormModulate:
-    return "rms_norm_modulate";
-  case Opcode::SwiGlu:
-    return "swiglu";
-  case Opcode::ResidualGate:
-    return "residual_gate";
-  case Opcode::Linear:
-    return "linear";
-  case Opcode::QkNormPartialRope:
-    return "qk_norm_partial_rope";
-  case Opcode::Attention:
-    return "attention";
-  case Opcode::Barrier:
-    return "barrier";
-  case Opcode::BiasAdd:
-    return "bias_add";
-  case Opcode::H3AdaLNSelect:
-    return "h3_adaln_select";
-  case Opcode::H3DeinterleaveQkv:
-    return "h3_deinterleave_qkv";
-  case Opcode::H3DeinterleaveQkvWeight:
-    return "h3_deinterleave_qkv_weight";
-  case Opcode::DequantizeInt4:
-    return "dequantize_int4";
-  case Opcode::DequantizeInt5:
-    return "dequantize_int5";
-  case Opcode::SiLU:
-    return "silu";
-  case Opcode::RmsNorm:
-    return "rms_norm";
-  case Opcode::Fill:
-    return "fill";
-  case Opcode::GatherRows:
-    return "gather_rows";
-  case Opcode::IndexedUpdateRows:
-    return "indexed_update_rows";
-  case Opcode::Cast:
-    return "cast";
-  case Opcode::SelectRowChunks:
-    return "select_row_chunks";
-  case Opcode::SinusoidalTimestep:
-    return "sinusoidal_timestep";
-  case Opcode::RotaryPosition:
-    return "rotary_position";
-  case Opcode::LinearBlend:
-    return "linear_blend";
-  case Opcode::FlowEulerStep:
-    return "flow_euler_step";
-  case Opcode::Patchify3D:
-    return "patchify_3d";
-  case Opcode::Unpatchify3D:
-    return "unpatchify_3d";
-  case Opcode::AffineLastDim:
-    return "affine_last_dim";
-  case Opcode::LayerNorm:
-    return "layer_norm";
-  case Opcode::Clamp:
-    return "clamp";
-  case Opcode::MseLoss:
-    return "mse_loss";
-  case Opcode::MseLossBackward:
-    return "mse_loss_backward";
-  case Opcode::LinearBackwardInput:
-    return "linear_backward_input";
-  case Opcode::LinearBackwardWeight:
-    return "linear_backward_weight";
-  case Opcode::BiasBackward:
-    return "bias_backward";
-  case Opcode::SiLUBackward:
-    return "silu_backward";
-  case Opcode::AdamWUpdate:
-    return "adamw_update";
-  case Opcode::RmsNormBackward:
-    return "rms_norm_backward";
-  case Opcode::RmsNormModulateBackward:
-    return "rms_norm_modulate_backward";
-  case Opcode::SwiGluBackward:
-    return "swiglu_backward";
-  case Opcode::ResidualGateBackward:
-    return "residual_gate_backward";
-  case Opcode::LayerNormBackward:
-    return "layer_norm_backward";
-  case Opcode::QkNormPartialRopeBackward:
-    return "qk_norm_partial_rope_backward";
-  case Opcode::AttentionLse:
-    return "attention_lse";
-  case Opcode::AttentionBackward:
-    return "attention_backward";
-  case Opcode::Conv1d:
-    return "conv1d";
-  case Opcode::SnakeBeta:
-    return "snake_beta";
-  case Opcode::Gelu:
-    return "gelu";
-  case Opcode::Sigmoid:
-    return "sigmoid";
-  case Opcode::Reshape:
-    return "reshape";
-  case Opcode::BroadcastTo:
-    return "broadcast_to";
-  case Opcode::Slice:
-    return "slice";
-  case Opcode::RotaryFrequency:
-    return "rotary_frequency";
-  case Opcode::RotaryApply:
-    return "rotary_apply";
-  case Opcode::BooleanMaskToBias:
-    return "boolean_mask_to_bias";
-  case Opcode::EulerVelocityStep:
-    return "euler_velocity_step";
-  case Opcode::Permute:
-    return "permute";
-  case Opcode::Concat:
-    return "concat";
-  case Opcode::Conv2d:
-    return "conv2d";
-  case Opcode::ChannelRmsNorm:
-    return "channel_rms_norm";
-  case Opcode::UpsampleNearest2d:
-    return "upsample_nearest_2d";
-  case Opcode::PadConstant:
-    return "pad_constant";
-  case Opcode::Conv3d:
-    return "conv3d";
-  case Opcode::GroupNorm:
-    return "group_norm";
-  case Opcode::PadReflect:
-    return "pad_reflect";
-  case Opcode::QuantizeInt8Rows:
-    return "quantize_int8_rows";
-  case Opcode::LinearInt8Scaled:
-    return "linear_int8_scaled";
-  case Opcode::QuantizeFp8Rows:
-    return "quantize_fp8_rows";
-  case Opcode::LinearFp8Scaled:
-    return "linear_fp8_scaled";
-  case Opcode::QuantizeFp8Blocks32:
-    return "quantize_fp8_blocks32";
-  case Opcode::LinearFp8BlockScaled:
-    return "linear_fp8_block_scaled";
-  case Opcode::DequantizeInt8Blocks:
-    return "dequantize_int8_blocks";
-  case Opcode::LinearInt8WeightScaled:
-    return "linear_int8_weight_scaled";
-  case Opcode::LayerNormModulate:
-    return "layer_norm_modulate";
-  }
-  return "invalid";
-}
+// opcode_name lives in opcodes.cpp, generated from opcodes.def.
 
 std::uint64_t TensorDesc::element_count() const {
   std::uint64_t count = 1;
@@ -446,7 +292,12 @@ Program decode(std::span<const std::uint8_t> bytes) {
   for (std::uint32_t i = 0; i < operation_count; ++i) {
     Operation operation;
     operation.id = reader.u32();
-    operation.opcode = static_cast<Opcode>(reader.u32());
+    const auto opcode_value = reader.u32();
+    if (!opcode_is_registered(opcode_value))
+      fail("DiffIR decode: unregistered opcode value " +
+           std::to_string(opcode_value) + " in operation " +
+           std::to_string(operation.id));
+    operation.opcode = static_cast<Opcode>(opcode_value);
     const auto input_count = reader.u32();
     const auto output_count = reader.u32();
     const auto attribute_count = reader.u32();

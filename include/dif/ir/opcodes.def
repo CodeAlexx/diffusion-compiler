@@ -1,0 +1,153 @@
+// DiffIR opcode registry — the ONE place an opcode is declared.
+//
+//   DIF_OPCODE(Name, value, "codec_name", traits)
+//
+// Everything else derives from this file: the Opcode enum (ir.hpp), the codec
+// name and its reverse lookup, decode validation (unknown values fail closed),
+// and the compiler's semantic classification tables (opt/semantics.cpp).
+// Adding an op = one line here + its verifier rule + a CPU reference +
+// a CUDA emitter. The dispatch switches in the executors have no default, so a
+// missing case is a compile error under -Werror.
+//
+// Values are the wire encoding: never renumber or reuse one.
+//
+// traits (opcode_trait::*, bit-or them):
+//   None           no semantic classification
+//   PinnedNumerics the op encodes an exact reference formula; the optimizer may
+//                  not re-express it at another precision or math mode
+//   DataMovement   bit-exact data movement (no arithmetic on values)
+//   DtypeUniform   every float input/output shares one dtype; the optimizer's
+//                  dtype-discovery pass may retype the op as a unit
+
+DIF_OPCODE(Add, 1, "add", DtypeUniform)
+DIF_OPCODE(Multiply, 2, "multiply", DtypeUniform)
+DIF_OPCODE(RmsNormModulate, 3, "rms_norm_modulate", DtypeUniform)
+DIF_OPCODE(SwiGlu, 4, "swiglu", DtypeUniform)
+DIF_OPCODE(ResidualGate, 5, "residual_gate", DtypeUniform)
+DIF_OPCODE(Linear, 6, "linear", DtypeUniform)
+DIF_OPCODE(QkNormPartialRope, 7, "qk_norm_partial_rope", DtypeUniform)
+DIF_OPCODE(Attention, 8, "attention", DtypeUniform)
+// Stream synchronization point; the only operation with a side effect.
+DIF_OPCODE(Barrier, 9, "barrier", None)
+DIF_OPCODE(BiasAdd, 10, "bias_add", DtypeUniform)
+DIF_OPCODE(H3AdaLNSelect, 11, "h3_adaln_select", DataMovement)
+DIF_OPCODE(H3DeinterleaveQkv, 12, "h3_deinterleave_qkv", DataMovement)
+DIF_OPCODE(H3DeinterleaveQkvWeight, 13, "h3_deinterleave_qkv_weight", DataMovement)
+DIF_OPCODE(DequantizeInt4, 14, "dequantize_int4", PinnedNumerics)
+DIF_OPCODE(DequantizeInt5, 15, "dequantize_int5", PinnedNumerics)
+DIF_OPCODE(SiLU, 16, "silu", DtypeUniform)
+DIF_OPCODE(RmsNorm, 17, "rms_norm", DtypeUniform)
+DIF_OPCODE(Fill, 18, "fill", DataMovement)
+DIF_OPCODE(GatherRows, 19, "gather_rows", DataMovement)
+DIF_OPCODE(IndexedUpdateRows, 20, "indexed_update_rows", DataMovement)
+// Cast is admitted as data movement only when the discovery pass has
+// established that the conversion widens, which is exact; see opt/rewrite.cpp.
+DIF_OPCODE(Cast, 21, "cast", DataMovement)
+DIF_OPCODE(SelectRowChunks, 22, "select_row_chunks", DataMovement)
+DIF_OPCODE(SinusoidalTimestep, 23, "sinusoidal_timestep", PinnedNumerics)
+DIF_OPCODE(RotaryPosition, 24, "rotary_position", PinnedNumerics)
+DIF_OPCODE(LinearBlend, 25, "linear_blend", None)
+DIF_OPCODE(FlowEulerStep, 26, "flow_euler_step", PinnedNumerics)
+DIF_OPCODE(Patchify3D, 27, "patchify_3d", None)
+DIF_OPCODE(Unpatchify3D, 28, "unpatchify_3d", None)
+DIF_OPCODE(AffineLastDim, 29, "affine_last_dim", DtypeUniform)
+DIF_OPCODE(LayerNorm, 30, "layer_norm", DtypeUniform)
+DIF_OPCODE(Clamp, 31, "clamp", DtypeUniform)
+DIF_OPCODE(MseLoss, 32, "mse_loss", None)
+DIF_OPCODE(MseLossBackward, 33, "mse_loss_backward", None)
+DIF_OPCODE(LinearBackwardInput, 34, "linear_backward_input", None)
+DIF_OPCODE(LinearBackwardWeight, 35, "linear_backward_weight", None)
+DIF_OPCODE(BiasBackward, 36, "bias_backward", None)
+DIF_OPCODE(SiLUBackward, 37, "silu_backward", None)
+DIF_OPCODE(AdamWUpdate, 38, "adamw_update", PinnedNumerics)
+DIF_OPCODE(RmsNormBackward, 39, "rms_norm_backward", None)
+DIF_OPCODE(RmsNormModulateBackward, 40, "rms_norm_modulate_backward", None)
+DIF_OPCODE(SwiGluBackward, 41, "swiglu_backward", None)
+DIF_OPCODE(ResidualGateBackward, 42, "residual_gate_backward", None)
+DIF_OPCODE(LayerNormBackward, 43, "layer_norm_backward", None)
+DIF_OPCODE(QkNormPartialRopeBackward, 44, "qk_norm_partial_rope_backward", None)
+DIF_OPCODE(AttentionLse, 45, "attention_lse", None)
+DIF_OPCODE(AttentionBackward, 46, "attention_backward", None)
+DIF_OPCODE(Conv1d, 47, "conv1d", None)
+DIF_OPCODE(SnakeBeta, 48, "snake_beta", None)
+DIF_OPCODE(Gelu, 49, "gelu", PinnedNumerics | DtypeUniform)
+DIF_OPCODE(Sigmoid, 50, "sigmoid", None)
+DIF_OPCODE(Reshape, 51, "reshape", None)
+DIF_OPCODE(BroadcastTo, 52, "broadcast_to", None)
+DIF_OPCODE(Slice, 53, "slice", None)
+DIF_OPCODE(RotaryFrequency, 54, "rotary_frequency", None)
+DIF_OPCODE(RotaryApply, 55, "rotary_apply", None)
+DIF_OPCODE(BooleanMaskToBias, 56, "boolean_mask_to_bias", None)
+// Generic velocity-form Euler update with eager storage-dtype boundaries:
+// output = sample + round_dtype((next_t - current_t) * velocity).
+// This is deliberately distinct from H3's data-ward FlowEulerStep.
+DIF_OPCODE(EulerVelocityStep, 57, "euler_velocity_step", PinnedNumerics)
+DIF_OPCODE(Permute, 58, "permute", DataMovement)
+// Concatenate equal-rank tensors along an explicit axis. The operation is
+// physical (not a view): output storage follows row-major tensor order.
+DIF_OPCODE(Concat, 59, "concat", DataMovement)
+// NCHW cross-correlation with OIHW weights and optional [C_out] bias.
+DIF_OPCODE(Conv2d, 60, "conv2d", DtypeUniform)
+// Channel-axis RMS normalization with the explicit creator storage
+// boundaries used by image/video VAEs.
+DIF_OPCODE(ChannelRmsNorm, 61, "channel_rms_norm", DtypeUniform)
+// Integer nearest-neighbor spatial expansion for NCHW tensors.
+DIF_OPCODE(UpsampleNearest2d, 62, "upsample_nearest_2d", DtypeUniform)
+// Constant padding for NCHW/NCDHW tensors. Spatial padding uses the shared
+// 2D attributes; rank-5 tensors additionally use front/back.
+DIF_OPCODE(PadConstant, 63, "pad_constant", DtypeUniform)
+// NCDHW cross-correlation with OIDHW weights and optional [C_out] bias.
+DIF_OPCODE(Conv3d, 64, "conv3d", DtypeUniform)
+// Group normalization over contiguous channel groups. For NCHW/NCDHW,
+// each batch item is normalized independently across C/groups and every
+// trailing spatial dimension. Frontends that require an isolated temporal
+// axis express that distinction with Permute + Reshape before this op.
+DIF_OPCODE(GroupNorm, 65, "group_norm", DtypeUniform)
+// Edge-exclusive reflection padding for NCHW/NCDHW tensors. Each padded
+// extent must be smaller than the corresponding source dimension, matching
+// the common framework reflect-padding contract.
+DIF_OPCODE(PadReflect, 66, "pad_reflect", DtypeUniform)
+// Dynamic symmetric per-row quantization. One or more BF16 inputs are
+// logically concatenated on their last axis; an optional final F32 scalar
+// input supplies the runtime clipping ratio. The first output is I8 with
+// that combined shape and the second is the F32 dequantization scale for
+// every flattened row. An optional third/fourth output pair carries a second I8
+// code and F32 row scale for the residual left by the first code. This
+// keeps higher-fidelity activation quantization reusable and explicit
+// without coupling it to a model family. Zero rows use the smallest
+// positive guarded scale. The Implementation attribute selects the
+// explicit row transform/rounding contract (Int8RowQuantization); it is never
+// inferred from a model family.
+DIF_OPCODE(QuantizeInt8Rows, 67, "quantize_int8_rows", PinnedNumerics)
+// Unbiased scaled INT8 matrix multiplication with an explicit numerical
+// contract:
+//   BF16 Y[m,n] = BF16(I32(X[m,k] * W[n,k]^T) * xs[m] * ws[n]).
+// Quantization policy is deliberately separate from this reusable math.
+DIF_OPCODE(LinearInt8Scaled, 68, "linear_int8_scaled", PinnedNumerics)
+// Dynamic symmetric per-row E4M3 quantization. The first output retains the
+// input shape in FP8; the second is one F32 dequantization scale per row.
+DIF_OPCODE(QuantizeFp8Rows, 69, "quantize_fp8_rows", PinnedNumerics)
+// FP8 E4M3 matrix multiplication with F32 accumulation, a BF16 raw GEMM
+// boundary, explicit F32 row/column dequantization scales, and BF16 output.
+DIF_OPCODE(LinearFp8Scaled, 70, "linear_fp8_scaled", PinnedNumerics)
+// Blackwell MXFP8 quantization: E4M3 values with one positive UE8M0
+// dequantization scale per 32 adjacent K values. Scale storage uses the
+// cuBLASLt 128x4 tiled layout and pads the outer dimension to 128.
+DIF_OPCODE(QuantizeFp8Blocks32, 71, "quantize_fp8_blocks32", PinnedNumerics)
+// Unbiased MXFP8 matrix multiplication with F32 accumulation and BF16
+// output. A/B scale tensors carry the explicit tiled UE8M0 block scales.
+DIF_OPCODE(LinearFp8BlockScaled, 72, "linear_fp8_block_scaled", PinnedNumerics)
+// Dequantize row-major signed INT8 weights with one F32 scale per adjacent
+// K block into BF16. The block size is explicit and model agnostic; this is
+// a storage/runtime primitive, not an approximate activation contract.
+DIF_OPCODE(DequantizeInt8Blocks, 73, "dequantize_int8_blocks", PinnedNumerics)
+// Mixed-input weight-only matrix multiplication. Activations remain BF16,
+// signed INT8 weights carry one F32 dequantization scale per output row,
+// accumulation is F32, and the explicit output storage boundary is BF16:
+//   BF16 Y[m,n] = BF16(F32(X[m,k] * I8(W[n,k])^T) * scale[n]).
+DIF_OPCODE(LinearInt8WeightScaled, 74, "linear_int8_weight_scaled", PinnedNumerics)
+// Layer normalization followed by creator-style adaptive scale/shift with
+// explicit storage-dtype boundaries after normalization, scale addition,
+// multiplication, and shift addition. Scale/shift carry one or more rows
+// which broadcast over contiguous groups of input rows.
+DIF_OPCODE(LayerNormModulate, 75, "layer_norm_modulate", DtypeUniform)

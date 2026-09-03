@@ -59,6 +59,7 @@ add_library(difcore
   src/frontend/lora.cpp
   src/frontend/training.cpp
     src/ir/codec.cpp
+    src/ir/opcodes.cpp
     src/ir/verify.cpp
     src/opt/bindings.cpp
     src/opt/gate.cpp
@@ -389,6 +390,7 @@ if(DIF_ENABLE_OPENCL AND DIF_OPENCL_INCLUDE_DIR AND DIF_OPENCL_LIBRARY)
       backends/opencl/opencl_backend.cpp
       src/compiler/memory_plan.cpp
       src/ir/codec.cpp
+      src/ir/opcodes.cpp
       src/ir/verify.cpp
       src/support/sha256.cpp)
   target_include_directories(dif_backend_opencl PRIVATE include
@@ -580,6 +582,9 @@ target_link_libraries(diftokenize PRIVATE dif_text)
 install(TARGETS diftokenize RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)
+  add_executable(dif_opcode_registry_tests tests/opcode_registry_tests.cpp)
+  target_link_libraries(dif_opcode_registry_tests PRIVATE difcore)
+  add_test(NAME dif_opcode_registry_tests COMMAND dif_opcode_registry_tests)
   add_executable(dif_tokenizer_tests tests/tokenizer_tests.cpp)
   target_link_libraries(dif_tokenizer_tests PRIVATE dif_text)
   add_test(NAME dif_tokenizer_tests COMMAND dif_tokenizer_tests

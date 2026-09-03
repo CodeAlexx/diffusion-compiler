@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -34,137 +35,51 @@ enum TensorRole : std::uint32_t {
   OptimizerState = 1U << 5U,
 };
 
+// Opcodes are declared once in opcodes.def (value, codec name, traits, doc);
+// this enum, the codec names, decode validation and the optimizer's semantic
+// tables all derive from that file.
 enum class Opcode : std::uint32_t {
-  Add = 1,
-  Multiply = 2,
-  RmsNormModulate = 3,
-  SwiGlu = 4,
-  ResidualGate = 5,
-  Linear = 6,
-  QkNormPartialRope = 7,
-  Attention = 8,
-  Barrier = 9,
-  BiasAdd = 10,
-  H3AdaLNSelect = 11,
-  H3DeinterleaveQkv = 12,
-  H3DeinterleaveQkvWeight = 13,
-  DequantizeInt4 = 14,
-  DequantizeInt5 = 15,
-  SiLU = 16,
-  RmsNorm = 17,
-  Fill = 18,
-  GatherRows = 19,
-  IndexedUpdateRows = 20,
-  Cast = 21,
-  SelectRowChunks = 22,
-  SinusoidalTimestep = 23,
-  RotaryPosition = 24,
-  LinearBlend = 25,
-  FlowEulerStep = 26,
-  Patchify3D = 27,
-  Unpatchify3D = 28,
-  AffineLastDim = 29,
-  LayerNorm = 30,
-  Clamp = 31,
-  MseLoss = 32,
-  MseLossBackward = 33,
-  LinearBackwardInput = 34,
-  LinearBackwardWeight = 35,
-  BiasBackward = 36,
-  SiLUBackward = 37,
-  AdamWUpdate = 38,
-  RmsNormBackward = 39,
-  RmsNormModulateBackward = 40,
-  SwiGluBackward = 41,
-  ResidualGateBackward = 42,
-  LayerNormBackward = 43,
-  QkNormPartialRopeBackward = 44,
-  AttentionLse = 45,
-  AttentionBackward = 46,
-  Conv1d = 47,
-  SnakeBeta = 48,
-  Gelu = 49,
-  Sigmoid = 50,
-  Reshape = 51,
-  BroadcastTo = 52,
-  Slice = 53,
-  RotaryFrequency = 54,
-  RotaryApply = 55,
-  BooleanMaskToBias = 56,
-  // Generic velocity-form Euler update with eager storage-dtype boundaries:
-  // output = sample + round_dtype((next_t - current_t) * velocity).
-  // This is deliberately distinct from H3's data-ward FlowEulerStep.
-  EulerVelocityStep = 57,
-  Permute = 58,
-  // Concatenate equal-rank tensors along an explicit axis. The operation is
-  // physical (not a view): output storage follows row-major tensor order.
-  Concat = 59,
-  // NCHW cross-correlation with OIHW weights and optional [C_out] bias.
-  Conv2d = 60,
-  // Channel-axis RMS normalization with the explicit creator storage
-  // boundaries used by image/video VAEs.
-  ChannelRmsNorm = 61,
-  // Integer nearest-neighbor spatial expansion for NCHW tensors.
-  UpsampleNearest2d = 62,
-  // Constant padding for NCHW/NCDHW tensors. Spatial padding uses the shared
-  // 2D attributes; rank-5 tensors additionally use front/back.
-  PadConstant = 63,
-  // NCDHW cross-correlation with OIDHW weights and optional [C_out] bias.
-  Conv3d = 64,
-  // Group normalization over contiguous channel groups. For NCHW/NCDHW,
-  // each batch item is normalized independently across C/groups and every
-  // trailing spatial dimension. Frontends that require an isolated temporal
-  // axis express that distinction with Permute + Reshape before this op.
-  GroupNorm = 65,
-  // Edge-exclusive reflection padding for NCHW/NCDHW tensors. Each padded
-  // extent must be smaller than the corresponding source dimension, matching
-  // the common framework reflect-padding contract.
-  PadReflect = 66,
-  // Dynamic symmetric per-row quantization. One or more BF16 inputs are
-  // logically concatenated on their last axis; an optional final F32 scalar
-  // input supplies the runtime clipping ratio. The first output is I8 with
-  // that combined shape and the second is the F32 dequantization scale for
-  // every flattened row. An optional third/fourth output pair carries a second I8
-  // code and F32 row scale for the residual left by the first code. This
-  // keeps higher-fidelity activation quantization reusable and explicit
-  // without coupling it to a model family. Zero rows use the smallest
-  // positive guarded scale. The Implementation attribute selects the
-  // explicit row transform/rounding contract; it is never inferred from a
-  // model family.
-  QuantizeInt8Rows = 67,
-  // Unbiased scaled INT8 matrix multiplication with an explicit numerical
-  // contract:
-  //   BF16 Y[m,n] = BF16(I32(X[m,k] * W[n,k]^T) * xs[m] * ws[n]).
-  // Quantization policy is deliberately separate from this reusable math.
-  LinearInt8Scaled = 68,
-  // Dynamic symmetric per-row E4M3 quantization. The first output retains the
-  // input shape in FP8; the second is one F32 dequantization scale per row.
-  QuantizeFp8Rows = 69,
-  // FP8 E4M3 matrix multiplication with F32 accumulation, a BF16 raw GEMM
-  // boundary, explicit F32 row/column dequantization scales, and BF16 output.
-  LinearFp8Scaled = 70,
-  // Blackwell MXFP8 quantization: E4M3 values with one positive UE8M0
-  // dequantization scale per 32 adjacent K values. Scale storage uses the
-  // cuBLASLt 128x4 tiled layout and pads the outer dimension to 128.
-  QuantizeFp8Blocks32 = 71,
-  // Unbiased MXFP8 matrix multiplication with F32 accumulation and BF16
-  // output. A/B scale tensors carry the explicit tiled UE8M0 block scales.
-  LinearFp8BlockScaled = 72,
-  // Dequantize row-major signed INT8 weights with one F32 scale per adjacent
-  // K block into BF16. The block size is explicit and model agnostic; this is
-  // a storage/runtime primitive, not an approximate activation contract.
-  DequantizeInt8Blocks = 73,
-  // Mixed-input weight-only matrix multiplication. Activations remain BF16,
-  // signed INT8 weights carry one F32 dequantization scale per output row,
-  // accumulation is F32, and the explicit output storage boundary is BF16:
-  //   BF16 Y[m,n] = BF16(F32(X[m,k] * I8(W[n,k])^T) * scale[n]).
-  LinearInt8WeightScaled = 74,
-  // Layer normalization followed by creator-style adaptive scale/shift with
-  // explicit storage-dtype boundaries after normalization, scale addition,
-  // multiplication, and shift addition. Scale/shift carry one or more rows
-  // which broadcast over contiguous groups of input rows.
-  LayerNormModulate = 75,
+#define DIF_OPCODE(name, value, codec_name, traits) name = value,
+#include "dif/ir/opcodes.def"
+#undef DIF_OPCODE
 };
+
+namespace opcode_trait {
+inline constexpr std::uint32_t None = 0U;
+inline constexpr std::uint32_t PinnedNumerics = 1U << 0U;
+inline constexpr std::uint32_t DataMovement = 1U << 1U;
+inline constexpr std::uint32_t DtypeUniform = 1U << 2U;
+} // namespace opcode_trait
+
+struct OpcodeInfo {
+  Opcode opcode;
+  std::uint32_t value;
+  std::string_view name;   // codec / telemetry name
+  std::uint32_t traits;    // opcode_trait bits
+};
+
+inline constexpr std::size_t kOpcodeCount = 0U
+#define DIF_OPCODE(name, value, codec_name, traits) +1U
+#include "dif/ir/opcodes.def"
+#undef DIF_OPCODE
+    ;
+
+constexpr std::array<OpcodeInfo, kOpcodeCount> make_opcode_registry() {
+  using namespace opcode_trait;
+  return {{
+#define DIF_OPCODE(name, value, codec_name, traits) \
+  OpcodeInfo{Opcode::name, value, codec_name, (traits)},
+#include "dif/ir/opcodes.def"
+#undef DIF_OPCODE
+  }};
+}
+inline constexpr std::array<OpcodeInfo, kOpcodeCount> kOpcodeRegistry =
+    make_opcode_registry();
+
+const OpcodeInfo *opcode_info(Opcode opcode);
+std::optional<Opcode> opcode_from_name(std::string_view name);
+bool opcode_is_registered(std::uint32_t value);
+bool opcode_has_trait(Opcode opcode, std::uint32_t trait);
 
 enum class AttrKey : std::uint32_t {
   Epsilon = 1,

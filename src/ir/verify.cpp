@@ -23,7 +23,7 @@ bool supported_float(DType dtype) {
 }
 
 bool valid_opcode(Opcode opcode) {
-  return opcode >= Opcode::Add && opcode <= Opcode::LayerNormModulate;
+  return opcode_is_registered(static_cast<std::uint32_t>(opcode));
 }
 
 bool valid_attr_key(AttrKey key) {

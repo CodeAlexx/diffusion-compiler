@@ -164,6 +164,14 @@ the runtime knobs that matter are documented in [USAGE.md](USAGE.md).
 
 ## Repository layout
 
+Opcodes are declared once, in `include/dif/ir/opcodes.def` (value, codec name,
+semantic traits, doc). The `Opcode` enum, the codec names and their reverse
+lookup, decode validation and the optimizer's classification tables derive from
+that file; `dif_opcode_registry_tests` keeps them consistent. A new op is one
+registry line plus its verifier rule, a CPU reference and a CUDA emitter; the
+executor dispatch switches have no default, so a missing case is a build error.
+
+
 ```text
 include/dif/       Public C++ and backend ABI headers
 src/               IR, compiler, runtime, frontend, support, and training code
