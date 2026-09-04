@@ -223,3 +223,10 @@ DIF_OPCODE(H3AdaLNSelectBackward, 97, "h3_adaln_select_backward", None)
 // convention travels on the operation, because a gradient that unrotates the
 // other way is silently wrong.
 DIF_OPCODE(RotaryApplyBackward, 98, "rotary_apply_backward", None)
+
+// Input gradient of a weight-only-quantized linear. The frozen weight stays
+// INT8 here exactly as it is in the forward pass: a training step that
+// dequantized it to compute this gradient would pay the conversion once per
+// linear per step, which is the cost the resident format exists to avoid.
+DIF_OPCODE(LinearInt8WeightScaledBackwardInput, 99,
+           "linear_int8_weight_scaled_backward_input", None)

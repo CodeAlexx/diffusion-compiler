@@ -53,6 +53,7 @@ add_library(difcore
     src/backend/plugin.cpp
     src/compiler/compiler.cpp
     src/compiler/int4.cpp
+  src/compiler/int8.cpp
     src/compiler/layout_plan.cpp
     src/compiler/memory_plan.cpp
     src/compiler/residency_plan.cpp
@@ -477,6 +478,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_training_gradient_tests tests/training_gradient_tests.cpp)
   target_link_libraries(dif_training_gradient_tests PRIVATE difcore)
   add_test(NAME dif_training_gradient_tests COMMAND dif_training_gradient_tests)
+
+  add_executable(dif_int8_resident_tests tests/int8_resident_tests.cpp)
+  target_link_libraries(dif_int8_resident_tests PRIVATE difcore)
+  add_test(NAME dif_int8_resident_tests COMMAND dif_int8_resident_tests)
 
   add_executable(dif_krea2_training_tests tests/krea2_training_tests.cpp)
   target_link_libraries(dif_krea2_training_tests PRIVATE difcore)

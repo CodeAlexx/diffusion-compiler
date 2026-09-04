@@ -1102,6 +1102,19 @@ void emit_linear_backward_input(std::ostringstream &out,
                                 {"outputs", std::to_string(outputs)}});
 }
 
+void emit_linear_int8_weight_scaled_backward_input(std::ostringstream &out,
+                                                   const ir::Program &program,
+                                                   const ir::Operation &op) {
+  const auto *weight = program.tensor(op.inputs[1]);
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  out << render_kernel_template(
+      "linear_int8_weight_scaled_backward_input",
+      {{"function", function_name(op)},
+       {"count", std::to_string(count)},
+       {"inner", std::to_string(weight->dims[1])},
+       {"outputs", std::to_string(weight->dims[0])}});
+}
+
 void emit_linear_backward_weight(std::ostringstream &out,
                                  const ir::Program &program,
                                  const ir::Operation &op) {
@@ -3520,6 +3533,9 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::LinearBackwardInput:
       emit_linear_backward_input(source, program, op);
+      break;
+    case ir::Opcode::LinearInt8WeightScaledBackwardInput:
+      emit_linear_int8_weight_scaled_backward_input(source, program, op);
       break;
     case ir::Opcode::LinearBackwardWeight:
       emit_linear_backward_weight(source, program, op);

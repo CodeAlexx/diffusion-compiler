@@ -527,6 +527,35 @@ void linear_int8_weight_scaled(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+// grad_input[m,k] = sum_n grad_output[m,n] * weight[n,k] * scale[n].
+//
+// The scale has to be applied per term rather than factored out, because the
+// sum runs over n and each n carries its own. The forward can factor it out
+// because its sum runs over k; that asymmetry is why this is its own kernel
+// and not the ordinary linear backward pointed at a dequantized weight.
+void linear_int8_weight_scaled_backward_input(const ir::Operation &op,
+                                              TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &scales = tensors.at(op.inputs[2]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto columns = weight.dims[0];
+  const auto inner = weight.dims[1];
+  const auto rows = grad_output.element_count() / columns;
+  const auto *weight_values =
+      reinterpret_cast<const std::int8_t *>(weight.data());
+  for (std::uint64_t row = 0U; row < rows; ++row)
+    for (std::uint64_t index = 0U; index < inner; ++index) {
+      float accumulator = 0.0F;
+      for (std::uint64_t column = 0U; column < columns; ++column)
+        accumulator +=
+            load_float(grad_output, row * columns + column) *
+            (static_cast<float>(weight_values[column * inner + index]) *
+             load_float(scales, column));
+      store_float(grad_input, row * inner + index, accumulator);
+    }
+}
+
 void dequantize_int8_blocks(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[0]);
   const auto &scales = tensors.at(op.inputs[1]);
@@ -3712,6 +3741,9 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::LinearInt8WeightScaled:
       linear_int8_weight_scaled(op, tensors);
+      break;
+    case ir::Opcode::LinearInt8WeightScaledBackwardInput:
+      linear_int8_weight_scaled_backward_input(op, tensors);
       break;
     case ir::Opcode::QuantizeFp8Rows:
       quantize_fp8_rows(op, tensors);

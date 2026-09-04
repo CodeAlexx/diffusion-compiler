@@ -1282,6 +1282,35 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::LinearInt8WeightScaledBackwardInput) {
+    expect_counts(op, 3U, 1U);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &scales = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    if (weight.dtype != DType::I8 || scales.dtype != DType::F32 ||
+        !supported_float(grad_output.dtype) ||
+        grad_input.dtype != grad_output.dtype || weight.dims.size() != 2U ||
+        grad_output.dims.empty() || grad_input.dims.empty())
+      fail("linear_int8_weight_scaled_backward_input requires a rank-2 I8 "
+           "weight, F32 scales, and float gradients of one dtype");
+    const auto columns = weight.dims[0];
+    const auto inner = weight.dims[1];
+    const auto rows = grad_output.element_count() / columns;
+    if (grad_output.dims.back() != columns ||
+        grad_output.element_count() != rows * columns ||
+        grad_input.dims.back() != inner ||
+        grad_input.element_count() != rows * inner ||
+        scales.dims != std::vector<std::uint64_t>{columns})
+      fail("linear_int8_weight_scaled_backward_input shapes must be [M,N] x "
+           "[N,K] -> [M,K] with scale [N]");
+    if (!weight.has_role(TensorRole::Constant) ||
+        !scales.has_role(TensorRole::Constant))
+      fail("linear_int8_weight_scaled_backward_input weight and scales must "
+           "be constants: this gradient exists for a FROZEN weight");
+    return;
+  }
+
   if (op.opcode == Opcode::LinearInt8WeightScaled) {
     expect_counts(op, 3U, 1U);
     const auto &input = tensor_or_fail(program, op.inputs[0], op);

@@ -235,6 +235,20 @@ AutodiffResult differentiate(const ir::Program &forward,
       }
       break;
     }
+    case ir::Opcode::LinearInt8WeightScaled: {
+      // A weight-only-quantized linear is frozen by construction: the
+      // verifier requires its weight and scales to be constants. So there is
+      // exactly one gradient to produce, and it reads the INT8 weight
+      // directly. Dequantizing it here would put back, once per linear per
+      // step, precisely the cost the resident format removed.
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::LinearInt8WeightScaledBackwardInput,
+                    {grad_output, operation.inputs[1], operation.inputs[2]},
+                    {grad_input});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
     case ir::Opcode::SiLU: {
       const auto grad_input =
           add_tensor(*result.program.tensor(operation.inputs[0]));

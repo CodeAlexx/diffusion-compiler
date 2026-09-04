@@ -1057,6 +1057,7 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::LinearFp8BlockScaled:
     case Opcode::DequantizeInt8Blocks:
     case Opcode::LinearInt8WeightScaled:
+    case Opcode::LinearInt8WeightScaledBackwardInput:
       // Quantized physical formats (INT8 rows, FP8 rows, MXFP8 blocks) are
       // NVIDIA-backend execution formats chosen per target; the reference
       // backend stays fail-closed rather than emulating them.
