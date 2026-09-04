@@ -80,32 +80,18 @@ AccumulatingStep build_accumulating_step(
                                          hyperparameters, decay_for);
   step.step_input = whole.step_input;
 
-  // Every operation up to the first AdamW update belongs to the micro-batch;
-  // the optimizer and anything feeding it belongs to the update.
-  std::size_t optimizer_begin = whole.program.operations.size();
-  for (std::size_t index = 0U; index < whole.program.operations.size();
-       ++index) {
-    const auto opcode = whole.program.operations[index].opcode;
-    if (opcode == ir::Opcode::AdamWUpdate) {
-      optimizer_begin = index;
-      break;
-    }
-  }
-  // A master-weight step casts the F16 gradient just before its update; those
-  // casts belong with the optimizer, not with the micro-batch.
-  std::unordered_set<std::uint32_t> optimizer_inputs;
+  const auto optimizer_begin = whole.optimizer_operations;
+
+  // What each optimizer update actually reads as its gradient.  With master
+  // weights that is a cast of the raw gradient rather than the gradient
+  // itself, and the cast belongs to the MICRO-BATCH: it happens once per
+  // micro-batch, and it is what makes the accumulator F32.
+  std::unordered_set<std::uint32_t> optimizer_gradients;
   for (std::size_t index = optimizer_begin;
-       index < whole.program.operations.size(); ++index)
-    for (const auto tensor : whole.program.operations[index].inputs)
-      optimizer_inputs.insert(tensor);
-  while (optimizer_begin > 0U) {
-    const auto &previous = whole.program.operations[optimizer_begin - 1U];
-    if (previous.opcode != ir::Opcode::Cast ||
-        !optimizer_inputs.contains(previous.outputs[0]))
-      break;
-    --optimizer_begin;
-    for (const auto tensor : previous.inputs)
-      optimizer_inputs.insert(tensor);
+       index < whole.program.operations.size(); ++index) {
+    const auto &operation = whole.program.operations[index];
+    if (operation.opcode == ir::Opcode::AdamWUpdate)
+      optimizer_gradients.insert(operation.inputs[1]);
   }
 
   next_tensor = next_free_tensor(whole.program);
@@ -115,6 +101,16 @@ AccumulatingStep build_accumulating_step(
   step.update.tensors = whole.program.tensors;
   for (std::size_t index = 0U; index < optimizer_begin; ++index)
     step.accumulate.operations.push_back(whole.program.operations[index]);
+  std::unordered_set<std::size_t> moved;
+  for (std::size_t index = optimizer_begin;
+       index < whole.program.operations.size(); ++index) {
+    const auto &operation = whole.program.operations[index];
+    if (operation.opcode == ir::Opcode::Cast &&
+        optimizer_gradients.contains(operation.outputs[0])) {
+      step.accumulate.operations.push_back(operation);
+      moved.insert(index);
+    }
+  }
 
   // One accumulator per parameter, in F32 whatever the gradient's storage is:
   // summing N contributions in half precision loses the small ones, which is
@@ -125,12 +121,26 @@ AccumulatingStep build_accumulating_step(
     binding.parameter_input = source.parameter_input;
     binding.gradient_output = source.gradient_output;
     binding.update = source;
-    const auto *gradient = whole.program.tensor(source.gradient_output);
+    // The optimizer's own view of this parameter's gradient: the raw one, or
+    // the cast the master-weight path put in front of it.
+    const auto optimizer_parameter = source.master_input != 0U
+                                         ? source.master_input
+                                         : source.parameter_input;
+    auto optimizer_gradient = source.gradient_output;
+    for (std::size_t op = optimizer_begin;
+         op < whole.program.operations.size(); ++op) {
+      const auto &operation = whole.program.operations[op];
+      if (operation.opcode == ir::Opcode::AdamWUpdate &&
+          operation.inputs[0] == optimizer_parameter)
+        optimizer_gradient = operation.inputs[1];
+    }
+    binding.gradient_output = optimizer_gradient;
+    const auto *gradient = whole.program.tensor(optimizer_gradient);
     if (!gradient)
       fail("a parameter gradient is not a tensor of the step");
     const auto dims = gradient->dims;
 
-    auto contribution = source.gradient_output;
+    auto contribution = optimizer_gradient;
     if (gradient->dtype != ir::DType::F32) {
       contribution = next_tensor++;
       step.accumulate.tensors.push_back(
@@ -138,7 +148,7 @@ AccumulatingStep build_accumulating_step(
       step.update.tensors.push_back(
           {contribution, ir::DType::F32, ir::TensorRole::Internal, dims});
       step.accumulate.operations.push_back({next_operation++, ir::Opcode::Cast,
-                                            {source.gradient_output},
+                                            {optimizer_gradient},
                                             {contribution},
                                             {}});
     }
@@ -166,6 +176,8 @@ AccumulatingStep build_accumulating_step(
   // program read this micro-batch's gradient.
   for (std::size_t index = optimizer_begin;
        index < whole.program.operations.size(); ++index) {
+    if (moved.contains(index))
+      continue;
     auto operation = whole.program.operations[index];
     for (auto &input : operation.inputs)
       for (const auto &binding : step.bindings)

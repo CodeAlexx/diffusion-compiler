@@ -2,6 +2,7 @@
 
 #include "dif/ir/ir.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -67,6 +68,12 @@ struct TrainingStep {
   std::uint32_t step_input{};
   std::vector<ParameterBinding> bindings;
   std::unordered_map<std::uint32_t, std::uint32_t> gradients;
+  // Where the forward pass ends and where the optimizer begins, as indices
+  // into `program.operations`.  A pass that has to treat the three phases
+  // differently -- recompute, accumulation -- reads these rather than
+  // guessing from opcodes.
+  std::size_t forward_operations{};
+  std::size_t optimizer_operations{};
 };
 
 // Differentiates `forward` with respect to `parameters` and appends one AdamW

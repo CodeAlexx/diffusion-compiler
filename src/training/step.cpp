@@ -21,6 +21,9 @@ TrainingStep build_training_step(
   step.program = std::move(differentiated.program);
   step.gradients = std::move(differentiated.gradients);
 
+  step.forward_operations = forward.operations.size();
+  step.optimizer_operations = step.program.operations.size();
+
   std::uint32_t next_tensor = 1U;
   std::uint32_t next_operation = 1U;
   for (const auto &tensor : step.program.tensors)
