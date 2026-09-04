@@ -67,7 +67,7 @@ def gpu_sample():
 def workflow(args, prefix):
     return {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CHECKPOINT}},
-        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": PROMPT, "clip": ["1", 1]}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": args.prompt, "clip": ["1", 1]}},
         "3": {"class_type": "CLIPTextEncode", "inputs": {"text": args.negative, "clip": ["1", 1]}},
         "4": {"class_type": "EmptyLatentImage",
               "inputs": {"width": args.width, "height": args.height, "batch_size": 1}},
@@ -89,6 +89,10 @@ def main():
     parser.add_argument("--server-pid", type=int)
     parser.add_argument("--poll-seconds", type=float, default=0.1)
     parser.add_argument("--tag", default="run")
+    parser.add_argument("--prompt", default=PROMPT,
+                        help="positive prompt (default: the frozen workload prompt); a different "
+                             "text on a warm-up run keeps ComfyUI's node cache from serving the "
+                             "CLIP encodes on the measured run")
     parser.add_argument("--negative", default="")
     parser.add_argument("--seed", type=int, default=20260901)
     parser.add_argument("--width", type=int, default=1024)
@@ -151,7 +155,7 @@ def main():
         "workload": {
             "model": "SDXL base 1.0 (single file: UNet + CLIP-L + OpenCLIP-G + VAE, fp16)",
             "checkpoint": CHECKPOINT,
-            "prompt": PROMPT, "negative_prompt": args.negative, "seed": args.seed,
+            "prompt": args.prompt, "negative_prompt": args.negative, "seed": args.seed,
             "width": args.width, "height": args.height, "steps": args.steps, "cfg": args.cfg,
             "sampler": args.sampler, "scheduler": args.scheduler,
             "product_boundary": "queued literal prompt through saved PNG",
