@@ -284,6 +284,9 @@ target_link_libraries(difinspect PRIVATE difcore)
 add_executable(difprobe tools/difprobe.cpp)
 target_link_libraries(difprobe PRIVATE difcore)
 
+add_executable(difmicrobench tools/difmicrobench.cpp)
+target_link_libraries(difmicrobench PRIVATE difcore)
+
 add_executable(difbench tools/difbench.cpp)
 target_link_libraries(difbench PRIVATE difcore)
 
