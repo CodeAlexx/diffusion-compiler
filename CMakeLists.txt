@@ -72,6 +72,9 @@ add_library(difcore
   src/frontend/flux2.cpp
   src/frontend/squareq_w4.cpp
   src/frontend/flux2_vae.cpp
+  src/frontend/sdxl_vae.cpp
+  src/frontend/sdxl_clip.cpp
+  src/frontend/sdxl_unet.cpp
   src/frontend/dit_block.cpp
   src/frontend/dit_lora.cpp
   src/frontend/lora.cpp
@@ -385,6 +388,10 @@ target_link_libraries(difkrea2block PRIVATE difcore)
 add_executable(difflux2block tools/difflux2block.cpp)
 target_link_libraries(difflux2block PRIVATE difcore)
 
+add_executable(difsdxlstage tools/difsdxlstage.cpp)
+target_link_libraries(difsdxlstage PRIVATE difcore)
+install(TARGETS difsdxlstage RUNTIME DESTINATION bin)
+
 add_executable(difflux2sample tools/difflux2sample.cpp)
 target_link_libraries(difflux2sample PRIVATE difcore)
 add_executable(difkrea2text tools/difkrea2text.cpp)
@@ -587,6 +594,7 @@ endif()
 add_library(dif_text STATIC
     src/text/unicode.cpp
     src/text/qwen_bpe_tokenizer.cpp
+    src/text/clip_bpe_tokenizer.cpp
     src/text/flux2_prompt.cpp)
 target_include_directories(dif_text PUBLIC include)
 target_compile_options(
@@ -613,6 +621,17 @@ if(DIF_BUILD_TESTS)
   add_test(NAME dif_tokenizer_tests COMMAND dif_tokenizer_tests
            ${CMAKE_SOURCE_DIR}/perf/regress/fixtures/tokenizer-mistral-tekken)
   set_tests_properties(dif_tokenizer_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(dif_sdxl_schedule_tests tests/sdxl_schedule_tests.cpp)
+  target_include_directories(dif_sdxl_schedule_tests PRIVATE tests)
+  target_link_libraries(dif_sdxl_schedule_tests PRIVATE difcore)
+  add_test(NAME dif_sdxl_schedule_tests COMMAND dif_sdxl_schedule_tests)
+
+  add_executable(dif_clip_tokenizer_tests tests/clip_tokenizer_tests.cpp)
+  target_link_libraries(dif_clip_tokenizer_tests PRIVATE dif_text)
+  add_test(NAME dif_clip_tokenizer_tests COMMAND dif_clip_tokenizer_tests
+           ${CMAKE_SOURCE_DIR}/perf/regress/fixtures/clip-tokenizer)
+  set_tests_properties(dif_clip_tokenizer_tests PROPERTIES SKIP_RETURN_CODE 77)
 
   add_executable(dif_flux2_prompt_tests tests/flux2_prompt_tests.cpp)
   target_link_libraries(dif_flux2_prompt_tests PRIVATE dif_text)
