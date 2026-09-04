@@ -11,6 +11,7 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -362,6 +363,112 @@ ClipBpeTokenizer::bpe(std::vector<std::string> word) const {
   return word;
 }
 
+namespace {
+
+// The reference's parse_parentheses: split on TOP-LEVEL parenthesised runs,
+// keeping the parentheses on the runs that have them.
+std::vector<std::string> parenthesised_runs(const std::string &text) {
+  std::vector<std::string> result;
+  std::string current;
+  int nesting = 0;
+  for (const char character : text) {
+    if (character == '(') {
+      if (nesting == 0) {
+        if (!current.empty())
+          result.push_back(current);
+        current = "(";
+      } else {
+        current.push_back(character);
+      }
+      ++nesting;
+    } else if (character == ')') {
+      --nesting;
+      if (nesting == 0) {
+        result.push_back(current + ")");
+        current.clear();
+      } else {
+        current.push_back(character);
+      }
+    } else {
+      current.push_back(character);
+    }
+  }
+  if (!current.empty())
+    result.push_back(current);
+  return result;
+}
+
+// The reference's token_weights, recursively: each parenthesis level
+// multiplies by 1.1, and a trailing ":number" sets the weight outright.
+void collect_weights(const std::string &text, float weight,
+                     std::vector<dif::text::WeightedSegment> &out) {
+  for (auto run : parenthesised_runs(text)) {
+    float run_weight = weight;
+    if (run.size() >= 2U && run.front() == '(' && run.back() == ')') {
+      run = run.substr(1U, run.size() - 2U);
+      run_weight *= 1.1F;
+      const auto colon = run.rfind(':');
+      if (colon != std::string::npos && colon > 0U) {
+        try {
+          std::size_t consumed = 0;
+          const auto parsed = std::stof(run.substr(colon + 1U), &consumed);
+          if (consumed == run.size() - colon - 1U) {
+            run_weight = parsed;
+            run = run.substr(0U, colon);
+          }
+        } catch (const std::exception &) {
+          // Not a number: the reference keeps the 1.1 multiplier and the
+          // colon stays part of the text.
+        }
+      }
+      collect_weights(run, run_weight, out);
+    } else {
+      out.push_back({run, weight});
+    }
+  }
+}
+
+} // namespace
+
+std::vector<WeightedSegment> parse_prompt_weights(std::string_view text) {
+  // Escaped parentheses stay literal through the split, as the reference
+  // does with its two sentinel pairs.
+  std::string escaped(text);
+  const std::string open_sentinel("\x01\x02", 2);
+  const std::string close_sentinel("\x01\x03", 2);
+  for (std::size_t at = escaped.find("\\)"); at != std::string::npos;
+       at = escaped.find("\\)", at + close_sentinel.size()))
+    escaped.replace(at, 2U, close_sentinel);
+  for (std::size_t at = escaped.find("\\("); at != std::string::npos;
+       at = escaped.find("\\(", at + open_sentinel.size()))
+    escaped.replace(at, 2U, open_sentinel);
+  std::vector<WeightedSegment> segments;
+  collect_weights(escaped, 1.0F, segments);
+  for (auto &segment : segments) {
+    for (std::size_t at = segment.text.find(close_sentinel);
+         at != std::string::npos; at = segment.text.find(close_sentinel, at + 1U))
+      segment.text.replace(at, close_sentinel.size(), ")");
+    for (std::size_t at = segment.text.find(open_sentinel);
+         at != std::string::npos; at = segment.text.find(open_sentinel, at + 1U))
+      segment.text.replace(at, open_sentinel.size(), "(");
+  }
+  return segments;
+}
+
+std::vector<std::int32_t> clip_empty_chunk(const ClipBpeTokenizer &tokenizer,
+                                           std::uint32_t pad_token,
+                                           std::uint64_t max_length) {
+  if (max_length < 2U)
+    dif::fail("clip_empty_chunk: max_length must hold BOS and EOS");
+  std::vector<std::int32_t> chunk;
+  chunk.reserve(static_cast<std::size_t>(max_length));
+  chunk.push_back(static_cast<std::int32_t>(tokenizer.bos_id()));
+  chunk.push_back(static_cast<std::int32_t>(tokenizer.eos_id()));
+  chunk.resize(static_cast<std::size_t>(max_length),
+               static_cast<std::int32_t>(pad_token));
+  return chunk;
+}
+
 ClipPromptTokens clip_prompt_tokens(const ClipBpeTokenizer &tokenizer,
                                     std::string_view text,
                                     std::uint32_t pad_token,
@@ -372,53 +479,80 @@ ClipPromptTokens clip_prompt_tokens(const ClipBpeTokenizer &tokenizer,
   // broken across chunks instead of being moved whole to the next one.
   constexpr std::size_t kMaxWordLength = 8;
 
-  const std::vector<std::uint32_t> raw = tokenizer.encode(text);
   const auto bos = static_cast<std::int32_t>(tokenizer.bos_id());
   const auto eos = static_cast<std::int32_t>(tokenizer.eos_id());
   const auto pad = static_cast<std::int32_t>(pad_token);
-  // Plain text is ONE token group: the reference tokenizes the whole prompt
-  // in one call and strips that call's BOS/EOS before batching.
-  std::vector<std::int32_t> group;
-  group.reserve(raw.size() - 2U);
-  for (std::size_t i = 1; i + 1U < raw.size(); ++i)
-    group.push_back(static_cast<std::int32_t>(raw[i]));
-  const bool is_large = group.size() >= kMaxWordLength;
+
+  // One token group per weighted segment; an unweighted prompt is a single
+  // group, which is exactly what the reference produces for plain text.
+  struct Group {
+    std::vector<std::int32_t> ids;
+    float weight{1.0F};
+  };
+  std::vector<Group> groups;
+  for (const auto &segment : parse_prompt_weights(text)) {
+    if (segment.text.empty())
+      continue;
+    const auto raw = tokenizer.encode(segment.text);
+    Group group;
+    group.weight = segment.weight;
+    group.ids.reserve(raw.size() > 2U ? raw.size() - 2U : 0U);
+    for (std::size_t index = 1; index + 1U < raw.size(); ++index)
+      group.ids.push_back(static_cast<std::int32_t>(raw[index]));
+    if (!group.ids.empty())
+      groups.push_back(std::move(group));
+  }
+  if (groups.empty())
+    groups.push_back({});
+
   // Slots available before the chunk's EOS.
   const std::size_t capacity = static_cast<std::size_t>(max_length) - 1U;
-
   ClipPromptTokens out;
   std::vector<std::int32_t> batch{bos};
+  std::vector<float> batch_weights{1.0F};
   const auto flush = [&] {
     out.ids.insert(out.ids.end(), batch.begin(), batch.end());
+    out.weights.insert(out.weights.end(), batch_weights.begin(),
+                       batch_weights.end());
     batch.assign(1U, bos);
+    batch_weights.assign(1U, 1.0F);
   };
-  std::size_t consumed = 0;
-  while (consumed < group.size()) {
-    const std::size_t left = group.size() - consumed;
-    if (left + batch.size() > capacity) {
-      const std::size_t remaining = capacity - batch.size();
-      if (is_large) {
-        // Break the group: fill this chunk, the tail starts the next one.
-        batch.insert(batch.end(), group.begin() + consumed,
-                     group.begin() + consumed + remaining);
-        batch.push_back(eos);
-        consumed += remaining;
+  for (const auto &group : groups) {
+    const bool is_large = group.ids.size() >= kMaxWordLength;
+    std::size_t consumed = 0;
+    while (consumed < group.ids.size()) {
+      const std::size_t left = group.ids.size() - consumed;
+      if (left + batch.size() > capacity) {
+        const std::size_t remaining = capacity - batch.size();
+        if (is_large) {
+          // Break the group: fill this chunk, the tail starts the next one.
+          batch.insert(batch.end(), group.ids.begin() + consumed,
+                       group.ids.begin() + consumed + remaining);
+          batch_weights.insert(batch_weights.end(), remaining, group.weight);
+          batch.push_back(eos);
+          batch_weights.push_back(1.0F);
+          consumed += remaining;
+        } else {
+          // A short group moves whole to the next chunk.
+          batch.push_back(eos);
+          batch_weights.push_back(1.0F);
+          batch.insert(batch.end(), remaining, pad);
+          batch_weights.insert(batch_weights.end(), remaining, 1.0F);
+        }
+        flush();
       } else {
-        // A short group moves whole to the next chunk. Unreachable with a
-        // single group (fewer than kMaxWordLength tokens always fit) but
-        // kept so this loop stays the reference's.
-        batch.push_back(eos);
-        batch.insert(batch.end(), remaining, pad);
+        batch.insert(batch.end(), group.ids.begin() + consumed,
+                     group.ids.end());
+        batch_weights.insert(batch_weights.end(), left, group.weight);
+        consumed = group.ids.size();
       }
-      flush();
-    } else {
-      batch.insert(batch.end(), group.begin() + consumed, group.end());
-      consumed = group.size();
     }
   }
   batch.push_back(eos);
-  batch.insert(batch.end(), static_cast<std::size_t>(max_length) - batch.size(),
-               pad);
+  batch_weights.push_back(1.0F);
+  const auto fill = static_cast<std::size_t>(max_length) - batch.size();
+  batch.insert(batch.end(), fill, pad);
+  batch_weights.insert(batch_weights.end(), fill, 1.0F);
   flush();
 
   // num_tokens of the first chunk: the reference's attention mask is 1 up to

@@ -113,10 +113,13 @@ private:
   }
 
   const ir::TensorDesc &description(std::uint32_t id) const {
-    const auto *value = build.program.tensor(id);
-    if (!value)
+    // Ids are handed out sequentially and pushed in the same order, so the
+    // descriptor is at id - 1. Program::tensor is a linear scan and the
+    // builders look up thousands of times.
+    if (id == 0U || id > build.program.tensors.size() ||
+        build.program.tensors[id - 1U].id != id)
       fail("CLIP text tower builder lost a tensor descriptor");
-    return *value;
+    return build.program.tensors[id - 1U];
   }
 
   std::uint32_t same(std::uint32_t source) {
@@ -260,13 +263,10 @@ private:
   }
 
   void mark_output(std::uint32_t value) {
-    for (auto &desc : build.program.tensors) {
-      if (desc.id != value)
-        continue;
-      desc.roles |= TensorRole::Output;
-      return;
-    }
-    fail("CLIP text tower output lost its tensor");
+    if (value == 0U || value > build.program.tensors.size() ||
+        build.program.tensors[value - 1U].id != value)
+      fail("CLIP text tower output lost its tensor");
+    build.program.tensors[value - 1U].roles |= ir::TensorRole::Output;
   }
 };
 

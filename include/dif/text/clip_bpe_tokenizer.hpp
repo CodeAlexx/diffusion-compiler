@@ -92,8 +92,39 @@ std::vector<std::string> clip_pretokenize(std::string_view text);
 //                  num_tokens, which selects the pooled output.
 struct ClipPromptTokens {
   std::vector<std::int32_t> ids;
+  // One weight per slot, from the prompt's (text:weight) syntax. Specials
+  // and padding always weigh one.
+  std::vector<float> weights;
   std::uint64_t valid_tokens{};
+
+  std::uint64_t chunks(std::uint64_t max_length = 77) const {
+    return ids.size() / max_length;
+  }
+  // True when the prompt asked for a weight, which is what makes the
+  // encoder blend each row against the empty-prompt encoding.
+  bool weighted() const {
+    for (const auto weight : weights)
+      if (weight != 1.0F)
+        return true;
+    return false;
+  }
 };
+
+// One weighted run of text. The reference reads nested parentheses as a 1.1
+// multiplier per level and "(text:weight)" as an absolute weight, with
+// backslash-escaped parentheses staying literal.
+struct WeightedSegment {
+  std::string text;
+  float weight{1.0F};
+};
+
+std::vector<WeightedSegment> parse_prompt_weights(std::string_view text);
+
+// The all-padding chunk the reference encodes to blend weighted rows
+// against: [BOS, EOS, pad...].
+std::vector<std::int32_t> clip_empty_chunk(const ClipBpeTokenizer &tokenizer,
+                                           std::uint32_t pad_token,
+                                           std::uint64_t max_length = 77);
 
 ClipPromptTokens clip_prompt_tokens(const ClipBpeTokenizer &tokenizer,
                                     std::string_view text,

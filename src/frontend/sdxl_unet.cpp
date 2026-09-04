@@ -34,7 +34,7 @@ constexpr std::uint64_t kGroups = 32U;
 constexpr double kResNormEpsilon = 1.0e-5;
 constexpr double kTransformerNormEpsilon = 1.0e-6;
 constexpr double kLayerNormEpsilon = 1.0e-5;
-constexpr std::uint64_t kConvWorkspace = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kConvWorkspace = 2048ULL * 1024ULL * 1024ULL;
 
 class Builder {
 public:
@@ -73,7 +73,7 @@ public:
     // emb_layers apply SiLU to the shared embedding in every res block;
     // one shared activation is the same value.
     emb_activated = same(emb);
-    operation(Opcode::SiLU, {emb}, {emb_activated});
+    operation(Opcode::SiLU, {emb}, {emb_activated}, fusable());
 
     std::vector<std::uint32_t> skips;
     auto h = conv(build.latent_input, kModelChannels, 3U, 1U, 1U,
@@ -130,7 +130,7 @@ public:
 
     h = group_norm(h, "out.0", kResNormEpsilon);
     auto activated = same(h);
-    operation(Opcode::SiLU, {h}, {activated});
+    operation(Opcode::SiLU, {h}, {activated}, fusable());
     build.output = conv(activated, kLatentChannels, 3U, 1U, 1U, "out.2");
     mark_output(build.output);
     build.boundaries.emplace_back("output", build.output);
@@ -155,10 +155,13 @@ private:
   }
 
   const ir::TensorDesc &description(std::uint32_t id) const {
-    const auto *value = build.program.tensor(id);
-    if (!value)
+    // Ids are handed out sequentially and pushed in the same order, so the
+    // descriptor is at id - 1. Program::tensor is a linear scan and the
+    // builders look up thousands of times.
+    if (id == 0U || id > build.program.tensors.size() ||
+        build.program.tensors[id - 1U].id != id)
       fail("SDXL UNet builder lost a tensor descriptor");
-    return *value;
+    return build.program.tensors[id - 1U];
   }
 
   std::uint32_t same(std::uint32_t source) {
@@ -172,6 +175,12 @@ private:
     build.program.operations.push_back({next_operation++, opcode,
                                         std::move(inputs), std::move(outputs),
                                         std::move(attributes)});
+  }
+
+  // Opt pointwise operations into the compiler's elementwise fusion
+  // pass, which folds a single-consumer chain into one kernel.
+  static std::vector<Attribute> fusable() {
+    return {Attribute::u64(AttrKey::Implementation, 2U)};
   }
 
   std::vector<Attribute>
@@ -253,8 +262,7 @@ private:
     const auto output = same(input);
     operation(Opcode::GroupNorm, {input, weight, bias}, {output},
               {Attribute::u64(AttrKey::Groups, kGroups),
-               Attribute::f64(AttrKey::Epsilon, epsilon),
-               Attribute::u64(AttrKey::BlockSize, 256U)});
+               Attribute::f64(AttrKey::Epsilon, epsilon)});
     return output;
   }
 
@@ -286,14 +294,14 @@ private:
     capture("time_embedding", sinusoid_typed);
     auto time = linear(sinusoid_typed, "time_embed.0", kTimeEmbed, true);
     auto activated = same(time);
-    operation(Opcode::SiLU, {time}, {activated});
+    operation(Opcode::SiLU, {time}, {activated}, fusable());
     time = linear(activated, "time_embed.2", kTimeEmbed, true);
     auto label = linear(build.vector_input, "label_emb.0.0", kTimeEmbed, true);
     activated = same(label);
-    operation(Opcode::SiLU, {label}, {activated});
+    operation(Opcode::SiLU, {label}, {activated}, fusable());
     label = linear(activated, "label_emb.0.2", kTimeEmbed, true);
     const auto sum = same(time);
-    operation(Opcode::Add, {time, label}, {sum});
+    operation(Opcode::Add, {time, label}, {sum}, fusable());
     return sum;
   }
 
@@ -308,7 +316,7 @@ private:
     const auto width = x_desc.dims[3];
     auto h = group_norm(x, prefix + ".in_layers.0", kResNormEpsilon);
     auto activated = same(h);
-    operation(Opcode::SiLU, {h}, {activated});
+    operation(Opcode::SiLU, {h}, {activated}, fusable());
     h = conv(activated, out_channels, 3U, 1U, 1U, prefix + ".in_layers.2");
     const auto emb_out =
         linear(emb_activated, prefix + ".emb_layers.1", out_channels, true);
@@ -319,16 +327,16 @@ private:
                                   {batch, out_channels, height, width});
     operation(Opcode::BroadcastTo, {emb_column}, {emb_plane});
     auto shifted = same(h);
-    operation(Opcode::Add, {h, emb_plane}, {shifted});
+    operation(Opcode::Add, {h, emb_plane}, {shifted}, fusable());
     h = group_norm(shifted, prefix + ".out_layers.0", kResNormEpsilon);
     activated = same(h);
-    operation(Opcode::SiLU, {h}, {activated});
+    operation(Opcode::SiLU, {h}, {activated}, fusable());
     h = conv(activated, out_channels, 3U, 1U, 1U, prefix + ".out_layers.3");
     auto skip = x;
     if (x_desc.dims[1] != out_channels)
       skip = conv(x, out_channels, 1U, 1U, 0U, prefix + ".skip_connection");
     const auto output = same(h);
-    operation(Opcode::Add, {skip, h}, {output});
+    operation(Opcode::Add, {skip, h}, {output}, fusable());
     return output;
   }
 
@@ -362,7 +370,7 @@ private:
     const auto nchw = same(x);
     operation(Opcode::Permute, {rows_nhwc}, {nchw}, permutation({0, 3, 1, 2}));
     const auto output = same(x);
-    operation(Opcode::Add, {nchw, x}, {output});
+    operation(Opcode::Add, {nchw, x}, {output}, fusable());
     return output;
   }
 
@@ -410,7 +418,7 @@ private:
     auto attended = attention(q, k, v, batch, tokens, tokens, channels);
     attended = linear(attended, prefix + ".attn1.to_out.0", channels, true);
     auto residual = same(rows);
-    operation(Opcode::Add, {rows, attended}, {residual});
+    operation(Opcode::Add, {rows, attended}, {residual}, fusable());
 
     normalized = layer_norm(residual, prefix + ".norm2");
     q = linear(normalized, prefix + ".attn2.to_q", channels, false);
@@ -420,7 +428,7 @@ private:
                          channels);
     attended = linear(attended, prefix + ".attn2.to_out.0", channels, true);
     auto residual2 = same(rows);
-    operation(Opcode::Add, {residual, attended}, {residual2});
+    operation(Opcode::Add, {residual, attended}, {residual2}, fusable());
 
     normalized = layer_norm(residual2, prefix + ".norm3");
     const auto inner = channels * 4U;
@@ -442,11 +450,11 @@ private:
                               static_cast<std::uint64_t>(
                                   ir::GeluApproximation::ExactErf))});
     const auto gated = same(value);
-    operation(Opcode::Multiply, {value, gate_activated}, {gated});
+    operation(Opcode::Multiply, {value, gate_activated}, {gated}, fusable());
     const auto contracted =
         linear(gated, prefix + ".ff.net.2", channels, true);
     const auto output = same(rows);
-    operation(Opcode::Add, {residual2, contracted}, {output});
+    operation(Opcode::Add, {residual2, contracted}, {output}, fusable());
     return output;
   }
 
@@ -486,13 +494,10 @@ private:
   }
 
   void mark_output(std::uint32_t value) {
-    for (auto &desc : build.program.tensors) {
-      if (desc.id != value)
-        continue;
-      desc.roles |= TensorRole::Output;
-      return;
-    }
-    fail("SDXL UNet output lost its tensor");
+    if (value == 0U || value > build.program.tensors.size() ||
+        build.program.tensors[value - 1U].id != value)
+      fail("SDXL UNet output lost its tensor");
+    build.program.tensors[value - 1U].roles |= ir::TensorRole::Output;
   }
 };
 

@@ -20,6 +20,8 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <algorithm>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -39,6 +41,17 @@ struct Arguments {
   std::string backend{"cuda"};
   std::string dtype;
   fs::path cache_directory;
+  // Timed replay: the executor's own mean/minimum over these iterations is
+  // the stage's compute cost, with preparation and readback excluded.
+  std::uint32_t warmups{};
+  std::uint32_t iterations{1};
+  bool capture{true};
+  // Print this many of the costliest operations, grouped by opcode and
+  // output shape, so a slow stage names its own hot spots.
+  std::uint32_t profile{};
+  // Benchmark every Linear at prepare and keep the fastest cuBLASLt
+  // algorithm. Same dtype, same math: an autotune, not a precision change.
+  bool tune_linears{};
 };
 
 Arguments parse(int argc, char **argv) {
@@ -64,6 +77,16 @@ Arguments parse(int argc, char **argv) {
       arguments.dtype = value();
     else if (flag == "--cache-dir")
       arguments.cache_directory = value();
+    else if (flag == "--warmups")
+      arguments.warmups = static_cast<std::uint32_t>(std::stoul(value()));
+    else if (flag == "--iterations")
+      arguments.iterations = static_cast<std::uint32_t>(std::stoul(value()));
+    else if (flag == "--no-capture")
+      arguments.capture = false;
+    else if (flag == "--profile")
+      arguments.profile = static_cast<std::uint32_t>(std::stoul(value()));
+    else if (flag == "--tune-linears")
+      arguments.tune_linears = true;
     else
       dif::fail("unknown argument " + flag);
   }
@@ -165,6 +188,7 @@ Stage build_vae(const Arguments &arguments,
                 const dif::weights::SafeTensorFile &fixture) {
   Stage stage;
   dif::frontend::SdxlVaeConfig config;
+  config.capture_boundaries = arguments.capture;
   config.dtype = parse_dtype(arguments.dtype, dif::ir::DType::BF16);
   const auto *latent = fixture.find("latent_input");
   if (!latent || latent->dims.size() != 4U)
@@ -174,8 +198,10 @@ Stage build_vae(const Arguments &arguments,
   config.latent_width = latent->dims[3];
   auto build = dif::frontend::make_sdxl_vae_decoder(config);
   for (const auto &weight : build.weights) {
+    // Map, then convert once: an owned copy first would double the traffic
+    // for a multi-gigabyte tower.
     auto tensor = as_dtype(
-        owned_copy(dif::weights::map_safetensor(checkpoint, weight.source_name)),
+        dif::weights::map_safetensor(checkpoint, weight.source_name),
         config.dtype);
     check_binding(build.program, weight.tensor, tensor, weight.source_name);
     stage.bindings.emplace(weight.tensor, std::move(tensor));
@@ -193,14 +219,14 @@ Stage build_clip(const Arguments &arguments,
   Stage stage;
   auto config = g ? dif::frontend::sdxl_clip_g_config()
                   : dif::frontend::sdxl_clip_l_config();
+  config.capture_boundaries = arguments.capture;
   config.dtype = parse_dtype(arguments.dtype, dif::ir::DType::F32);
   if (config.dtype != dif::ir::DType::F32)
     config.attention_implementation = 2U;
   auto build = dif::frontend::make_clip_text_tower(config);
   const auto hidden = config.hidden_size;
   for (const auto &weight : build.weights) {
-    auto source = owned_copy(
-        dif::weights::map_safetensor(checkpoint, weight.source_name));
+    auto source = dif::weights::map_safetensor(checkpoint, weight.source_name);
     using Transform = dif::frontend::ClipWeightTransform;
     switch (weight.transform) {
     case Transform::Direct:
@@ -241,6 +267,7 @@ Stage build_unet(const Arguments &arguments,
                  const dif::weights::SafeTensorFile &fixture) {
   Stage stage;
   dif::frontend::SdxlUnetConfig config;
+  config.capture_boundaries = arguments.capture;
   config.dtype = parse_dtype(arguments.dtype, dif::ir::DType::F16);
   const auto *latent = fixture.find("latent_input");
   const auto *context = fixture.find("context");
@@ -295,10 +322,15 @@ int main(int argc, char **argv) {
         std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 
     dif::runtime::RunOptions options;
-    options.warmups = 0U;
-    options.iterations = 1U;
+    options.warmups = arguments.warmups;
+    options.iterations = arguments.iterations;
     options.minimum_free_bytes = 256ULL * 1024ULL * 1024ULL;
     options.cache_directory = arguments.cache_directory;
+    options.profile_pipeline = arguments.profile != 0U;
+    if (arguments.tune_linears)
+      for (const auto &operation : stage.program.operations)
+        if (operation.opcode == dif::ir::Opcode::Linear)
+          options.tune_linear_operations.push_back(operation.id);
     auto backend = arguments.backend == "cpu"
                        ? dif::runtime::make_cpu_executor()
                        : dif::runtime::make_cuda_executor();
@@ -310,6 +342,62 @@ int main(int argc, char **argv) {
     auto result = prepared->run(stage.bindings, options);
     const auto run_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+
+    if (arguments.profile != 0U) {
+      struct Bucket {
+        double milliseconds{};
+        std::uint64_t count{};
+        std::string label;
+      };
+      std::map<std::string, Bucket> buckets;
+      double total = 0.0;
+      for (const auto &timing : result.operation_timings) {
+        const auto *op = std::find_if(
+            stage.program.operations.begin(), stage.program.operations.end(),
+            [&](const dif::ir::Operation &candidate) {
+              return candidate.id == timing.operation_id;
+            }).base();
+        std::string shape;
+        for (const auto &operation : stage.program.operations) {
+          if (operation.id != timing.operation_id)
+            continue;
+          for (const auto output : operation.outputs) {
+            const auto *description = stage.program.tensor(output);
+            shape += "[";
+            for (std::size_t index = 0; index < description->dims.size();
+                 ++index)
+              shape += (index ? "," : "") +
+                       std::to_string(description->dims[index]);
+            shape += "]";
+          }
+          break;
+        }
+        (void)op;
+        const auto key =
+            std::string(dif::ir::opcode_name(timing.opcode)) + " " + shape +
+            (timing.plan.empty() ? "" : " plan=" + timing.plan);
+        auto &bucket = buckets[key];
+        bucket.milliseconds += timing.minimum_milliseconds;
+        bucket.count += 1U;
+        bucket.label = key;
+        total += timing.minimum_milliseconds;
+      }
+      std::vector<Bucket> ordered;
+      ordered.reserve(buckets.size());
+      for (auto &[key, bucket] : buckets)
+        ordered.push_back(bucket);
+      std::sort(ordered.begin(), ordered.end(),
+                [](const Bucket &a, const Bucket &b) {
+                  return a.milliseconds > b.milliseconds;
+                });
+      std::cout << "SDXL_PROFILE stage=" << arguments.stage
+                << " accounted_ms=" << total << "\n";
+      for (std::size_t index = 0;
+           index < ordered.size() && index < arguments.profile; ++index)
+        std::cout << "  " << ordered[index].milliseconds << " ms  x"
+                  << ordered[index].count << "  " << ordered[index].label
+                  << "\n";
+    }
 
     std::vector<dif::weights::SafeTensorWriteSpec> specs;
     std::vector<dif::runtime::Tensor> values;
@@ -335,6 +423,13 @@ int main(int argc, char **argv) {
               << " weights=" << stage.bindings.size()
               << " build_ms=" << build_ms << " prepare_ms=" << prepare_ms
               << " run_ms=" << run_ms
+              << " gpu_mean_ms=" << result.mean_milliseconds
+              << " gpu_min_ms=" << result.minimum_milliseconds
+              << " resident_bytes_h2d=" << result.pipeline_profile.resident_weight_bytes
+              << " resident_h2d_ms=" << result.pipeline_profile.resident_h2d_milliseconds
+              << " resident_upload_ms="
+              << result.pipeline_profile.resident_upload_milliseconds
+              << " major_faults=" << result.pipeline_profile.resident_major_page_faults
               << " resident_bytes=" << result.resident_bytes
               << " boundaries=" << values.size() << " -> " << arguments.output
               << "\n";

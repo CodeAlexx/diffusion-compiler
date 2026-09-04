@@ -56,11 +56,14 @@ def main() -> None:
     captures.input(unet.time_embed, "time_embedding")
     captures.output(unet.time_embed, "time_embed_out")
     captures.output(unet.label_emb, "label_emb_out")
+    # The reference iterates each block's children rather than calling the
+    # block, so a hook on the block itself never fires: hook the last child,
+    # whose output is the block's output.
     for index, block in enumerate(unet.input_blocks):
-        captures.output(block, f"input_block_{index}")
-    captures.output(unet.middle_block, "middle_block")
+        captures.output(block[-1], f"input_block_{index}")
+    captures.output(unet.middle_block[-1], "middle_block")
     for index, block in enumerate(unet.output_blocks):
-        captures.output(block, f"output_block_{index}")
+        captures.output(block[-1], f"output_block_{index}")
     with torch.no_grad():
         xc = x.to(device="cuda", dtype=dtype)
         ctx = context.to(device="cuda", dtype=dtype)

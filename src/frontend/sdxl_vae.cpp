@@ -21,7 +21,7 @@ constexpr std::uint64_t kLatentChannels = 4U;
 constexpr std::uint64_t kBaseChannels = 128U;
 constexpr std::uint64_t kGroups = 32U;
 constexpr double kNormEpsilon = 1.0e-6;
-constexpr std::uint64_t kConvWorkspace = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kConvWorkspace = 2048ULL * 1024ULL * 1024ULL;
 
 class Builder {
 public:
@@ -74,7 +74,7 @@ public:
     value = group_norm(value, "decoder.norm_out");
     capture("norm_out", value);
     const auto activated = same(value);
-    operation(Opcode::SiLU, {value}, {activated});
+    operation(Opcode::SiLU, {value}, {activated}, fusable());
     value = conv(activated, 3U, 3U, 1U, "decoder.conv_out");
     build.raw_output = value;
     mark_output(value, "raw_output");
@@ -96,10 +96,13 @@ private:
   }
 
   const ir::TensorDesc &description(std::uint32_t id) const {
-    const auto *value = build.program.tensor(id);
-    if (!value)
+    // Ids are handed out sequentially and pushed in the same order, so the
+    // descriptor is at id - 1. Program::tensor is a linear scan and the
+    // builders look up thousands of times.
+    if (id == 0U || id > build.program.tensors.size() ||
+        build.program.tensors[id - 1U].id != id)
       fail("SDXL VAE builder lost a tensor descriptor");
-    return *value;
+    return build.program.tensors[id - 1U];
   }
 
   std::uint32_t same(std::uint32_t source) {
@@ -114,6 +117,12 @@ private:
     build.program.operations.push_back({next_operation++, opcode,
                                         std::move(inputs), std::move(outputs),
                                         std::move(attributes)});
+  }
+
+  // Opt pointwise operations into the compiler's elementwise fusion
+  // pass, which folds a single-consumer chain into one kernel.
+  static std::vector<ir::Attribute> fusable() {
+    return {ir::Attribute::u64(ir::AttrKey::Implementation, 2U)};
   }
 
   std::vector<ir::Attribute>
@@ -177,8 +186,7 @@ private:
     const auto output = same(input);
     operation(Opcode::GroupNorm, {input, weight, bias}, {output},
               {Attribute::u64(AttrKey::Groups, kGroups),
-               Attribute::f64(AttrKey::Epsilon, kNormEpsilon),
-               Attribute::u64(AttrKey::BlockSize, 256U)});
+               Attribute::f64(AttrKey::Epsilon, kNormEpsilon)});
     return output;
   }
 
@@ -191,14 +199,14 @@ private:
       shortcut = conv(input, out_channels, 1U, 0U, prefix + ".nin_shortcut");
     auto value = group_norm(input, prefix + ".norm1");
     auto activated = same(value);
-    operation(ir::Opcode::SiLU, {value}, {activated});
+    operation(ir::Opcode::SiLU, {value}, {activated}, fusable());
     value = conv(activated, out_channels, 3U, 1U, prefix + ".conv1");
     value = group_norm(value, prefix + ".norm2");
     activated = same(value);
-    operation(ir::Opcode::SiLU, {value}, {activated});
+    operation(ir::Opcode::SiLU, {value}, {activated}, fusable());
     value = conv(activated, out_channels, 3U, 1U, prefix + ".conv2");
     const auto output = same(value);
-    operation(ir::Opcode::Add, {shortcut, value}, {output});
+    operation(ir::Opcode::Add, {shortcut, value}, {output}, fusable());
     return output;
   }
 
@@ -251,7 +259,7 @@ private:
               permutation({0, 3, 1, 2}));
     value = conv(value, channels, 1U, 0U, prefix + ".proj_out");
     const auto output = same(input);
-    operation(Opcode::Add, {input, value}, {output});
+    operation(ir::Opcode::Add, {input, value}, {output}, fusable());
     return output;
   }
 
@@ -276,13 +284,10 @@ private:
   }
 
   void mark_output(std::uint32_t value, const char *kind) {
-    for (auto &desc : build.program.tensors) {
-      if (desc.id != value)
-        continue;
-      desc.roles |= ir::TensorRole::Output;
-      return;
-    }
-    fail(std::string("SDXL VAE ") + kind + " lost its tensor");
+    if (value == 0U || value > build.program.tensors.size() ||
+        build.program.tensors[value - 1U].id != value)
+      fail(std::string("SDXL VAE ") + kind + " lost its tensor");
+    build.program.tensors[value - 1U].roles |= ir::TensorRole::Output;
   }
 };
 

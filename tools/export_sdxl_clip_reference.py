@@ -33,7 +33,11 @@ def main() -> None:
 
     # The creator's own single-file loader: it recognizes the SDXL dual
     # tower and converts the OpenCLIP-G layout the way the sampler does.
-    clip = comfy.sd.load_checkpoint_guess_config_clip_only(str(args.checkpoint))
+    _model, clip, *_rest = comfy.sd.load_checkpoint_guess_config(
+        str(args.checkpoint), output_vae=False, output_clip=True,
+        output_model=False)
+    if clip is None:
+        raise SystemExit("the reference did not load a text encoder")
     if not hasattr(clip.cond_stage_model, "clip_g"):
         raise SystemExit("the reference did not build the SDXL dual tower")
     tokens = clip.tokenize(args.prompt)
