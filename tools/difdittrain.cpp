@@ -14,6 +14,7 @@
 #include "dif/support/json.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/training/checkpoint.hpp"
+#include "dif/training/session.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -23,6 +24,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 namespace {
 
@@ -75,7 +77,7 @@ int run_dit_lora(const dif::json::Value &configuration,
                  const std::string &backend, std::uint64_t steps_override,
                  const std::filesystem::path &checkpoint_path,
                  const std::filesystem::path &resume_path,
-                 const std::filesystem::path &export_path, bool persistent) {
+                 const std::filesystem::path &export_path) {
   const auto field = [&](const char *key) -> const dif::json::Value & {
     const auto *value = configuration.find(key);
     if (!value)
@@ -140,11 +142,15 @@ int run_dit_lora(const dif::json::Value &configuration,
          "frozen-" + std::to_string(index));
 
   std::uint64_t completed_steps = 0U;
+  // Kept in scope so the session can take both the state and the step count
+  // from it rather than being told the count separately.
+  dif::training::Checkpoint resume_checkpoint;
   if (!resume_path.empty()) {
     auto checkpoint = dif::training::read_checkpoint(resume_path);
     if (checkpoint.program_fingerprint != fingerprint)
       dif::fail("resume checkpoint targets a different program fingerprint");
     completed_steps = checkpoint.completed_steps;
+    resume_checkpoint = checkpoint;
     std::size_t expected = 0U;
     for (const auto &binding : build.optimizer_bindings) {
       for (const auto id :
@@ -202,35 +208,32 @@ int run_dit_lora(const dif::json::Value &configuration,
   else
     dif::fail("unknown backend: " + backend);
 
-  inputs.emplace(build.step_input,
-                 i32_scalar(static_cast<std::int32_t>(completed_steps)));
-  // "This output is that input next time", stated once per tensor the step
-  // advances. The runtime is told nothing about what an optimizer is.
-  if (persistent)
-    for (const auto &binding : build.optimizer_bindings) {
-      options.persistent_state.push_back(
-          {binding.parameter_input, binding.parameter_output});
-      options.persistent_state.push_back(
-          {binding.first_moment_input, binding.first_moment_output});
-      options.persistent_state.push_back(
-          {binding.second_moment_input, binding.second_moment_output});
-    }
+  auto plan = dif::training::plan_from_composed(
+      build.program, build.step_input, build.loss_output,
+      build.optimizer_bindings);
+  // Everything a step supplies: every program input the session does not own.
+  dif::runtime::TensorMap batch;
+  {
+    std::unordered_set<std::uint32_t> owned{plan.step_input};
+    for (const auto &binding : plan.persistent_state())
+      owned.insert(binding.input);
+    for (const auto &desc : plan.program.tensors)
+      if (desc.has_role(dif::ir::TensorRole::Input) && !owned.contains(desc.id))
+        batch.emplace(desc.id, inputs.at(desc.id));
+  }
   const auto wall_start = std::chrono::steady_clock::now();
-  auto prepared = executor->prepare(build.program, inputs, options);
+  dif::training::TrainingSession session(std::move(plan), *executor, inputs,
+                                         options);
+  if (!resume_path.empty())
+    session.restore(resume_checkpoint);
   std::filesystem::create_directories(output);
   std::vector<float> losses;
   std::uint64_t state_host_to_device = 0U;
   std::uint64_t state_device_to_host = 0U;
-  dif::runtime::RunResult result;
+  dif::runtime::TensorMap step_outputs;
   for (std::uint64_t step = 0U; step < steps; ++step) {
-    inputs.insert_or_assign(
-        build.step_input,
-        i32_scalar(static_cast<std::int32_t>(completed_steps + step)));
-    result = prepared->run(inputs, options);
-    const auto loss = result.outputs.at(build.loss_output).f32()[0];
-    if (!std::isfinite(loss))
-      dif::fail("DiT LoRA training produced a non-finite loss at step " +
-                std::to_string(step));
+    auto result = session.step(batch);
+    const auto loss = result.loss;
     losses.push_back(loss);
     if (step == 0U && resume_path.empty())
       for (std::size_t index = 0U; index < build.optimizer_bindings.size();
@@ -239,27 +242,16 @@ int run_dit_lora(const dif::json::Value &configuration,
             result.outputs.at(
                 build.optimizer_bindings[index].gradient_output),
             output / ("grad1-" + std::to_string(index) + ".diftensor"));
-    if (!persistent)
-      for (const auto &binding : build.optimizer_bindings) {
-        inputs.insert_or_assign(
-            binding.parameter_input,
-            std::move(result.outputs.at(binding.parameter_output)));
-        inputs.insert_or_assign(
-            binding.first_moment_input,
-            std::move(result.outputs.at(binding.first_moment_output)));
-        inputs.insert_or_assign(
-            binding.second_moment_input,
-            std::move(result.outputs.at(binding.second_moment_output)));
-      }
     state_host_to_device += result.persistent_state_host_to_device_bytes;
     state_device_to_host += result.persistent_state_device_to_host_bytes;
+    step_outputs = std::move(result.outputs);
   }
   // Read the state back once, on purpose, so the frozen-base check, the
   // written tensors, the checkpoint and the adapter export are unchanged.
-  if (persistent)
-    for (auto &[id, tensor] : prepared->capture_persistent_state())
-      inputs.insert_or_assign(id, std::move(tensor));
-  completed_steps += steps;
+  const auto final_checkpoint = session.capture();
+  for (const auto &[id, tensor] : final_checkpoint.state)
+    inputs.insert_or_assign(id, tensor);
+  completed_steps = final_checkpoint.completed_steps;
   const auto wall_stop = std::chrono::steady_clock::now();
 
   // Base-bits invariant: every frozen tensor is byte-identical.
@@ -278,7 +270,7 @@ int run_dit_lora(const dif::json::Value &configuration,
 
   dif::runtime::write_tensor(f32_vector(losses),
                              output / "losses.diftensor");
-  dif::runtime::write_tensor(result.outputs.at(build.prediction_output),
+  dif::runtime::write_tensor(step_outputs.at(build.prediction_output),
                              output / "prediction.diftensor");
   for (std::size_t index = 0U; index < build.optimizer_bindings.size();
        ++index) {
@@ -290,21 +282,12 @@ int run_dit_lora(const dif::json::Value &configuration,
                                output / ("moment1-" + suffix));
     dif::runtime::write_tensor(inputs.at(binding.second_moment_input),
                                output / ("moment2-" + suffix));
-    dif::runtime::write_tensor(result.outputs.at(binding.gradient_output),
+    dif::runtime::write_tensor(step_outputs.at(binding.gradient_output),
                                output / ("grad-" + suffix));
   }
 
-  dif::training::Checkpoint checkpoint;
-  checkpoint.program_fingerprint = fingerprint;
-  checkpoint.completed_steps = completed_steps;
-  for (const auto &binding : build.optimizer_bindings) {
-    checkpoint.state.emplace(binding.parameter_input,
-                             inputs.at(binding.parameter_input));
-    checkpoint.state.emplace(binding.first_moment_input,
-                             inputs.at(binding.first_moment_input));
-    checkpoint.state.emplace(binding.second_moment_input,
-                             inputs.at(binding.second_moment_input));
-  }
+  // The session already knows what a checkpoint of this plan holds.
+  const auto &checkpoint = final_checkpoint;
   if (!checkpoint_path.empty())
     atomic_write_checkpoint(checkpoint, checkpoint_path);
   if (!export_path.empty()) {
@@ -313,11 +296,11 @@ int run_dit_lora(const dif::json::Value &configuration,
     dif::frontend::validate_lora_export(export_path, build.adapters);
   }
 
-  std::cout << "PERSISTENT_STATE persistent=" << (persistent ? 1 : 0)
-            << " resident_bytes=" << result.persistent_state_bytes
+  std::cout << "PERSISTENT_STATE persistent=1"
+            << " resident_bytes=" << session.persistent_state_bytes()
             << " step_h2d_bytes=" << state_host_to_device
             << " step_d2h_bytes=" << state_device_to_host << "\n";
-  std::cout << "DIT_LORA_TRAIN PASS backend=" << result.backend_name
+  std::cout << "DIT_LORA_TRAIN PASS backend=" << executor->name()
             << " blocks=" << config.blocks << " steps=" << steps
             << " completed_steps=" << completed_steps
             << " sites=" << build.adapters.size()
@@ -343,9 +326,6 @@ int main(int argc, char **argv) {
     std::filesystem::path output;
     std::filesystem::path cache_directory;
     std::filesystem::path checkpoint_path;
-    // Ask the runtime to own the optimizer state instead of carrying it back
-    // through host memory between steps.
-    bool persistent = false;
     std::filesystem::path resume_path;
     std::filesystem::path export_path;
     std::string backend{"cpu"};
@@ -365,8 +345,6 @@ int main(int argc, char **argv) {
         output = value("--output");
       else if (option == "--cache-dir")
         cache_directory = value("--cache-dir");
-      else if (option == "--persistent")
-        persistent = true;
       else if (option == "--checkpoint")
         checkpoint_path = value("--checkpoint");
       else if (option == "--resume")
@@ -394,7 +372,7 @@ int main(int argc, char **argv) {
     if (configuration.find("lora_rank"))
       return run_dit_lora(configuration, fixture, output, cache_directory,
                           backend, steps_override, checkpoint_path,
-                          resume_path, export_path, persistent);
+                          resume_path, export_path);
     if (!checkpoint_path.empty() || !resume_path.empty() ||
         !export_path.empty())
       dif::fail("--checkpoint/--resume/--export-adapters require a LoRA "
@@ -479,34 +457,35 @@ int main(int argc, char **argv) {
     else
       dif::fail("unknown backend: " + backend);
 
-    inputs.emplace(build.step_input, i32_scalar(0));
-    // "This output is that input next time", stated once per tensor the step
-    // advances. The runtime is told nothing about what an optimizer is.
-    if (persistent)
-      for (const auto &binding : build.optimizer_bindings) {
-        options.persistent_state.push_back(
-            {binding.parameter_input, binding.parameter_output});
-        options.persistent_state.push_back(
-            {binding.first_moment_input, binding.first_moment_output});
-        options.persistent_state.push_back(
-            {binding.second_moment_input, binding.second_moment_output});
-      }
+    // The plan derives its own state declaration from the bindings, so the
+    // tool no longer states which tensor becomes which.
+    auto plan = dif::training::plan_from_composed(
+        build.program, build.step_input, build.loss_output,
+        build.optimizer_bindings);
+    // Everything a step supplies: every program input the session does not
+    // own. This fixture's batch never changes, but it is handed over every
+    // step exactly as a real one would be.
+    dif::runtime::TensorMap batch;
+    {
+      std::unordered_set<std::uint32_t> owned{plan.step_input};
+      for (const auto &binding : plan.persistent_state())
+        owned.insert(binding.input);
+      for (const auto &desc : plan.program.tensors)
+        if (desc.has_role(dif::ir::TensorRole::Input) &&
+            !owned.contains(desc.id))
+          batch.emplace(desc.id, inputs.at(desc.id));
+    }
     const auto wall_start = std::chrono::steady_clock::now();
-    auto prepared = executor->prepare(build.program, inputs, options);
+    dif::training::TrainingSession session(std::move(plan), *executor, inputs,
+                                           options);
     std::filesystem::create_directories(output);
     std::vector<float> losses;
     std::uint64_t state_host_to_device = 0U;
     std::uint64_t state_device_to_host = 0U;
-    dif::runtime::RunResult result;
+    dif::runtime::TensorMap step_outputs;
     for (std::uint64_t step = 0U; step < steps; ++step) {
-      inputs.insert_or_assign(build.step_input,
-                              i32_scalar(static_cast<std::int32_t>(step)));
-      result = prepared->run(inputs, options);
-      const auto loss = result.outputs.at(build.loss_output).f32()[0];
-      if (!std::isfinite(loss))
-        dif::fail("DiT block training produced a non-finite loss at step " +
-                  std::to_string(step));
-      losses.push_back(loss);
+      auto result = session.step(batch);
+      losses.push_back(result.loss);
       if (step == 0U)
         for (std::size_t index = 0U; index < build.optimizer_bindings.size();
              ++index)
@@ -514,26 +493,14 @@ int main(int argc, char **argv) {
               result.outputs.at(
                   build.optimizer_bindings[index].gradient_output),
               output / ("grad1-" + std::to_string(index) + ".diftensor"));
-      if (!persistent)
-        for (const auto &binding : build.optimizer_bindings) {
-          inputs.insert_or_assign(
-              binding.parameter_input,
-              std::move(result.outputs.at(binding.parameter_output)));
-          inputs.insert_or_assign(
-              binding.first_moment_input,
-              std::move(result.outputs.at(binding.first_moment_output)));
-          inputs.insert_or_assign(
-              binding.second_moment_input,
-              std::move(result.outputs.at(binding.second_moment_output)));
-        }
       state_host_to_device += result.persistent_state_host_to_device_bytes;
       state_device_to_host += result.persistent_state_device_to_host_bytes;
+      step_outputs = std::move(result.outputs);
     }
     // Read the state back once, on purpose, so everything written below is
     // unchanged.
-    if (persistent)
-      for (auto &[id, tensor] : prepared->capture_persistent_state())
-        inputs.insert_or_assign(id, std::move(tensor));
+    for (auto &[id, tensor] : session.capture().state)
+      inputs.insert_or_assign(id, std::move(tensor));
     const auto wall_stop = std::chrono::steady_clock::now();
 
     dif::runtime::write_tensor(f32_vector(losses),
@@ -548,14 +515,14 @@ int main(int argc, char **argv) {
                                  output / ("moment1-" + suffix));
       dif::runtime::write_tensor(inputs.at(binding.second_moment_input),
                                  output / ("moment2-" + suffix));
-      dif::runtime::write_tensor(result.outputs.at(binding.gradient_output),
+      dif::runtime::write_tensor(step_outputs.at(binding.gradient_output),
                                  output / ("grad-" + suffix));
     }
-    std::cout << "PERSISTENT_STATE persistent=" << (persistent ? 1 : 0)
-              << " resident_bytes=" << result.persistent_state_bytes
+    std::cout << "PERSISTENT_STATE persistent=1"
+              << " resident_bytes=" << session.persistent_state_bytes()
               << " step_h2d_bytes=" << state_host_to_device
               << " step_d2h_bytes=" << state_device_to_host << "\n";
-    std::cout << "DIT_TRAIN PASS backend=" << result.backend_name
+    std::cout << "DIT_TRAIN PASS backend=" << executor->name()
               << " blocks=" << config.blocks << " steps=" << steps
               << " parameters=" << build.parameters.size()
               << " initial_loss=" << losses.front()

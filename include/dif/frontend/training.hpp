@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dif/ir/ir.hpp"
+#include "dif/training/step.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -25,15 +26,10 @@ struct MlpTrainingConfig {
   ir::DType compute_dtype{ir::DType::F32};
 };
 
-struct OptimizerBinding {
-  std::uint32_t parameter_input{};
-  std::uint32_t gradient_output{};
-  std::uint32_t first_moment_input{};
-  std::uint32_t second_moment_input{};
-  std::uint32_t parameter_output{};
-  std::uint32_t first_moment_output{};
-  std::uint32_t second_moment_output{};
-};
+// The binding difcore already defines. It used to be re-declared here with
+// the master-weight fields dropped, so every frontend copied it field by
+// field out of the training step and quietly lost them.
+using OptimizerBinding = training::ParameterBinding;
 
 struct MlpTrainingBuild {
   ir::Program program;

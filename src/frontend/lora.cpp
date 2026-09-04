@@ -168,12 +168,9 @@ make_lora_flow_training(const LoraFlowTrainingConfig &config) {
                                             adapter_parameters, hyperparameters);
   build.program = std::move(step.program);
   build.step_input = step.step_input;
-  for (const auto &binding : step.bindings)
-    build.optimizer_bindings.push_back(
-        {binding.parameter_input, binding.gradient_output,
-         binding.first_moment_input, binding.second_moment_input,
-         binding.parameter_output, binding.first_moment_output,
-         binding.second_moment_output});
+  // The bindings are difcore's own type now, so the master-weight fields
+  // travel with them instead of being dropped by a field-by-field copy.
+  build.optimizer_bindings = std::move(step.bindings);
   ir::verify(build.program);
   return build;
 }

@@ -1,0 +1,109 @@
+#pragma once
+
+#include "dif/ir/codec.hpp"
+#include "dif/ir/ir.hpp"
+#include "dif/runtime/executor.hpp"
+#include "dif/support/sha256.hpp"
+#include "dif/training/accumulate.hpp"
+#include "dif/training/checkpoint.hpp"
+#include "dif/training/step.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <vector>
+
+namespace dif::training {
+
+// A training step, and the thing that runs it.
+//
+// The split is the point of this file. A TrainingPlan describes WHAT a step
+// is -- the composed program, which tensors carry state, where the phases
+// begin. A TrainingSession is HOW it executes -- it owns the device-resident
+// state, advances the step counter, and is the only thing that touches the
+// runtime. A model frontend builds a forward graph and names its trainable
+// parameters; it writes none of this.
+//
+// Before this existed, every caller hand-wrote the loop, the state carry and
+// the checkpoint plumbing. Two tools in this repository did it differently.
+
+struct TrainingPlan {
+  ir::Program program;
+  std::uint32_t step_input{};
+  std::uint32_t loss_tensor{};
+  std::vector<ParameterBinding> bindings;
+  // Where the forward pass ends and the optimizer begins, as indices into
+  // `program.operations`.
+  std::size_t forward_operations{};
+  std::size_t optimizer_operations{};
+
+  // The persistent-state declaration this plan implies: every tensor the step
+  // advances, paired with where its next value comes from. DERIVED, never
+  // authored by a caller -- a hand-written list is a list that can disagree
+  // with the program it describes.
+  std::vector<runtime::PersistentStateBinding> persistent_state() const;
+
+  // Every tensor a checkpoint has to hold for a resume to be exact.
+  std::vector<std::uint32_t> checkpoint_tensors() const;
+
+  Sha256Digest fingerprint() const { return ir::fingerprint(program); }
+};
+
+// Wraps a step a model frontend already composed. Frontends build their
+// training graph through build_training_step and hand back its pieces; this
+// is how those become a plan a session can run, without the caller
+// reassembling the persistent-state declaration by hand.
+TrainingPlan plan_from_composed(ir::Program program, std::uint32_t step_input,
+                                std::uint32_t loss_tensor,
+                                std::vector<ParameterBinding> bindings);
+
+// Composes forward, backward and the optimizer update into one plan.
+TrainingPlan compile(const ir::Program &forward, std::uint32_t loss_tensor,
+                     std::span<const std::uint32_t> parameters,
+                     const OptimizerHyperparameters &hyperparameters,
+                     const std::function<double(std::size_t, std::uint32_t)>
+                         &decay_for = {});
+
+struct TrainingStepResult {
+  float loss{};
+  double step_milliseconds{};
+  std::uint64_t completed_steps{};
+  // Zero on an ordinary step. Reported rather than assumed.
+  std::uint64_t persistent_state_host_to_device_bytes{};
+  std::uint64_t persistent_state_device_to_host_bytes{};
+  // Whatever the program produced besides the carried state -- gradients, a
+  // prediction. The state itself is NOT here: it stays on the device.
+  runtime::TensorMap outputs;
+};
+
+class TrainingSession {
+public:
+  // `initial` seeds everything the program needs once: constants, the
+  // starting parameters, and zeroed optimizer state. After this the session
+  // owns the state and a step supplies only its batch.
+  TrainingSession(TrainingPlan plan, runtime::Executor &executor,
+                  const runtime::TensorMap &initial,
+                  runtime::RunOptions options);
+
+  // Runs one step. `batch` carries only what genuinely changes.
+  TrainingStepResult step(const runtime::TensorMap &batch);
+
+  // Device to host, on request only.
+  Checkpoint capture() const;
+  // Host to device, on request only. Refuses a checkpoint built for a
+  // different program.
+  void restore(const Checkpoint &checkpoint);
+
+  std::uint64_t completed_steps() const { return completed_steps_; }
+  const TrainingPlan &plan() const { return plan_; }
+  std::uint64_t persistent_state_bytes() const { return state_bytes_; }
+
+private:
+  TrainingPlan plan_;
+  runtime::RunOptions options_;
+  std::unique_ptr<runtime::PreparedExecution> prepared_;
+  std::uint64_t completed_steps_{};
+  std::uint64_t state_bytes_{};
+};
+
+} // namespace dif::training

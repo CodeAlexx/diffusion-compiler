@@ -115,6 +115,7 @@ add_library(difcore
     src/tune/database.cpp
     src/training/autodiff.cpp
     src/training/step.cpp
+    src/training/session.cpp
     src/training/recompute.cpp
     src/training/accumulate.cpp
     src/training/checkpoint.cpp
