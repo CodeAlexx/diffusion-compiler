@@ -30,7 +30,25 @@ set(DIF_FLASH_ATTENTION_ROOT "" CACHE PATH
 set(DIF_CUDA_ARCHITECTURES "native" CACHE STRING
     "CUDA architectures for compiled kernels (for example 86 or 120)")
 
+# CUDA kernel templates (src/compiler/kernels/*.cu) are embedded at build time;
+# the generated table is rebuilt whenever a template or the script changes.
+file(GLOB DIF_KERNEL_TEMPLATE_FILES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/kernels/*.cu")
+set(DIF_KERNEL_TEMPLATES_CPP "${CMAKE_CURRENT_BINARY_DIR}/generated/kernel_templates_generated.cpp")
+add_custom_command(
+    OUTPUT "${DIF_KERNEL_TEMPLATES_CPP}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND ${CMAKE_COMMAND}
+            -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/kernels
+            -DOUTPUT=${DIF_KERNEL_TEMPLATES_CPP}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_kernels.cmake"
+    DEPENDS ${DIF_KERNEL_TEMPLATE_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_kernels.cmake"
+    COMMENT "Embedding CUDA kernel templates"
+    VERBATIM)
+
 add_library(difcore
+    "${DIF_KERNEL_TEMPLATES_CPP}"
+    src/compiler/kernel_template.cpp
     src/build_info.cpp
     src/backend/plugin.cpp
     src/compiler/compiler.cpp
@@ -582,6 +600,11 @@ target_link_libraries(diftokenize PRIVATE dif_text)
 install(TARGETS diftokenize RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)
+  add_executable(dif_kernel_source_tests tests/kernel_source_tests.cpp)
+  target_link_libraries(dif_kernel_source_tests PRIVATE difcore)
+  add_test(NAME dif_kernel_source_tests
+           COMMAND dif_kernel_source_tests
+                   "${CMAKE_CURRENT_SOURCE_DIR}/perf/regress/fixtures/kernel-sources")
   add_executable(dif_opcode_registry_tests tests/opcode_registry_tests.cpp)
   target_link_libraries(dif_opcode_registry_tests PRIVATE difcore)
   add_test(NAME dif_opcode_registry_tests COMMAND dif_opcode_registry_tests)

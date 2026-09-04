@@ -1,4 +1,5 @@
 #include "dif/compiler/compiler.hpp"
+#include "dif/compiler/kernel_template.hpp"
 
 #include "dif/ir/verify.hpp"
 #include "dif/support/error.hpp"
@@ -1003,10 +1004,9 @@ void emit_clamp(std::ostringstream &out, const ir::Program &program,
 void emit_silu(std::ostringstream &out, const ir::Program &program,
                const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL)dif_store(y,i,dif_silu(dif_load(x,i)));}\n";
+  out << render_kernel_template(
+      "silu", {{"function", function_name(op)},
+               {"count", std::to_string(count)}});
 }
 
 void emit_gelu(std::ostringstream &out, const ir::Program &program,
@@ -1014,17 +1014,16 @@ void emit_gelu(std::ostringstream &out, const ir::Program &program,
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto approximation = static_cast<ir::GeluApproximation>(
       op.u64(ir::AttrKey::Approximation, 0U));
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){float v=dif_load(x,i);";
-  if (approximation == ir::GeluApproximation::ExactErf)
-    out << "dif_store(y,i,5.0e-1f*v*(1.0f+erff(v*7.071067812e-1f)));";
-  else
-    out << "float c=v*v*v;float z="
-           "7.978845608e-1f*(v+4.471500218e-2f*c);"
-           "dif_store(y,i,5.0e-1f*v*(1.0f+tanhf(z)));";
-  out << "}}\n";
+  const std::string body =
+      approximation == ir::GeluApproximation::ExactErf
+          ? "dif_store(y, i, 5.0e-1f * v * (1.0f + erff(v * 7.071067812e-1f)));"
+          : "float c = v * v * v;\n"
+            "    float z = 7.978845608e-1f * (v + 4.471500218e-2f * c);\n"
+            "    dif_store(y, i, 5.0e-1f * v * (1.0f + tanhf(z)));";
+  out << render_kernel_template(
+      "gelu", {{"function", function_name(op)},
+               {"count", std::to_string(count)},
+               {"approximation", body}});
 }
 
 // The training ops below may legally mix storage dtypes across their
@@ -2420,28 +2419,30 @@ void emit_dequantize_int4(std::ostringstream &out,
   const auto groups = columns / op.u64(ir::AttrKey::GroupSize, 64U);
   const auto group = op.u64(ir::AttrKey::GroupSize, 64U);
   const auto count = rows * columns;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << (op.inputs.size() == 4U
-              ? "(const unsigned char* packed,const dif_scalar* scales,const unsigned char* outlier_indices,const dif_scalar* outlier_residuals,dif_scalar* y){"
-              : "(const unsigned char* packed,const dif_scalar* scales,dif_scalar* y){")
-      << "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
-         "if(i<"
-      << count << "ULL){unsigned long long row=i/" << columns
-      << "ULL,col=i%" << columns
-      << "ULL;unsigned char byte=packed[row*" << columns / 2U
-      << "ULL+col/2ULL];unsigned int nibble=(col&1ULL)?(byte>>4U):(byte&15U);"
-         "int q=nibble<8U?(int)nibble:(int)nibble-16;"
-         "float scale=dif_load(scales,row*"
-      << groups << "ULL+col/" << group
-      << "ULL);float value=(float)q*scale;"
-      << (op.inputs.size() == 4U
-              ? "unsigned long long gi=row*" + std::to_string(groups) +
-                    "ULL+col/" + std::to_string(group) +
-                    "ULL;if(outlier_indices[gi]==col%" +
-                    std::to_string(group) +
-                    "ULL)value+=dif_load(outlier_residuals,gi);"
-              : "")
-      << "dif_store(y,i,value);}}\n";
+  const bool outliers = op.inputs.size() == 4U;
+  const std::string parameters =
+      outliers ? "const unsigned char* packed, const dif_scalar* scales, "
+                 "const unsigned char* outlier_indices, "
+                 "const dif_scalar* outlier_residuals, dif_scalar* y"
+               : "const unsigned char* packed, const dif_scalar* scales, "
+                 "dif_scalar* y";
+  const std::string outlier =
+      outliers ? "unsigned long long gi = row * " + std::to_string(groups) +
+                     "ULL + col / " + std::to_string(group) + "ULL;\n"
+                     "    if (outlier_indices[gi] == col % " +
+                     std::to_string(group) +
+                     "ULL)\n      value += dif_load(outlier_residuals, gi);"
+               : "";
+  out << render_kernel_template(
+      "dequantize_int4",
+      {{"function", function_name(op)},
+       {"parameters", parameters},
+       {"count", std::to_string(count)},
+       {"columns", std::to_string(columns)},
+       {"packed_columns", std::to_string(columns / 2U)},
+       {"groups", std::to_string(groups)},
+       {"group", std::to_string(group)},
+       {"outlier", outlier}});
 }
 
 void emit_dequantize_int5(std::ostringstream &out,
@@ -2454,24 +2455,23 @@ void emit_dequantize_int5(std::ostringstream &out,
   const auto group = op.u64(ir::AttrKey::GroupSize, 64U);
   const auto groups = columns / group;
   const auto count = rows * columns;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << (op.inputs.size() == 3U
-              ? "(const unsigned char* packed,const dif_scalar* scales,const dif_scalar* column_scales,dif_scalar* y){"
-              : "(const unsigned char* packed,const dif_scalar* scales,dif_scalar* y){")
-      << "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
-         "if(i<"
-      << count << "ULL){unsigned long long row=i/" << columns
-      << "ULL,col=i%" << columns
-      << "ULL,bit=col*5ULL,bi=row*" << row_bytes
-      << "ULL+bit/8ULL;unsigned int shift=(unsigned int)(bit&7ULL);"
-         "unsigned int word=packed[bi];if(shift+5U>8U)word|=((unsigned int)"
-         "packed[bi+1ULL])<<8U;unsigned int encoded=(word>>shift)&31U;"
-         "int q=encoded<16U?(int)encoded:(int)encoded-32;float scale="
-         "dif_load(scales,row*"
-      << groups << "ULL+col/" << group
-      << "ULL);float value=(float)q*scale;"
-      << (op.inputs.size() == 3U ? "value*=dif_load(column_scales,col);" : "")
-      << "dif_store(y,i,value);}}\n";
+  const bool column_scaled = op.inputs.size() == 3U;
+  const std::string parameters =
+      column_scaled ? "const unsigned char* packed, const dif_scalar* scales, "
+                      "const dif_scalar* column_scales, dif_scalar* y"
+                    : "const unsigned char* packed, const dif_scalar* scales, "
+                      "dif_scalar* y";
+  out << render_kernel_template(
+      "dequantize_int5",
+      {{"function", function_name(op)},
+       {"parameters", parameters},
+       {"count", std::to_string(count)},
+       {"columns", std::to_string(columns)},
+       {"row_bytes", std::to_string(row_bytes)},
+       {"groups", std::to_string(groups)},
+       {"group", std::to_string(group)},
+       {"column_scale",
+        column_scaled ? "value *= dif_load(column_scales, col);" : ""}});
 }
 
 void emit_residual_gate(std::ostringstream &out, const ir::Program &program,
