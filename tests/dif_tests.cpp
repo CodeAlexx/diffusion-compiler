@@ -2786,18 +2786,23 @@ void test_h3_bf16_lowering_preserves_source_reduction_identity() {
       18, 5376, 56, 128, 14336, 96, 1, 2, 2688, 256, false,
       false);
   const auto generated = dif::compiler::emit_cuda(program);
-  expect(generated.source.find("col+=256ULL") != std::string::npos &&
-             generated.source.find("active=128U;active>0U;active>>=1U") !=
+  // The kernels come from readable templates now; exact text belongs to the
+  // kernel-source snapshot gate. Here the tokens are what matters.
+  std::string tokens;
+  for (const char c : generated.source)
+    if (c != ' ' && c != '\n' && c != '\t')
+      tokens.push_back(c);
+  expect(tokens.find("col+=256ULL") != std::string::npos &&
+             tokens.find("active=128U;active>0U;active>>=1U") !=
                  std::string::npos,
          "H3 hidden RMSNorm uses Serenity's accepted 256-thread reduction");
-  expect(generated.source.find(
-             "float result=(1.0f+dif_load(scale,vector+col))*normed+") !=
+  expect(tokens.find(
+             "floatresult=(1.0f+dif_load(scale,vector+col))*normed+") !=
              std::string::npos,
          "H3 hidden RMSNorm preserves the BF16 norm boundary and F32 AdaLN");
-  expect(generated.source.find("active=64U;active>0U;active>>=1U") !=
+  expect(tokens.find("active=64U;active>0U;active>>=1U") !=
                  std::string::npos &&
-             generated.source.find("float norm0=dif_round(") !=
-                 std::string::npos,
+             tokens.find("floatnorm0=dif_round(") != std::string::npos,
          "H3 QK RMSNorm preserves Serenity's 128-lane reduction and BF16 "
          "normalization boundary");
 }

@@ -658,6 +658,158 @@ Program batch7_program(std::string_view which) {
   return program;
 }
 
+
+Program batch8_program(std::string_view which) {
+  Program program;
+  auto op = [&](Opcode opcode, std::vector<std::uint32_t> inputs,
+                std::vector<std::uint32_t> outputs,
+                std::vector<Attribute> attributes = {}) {
+    program.operations = {{1, opcode, std::move(inputs), std::move(outputs),
+                           std::move(attributes)}};
+  };
+  if (which == "rms_norm_modulate_fused_bf16") {
+    // weighted, BF16, block 256: the explicit layout needs scale/shift
+    // shaped like x
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Constant, {8}},
+                       {3, DType::BF16, TensorRole::Input, {4, 8}},
+                       {4, DType::BF16, TensorRole::Input, {4, 8}},
+                       {5, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::RmsNormModulate, {1, 2, 3, 4}, {5}, {Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "rms_norm_modulate_generic_packed4" || which == "rms_norm_modulate_generic_odd") {
+    const std::uint64_t cols = which == "rms_norm_modulate_generic_packed4" ? 8U : 6U;
+    program.tensors = {{1, DType::F32, TensorRole::Input, {4, cols}},
+                       {2, DType::F32, TensorRole::Input, {4, cols}},
+                       {3, DType::F32, TensorRole::Input, {4, cols}},
+                       {4, DType::F32, TensorRole::Output, {4, cols}}};
+    op(Opcode::RmsNormModulate, {1, 2, 3}, {4}, {Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "rms_norm_modulate_generic_weighted_f32") {
+    program.tensors = {{1, DType::F32, TensorRole::Input, {4, 8}},
+                       {2, DType::F32, TensorRole::Constant, {8}},
+                       {3, DType::F32, TensorRole::Input, {4, 8}},
+                       {4, DType::F32, TensorRole::Input, {4, 8}},
+                       {5, DType::F32, TensorRole::Output, {4, 8}}};
+    op(Opcode::RmsNormModulate, {1, 2, 3, 4}, {5}, {Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "rms_norm_modulate_shared_chunked" || which == "rms_norm_modulate_shared_blocked") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {2, 6144}},
+                       {2, DType::BF16, TensorRole::Constant, {6144}},
+                       {3, DType::BF16, TensorRole::Input, {1, 6144}},
+                       {4, DType::BF16, TensorRole::Input, {2, 6144}},
+                       {5, DType::BF16, TensorRole::Output, {2, 6144}}};
+    op(Opcode::RmsNormModulate, {1, 2, 3, 4}, {5},
+       {Attribute::u64(AttrKey::ModulationLayout,
+                       static_cast<std::uint64_t>(ModulationLayout::SharedVectorDelta)),
+        Attribute::u64(AttrKey::BlockSize, 512U),
+        Attribute::u64(AttrKey::ReductionTileSize,
+                       which == "rms_norm_modulate_shared_chunked" ? 2048U : 8192U),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-6), Attribute::f64(AttrKey::WeightOffset, 1.0)});
+  } else if (which == "qk_norm_rope_interleaved128") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 128}},
+                       {2, DType::BF16, TensorRole::Constant, {128}},
+                       {3, DType::F32, TensorRole::Input, {4, 64}},
+                       {4, DType::F32, TensorRole::Input, {4, 64}},
+                       {5, DType::BF16, TensorRole::Output, {4, 2, 128}}};
+    op(Opcode::QkNormPartialRope, {1, 2, 3, 4}, {5},
+       {Attribute::u64(AttrKey::Implementation, 2U),
+        Attribute::u64(AttrKey::RotaryLayout,
+                       static_cast<std::uint64_t>(RotaryLayout::Interleaved)),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "qk_norm_rope_fused128") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 128}},
+                       {2, DType::BF16, TensorRole::Constant, {128}},
+                       {3, DType::BF16, TensorRole::Input, {4, 128}},
+                       {4, DType::BF16, TensorRole::Input, {4, 128}},
+                       {5, DType::BF16, TensorRole::Output, {4, 2, 128}}};
+    op(Opcode::QkNormPartialRope, {1, 2, 3, 4}, {5},
+       {Attribute::u64(AttrKey::RotaryDim, 128U), Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "qk_norm_rope_generic_warp4") {
+    program.tensors = {{1, DType::F32, TensorRole::Input, {4, 2, 64}},
+                       {2, DType::F32, TensorRole::Constant, {64}},
+                       {3, DType::F32, TensorRole::Input, {4, 32}},
+                       {4, DType::F32, TensorRole::Input, {4, 32}},
+                       {5, DType::F32, TensorRole::Output, {4, 2, 64}}};
+    op(Opcode::QkNormPartialRope, {1, 2, 3, 4}, {5}, {Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "qk_norm_rope_generic_wide") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 200}},
+                       {2, DType::BF16, TensorRole::Constant, {200}},
+                       {3, DType::F32, TensorRole::Input, {4, 100}},
+                       {4, DType::F32, TensorRole::Input, {4, 100}},
+                       {5, DType::BF16, TensorRole::Output, {4, 2, 200}}};
+    op(Opcode::QkNormPartialRope, {1, 2, 3, 4}, {5}, {Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "lowbit_linear" || which == "lowbit_linear_scaled_biased") {
+    const bool extras = which == "lowbit_linear_scaled_biased";
+    program.tensors = {{1, DType::I8, TensorRole::Constant, {8, 80}},
+                       {2, DType::BF16, TensorRole::Constant, {8, 2}},
+                       {3, DType::BF16, TensorRole::Internal, {8, 128}},
+                       {4, DType::BF16, TensorRole::Input, {4, 128}},
+                       {5, DType::BF16, TensorRole::Output, {4, 8}}};
+    std::vector<std::uint32_t> dequant_inputs{1, 2};
+    std::vector<std::uint32_t> linear_inputs{4, 3};
+    if (extras) {
+      program.tensors.push_back({6, DType::BF16, TensorRole::Constant, {128}});
+      program.tensors.push_back({7, DType::BF16, TensorRole::Constant, {8}});
+      dequant_inputs.push_back(6);
+      linear_inputs.push_back(7);
+    }
+    program.operations = {
+        {1, Opcode::DequantizeInt5, dequant_inputs, {3},
+         {Attribute::u64(AttrKey::GroupSize, 64U)}},
+        {2, Opcode::Linear, linear_inputs, {5},
+         {Attribute::u64(AttrKey::Implementation, 3U)}}};
+  } else if (which == "attention_backward" || which == "attention_backward_causal" ||
+             which == "attention_backward_gqa") {
+    const std::uint64_t kv = which == "attention_backward_gqa" ? 1U : 2U;
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 2, 8}},
+                       {3, DType::BF16, TensorRole::Input, {4, kv, 8}},
+                       {4, DType::BF16, TensorRole::Input, {4, kv, 8}},
+                       {5, DType::BF16, TensorRole::Input, {4, 2, 8}},
+                       {6, DType::F32, TensorRole::Input, {4, 2}},
+                       {7, DType::BF16, TensorRole::Output, {4, 2, 8}},
+                       {8, DType::BF16, TensorRole::Output, {4, kv, 8}},
+                       {9, DType::BF16, TensorRole::Output, {4, kv, 8}}};
+    std::vector<Attribute> attributes{accumulate_f32()};
+    if (which == "attention_backward_causal")
+      attributes.push_back(Attribute::boolean(AttrKey::Causal, true));
+    if (which == "attention_backward_gqa")
+      attributes.push_back(Attribute::u64(AttrKey::KvHeads, 1U));
+    op(Opcode::AttentionBackward, {1, 2, 3, 4, 5, 6}, {7, 8, 9}, attributes);
+  } else if (which == "fused_elementwise") {
+    // Add -> SiLU, both opted in (Implementation 2), the intermediate a
+    // role-free internal value with one consumer: one fused kernel at SiLU.
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, 0U, {4, 8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 8}}};
+    program.operations = {
+        {1, Opcode::Add, {1, 2}, {3}, {Attribute::u64(AttrKey::Implementation, 2U)}},
+        {2, Opcode::SiLU, {3}, {4}, {Attribute::u64(AttrKey::Implementation, 2U)}}};
+  } else if (which == "layer_norm_modulate_welford128" ||
+             which == "layer_norm_modulate_generic_bf16_odd" ||
+             which == "layer_norm_modulate_generic_f32") {
+    const bool f32 = which == "layer_norm_modulate_generic_f32";
+    const DType dtype = f32 ? DType::F32 : DType::BF16;
+    const std::uint64_t cols = which == "layer_norm_modulate_generic_bf16_odd" ? 6U : 8U;
+    const std::uint64_t modulation_rows = f32 ? 4U : 1U;
+    program.tensors = {{1, dtype, TensorRole::Input, {4, cols}},
+                       {2, dtype, TensorRole::Constant, {cols}},
+                       {3, dtype, TensorRole::Constant, {cols}},
+                       {4, dtype, TensorRole::Input, {modulation_rows, cols}},
+                       {5, dtype, TensorRole::Input, {modulation_rows, cols}},
+                       {6, dtype, TensorRole::Output, {4, cols}}};
+    std::vector<Attribute> attributes;
+    if (!f32) {
+      // block 128 selects the Welford path when the width packs by four
+      attributes.push_back(Attribute::u64(AttrKey::BlockSize, 128U));
+      attributes.push_back(Attribute::f64(AttrKey::Epsilon, 1.0e-6));
+    }
+    op(Opcode::LayerNormModulate, {1, 2, 3, 4, 5}, {6}, attributes);
+  } else {
+    fail("unknown batch8 corpus program " + std::string(which));
+  }
+  return program;
+}
+
 std::vector<Case> corpus() {
   using Q = Int8RowQuantization;
   return {
@@ -815,6 +967,26 @@ std::vector<Case> corpus() {
       {"qk_norm_rope_backward", [] { return batch7_program("qk_norm_rope_backward"); }},
       {"qk_norm_rope_backward_half_table", [] { return batch7_program("qk_norm_rope_backward_half_table"); }},
       {"qk_norm_rope_backward_weight", [] { return batch7_program("qk_norm_rope_backward_weight"); }},
+      // batch 8: rms_norm_modulate, qk_norm_partial_rope, fused low-bit linear
+      {"rms_norm_modulate_fused_bf16", [] { return batch8_program("rms_norm_modulate_fused_bf16"); }},
+      {"rms_norm_modulate_generic_packed4", [] { return batch8_program("rms_norm_modulate_generic_packed4"); }},
+      {"rms_norm_modulate_generic_odd", [] { return batch8_program("rms_norm_modulate_generic_odd"); }},
+      {"rms_norm_modulate_generic_weighted_f32", [] { return batch8_program("rms_norm_modulate_generic_weighted_f32"); }},
+      {"rms_norm_modulate_shared_chunked", [] { return batch8_program("rms_norm_modulate_shared_chunked"); }},
+      {"rms_norm_modulate_shared_blocked", [] { return batch8_program("rms_norm_modulate_shared_blocked"); }},
+      {"qk_norm_rope_interleaved128", [] { return batch8_program("qk_norm_rope_interleaved128"); }},
+      {"qk_norm_rope_fused128", [] { return batch8_program("qk_norm_rope_fused128"); }},
+      {"qk_norm_rope_generic_warp4", [] { return batch8_program("qk_norm_rope_generic_warp4"); }},
+      {"qk_norm_rope_generic_wide", [] { return batch8_program("qk_norm_rope_generic_wide"); }},
+      {"lowbit_linear", [] { return batch8_program("lowbit_linear"); }},
+      {"lowbit_linear_scaled_biased", [] { return batch8_program("lowbit_linear_scaled_biased"); }},
+      {"attention_backward", [] { return batch8_program("attention_backward"); }},
+      {"attention_backward_causal", [] { return batch8_program("attention_backward_causal"); }},
+      {"attention_backward_gqa", [] { return batch8_program("attention_backward_gqa"); }},
+      {"fused_elementwise", [] { return batch8_program("fused_elementwise"); }},
+      {"layer_norm_modulate_welford128", [] { return batch8_program("layer_norm_modulate_welford128"); }},
+      {"layer_norm_modulate_generic_bf16_odd", [] { return batch8_program("layer_norm_modulate_generic_bf16_odd"); }},
+      {"layer_norm_modulate_generic_f32", [] { return batch8_program("layer_norm_modulate_generic_f32"); }},
   };
 }
 
