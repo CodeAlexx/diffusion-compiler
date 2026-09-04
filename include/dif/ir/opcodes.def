@@ -188,3 +188,13 @@ DIF_OPCODE(ClampBackward, 85, "clamp_backward", None)
 // GELU gradients are: composing it would allocate three full-size
 // intermediates to express one elementwise derivative.
 DIF_OPCODE(SigmoidBackward, 86, "sigmoid_backward", None)
+// Gradient of a row gather: the contributions of every gathered row scatter
+// back into the table row it came from. Duplicated indices sum, which is what
+// makes a token embedding trainable at all.
+DIF_OPCODE(GatherRowsBackward, 87, "gather_rows_backward", None)
+// Gradient of layer normalization with an adaptive scale and shift, the
+// modulation every DiT block applies. One operation with five outputs because
+// the three reductions inside it share the row statistics they would
+// otherwise each recompute: elementwise for the input, down every row for the
+// affine pair, and across one modulation group for the modulation pair.
+DIF_OPCODE(LayerNormModulateBackward, 88, "layer_norm_modulate_backward", None)

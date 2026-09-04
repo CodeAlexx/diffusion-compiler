@@ -56,11 +56,13 @@ extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_sca
   unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < 32ULL) {
     float upstream = dif_load(grad_output, i);
-    dif_store(grad_branch, i, upstream * dif_load(gate, i));
+    dif_store(grad_branch, i, upstream * dif_load(gate, i / 32ULL * 8ULL + i % 8ULL));
   }
-  if (i < 32ULL) {
+  if (i < 8ULL) {
     float accumulator = 0.0f;
-    accumulator = dif_load(grad_output, i) * dif_load(branch, i);
+    unsigned long long row = i / 8ULL * 4ULL, column = i % 8ULL;
+    for (unsigned long long r = row; r < row + 4ULL; ++r)
+      accumulator = fmaf(dif_load(grad_output, r * 8ULL + column), dif_load(branch, r * 8ULL + column), accumulator);
     dif_store(grad_gate, i, accumulator);
   }
 }

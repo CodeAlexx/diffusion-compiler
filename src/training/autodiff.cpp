@@ -371,7 +371,7 @@ AutodiffResult differentiate(const ir::Program &forward,
         grad_weight = add_tensor(*result.program.tensor(weight));
         outputs.push_back(grad_weight);
       }
-      const auto head_dim = result.program.tensor(x)->dims[2];
+      const auto head_dim = result.program.tensor(x)->dims.back();
       add_operation(
           ir::Opcode::QkNormPartialRopeBackward,
           {grad_output, x, weight, operation.inputs[2],
@@ -585,6 +585,45 @@ AutodiffResult differentiate(const ir::Program &forward,
       // The timestep is a schedule position, not a learnable value: reverse
       // mode terminates here the way it does at a Fill.
       break;
+    case ir::Opcode::LayerNormModulate: {
+      // One backward operation produces all five gradients, because the three
+      // reductions inside it share the row statistics.  Epsilon is stamped
+      // from the forward's own value so the two cannot disagree.
+      const auto x = operation.inputs[0];
+      const auto grad_input = add_tensor(*result.program.tensor(x));
+      const auto grad_weight =
+          add_tensor(*result.program.tensor(operation.inputs[1]));
+      const auto grad_bias =
+          add_tensor(*result.program.tensor(operation.inputs[2]));
+      const auto grad_scale =
+          add_tensor(*result.program.tensor(operation.inputs[3]));
+      const auto grad_shift =
+          add_tensor(*result.program.tensor(operation.inputs[4]));
+      add_operation(
+          ir::Opcode::LayerNormModulateBackward,
+          {grad_output, x, operation.inputs[1], operation.inputs[2],
+           operation.inputs[3]},
+          {grad_input, grad_weight, grad_bias, grad_scale, grad_shift},
+          {ir::Attribute::f64(ir::AttrKey::Epsilon,
+                              operation.f64(ir::AttrKey::Epsilon, 1.0e-5))});
+      accumulate(x, grad_input);
+      accumulate(operation.inputs[1], grad_weight);
+      accumulate(operation.inputs[2], grad_bias);
+      accumulate(operation.inputs[3], grad_scale);
+      accumulate(operation.inputs[4], grad_shift);
+      break;
+    }
+    case ir::Opcode::GatherRows: {
+      // The index vector is a selection, not a value: reverse mode passes
+      // through it untouched and scatters the gathered rows' gradients back
+      // into the table they came from.
+      const auto table = operation.inputs[0];
+      const auto grad_input = add_tensor(*result.program.tensor(table));
+      add_operation(ir::Opcode::GatherRowsBackward,
+                    {grad_output, operation.inputs[1]}, {grad_input});
+      accumulate(table, grad_input);
+      break;
+    }
     case ir::Opcode::Sigmoid: {
       const auto grad_input =
           add_tensor(*result.program.tensor(operation.inputs[0]));

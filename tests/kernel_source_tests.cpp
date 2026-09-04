@@ -164,12 +164,17 @@ Program batch3_program(std::string_view which) {
   if (which == "silu_backward") {
     program = binary(Opcode::SiLUBackward, DType::BF16);
     program.operations[0].attributes = {accumulate_f32()};
-  } else if (which == "residual_gate_backward") {
+  } else if (which == "residual_gate_backward" ||
+             which == "residual_gate_backward_broadcast") {
+    // The broadcast case is the one a DiT block produces: one gate row
+    // governing every token.
+    const std::uint64_t gate_rows =
+        which == "residual_gate_backward_broadcast" ? 1U : 4U;
     program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
                        {2, DType::BF16, TensorRole::Input, {4, 8}},
-                       {3, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Input, {gate_rows, 8}},
                        {4, DType::BF16, TensorRole::Output, {4, 8}},
-                       {5, DType::BF16, TensorRole::Output, {4, 8}}};
+                       {5, DType::BF16, TensorRole::Output, {gate_rows, 8}}};
     program.operations = {{1, Opcode::ResidualGateBackward, {1, 2, 3}, {4, 5},
                            {accumulate_f32()}}};
   } else if (which == "bias_backward") {
@@ -954,6 +959,33 @@ Program batch11_program(std::string_view which) {
   program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
                      {2, DType::BF16, TensorRole::Input, {4, 8}},
                      {3, DType::BF16, TensorRole::Output, {4, 8}}};
+  if (which == "layer_norm_modulate_backward" ||
+      which == "layer_norm_modulate_backward_broadcast") {
+    const std::uint64_t modulation =
+        which == "layer_norm_modulate_backward_broadcast" ? 2U : 4U;
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Constant, {8}},
+                       {4, DType::BF16, TensorRole::Constant, {8}},
+                       {5, DType::BF16, TensorRole::Input, {modulation, 8}},
+                       {6, DType::BF16, TensorRole::Output, {4, 8}},
+                       {7, DType::BF16, TensorRole::Output, {8}},
+                       {8, DType::BF16, TensorRole::Output, {8}},
+                       {9, DType::BF16, TensorRole::Output, {modulation, 8}},
+                       {10, DType::BF16, TensorRole::Output, {modulation, 8}}};
+    program.operations = {{1, Opcode::LayerNormModulateBackward,
+                           {1, 2, 3, 4, 5},
+                           {6, 7, 8, 9, 10},
+                           {Attribute::f64(AttrKey::Epsilon, 1.0e-5)}}};
+    return program;
+  }
+  if (which == "gather_rows_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {6, 4}},
+                       {2, DType::I32, TensorRole::Input, {6}},
+                       {3, DType::BF16, TensorRole::Output, {5, 4}}};
+    program.operations = {{1, Opcode::GatherRowsBackward, {1, 2}, {3}, {}}};
+    return program;
+  }
   if (which == "sigmoid_backward") {
     program.operations = {{1, Opcode::SigmoidBackward, {1, 2}, {3}, {}}};
     return program;
@@ -1048,6 +1080,7 @@ std::vector<Case> corpus() {
       {"fill_default", [] { return batch3_program("fill_default"); }},
       {"silu_backward", [] { return batch3_program("silu_backward"); }},
       {"residual_gate_backward", [] { return batch3_program("residual_gate_backward"); }},
+      {"residual_gate_backward_broadcast", [] { return batch3_program("residual_gate_backward_broadcast"); }},
       {"bias_backward", [] { return batch3_program("bias_backward"); }},
       {"euler_velocity_step", [] { return batch3_program("euler_velocity_step"); }},
       {"linear_blend", [] { return batch3_program("linear_blend"); }},
@@ -1151,6 +1184,9 @@ std::vector<Case> corpus() {
       {"clamp_backward", [] { return batch11_program("clamp_backward"); }},
       {"clamp_backward_open", [] { return batch11_program("clamp_backward_open"); }},
       {"sigmoid_backward", [] { return batch11_program("sigmoid_backward"); }},
+      {"gather_rows_backward", [] { return batch11_program("gather_rows_backward"); }},
+      {"layer_norm_modulate_backward", [] { return batch11_program("layer_norm_modulate_backward"); }},
+      {"layer_norm_modulate_backward_broadcast", [] { return batch11_program("layer_norm_modulate_backward_broadcast"); }},
       // batch 10: batched and cross attention, all three kernels
       {"attention_exact_batched", [] { return batch10_program("attention_exact_batched"); }},
       {"attention_exact_batched_cross", [] { return batch10_program("attention_exact_batched_cross"); }},

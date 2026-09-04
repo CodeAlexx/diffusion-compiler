@@ -46,22 +46,22 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-// Gradient of the gated residual add. The gate may govern several rows at
-// once (a DiT block gates every token with one per-sample value), so the
-// branch gradient is elementwise against the broadcast gate while the gate
-// gradient reduces across the rows that share it. When the gate is not
-// broadcast the two guards cover the same elements and each expression
-// collapses to the form this kernel always had.
-extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_scalar* branch, const dif_scalar* gate, dif_scalar* grad_branch, dif_scalar* grad_gate) {
+// Scatter-add of the gathered rows' gradients back into the table. One thread
+// owns one TABLE element and scans the index vector for the rows that chose
+// it, rather than one thread per gathered row racing with atomicAdd: a
+// duplicated index would then sum in whatever order the scheduler happened to
+// pick, and a training run that cannot reproduce its own gradients is not
+// worth much. The index vector is small and stays in cache, so the scan costs
+// far less than its arithmetic suggests.
+extern "C" __global__ void dif_op_1(const dif_bf16* g, const int* indices, dif_bf16* y) {
   unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < 32ULL) {
-    float upstream = dif_load(grad_output, i);
-    dif_store(grad_branch, i, upstream * dif_load(gate, i));
-  }
-  if (i < 32ULL) {
+  if (i < 20ULL) {
+    unsigned long long row = i / 4ULL, col = i % 4ULL;
     float accumulator = 0.0f;
-    accumulator = dif_load(grad_output, i) * dif_load(branch, i);
-    dif_store(grad_gate, i, accumulator);
+    for (unsigned long long m = 0ULL; m < 6ULL; ++m)
+      if ((unsigned long long)indices[m] == row)
+        accumulator += dif_load_bf16(g, m * 4ULL + col);
+    dif_store_bf16(y, i, accumulator);
   }
 }
 #undef dif_scalar

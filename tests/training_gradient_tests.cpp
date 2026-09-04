@@ -261,6 +261,102 @@ Case group_norm_case() {
   return c;
 }
 
+// The gated residual add, with the gate governing several rows at once --
+// how a DiT block gates every token with one per-sample value. The gate
+// gradient is a sum over the rows it governs; the square case is the
+// degenerate one where that sum has a single term.
+Case residual_gate_case(std::uint64_t gate_rows) {
+  Case c;
+  const std::uint64_t rows = 4U;
+  const std::uint64_t columns = 5U;
+  c.program.tensors = {
+      {1U, DType::F32, TensorRole::Input, {rows, columns}},
+      {2U, DType::F32, TensorRole::Input, {rows, columns}},
+      {3U, DType::F32, TensorRole::Input, {gate_rows, columns}},
+      {4U, DType::F32, TensorRole::Internal, {rows, columns}},
+      {5U, DType::F32, TensorRole::Input, {rows, columns}},
+      {6U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::ResidualGate, {1U, 2U, 3U}, {4U}, {}},
+      {2U, Opcode::MseLoss, {4U, 5U}, {6U}, {}}};
+  c.inputs.emplace(1U, f32_tensor({rows, columns}, 191U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor({rows, columns}, 193U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor({gate_rows, columns}, 197U, 1.0F));
+  c.inputs.emplace(5U, f32_tensor({rows, columns}, 199U, 1.0F));
+  c.loss = 6U;
+  c.targets = {1U, 2U, 3U};
+  return c;
+}
+
+// Layer normalization with an adaptive scale and shift -- the modulation
+// every DiT block applies. The modulation rows are BROADCAST: two rows share
+// each scale/shift row here, so the modulation gradients are sums over a
+// group and the affine gradients are sums over everything. A rule that
+// confuses those two reductions passes on a square case and fails here.
+Case layer_norm_modulate_case(std::uint64_t modulation_rows) {
+  Case c;
+  const std::uint64_t rows = 4U;
+  const std::uint64_t columns = 5U;
+  c.program.tensors = {
+      {1U, DType::F32, TensorRole::Input, {rows, columns}},
+      {2U, DType::F32, TensorRole::Input, {columns}},
+      {3U, DType::F32, TensorRole::Input, {columns}},
+      {4U, DType::F32, TensorRole::Input, {modulation_rows, columns}},
+      {5U, DType::F32, TensorRole::Input, {modulation_rows, columns}},
+      {6U, DType::F32, TensorRole::Internal, {rows, columns}},
+      {7U, DType::F32, TensorRole::Input, {rows, columns}},
+      {8U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::LayerNormModulate, {1U, 2U, 3U, 4U, 5U}, {6U},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-5)}},
+      {2U, Opcode::MseLoss, {6U, 7U}, {8U}, {}}};
+  c.inputs.emplace(1U, f32_tensor({rows, columns}, 157U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor({columns}, 163U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor({columns}, 167U, 0.5F));
+  c.inputs.emplace(4U, f32_tensor({modulation_rows, columns}, 173U, 0.5F));
+  c.inputs.emplace(5U, f32_tensor({modulation_rows, columns}, 179U, 0.5F));
+  c.inputs.emplace(7U, f32_tensor({rows, columns}, 181U, 1.0F));
+  c.loss = 8U;
+  c.targets = {1U, 2U, 3U, 4U, 5U};
+  return c;
+}
+
+dif::runtime::Tensor i32_tensor(std::vector<std::uint64_t> dims,
+                                const std::vector<std::int32_t> &values) {
+  dif::runtime::Tensor tensor{DType::I32, std::move(dims), {}};
+  tensor.bytes.resize(values.size() * sizeof(std::int32_t));
+  std::memcpy(tensor.bytes.data(), values.data(), tensor.bytes.size());
+  tensor.validate();
+  return tensor;
+}
+
+// An embedding lookup. Index 2 is chosen three times and index 0 twice, so
+// the gradient of those table rows is a SUM of several contributions -- the
+// behaviour that makes a token embedding trainable, and the one a
+// scatter-add gets wrong if it drops or double-counts a hit. Row 3 is never
+// chosen, so its gradient must come out exactly zero.
+Case gather_case() {
+  Case c;
+  const std::uint64_t table_rows = 5U;
+  const std::uint64_t width = 4U;
+  const std::vector<std::int32_t> indices{2, 0, 2, 4, 0, 2};
+  const auto gathered = static_cast<std::uint64_t>(indices.size());
+  c.program.tensors = {
+      {1U, DType::F32, TensorRole::Input, {table_rows, width}},
+      {2U, DType::I32, TensorRole::Input, {gathered}},
+      {3U, DType::F32, TensorRole::Internal, {gathered, width}},
+      {4U, DType::F32, TensorRole::Input, {gathered, width}},
+      {5U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {{1U, Opcode::GatherRows, {1U, 2U}, {3U}, {}},
+                          {2U, Opcode::MseLoss, {3U, 4U}, {5U}, {}}};
+  c.inputs.emplace(1U, f32_tensor({table_rows, width}, 149U, 1.0F));
+  c.inputs.emplace(2U, i32_tensor({gathered}, indices));
+  c.inputs.emplace(4U, f32_tensor({gathered, width}, 151U, 1.0F));
+  c.loss = 5U;
+  c.targets = {1U};
+  return c;
+}
+
 // The elementwise and affine rules the VAE and text frontends need. Clamp is
 // checked with the sampled values straddling both bounds, so the saturated
 // region is actually exercised rather than assumed.
@@ -470,6 +566,11 @@ int main() {
   run("conv2d strided", conv2d_case(2U, 1U, 1U));
   run("conv2d unpadded", conv2d_case(1U, 0U, 1U));
   run("conv2d grouped", conv2d_case(1U, 1U, 2U));
+  run("residual gate", residual_gate_case(4U));
+  run("residual gate broadcast", residual_gate_case(1U));
+  run("layer norm modulate", layer_norm_modulate_case(4U));
+  run("layer norm modulate broadcast", layer_norm_modulate_case(2U));
+  run("gather rows", gather_case());
   run("clamp", clamp_case());
   run("sigmoid", sigmoid_case());
   run("affine last dim", affine_case(true));

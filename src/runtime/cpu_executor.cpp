@@ -81,6 +81,123 @@ void clamp(const ir::Operation &op, TensorMap &tensors) {
                 std::clamp(load_float(input, index), lower, upper));
 }
 
+void layer_norm_modulate_backward(const ir::Operation &op,
+                                  TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &input = tensors.at(op.inputs[1]);
+  const auto &weight = tensors.at(op.inputs[2]);
+  const auto &bias = tensors.at(op.inputs[3]);
+  const auto &scale = tensors.at(op.inputs[4]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  auto &grad_weight = tensors.at(op.outputs[1]);
+  auto &grad_bias = tensors.at(op.outputs[2]);
+  auto &grad_scale = tensors.at(op.outputs[3]);
+  auto &grad_shift = tensors.at(op.outputs[4]);
+  const auto columns = input.dims.back();
+  const auto rows = input.element_count() / columns;
+  const auto modulation_rows = scale.element_count() / columns;
+  const auto rows_per_modulation = rows / modulation_rows;
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+
+  // F32 accumulators for every cross-row reduction; one rounding store each.
+  std::vector<float> weight_gradient(static_cast<std::size_t>(columns), 0.0F);
+  std::vector<float> bias_gradient(static_cast<std::size_t>(columns), 0.0F);
+  std::vector<float> scale_gradient(
+      static_cast<std::size_t>(grad_scale.element_count()), 0.0F);
+  std::vector<float> shift_gradient(
+      static_cast<std::size_t>(grad_shift.element_count()), 0.0F);
+
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    const auto base = row * columns;
+    const auto modulation = row / rows_per_modulation * columns;
+    float mean = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column)
+      mean += load_float(input, base + column);
+    mean /= static_cast<float>(columns);
+    float variance = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto centered = load_float(input, base + column) - mean;
+      variance += centered * centered;
+    }
+    const auto inverse =
+        1.0F / std::sqrt(variance / static_cast<float>(columns) + epsilon);
+    // Upstream gradient of the normalized value, and of the affine result.
+    float gradient_mean = 0.0F;
+    float projected_mean = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto upstream =
+          load_float(grad_output, base + column) *
+          (1.0F + load_float(scale, modulation + column));
+      const auto weighted = upstream * load_float(weight, column);
+      const auto normalized =
+          (load_float(input, base + column) - mean) * inverse;
+      gradient_mean += weighted;
+      projected_mean += weighted * normalized;
+      weight_gradient[static_cast<std::size_t>(column)] +=
+          upstream * normalized;
+      bias_gradient[static_cast<std::size_t>(column)] += upstream;
+      const auto affine =
+          normalized * load_float(weight, column) + load_float(bias, column);
+      const auto raw = load_float(grad_output, base + column);
+      scale_gradient[static_cast<std::size_t>(modulation + column)] +=
+          raw * affine;
+      shift_gradient[static_cast<std::size_t>(modulation + column)] += raw;
+    }
+    gradient_mean /= static_cast<float>(columns);
+    projected_mean /= static_cast<float>(columns);
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto upstream =
+          load_float(grad_output, base + column) *
+          (1.0F + load_float(scale, modulation + column));
+      const auto weighted = upstream * load_float(weight, column);
+      const auto normalized =
+          (load_float(input, base + column) - mean) * inverse;
+      store_float(grad_input, base + column,
+                  inverse * (weighted - gradient_mean -
+                             normalized * projected_mean));
+    }
+  }
+  for (std::uint64_t column = 0U; column < columns; ++column) {
+    store_float(grad_weight, column,
+                weight_gradient[static_cast<std::size_t>(column)]);
+    store_float(grad_bias, column,
+                bias_gradient[static_cast<std::size_t>(column)]);
+  }
+  for (std::uint64_t index = 0U; index < grad_scale.element_count(); ++index) {
+    store_float(grad_scale, index,
+                scale_gradient[static_cast<std::size_t>(index)]);
+    store_float(grad_shift, index,
+                shift_gradient[static_cast<std::size_t>(index)]);
+  }
+}
+
+void gather_rows_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &indices_tensor = tensors.at(op.inputs[1]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto *indices =
+      reinterpret_cast<const std::int32_t *>(indices_tensor.data());
+  const auto table_rows = grad_input.dims[0];
+  const auto gathered_rows = grad_output.dims[0];
+  const auto row_width = grad_input.element_count() / table_rows;
+  // Accumulate in F32 and store once: a table row chosen by many gathered
+  // rows would otherwise round through storage precision on every hit.
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_input.element_count()), 0.0F);
+  for (std::uint64_t row = 0; row < gathered_rows; ++row) {
+    if (indices[row] < 0 ||
+        static_cast<std::uint64_t>(indices[row]) >= table_rows)
+      fail("gather_rows_backward index is out of range");
+    const auto target = static_cast<std::uint64_t>(indices[row]);
+    for (std::uint64_t column = 0; column < row_width; ++column)
+      accumulator[static_cast<std::size_t>(target * row_width + column)] +=
+          load_float(grad_output, row * row_width + column);
+  }
+  for (std::uint64_t index = 0; index < grad_input.element_count(); ++index)
+    store_float(grad_input, index,
+                accumulator[static_cast<std::size_t>(index)]);
+}
+
 void sigmoid_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[0]);
   const auto &grad_output = tensors.at(op.inputs[1]);
@@ -1976,12 +2093,14 @@ void qk_norm_rope_backward(const ir::Operation &op, TensorMap &tensors) {
   auto &grad_input = tensors.at(op.outputs[0]);
   auto *grad_weight =
       op.outputs.size() == 2U ? &tensors.at(op.outputs[1]) : nullptr;
-  const auto sequence = input.dims[0];
-  const auto heads = input.dims[1];
-  const auto dim = input.dims[2];
+  // [S,H,D] and [B,S,H,D] differ only in how many rotation rows there are,
+  // and both index flat, so one loop over rows serves both.
+  const auto dim = input.dims.back();
+  const auto heads = input.dims[input.dims.size() - 2U];
+  const auto sequence = input.element_count() / dim / heads;
   const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
   const auto half = rotary / 2U;
-  const auto table_width = cosv.dims[1];
+  const auto table_width = cosv.dims.back();
   const auto epsilon =
       static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
   std::vector<float> rotated_gradient(dim);
@@ -2097,10 +2216,27 @@ void residual_gate_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto &gate = tensors.at(op.inputs[2]);
   auto &grad_branch = tensors.at(op.outputs[0]);
   auto &grad_gate = tensors.at(op.outputs[1]);
+  const auto columns = grad_output.dims.back();
+  const auto rows = grad_output.element_count() / columns;
+  const auto gate_rows = gate.element_count() / columns;
+  const auto rows_per_gate = rows / gate_rows;
   for (std::uint64_t i = 0U; i < grad_branch.element_count(); ++i) {
-    const auto upstream = load_float(grad_output, i);
-    store_float(grad_branch, i, upstream * load_float(gate, i));
-    store_float(grad_gate, i, upstream * load_float(branch, i));
+    const auto gate_index =
+        i / (rows_per_gate * columns) * columns + i % columns;
+    store_float(grad_branch, i,
+                load_float(grad_output, i) * load_float(gate, gate_index));
+  }
+  // The gate gradient reduces across the rows one gate row governs, in F32
+  // so a wide broadcast does not round through storage on every hit.
+  for (std::uint64_t index = 0U; index < gate.element_count(); ++index) {
+    const auto gate_row = index / columns;
+    const auto column = index % columns;
+    float accumulator = 0.0F;
+    for (std::uint64_t row = gate_row * rows_per_gate;
+         row < (gate_row + 1U) * rows_per_gate; ++row)
+      accumulator += load_float(grad_output, row * columns + column) *
+                     load_float(branch, row * columns + column);
+    store_float(grad_gate, index, accumulator);
   }
 }
 
@@ -3316,6 +3452,12 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::QkNormPartialRopeBackward:
       qk_norm_rope_backward(op, tensors);
+      break;
+    case ir::Opcode::LayerNormModulateBackward:
+      layer_norm_modulate_backward(op, tensors);
+      break;
+    case ir::Opcode::GatherRowsBackward:
+      gather_rows_backward(op, tensors);
       break;
     case ir::Opcode::SigmoidBackward:
       sigmoid_backward(op, tensors);

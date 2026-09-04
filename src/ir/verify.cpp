@@ -715,6 +715,26 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::GatherRowsBackward) {
+    expect_counts(op, 2, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &indices = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    check_accumulator_f32(op);
+    // The table's own row count is free -- it is whatever the forward
+    // gathered from -- but everything else has to line up with the gather.
+    if (!supported_float(grad_input.dtype) || grad_input.dims.size() < 2U ||
+        indices.dtype != DType::I32 || indices.dims.size() != 1U ||
+        grad_output.dtype != grad_input.dtype ||
+        grad_output.dims.size() != grad_input.dims.size() ||
+        grad_output.dims[0] != indices.dims[0] ||
+        !std::equal(grad_input.dims.begin() + 1, grad_input.dims.end(),
+                    grad_output.dims.begin() + 1))
+      fail("gather_rows_backward requires float [M,...], i32 [M], and float "
+           "[S,...] sharing the row width");
+    return;
+  }
+
   if (op.opcode == Opcode::IndexedUpdateRows) {
     expect_counts(op, 3, 1);
     const auto &base = tensor_or_fail(program, op.inputs[0], op);
@@ -1738,12 +1758,20 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &grad_branch = tensor_or_fail(program, op.outputs[0], op);
     const auto &grad_gate = tensor_or_fail(program, op.outputs[1], op);
     same_shape_dtype(grad_output, branch, op);
-    same_shape_dtype(grad_output, gate, op);
     same_shape_dtype(grad_output, grad_branch, op);
-    same_shape_dtype(grad_output, grad_gate, op);
+    same_shape_dtype(gate, grad_gate, op);
     check_accumulator_f32(op);
-    if (!supported_float(grad_output.dtype))
-      fail("residual_gate_backward admits f32, bf16, or f16");
+    // The forward admits a gate that governs several rows at once; so must
+    // this, or a DiT block cannot be differentiated at all.
+    if (!supported_float(grad_output.dtype) || grad_output.dims.empty() ||
+        gate.dtype != grad_output.dtype || gate.dims.empty() ||
+        gate.dims.back() != grad_output.dims.back())
+      fail("residual_gate_backward admits f32, bf16, or f16 with gate rows "
+           "sharing the final dimension");
+    const auto rows = grad_output.element_count() / grad_output.dims.back();
+    const auto gate_rows = gate.element_count() / gate.dims.back();
+    if (gate_rows == 0U || rows % gate_rows != 0U)
+      fail("residual_gate_backward gate rows must divide the output rows");
     return;
   }
 
@@ -1775,6 +1803,49 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::LayerNormModulateBackward) {
+    expect_counts(op, 5, 5);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[2], op);
+    const auto &bias = tensor_or_fail(program, op.inputs[3], op);
+    const auto &scale = tensor_or_fail(program, op.inputs[4], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);
+    const auto &grad_bias = tensor_or_fail(program, op.outputs[2], op);
+    const auto &grad_scale = tensor_or_fail(program, op.outputs[3], op);
+    const auto &grad_shift = tensor_or_fail(program, op.outputs[4], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    same_shape_dtype(scale, grad_scale, op);
+    same_shape_dtype(scale, grad_shift, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype) || input.dims.empty() ||
+        weight.dtype != input.dtype || weight.dims.size() != 1U ||
+        weight.dims[0] != input.dims.back() || bias.dtype != input.dtype ||
+        bias.dims != weight.dims || grad_weight.dtype != weight.dtype ||
+        grad_weight.dims != weight.dims || grad_bias.dtype != weight.dtype ||
+        grad_bias.dims != weight.dims || scale.dtype != input.dtype ||
+        scale.dims.empty() || scale.dims.back() != input.dims.back())
+      fail("layer_norm_modulate_backward requires float tensors with affine "
+           "gradients matching the final dimension and modulation gradients "
+           "matching the scale");
+    // The same divisibility the forward demands: a modulation row governs a
+    // whole number of input rows.
+    const auto input_rows = input.element_count() / input.dims.back();
+    const auto modulation_rows = scale.element_count() / scale.dims.back();
+    if (modulation_rows == 0U || input_rows % modulation_rows != 0U)
+      fail("layer_norm_modulate_backward scale rows must divide input rows");
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-5);
+    if (!(epsilon > 0.0))
+      fail("layer_norm_modulate_backward epsilon must be positive");
+    const auto block = op.u64(AttrKey::BlockSize, 256U);
+    if (block < 32U || block > 1024U || (block & (block - 1U)) != 0U)
+      fail("layer_norm_modulate_backward block size must be a power of two in "
+           "[32,1024]");
+    return;
+  }
+
   if (op.opcode == Opcode::QkNormPartialRopeBackward) {
     // Backward of the fused per-head RMSNorm + partial halfsplit rotation.
     // The rotation layout (RotaryDim, table width) is explicit in the op
@@ -1792,17 +1863,26 @@ void verify_operation(const Program &program, const Operation &op) {
     same_shape_dtype(input, grad_output, op);
     same_shape_dtype(input, grad_input, op);
     check_accumulator_f32(op);
-    if (!supported_float(input.dtype) || input.dims.size() != 3U ||
+    // The forward admits [S,H,D] and the batched [B,S,H,D]; so must this.
+    // The rotation tables carry one row per (batch, sequence) position, which
+    // is exactly the input's row count divided by its heads, whatever the
+    // rank -- so one comparison serves both.
+    const bool batched = input.dims.size() == 4U;
+    if (!supported_float(input.dtype) ||
+        (input.dims.size() != 3U && input.dims.size() != 4U) ||
         weight.dtype != input.dtype || weight.dims.size() != 1U ||
-        weight.dims[0] != input.dims[2] || cos.dtype != input.dtype ||
+        weight.dims[0] != input.dims.back() || cos.dtype != input.dtype ||
         sin.dtype != input.dtype || cos.dims != sin.dims ||
-        cos.dims.size() != 2U || cos.dims[0] != input.dims[0])
-      fail("qk_norm_partial_rope_backward requires grad/input [S,H,D], "
-           "weight [D], cos/sin [S,T]");
-    const auto head_dim = input.dims[2];
+        cos.dims.size() != (batched ? 3U : 2U) ||
+        cos.element_count() / cos.dims.back() !=
+            input.element_count() / input.dims.back() /
+                input.dims[input.dims.size() - 2U])
+      fail("qk_norm_partial_rope_backward requires grad/input [S,H,D] or "
+           "[B,S,H,D], weight [D], and matching cos/sin rows");
+    const auto head_dim = input.dims.back();
     const auto rotary = op.u64(AttrKey::RotaryDim, head_dim);
     if (rotary == 0U || rotary > head_dim || (rotary % 2U) != 0U ||
-        (cos.dims[1] != rotary && cos.dims[1] * 2U != rotary))
+        (cos.dims.back() != rotary && cos.dims.back() * 2U != rotary))
       fail("qk_norm_partial_rope_backward rotary geometry is inconsistent");
     if (op.outputs.size() == 2U) {
       const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);

@@ -1153,6 +1153,46 @@ std::string group_reduction_fragment(std::uint64_t block) {
   return reduction;
 }
 
+void emit_layer_norm_modulate_backward(std::ostringstream &out,
+                                       const ir::Program &program,
+                                       const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[1]);
+  const auto *scale = program.tensor(op.inputs[4]);
+  const auto columns = input->dims.back();
+  const auto rows = input->element_count() / columns;
+  const auto modulation_rows = scale->element_count() / columns;
+  std::ostringstream epsilon;
+  epsilon << std::setprecision(9)
+          << static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  out << render_kernel_template(
+      "layer_norm_modulate_backward",
+      {{"function", function_name(op)},
+       {"count", std::to_string(input->element_count())},
+       {"columns", std::to_string(columns)},
+       {"rows", std::to_string(rows)},
+       {"rows_per_modulation", std::to_string(rows / modulation_rows)},
+       {"modulation_count", std::to_string(scale->element_count())},
+       {"epsilon", epsilon.str()}});
+  out << std::setprecision(9);
+}
+
+void emit_gather_rows_backward(std::ostringstream &out,
+                               const ir::Program &program,
+                               const ir::Operation &op) {
+  const auto *grad_input = program.tensor(op.outputs[0]);
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto row_width = grad_input->element_count() / grad_input->dims[0];
+  out << render_kernel_template(
+      "gather_rows_backward",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(grad_input->dtype)},
+       {"count", std::to_string(grad_input->element_count())},
+       {"row_width", std::to_string(row_width)},
+       {"gathered_rows", std::to_string(grad_output->dims[0])},
+       {"load", typed_load(grad_input->dtype)},
+       {"store", typed_store(grad_input->dtype)}});
+}
+
 void emit_sigmoid_backward(std::ostringstream &out, const ir::Program &program,
                            const ir::Operation &op) {
   out << render_kernel_template(
@@ -2273,13 +2313,15 @@ void emit_qk_norm_rope_backward(std::ostringstream &out,
                                 const ir::Program &program,
                                 const ir::Operation &op) {
   const auto *input = program.tensor(op.inputs[1]);
-  const auto sequence = input->dims[0];
-  const auto heads = input->dims[1];
-  const auto dim = input->dims[2];
-  const auto count = sequence * heads * dim;
+  // The kernel indexes flat and derives its table row as row/heads, which is
+  // already right for [B,S,H,D]; only the counts have to notice the batch.
+  const auto dim = input->dims.back();
+  const auto heads = input->dims[input->dims.size() - 2U];
+  const auto count = input->element_count();
+  const auto sequence = count / dim / heads;
   const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
   const auto half = rotary / 2U;
-  const auto table_width = program.tensor(op.inputs[3])->dims[1];
+  const auto table_width = program.tensor(op.inputs[3])->dims.back();
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
   const bool weight_grad = op.outputs.size() == 2U;
   const auto text = [](std::uint64_t v) { return std::to_string(v); };
@@ -2352,10 +2394,41 @@ void emit_layer_norm_backward(std::ostringstream &out,
 void emit_residual_gate_backward(std::ostringstream &out,
                                  const ir::Program &program,
                                  const ir::Operation &op) {
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto *gate = program.tensor(op.inputs[2]);
   const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto columns = grad_output->dims.back();
+  const auto rows = grad_output->element_count() / columns;
+  const auto gate_rows = gate->element_count() / columns;
+  const auto rows_per_gate = rows / gate_rows;
+  // An ungated broadcast is the historical case: the gate index is the
+  // element index and the reduction is a single term, so the emitted text is
+  // exactly what it always was.
+  const std::string gate_index =
+      rows_per_gate == 1U
+          ? std::string("i")
+          : "i / " + std::to_string(rows_per_gate * columns) + "ULL * " +
+                std::to_string(columns) + "ULL + i % " +
+                std::to_string(columns) + "ULL";
+  const std::string reduction =
+      rows_per_gate == 1U
+          ? "accumulator = dif_load(grad_output, i) * dif_load(branch, i);"
+          : "unsigned long long row = i / " + std::to_string(columns) +
+                "ULL * " + std::to_string(rows_per_gate) + "ULL, column = i % " +
+                std::to_string(columns) + "ULL;\n"
+                "    for (unsigned long long r = row; r < row + " +
+                std::to_string(rows_per_gate) + "ULL; ++r)\n"
+                "      accumulator = fmaf(dif_load(grad_output, r * " +
+                std::to_string(columns) +
+                "ULL + column), dif_load(branch, r * " +
+                std::to_string(columns) + "ULL + column), accumulator);";
   out << render_kernel_template(
-      "residual_gate_backward", {{"function", function_name(op)},
-                                 {"count", std::to_string(count)}});
+      "residual_gate_backward",
+      {{"function", function_name(op)},
+       {"count", std::to_string(count)},
+       {"gate_count", std::to_string(gate->element_count())},
+       {"gate_index", gate_index},
+       {"gate_reduction", reduction}});
 }
 
 void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
@@ -3242,6 +3315,12 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::QkNormPartialRopeBackward:
       emit_qk_norm_rope_backward(source, program, op);
+      break;
+    case ir::Opcode::LayerNormModulateBackward:
+      emit_layer_norm_modulate_backward(source, program, op);
+      break;
+    case ir::Opcode::GatherRowsBackward:
+      emit_gather_rows_backward(source, program, op);
       break;
     case ir::Opcode::SigmoidBackward:
       emit_sigmoid_backward(source, program, op);
