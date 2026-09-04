@@ -84,7 +84,7 @@ extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weigh
   float inv = rsqrtf(reduction[0] / 768.0f + 9.9999999747524271e-07f);
   for (unsigned long long col = threadIdx.x; col < 768ULL; col += blockDim.x) {
     unsigned long long i = row * 768ULL + col;
-    dif_store(y, i, dif_load(x, i) * inv * (dif_load(weight, col) + 0.000000000e+00f));
+    dif_store(y, i, dif_load(x, i) * inv * (dif_load(weight, col) + 1.000000000e+00f));
   }
 }
 #undef dif_scalar

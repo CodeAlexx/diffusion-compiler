@@ -684,6 +684,9 @@ void emit_quantize_int8_rows(std::ostringstream &out,
                    : clip_ratio_literal.str() + "f";
   const auto sylvester =
       implementation == ir::Int8RowQuantization::H256F32SylvesterConvRot;
+  const std::string parameters =
+      input_parameters + "signed char* q, float* scales" +
+      (residual2 ? ", signed char* q2, float* scales2" : "");
   if (ir::is_convrot_int8_row_quantization(implementation)) {
     const auto f32_convrot =
         implementation == ir::Int8RowQuantization::H256F32ConvRot ||
@@ -695,159 +698,93 @@ void emit_quantize_int8_rows(std::ostringstream &out,
         implementation == ir::Int8RowQuantization::H256F32SignedConvRot ||
         implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
         implementation == ir::Int8RowQuantization::H4096F32SignedConvRot;
-    auto rotation_group =
+    const auto rotation_group =
         (implementation == ir::Int8RowQuantization::H4096SignedConvRot ||
          implementation == ir::Int8RowQuantization::H4096F32SignedConvRot)
             ? 4096U
             : 256U;
-    const auto signed_rotation_source =
-        signed_rotation
-            ? "unsigned h=(unsigned)column+" +
-                  std::to_string(0x9e3779b9U) +
-                  "U;h=(h^(h>>16))*0x7feb352dU;h=(h^(h>>15))*"
-                  "0x846ca68bU;h^=h>>16;value=(h&1U)?-value:value;"
-            : std::string{};
     auto rotation_stages = 0U;
     for (auto width = rotation_group; width > 1U; width /= 4U)
       ++rotation_stages;
-    out << "extern \"C\" __global__ void " << function_name(op)
-        << "(" << input_parameters << "signed char* q,float* scales"
-        << (residual2 ? ",signed char* q2,float* scales2" : "")
-        << "){"
-           "extern __shared__ float values[];__shared__ float maximums[256];"
-           "unsigned long long row=blockIdx.x;unsigned tid=threadIdx.x;if(row>="
-        << rows
-        << "ULL)return;unsigned long long base=row*" << columns
-        << "ULL;for(unsigned long long column=tid;column<" << columns
-        << "ULL;column+=256ULL){float value=" << load_input << ";"
-        << signed_rotation_source
-        << "values[column]=value;}"
-           "__syncthreads();for(unsigned stage=0U;stage<"
-        << rotation_stages
-        << "U;++stage){unsigned stride=1U<<(2U*stage);"
-           "for(unsigned long long tuple=tid;tuple<"
-        << columns
-        << "ULL/4ULL;tuple+=256ULL){unsigned long long group=(tuple/"
-        << rotation_group / 4U << "ULL)*" << rotation_group
-        << "ULL;unsigned lane=(unsigned)(tuple%" << rotation_group / 4U
-        << "ULL);unsigned offset=(lane%stride)+"
-           "(lane/stride)*(4U*stride);unsigned long long i=group+offset;"
-           "float x0=values[i],x1=values[i+stride],x2=values[i+2U*stride],"
-           "x3=values[i+3U*stride];"
-        << (sylvester
-                ? "values[i]=0.5f*(x0+x1+x2+x3);"
-                  "values[i+stride]=0.5f*(x0-x1+x2-x3);"
-                  "values[i+2U*stride]=0.5f*(x0+x1-x2-x3);"
-                  "values[i+3U*stride]=0.5f*(x0-x1-x2+x3);"
-                : "values[i]=0.5f*(x0+x1+x2-x3);"
-                  "values[i+stride]=0.5f*(x0+x1-x2+x3);"
-                  "values[i+2U*stride]=0.5f*(x0-x1+x2+x3);"
-                  "values[i+3U*stride]=0.5f*(-x0+x1+x2+x3);")
-        << "}__syncthreads();}"
-           "float maximum=0.0f;for(unsigned long long column=tid;column<"
-        << columns
-        << "ULL;column+=256ULL)maximum=fmaxf(maximum,fabsf(values[column]));"
-           "maximums[tid]=maximum;__syncthreads();for(unsigned active=128U;"
-           "active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf("
-           "maximums[tid],maximums[tid+active]);__syncthreads();}float scale="
-           "fmaxf(maximums[0]*"
-        << clip_ratio_source
-        << "/127.0f,1.0e-30f);float scale_bf16=dif_round_bf16(scale);"
-           "if(tid==0U)scales[row]="
-        << (signed_rotation && !f32_convrot ? "scale_bf16;" : "scale;")
-        << "__syncthreads();"
-           "for(unsigned long long column=tid;column<"
-        << columns
-        << "ULL;column+=256ULL){"
-        << (f32_convrot
-                ? "float value=values[column];float divided=value/scale;"
-                  "int encoded=(int)nearbyintf(divided);encoded=encoded>127?"
-                  "127:(encoded<-127?-127:encoded);"
-                : "float value=dif_round_bf16(values[column]);float divided="
-                  "dif_round_bf16(value/scale_bf16);int encoded=(int)"
-                  "nearbyintf(divided);encoded=encoded>127?127:(encoded<-128?"
-                  "-128:encoded);")
-        << "q[base+column]=(signed char)encoded;}"
-        << (residual2
-                ? "__syncthreads();float stored_scale=scales[row];float "
-                  "residual_maximum=0.0f;for(unsigned long long column=tid;"
-                  "column<" + std::to_string(columns) +
-                  "ULL;column+=256ULL){float value=" +
-                  std::string(f32_convrot ? "values[column]"
-                                          : "dif_round_bf16(values[column])") +
-                  ";float residual=fmaf(-(float)q[base+column],"
-                  "stored_scale,value);residual_maximum=fmaxf(residual_maximum,"
-                  "fabsf(residual));}maximums[tid]=residual_maximum;"
-                  "__syncthreads();for(unsigned active=128U;active>0U;"
-                  "active>>=1U){if(tid<active)maximums[tid]=fmaxf(maximums["
-                  "tid],maximums[tid+active]);__syncthreads();}float scale2="
-                  "fmaxf(maximums[0]/127.0f,1.0e-30f);float scale2_bf16="
-                  "dif_round_bf16(scale2);if(tid==0U)scales2[row]=" +
-                  std::string(signed_rotation && !f32_convrot
-                                  ? "scale2_bf16;"
-                                  : "scale2;") +
-                  "__syncthreads();float stored_scale2=scales2[row];for("
-                  "unsigned long long column=tid;column<" +
-                  std::to_string(columns) +
-                  "ULL;column+=256ULL){float value=" +
-                  std::string(f32_convrot ? "values[column]"
-                                          : "dif_round_bf16(values[column])") +
-                  ";float residual=" +
-                  std::string(f32_convrot
-                                  ? "fmaf(-(float)q[base+column],stored_scale,value)"
-                                  : "dif_round_bf16(fmaf(-(float)q[base+column],stored_scale,value))") +
-                  ";float divided=" +
-                  std::string(f32_convrot
-                                  ? "residual/scale2"
-                                  : "dif_round_bf16(residual/scale2_bf16)") +
-                  ";int encoded=(int)nearbyintf(divided);encoded=encoded>127?"
-                  "127:(encoded<" +
-                  std::string(f32_convrot ? "-127?-127:" : "-128?-128:") +
-                  "encoded);q2[base+column]=(signed char)encoded;}"
-                : "")
-        << "}\n";
+    // Per-column sign flip keyed by a splitmix-style hash of the column.
+    const std::string signed_rotation_source =
+        signed_rotation
+            ? "unsigned h = (unsigned)column + " +
+                  std::to_string(0x9e3779b9U) +
+                  "U;\n    h = (h ^ (h >> 16)) * 0x7feb352dU;\n"
+                  "    h = (h ^ (h >> 15)) * 0x846ca68bU;\n    h ^= h >> 16;\n"
+                  "    value = (h & 1U) ? -value : value;"
+            : std::string{};
+    const std::string butterfly =
+        sylvester ? "values[i] = 0.5f * (x0 + x1 + x2 + x3);\n"
+                    "      values[i + stride] = 0.5f * (x0 - x1 + x2 - x3);\n"
+                    "      values[i + 2U * stride] = 0.5f * (x0 + x1 - x2 - x3);\n"
+                    "      values[i + 3U * stride] = 0.5f * (x0 - x1 - x2 + x3);"
+                  : "values[i] = 0.5f * (x0 + x1 + x2 - x3);\n"
+                    "      values[i + stride] = 0.5f * (x0 + x1 - x2 + x3);\n"
+                    "      values[i + 2U * stride] = 0.5f * (x0 - x1 + x2 + x3);\n"
+                    "      values[i + 3U * stride] = 0.5f * (-x0 + x1 + x2 + x3);";
+    const std::string encode =
+        f32_convrot
+            ? "float value = values[column];\n    float divided = value / scale;\n"
+              "    int encoded = (int)nearbyintf(divided);\n"
+              "    encoded = encoded > 127 ? 127 : (encoded < -127 ? -127 : encoded);"
+            : "float value = dif_round_bf16(values[column]);\n"
+              "    float divided = dif_round_bf16(value / scale_bf16);\n"
+              "    int encoded = (int)nearbyintf(divided);\n"
+              "    encoded = encoded > 127 ? 127 : (encoded < -128 ? -128 : encoded);";
+    const auto bf16_scales = signed_rotation && !f32_convrot;
+    const std::string residual =
+        residual2
+            ? render_kernel_template(
+                  "quantize_int8_rows_convrot_residual2",
+                  {{"columns", std::to_string(columns)},
+                   {"value", f32_convrot ? "values[column]"
+                                         : "dif_round_bf16(values[column])"},
+                   {"scale2_store", bf16_scales ? "scale2_bf16" : "scale2"},
+                   {"residual",
+                    f32_convrot
+                        ? "fmaf(-(float)q[base + column], stored_scale, value)"
+                        : "dif_round_bf16(fmaf(-(float)q[base + column], "
+                          "stored_scale, value))"},
+                   {"divided", f32_convrot
+                                   ? "residual / scale2"
+                                   : "dif_round_bf16(residual / scale2_bf16)"},
+                   {"clamp_low", f32_convrot ? "-127" : "-128"}})
+            : std::string{};
+    out << render_kernel_template(
+        "quantize_int8_rows_convrot",
+        {{"function", function_name(op)},
+         {"parameters", parameters},
+         {"rows", std::to_string(rows)},
+         {"columns", std::to_string(columns)},
+         {"load_input", load_input},
+         {"signed_rotation", signed_rotation_source},
+         {"rotation_stages", std::to_string(rotation_stages)},
+         {"rotation_lanes", std::to_string(rotation_group / 4U)},
+         {"rotation_group", std::to_string(rotation_group)},
+         {"butterfly", butterfly},
+         {"clip_ratio", clip_ratio_source},
+         {"scale_store", bf16_scales ? "scale_bf16" : "scale"},
+         {"encode", encode},
+         {"residual2", residual}});
     return;
   }
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(" << input_parameters << "signed char* q,float* scales"
-      << (residual2 ? ",signed char* q2,float* scales2" : "")
-      << "){"
-         "__shared__ float maximums[256];unsigned long long row=blockIdx.x;"
-         "unsigned tid=threadIdx.x;if(row>="
-      << rows
-      << "ULL)return;unsigned long long base=row*" << columns
-      << "ULL;float maximum=0.0f;for(unsigned long long column=tid;column<"
-      << columns
-      << "ULL;column+=256ULL){float value=fabsf(" << load_input << ");"
-         "maximum=fmaxf(maximum,value);}maximums[tid]=maximum;__syncthreads();"
-         "for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)"
-         "maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);"
-         "__syncthreads();}float scale=fmaxf(maximums[0]*"
-      << clip_ratio_source
-      << "/127.0f,1.0e-30f);"
-         "if(tid==0U)scales[row]=scale;for(unsigned long long column=tid;column<"
-      << columns
-      << "ULL;column+=256ULL){int value=(int)rintf(" << load_input
-      << "/scale);value=value>127?127:(value<-127?-127:value);"
-         "q[base+column]=(signed char)value;}"
-      << (residual2
-              ? "__syncthreads();float residual_maximum=0.0f;for(unsigned "
-                "long long column=tid;column<" + std::to_string(columns) +
-                "ULL;column+=256ULL){float residual=fmaf(-(float)q[base+"
-                "column],scale," + load_input + ");residual_maximum=fmaxf("
-                "residual_maximum,fabsf(residual));}maximums[tid]="
-                "residual_maximum;__syncthreads();for(unsigned active=128U;"
-                "active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf("
-                "maximums[tid],maximums[tid+active]);__syncthreads();}float "
-                "scale2=fmaxf(maximums[0]/127.0f,1.0e-30f);if(tid==0U)"
-                "scales2[row]=scale2;__syncthreads();for(unsigned long long "
-                "column=tid;column<" + std::to_string(columns) +
-                "ULL;column+=256ULL){float residual=fmaf(-(float)q[base+"
-                "column],scale," + load_input + ");int value=(int)rintf("
-                "residual/scale2);value=value>127?127:(value<-127?-127:"
-                "value);q2[base+column]=(signed char)value;}"
-              : "")
-      << "}\n";
+  const std::string residual =
+      residual2 ? render_kernel_template(
+                      "quantize_int8_rows_direct_residual2",
+                      {{"columns", std::to_string(columns)},
+                       {"load_input", load_input}})
+                : std::string{};
+  out << render_kernel_template(
+      "quantize_int8_rows_direct",
+      {{"function", function_name(op)},
+       {"parameters", parameters},
+       {"rows", std::to_string(rows)},
+       {"columns", std::to_string(columns)},
+       {"load_input", load_input},
+       {"clip_ratio", clip_ratio_source},
+       {"residual2", residual}});
 }
 
 void emit_dequantize_int8_blocks(std::ostringstream &out,
@@ -1706,28 +1643,15 @@ void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
                         << static_cast<float>(weight_offset);
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
   const auto reduction_tile = op.u64(ir::AttrKey::ReductionTileSize, 0U);
+  // Float literals print exactly as the historical std::setprecision(17)
+  // stream did, so the generated text (and the PTX cache key) is unchanged.
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::setprecision(17) << static_cast<float>(epsilon);
   if (op.u64(ir::AttrKey::Implementation, 1U) == 2U) {
-    out << std::setprecision(17) << "extern \"C\" __global__ void "
-        << function_name(op)
-        << "(const dif_scalar* x,const dif_scalar* weight,dif_scalar* y){"
-           "extern __shared__ float reduction[];unsigned long long row="
-           "blockIdx.x;if(row>="
-        << rows
-        << "ULL)return;unsigned tid=threadIdx.x;float sigma2=0.0f;if(tid<32U){"
-           "unsigned long long base=row*128ULL+(unsigned long long)tid;float "
-           "v0=dif_load(x,base),v1=dif_load(x,base+32ULL),v2=dif_load(x,base+"
-           "64ULL),v3=dif_load(x,base+96ULL),s0,s1,s2,s3;asm volatile("
-           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s0):\"f\"(v0));asm volatile("
-           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s1):\"f\"(v1));asm volatile("
-           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s2):\"f\"(v2));asm volatile("
-           "\"mul.rn.f32 %0,%1,%1;\":\"=f\"(s3):\"f\"(v3));sigma2=((s0+"
-           "s1)+s2)+s3;for(unsigned offset=1U;offset<32U;offset<<=1U)sigma2="
-           "sigma2+__shfl_down_sync(0xffffffffU,sigma2,offset);}if(tid==0U)"
-           "reduction[0]=sigma2*0.0078125f;__syncthreads();float inverse=rsqrtf("
-           "reduction[0]+"
-        << static_cast<float>(epsilon)
-        << "f);if(tid<128U){unsigned long long index=row*128ULL+tid;dif_store("
-           "y,index,dif_load(weight,tid)*(inverse*dif_load(x,index)));}}\n";
+    out << render_kernel_template(
+        "rms_norm_welford128", {{"function", function_name(op)},
+                                {"rows", std::to_string(rows)},
+                                {"epsilon", epsilon_literal.str()}});
     return;
   }
   const auto triton_blocked_reduction =
@@ -1735,125 +1659,42 @@ void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
   const auto triton_chunked_reduction =
       block == 512U && columns == block * 12U && reduction_tile == 2048U;
   const auto triton_per_row_reduction = block == 128U && columns == 128U;
-  out << std::setprecision(17) << "extern \"C\" __global__ void "
-      << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* weight,dif_scalar* y){\n"
-         "  extern __shared__ float reduction[];unsigned long long row=blockIdx.x;"
-         "float local=0.0f;if(row>="
-      << rows << "ULL)return;\n";
+  std::string reduction;
   if (triton_blocked_reduction) {
-    out << "  unsigned long long base=row*" << columns
-        << "ULL+(unsigned long long)threadIdx.x*8ULL;"
-           "float v0=dif_load(x,base),v1=dif_load(x,base+1ULL),"
-           "v2=dif_load(x,base+2ULL),v3=dif_load(x,base+3ULL),"
-           "v4=dif_load(x,base+4ULL),v5=dif_load(x,base+5ULL),"
-           "v6=dif_load(x,base+6ULL),v7=dif_load(x,base+7ULL);"
-           "local=v1*v1;local=fmaf(v0,v0,local);"
-           "local=fmaf(v2,v2,local);local=fmaf(v3,v3,local);"
-           "local=fmaf(v4,v4,local);local=fmaf(v5,v5,local);"
-           "local=fmaf(v6,v6,local);local=fmaf(v7,v7,local);"
-           "if(threadIdx.x<256U){float square,value;"
-           "value=dif_load(x,base+4096ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;value=dif_load(x,base+4097ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;value=dif_load(x,base+4098ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;value=dif_load(x,base+4099ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;value=dif_load(x,base+4100ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;value=dif_load(x,base+4101ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;value=dif_load(x,base+4102ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;value=dif_load(x,base+4103ULL);"
-           "asm volatile(\"mul.rn.f32 %0,%1,%1;\":\"=f\"(square):\"f\"(value));"
-           "local=square+local;}"
-           "for(unsigned delta=16U;delta>0U;delta>>=1U)"
-           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
-           "unsigned lane=threadIdx.x&31U,warp=threadIdx.x>>5U;"
-           "if(lane==0U)reduction[warp]=local;__syncthreads();"
-           "if(warp==0U){local=lane<16U?reduction[lane]:0.0f;"
-           "for(unsigned delta=8U;delta>0U;delta>>=1U)"
-           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
-           "if(lane==0U)reduction[0]=local;}__syncthreads();\n";
+    reduction = render_kernel_template(
+        "rms_norm_reduce_blocked", {{"columns", std::to_string(columns)}});
   } else if (triton_chunked_reduction) {
-    out << "  unsigned long long base=row*" << columns
-        << "ULL+(unsigned long long)threadIdx.x*4ULL;float a0,a1,a2,a3;"
-           "float m0=dif_load(x,base+2048ULL),m1=dif_load(x,base+2049ULL),"
-           "m2=dif_load(x,base+2050ULL),m3=dif_load(x,base+2051ULL);"
-           "float l0=dif_load(x,base),l1=dif_load(x,base+1ULL),"
-           "l2=dif_load(x,base+2ULL),l3=dif_load(x,base+3ULL);"
-           "a0=fmaf(l0,l0,m0*m0);a1=fmaf(l1,l1,m1*m1);"
-           "a2=fmaf(l2,l2,m2*m2);a3=fmaf(l3,l3,m3*m3);"
-           "float h0=dif_load(x,base+4096ULL),h1=dif_load(x,base+4097ULL),"
-           "h2=dif_load(x,base+4098ULL),h3=dif_load(x,base+4099ULL);"
-           "a0=fmaf(h0,h0,a0);a1=fmaf(h1,h1,a1);"
-           "a2=fmaf(h2,h2,a2);a3=fmaf(h3,h3,a3);"
-           "local=((a0+a1)+a2)+a3;"
-           "for(unsigned delta=16U;delta>0U;delta>>=1U)"
-           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
-           "unsigned lane=threadIdx.x&31U,warp=threadIdx.x>>5U;"
-           "if(lane==0U)reduction[warp]=local;__syncthreads();"
-           "if(warp==0U){local=lane<16U?reduction[lane]:0.0f;"
-           "for(unsigned delta=8U;delta>0U;delta>>=1U)"
-           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
-           "if(lane==0U)reduction[0]=local;}__syncthreads();\n";
+    reduction = render_kernel_template(
+        "rms_norm_reduce_chunked", {{"columns", std::to_string(columns)}});
   } else if (triton_per_row_reduction) {
-    out << "  if(threadIdx.x<16U){unsigned long long base=row*128ULL+"
-           "(unsigned long long)threadIdx.x*8ULL;"
-           "float v0=dif_load(x,base),v1=dif_load(x,base+1ULL),"
-           "v2=dif_load(x,base+2ULL),v3=dif_load(x,base+3ULL),"
-           "v4=dif_load(x,base+4ULL),v5=dif_load(x,base+5ULL),"
-           "v6=dif_load(x,base+6ULL),v7=dif_load(x,base+7ULL);"
-           "local=v1*v1;local=fmaf(v0,v0,local);"
-           "local=fmaf(v2,v2,local);local=fmaf(v3,v3,local);"
-           "local=fmaf(v4,v4,local);local=fmaf(v5,v5,local);"
-           "local=fmaf(v6,v6,local);local=fmaf(v7,v7,local);}"
-           "else local=0.0f;"
-           "if(threadIdx.x<32U){for(unsigned delta=8U;delta>0U;delta>>=1U)"
-           "local+=__shfl_xor_sync(0xffffffffU,local,delta);"
-           "if(threadIdx.x==0U)reduction[0]=local;}__syncthreads();\n";
+    reduction = render_kernel_template("rms_norm_reduce_per_row", {});
   } else if (columns % 4U == 0U && block >= 128U && block < 512U) {
-    out << "  if(threadIdx.x<128U){for(unsigned long long pack=threadIdx.x;pack<"
-        << columns / 4U
-        << "ULL;pack+=128ULL){unsigned long long col=pack*4ULL;unsigned long "
-           "long base=row*"
-        << columns
-        << "ULL+col;float v0=dif_load(x,base);local+=v0*v0;float v1=dif_load(x,"
-           "base+1ULL);local+=v1*v1;float v2=dif_load(x,base+2ULL);local+=v2*v2;"
-           "float v3=dif_load(x,base+3ULL);local+=v3*v3;}}\n"
-           "  reduction[threadIdx.x]=local;__syncthreads();for(unsigned stride="
-           "16U;stride>0U;stride>>=1U){unsigned lane=threadIdx.x&31U;if(threadIdx.x<"
-           "128U&&lane<stride)reduction[threadIdx.x]+=reduction[threadIdx.x+stride];"
-           "__syncthreads();}if(threadIdx.x==0U)reduction[0]+=reduction[64];else "
-           "if(threadIdx.x==32U)reduction[32]+=reduction[96];__syncthreads();if("
-           "threadIdx.x==0U)reduction[0]+=reduction[32];__syncthreads();\n";
+    reduction = render_kernel_template(
+        "rms_norm_reduce_packed4", {{"packs", std::to_string(columns / 4U)},
+                                    {"columns", std::to_string(columns)}});
   } else {
-    out << "  for(unsigned long long col=threadIdx.x;col<" << columns
-        << "ULL;col+=blockDim.x){float v=dif_load(x,row*" << columns
-        << "ULL+col);local+=v*v;}reduction[threadIdx.x]=local;__syncthreads();"
-           "for(unsigned stride=blockDim.x/2;stride>0;stride>>=1){if(threadIdx.x<"
-           "stride)reduction[threadIdx.x]+=reduction[threadIdx.x+stride];"
-           "__syncthreads();}\n";
+    reduction = render_kernel_template(
+        "rms_norm_reduce_generic", {{"columns", std::to_string(columns)}});
   }
-  if (triton_blocked_reduction || triton_chunked_reduction ||
-      triton_per_row_reduction) {
-    out << "  float mean,mean_eps,inv;asm volatile(\"div.full.f32 %0,%1,%2;\""
-           ":\"=f\"(mean):\"f\"(reduction[0]),\"f\"("
-        << columns
-        << ".0f));mean_eps=mean+" << static_cast<float>(epsilon)
-        << "f;asm volatile(\"rsqrt.approx.ftz.f32 %0,%1;\""
-           ":\"=f\"(inv):\"f\"(mean_eps));";
-  } else {
-    out << "  float inv=rsqrtf(reduction[0]/" << columns << ".0f+"
-        << static_cast<float>(epsilon) << "f);";
-  }
-  out << "for(unsigned long long col=threadIdx.x;col<" << columns
-      << "ULL;col+=blockDim.x){unsigned long long i=row*" << columns
-      << "ULL+col;dif_store(y,i,dif_load(x,i)*inv*(dif_load(weight,col)+"
-      << weight_offset_literal.str() << "f));}}\n";
+  const auto triton_inverse = triton_blocked_reduction ||
+                              triton_chunked_reduction ||
+                              triton_per_row_reduction;
+  const std::string inverse =
+      triton_inverse
+          ? "  float mean, mean_eps, inv;\n"
+            "  asm volatile(\"div.full.f32 %0,%1,%2;\" : \"=f\"(mean) : \"f\"(reduction[0]), \"f\"(" +
+                std::to_string(columns) + ".0f));\n  mean_eps = mean + " +
+                epsilon_literal.str() +
+                "f;\n  asm volatile(\"rsqrt.approx.ftz.f32 %0,%1;\" : \"=f\"(inv) : \"f\"(mean_eps));"
+          : "  float inv = rsqrtf(reduction[0] / " + std::to_string(columns) +
+                ".0f + " + epsilon_literal.str() + "f);";
+  out << render_kernel_template(
+      "rms_norm", {{"function", function_name(op)},
+                   {"rows", std::to_string(rows)},
+                   {"columns", std::to_string(columns)},
+                   {"reduction", reduction},
+                   {"inverse", inverse},
+                   {"weight_offset", weight_offset_literal.str()}});
 }
 
 void emit_layer_norm(std::ostringstream &out, const ir::Program &program,

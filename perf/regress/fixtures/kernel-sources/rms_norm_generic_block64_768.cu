@@ -42,32 +42,37 @@ extern "C" __device__ float dif_round_f16(float input) {
 extern "C" __device__ float dif_silu(float x) {
   return x / (1.0f + expf(-x));
 }
-// Dynamic symmetric per-row INT8 quantization, one block of 256 threads per
-// row: |max| reduction, scale = max * clip / 127 (guarded), round-to-nearest,
-// clamp to [-127, 127]. Optional second code for the residual of the first.
-extern "C" __global__ void dif_op_1(const dif_bf16* x0,const dif_f32* clip_ratio,signed char* q, float* scales) {
-  __shared__ float maximums[256];
+#define dif_scalar dif_bf16
+#define dif_load dif_load_bf16
+#define dif_store dif_store_bf16
+#define dif_round dif_round_bf16
+// RMS normalization, one block per row: sum of squares reduced into
+// reduction[0] by the reduction strategy the emitter selected for the row
+// width and block size, then y = x * rsqrt(mean + eps) * (weight + offset).
+extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weight, dif_scalar* y) {
+  extern __shared__ float reduction[];
   unsigned long long row = blockIdx.x;
-  unsigned tid = threadIdx.x;
-  if (row >= 2ULL) return;
-  unsigned long long base = row * 512ULL;
-  float maximum = 0.0f;
-  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
-    float value = fabsf(dif_load_bf16(x0,row*512ULL+column-0ULL));
-    maximum = fmaxf(maximum, value);
+  float local = 0.0f;
+  if (row >= 4ULL) return;
+  // Any width and block size: strided squares, then a shared-memory tree.
+  for (unsigned long long col = threadIdx.x; col < 768ULL; col += blockDim.x) {
+    float v = dif_load(x, row * 768ULL + col);
+    local += v * v;
   }
-  maximums[tid] = maximum;
+  reduction[threadIdx.x] = local;
   __syncthreads();
-  for (unsigned active = 128U; active > 0U; active >>= 1U) {
-    if (tid < active) maximums[tid] = fmaxf(maximums[tid], maximums[tid + active]);
+  for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
     __syncthreads();
   }
-  float scale = fmaxf(maximums[0] * dif_load_f32(clip_ratio,0ULL) / 127.0f, 1.0e-30f);
-  if (tid == 0U) scales[row] = scale;
-  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
-    int value = (int)rintf(dif_load_bf16(x0,row*512ULL+column-0ULL) / scale);
-    value = value > 127 ? 127 : (value < -127 ? -127 : value);
-    q[base + column] = (signed char)value;
+
+  float inv = rsqrtf(reduction[0] / 768.0f + 9.9999999747524271e-07f);
+  for (unsigned long long col = threadIdx.x; col < 768ULL; col += blockDim.x) {
+    unsigned long long i = row * 768ULL + col;
+    dif_store(y, i, dif_load(x, i) * inv * (dif_load(weight, col) + 0.000000000e+00f));
   }
-  
 }
+#undef dif_scalar
+#undef dif_load
+#undef dif_store
+#undef dif_round

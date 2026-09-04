@@ -42,4 +42,53 @@ extern "C" __device__ float dif_round_f16(float input) {
 extern "C" __device__ float dif_silu(float x) {
   return x / (1.0f + expf(-x));
 }
-extern "C" __global__ void dif_op_1(const dif_bf16* x0,signed char* q,float* scales,signed char* q2,float* scales2){__shared__ float maximums[256];unsigned long long row=blockIdx.x;unsigned tid=threadIdx.x;if(row>=2ULL)return;unsigned long long base=row*512ULL;float maximum=0.0f;for(unsigned long long column=tid;column<512ULL;column+=256ULL){float value=fabsf(dif_load_bf16(x0,row*512ULL+column-0ULL));maximum=fmaxf(maximum,value);}maximums[tid]=maximum;__syncthreads();for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);__syncthreads();}float scale=fmaxf(maximums[0]*1.000000000e+00f/127.0f,1.0e-30f);if(tid==0U)scales[row]=scale;for(unsigned long long column=tid;column<512ULL;column+=256ULL){int value=(int)rintf(dif_load_bf16(x0,row*512ULL+column-0ULL)/scale);value=value>127?127:(value<-127?-127:value);q[base+column]=(signed char)value;}__syncthreads();float residual_maximum=0.0f;for(unsigned long long column=tid;column<512ULL;column+=256ULL){float residual=fmaf(-(float)q[base+column],scale,dif_load_bf16(x0,row*512ULL+column-0ULL));residual_maximum=fmaxf(residual_maximum,fabsf(residual));}maximums[tid]=residual_maximum;__syncthreads();for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);__syncthreads();}float scale2=fmaxf(maximums[0]/127.0f,1.0e-30f);if(tid==0U)scales2[row]=scale2;__syncthreads();for(unsigned long long column=tid;column<512ULL;column+=256ULL){float residual=fmaf(-(float)q[base+column],scale,dif_load_bf16(x0,row*512ULL+column-0ULL));int value=(int)rintf(residual/scale2);value=value>127?127:(value<-127?-127:value);q2[base+column]=(signed char)value;}}
+// Dynamic symmetric per-row INT8 quantization, one block of 256 threads per
+// row: |max| reduction, scale = max * clip / 127 (guarded), round-to-nearest,
+// clamp to [-127, 127]. Optional second code for the residual of the first.
+extern "C" __global__ void dif_op_1(const dif_bf16* x0,signed char* q, float* scales, signed char* q2, float* scales2) {
+  __shared__ float maximums[256];
+  unsigned long long row = blockIdx.x;
+  unsigned tid = threadIdx.x;
+  if (row >= 2ULL) return;
+  unsigned long long base = row * 512ULL;
+  float maximum = 0.0f;
+  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
+    float value = fabsf(dif_load_bf16(x0,row*512ULL+column-0ULL));
+    maximum = fmaxf(maximum, value);
+  }
+  maximums[tid] = maximum;
+  __syncthreads();
+  for (unsigned active = 128U; active > 0U; active >>= 1U) {
+    if (tid < active) maximums[tid] = fmaxf(maximums[tid], maximums[tid + active]);
+    __syncthreads();
+  }
+  float scale = fmaxf(maximums[0] * 1.000000000e+00f / 127.0f, 1.0e-30f);
+  if (tid == 0U) scales[row] = scale;
+  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
+    int value = (int)rintf(dif_load_bf16(x0,row*512ULL+column-0ULL) / scale);
+    value = value > 127 ? 127 : (value < -127 ? -127 : value);
+    q[base + column] = (signed char)value;
+  }
+    __syncthreads();
+  float residual_maximum = 0.0f;
+  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
+    float residual = fmaf(-(float)q[base + column], scale, dif_load_bf16(x0,row*512ULL+column-0ULL));
+    residual_maximum = fmaxf(residual_maximum, fabsf(residual));
+  }
+  maximums[tid] = residual_maximum;
+  __syncthreads();
+  for (unsigned active = 128U; active > 0U; active >>= 1U) {
+    if (tid < active) maximums[tid] = fmaxf(maximums[tid], maximums[tid + active]);
+    __syncthreads();
+  }
+  float scale2 = fmaxf(maximums[0] / 127.0f, 1.0e-30f);
+  if (tid == 0U) scales2[row] = scale2;
+  __syncthreads();
+  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
+    float residual = fmaf(-(float)q[base + column], scale, dif_load_bf16(x0,row*512ULL+column-0ULL));
+    int value = (int)rintf(residual / scale2);
+    value = value > 127 ? 127 : (value < -127 ? -127 : value);
+    q2[base + column] = (signed char)value;
+  }
+
+}

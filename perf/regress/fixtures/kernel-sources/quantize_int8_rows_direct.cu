@@ -42,4 +42,32 @@ extern "C" __device__ float dif_round_f16(float input) {
 extern "C" __device__ float dif_silu(float x) {
   return x / (1.0f + expf(-x));
 }
-extern "C" __global__ void dif_op_1(const dif_bf16* x0,signed char* q,float* scales){__shared__ float maximums[256];unsigned long long row=blockIdx.x;unsigned tid=threadIdx.x;if(row>=2ULL)return;unsigned long long base=row*512ULL;float maximum=0.0f;for(unsigned long long column=tid;column<512ULL;column+=256ULL){float value=fabsf(dif_load_bf16(x0,row*512ULL+column-0ULL));maximum=fmaxf(maximum,value);}maximums[tid]=maximum;__syncthreads();for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);__syncthreads();}float scale=fmaxf(maximums[0]*1.000000000e+00f/127.0f,1.0e-30f);if(tid==0U)scales[row]=scale;for(unsigned long long column=tid;column<512ULL;column+=256ULL){int value=(int)rintf(dif_load_bf16(x0,row*512ULL+column-0ULL)/scale);value=value>127?127:(value<-127?-127:value);q[base+column]=(signed char)value;}}
+// Dynamic symmetric per-row INT8 quantization, one block of 256 threads per
+// row: |max| reduction, scale = max * clip / 127 (guarded), round-to-nearest,
+// clamp to [-127, 127]. Optional second code for the residual of the first.
+extern "C" __global__ void dif_op_1(const dif_bf16* x0,signed char* q, float* scales) {
+  __shared__ float maximums[256];
+  unsigned long long row = blockIdx.x;
+  unsigned tid = threadIdx.x;
+  if (row >= 2ULL) return;
+  unsigned long long base = row * 512ULL;
+  float maximum = 0.0f;
+  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
+    float value = fabsf(dif_load_bf16(x0,row*512ULL+column-0ULL));
+    maximum = fmaxf(maximum, value);
+  }
+  maximums[tid] = maximum;
+  __syncthreads();
+  for (unsigned active = 128U; active > 0U; active >>= 1U) {
+    if (tid < active) maximums[tid] = fmaxf(maximums[tid], maximums[tid + active]);
+    __syncthreads();
+  }
+  float scale = fmaxf(maximums[0] * 1.000000000e+00f / 127.0f, 1.0e-30f);
+  if (tid == 0U) scales[row] = scale;
+  for (unsigned long long column = tid; column < 512ULL; column += 256ULL) {
+    int value = (int)rintf(dif_load_bf16(x0,row*512ULL+column-0ULL) / scale);
+    value = value > 127 ? 127 : (value < -127 ? -127 : value);
+    q[base + column] = (signed char)value;
+  }
+  
+}

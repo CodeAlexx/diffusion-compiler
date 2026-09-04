@@ -54,36 +54,40 @@ extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weigh
   unsigned long long row = blockIdx.x;
   float local = 0.0f;
   if (row >= 4ULL) return;
-  // Rows divisible by 4, blocks of 128..511 threads: the first 128 threads
-  // each square 4-column packs, then a 128-wide shared tree with the
-  // two-stage fold that keeps the historical summation order.
-  if (threadIdx.x < 128U) {
-    for (unsigned long long pack = threadIdx.x; pack < 192ULL; pack += 128ULL) {
-      unsigned long long col = pack * 4ULL;
-      unsigned long long base = row * 768ULL + col;
-      float v0 = dif_load(x, base); local += v0 * v0;
-      float v1 = dif_load(x, base + 1ULL); local += v1 * v1;
-      float v2 = dif_load(x, base + 2ULL); local += v2 * v2;
-      float v3 = dif_load(x, base + 3ULL); local += v3 * v3;
-    }
-  }
-  reduction[threadIdx.x] = local;
+  // 6144-wide rows, 512 threads: three 2048-column chunks accumulated
+  // per lane in four accumulators (Triton reduction-tile 2048 order).
+  unsigned long long base = row * 6144ULL + (unsigned long long)threadIdx.x * 4ULL;
+  float a0, a1, a2, a3;
+  float m0 = dif_load(x, base + 2048ULL), m1 = dif_load(x, base + 2049ULL),
+        m2 = dif_load(x, base + 2050ULL), m3 = dif_load(x, base + 2051ULL);
+  float l0 = dif_load(x, base), l1 = dif_load(x, base + 1ULL),
+        l2 = dif_load(x, base + 2ULL), l3 = dif_load(x, base + 3ULL);
+  a0 = fmaf(l0, l0, m0 * m0); a1 = fmaf(l1, l1, m1 * m1);
+  a2 = fmaf(l2, l2, m2 * m2); a3 = fmaf(l3, l3, m3 * m3);
+  float h0 = dif_load(x, base + 4096ULL), h1 = dif_load(x, base + 4097ULL),
+        h2 = dif_load(x, base + 4098ULL), h3 = dif_load(x, base + 4099ULL);
+  a0 = fmaf(h0, h0, a0); a1 = fmaf(h1, h1, a1);
+  a2 = fmaf(h2, h2, a2); a3 = fmaf(h3, h3, a3);
+  local = ((a0 + a1) + a2) + a3;
+  for (unsigned delta = 16U; delta > 0U; delta >>= 1U)
+    local += __shfl_xor_sync(0xffffffffU, local, delta);
+  unsigned lane = threadIdx.x & 31U, warp = threadIdx.x >> 5U;
+  if (lane == 0U) reduction[warp] = local;
   __syncthreads();
-  for (unsigned stride = 16U; stride > 0U; stride >>= 1U) {
-    unsigned lane = threadIdx.x & 31U;
-    if (threadIdx.x < 128U && lane < stride)
-      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-    __syncthreads();
+  if (warp == 0U) {
+    local = lane < 16U ? reduction[lane] : 0.0f;
+    for (unsigned delta = 8U; delta > 0U; delta >>= 1U)
+      local += __shfl_xor_sync(0xffffffffU, local, delta);
+    if (lane == 0U) reduction[0] = local;
   }
-  if (threadIdx.x == 0U) reduction[0] += reduction[64];
-  else if (threadIdx.x == 32U) reduction[32] += reduction[96];
-  __syncthreads();
-  if (threadIdx.x == 0U) reduction[0] += reduction[32];
   __syncthreads();
 
-  float inv = rsqrtf(reduction[0] / 768.0f + 9.9999999747524271e-07f);
-  for (unsigned long long col = threadIdx.x; col < 768ULL; col += blockDim.x) {
-    unsigned long long i = row * 768ULL + col;
+  float mean, mean_eps, inv;
+  asm volatile("div.full.f32 %0,%1,%2;" : "=f"(mean) : "f"(reduction[0]), "f"(6144.0f));
+  mean_eps = mean + 9.9999999747524271e-07f;
+  asm volatile("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(inv) : "f"(mean_eps));
+  for (unsigned long long col = threadIdx.x; col < 6144ULL; col += blockDim.x) {
+    unsigned long long i = row * 6144ULL + col;
     dif_store(y, i, dif_load(x, i) * inv * (dif_load(weight, col) + 0.000000000e+00f));
   }
 }

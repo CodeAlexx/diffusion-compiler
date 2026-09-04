@@ -58,9 +58,9 @@ extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weigh
   // each square 4-column packs, then a 128-wide shared tree with the
   // two-stage fold that keeps the historical summation order.
   if (threadIdx.x < 128U) {
-    for (unsigned long long pack = threadIdx.x; pack < 192ULL; pack += 128ULL) {
+    for (unsigned long long pack = threadIdx.x; pack < 25ULL; pack += 128ULL) {
       unsigned long long col = pack * 4ULL;
-      unsigned long long base = row * 768ULL + col;
+      unsigned long long base = row * 100ULL + col;
       float v0 = dif_load(x, base); local += v0 * v0;
       float v1 = dif_load(x, base + 1ULL); local += v1 * v1;
       float v2 = dif_load(x, base + 2ULL); local += v2 * v2;
@@ -81,9 +81,9 @@ extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weigh
   if (threadIdx.x == 0U) reduction[0] += reduction[32];
   __syncthreads();
 
-  float inv = rsqrtf(reduction[0] / 768.0f + 9.9999999747524271e-07f);
-  for (unsigned long long col = threadIdx.x; col < 768ULL; col += blockDim.x) {
-    unsigned long long i = row * 768ULL + col;
+  float inv = rsqrtf(reduction[0] / 100.0f + 9.9999999747524271e-07f);
+  for (unsigned long long col = threadIdx.x; col < 100ULL; col += blockDim.x) {
+    unsigned long long i = row * 100ULL + col;
     dif_store(y, i, dif_load(x, i) * inv * (dif_load(weight, col) + 0.000000000e+00f));
   }
 }

@@ -25,6 +25,13 @@ string(APPEND content "  static const std::unordered_map<std::string_view, std::
 foreach(path IN LISTS kernel_files)
   get_filename_component(stem "${path}" NAME_WE)
   file(READ "${path}" text)
+  # A placeholder inside a comment line would be substituted like any other
+  # (the engine cannot tell prose from code) and could smuggle a multi-line
+  # fragment out of the comment; refuse it at embed time.
+  string(REGEX MATCH "(^|\n)[ \t]*//[^\n]*\\$\\{" comment_placeholder "${text}")
+  if(NOT comment_placeholder STREQUAL "")
+    message(FATAL_ERROR "${path}: a placeholder inside a // comment line is not allowed")
+  endif()
   string(FIND "${text}" ")${delimiter}\"" clash)
   if(NOT clash EQUAL -1)
     message(FATAL_ERROR "${path} contains the raw-string delimiter )${delimiter}\"")
