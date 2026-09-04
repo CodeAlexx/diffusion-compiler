@@ -612,11 +612,15 @@ Program batch7_program(std::string_view which) {
                                ? RotaryLayout::HalfSplit
                                : RotaryLayout::Interleaved))});
   } else if (which == "attention_exact" || which == "attention_exact_causal" ||
-             which == "attention_exact_gqa") {
+             which == "attention_exact_gqa" ||
+             which == "attention_exact_rectangular") {
     const std::uint64_t kv = which == "attention_exact_gqa" ? 1U : 2U;
+    // rectangular: 4 query rows attend 6 key rows (cross-attention)
+    const std::uint64_t key_rows =
+        which == "attention_exact_rectangular" ? 6U : 4U;
     program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 8}},
-                       {2, DType::BF16, TensorRole::Input, {4, kv, 8}},
-                       {3, DType::BF16, TensorRole::Input, {4, kv, 8}},
+                       {2, DType::BF16, TensorRole::Input, {key_rows, kv, 8}},
+                       {3, DType::BF16, TensorRole::Input, {key_rows, kv, 8}},
                        {4, DType::BF16, TensorRole::Output, {4, 2, 8}}};
     std::vector<Attribute> attributes;
     if (which == "attention_exact_causal")
@@ -962,6 +966,7 @@ std::vector<Case> corpus() {
       {"attention_exact", [] { return batch7_program("attention_exact"); }},
       {"attention_exact_causal", [] { return batch7_program("attention_exact_causal"); }},
       {"attention_exact_gqa", [] { return batch7_program("attention_exact_gqa"); }},
+      {"attention_exact_rectangular", [] { return batch7_program("attention_exact_rectangular"); }},
       {"attention_lse", [] { return batch7_program("attention_lse"); }},
       {"attention_lse_causal_gqa", [] { return batch7_program("attention_lse_causal_gqa"); }},
       {"qk_norm_rope_backward", [] { return batch7_program("qk_norm_rope_backward"); }},

@@ -861,6 +861,8 @@ void emit_gelu(std::ostringstream &out, const ir::Program &program,
   const std::string body =
       approximation == ir::GeluApproximation::ExactErf
           ? "dif_store(y, i, 5.0e-1f * v * (1.0f + erff(v * 7.071067812e-1f)));"
+      : approximation == ir::GeluApproximation::QuickSigmoid
+          ? "dif_store(y, i, v / (1.0f + expf(-1.702f * v)));"
           : "float c = v * v * v;\n"
             "    float z = 7.978845608e-1f * (v + 4.471500218e-2f * c);\n"
             "    dif_store(y, i, 5.0e-1f * v * (1.0f + tanhf(z)));";
@@ -1909,6 +1911,9 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
   const auto sequence = shape[0];
   const auto heads = shape[1];
   const auto dim = shape[2];
+  // Cross-attention keys carry their own row count; a square program keeps
+  // its historical generated source (kend is the query row count).
+  const auto kv_sequence = program.tensor(op.inputs[1])->dims[0];
   // GQA (KvHeads attr): query head h reads kv head h/(H/KvHeads).  When
   // KvHeads == H the emitted source is BYTE-IDENTICAL to the pre-GQA kernel
   // (kv_head_expr collapses to "h"), so recorded programs keep their
@@ -1928,7 +1933,7 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
       {{"function", function_name(op)},
        {"items", std::to_string(sequence * heads)},
        {"heads", std::to_string(heads)},
-       {"kend", causal ? "qs + 1ULL" : std::to_string(sequence) + "ULL"},
+       {"kend", causal ? "qs + 1ULL" : std::to_string(kv_sequence) + "ULL"},
        {"dim", std::to_string(dim)},
        {"kv_heads", std::to_string(kv_heads)},
        {"kv_head", kv_head_expr},

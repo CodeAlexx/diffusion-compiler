@@ -1760,6 +1760,105 @@ void test_new_primitives_cuda_parity() {
             << " max_abs=" << gate_maximum_absolute_error << "\n";
 }
 
+// Cross-attention: K/V carry their own row count (text keys under image
+// queries). The CPU reference is the oracle; the generated exact kernel and
+// the cuDNN plan must agree with it for both the unbatched and the batched
+// layouts. Also covers the quick-sigmoid GELU the CLIP text tower uses.
+void test_rectangular_attention_and_quick_gelu_cuda_parity() {
+  using namespace dif::ir;
+  Program program;
+  program.tensors = {
+      {1, DType::BF16, TensorRole::Input, {4, 2, 16}},
+      {2, DType::BF16, TensorRole::Input, {6, 2, 16}},
+      {3, DType::BF16, TensorRole::Input, {6, 2, 16}},
+      {4, DType::BF16, TensorRole::Output, {4, 2, 16}},
+      {5, DType::BF16, TensorRole::Output, {4, 2, 16}},
+      {6, DType::BF16, TensorRole::Input, {2, 4, 2, 16}},
+      {7, DType::BF16, TensorRole::Input, {2, 6, 2, 16}},
+      {8, DType::BF16, TensorRole::Input, {2, 6, 2, 16}},
+      {9, DType::BF16, TensorRole::Output, {2, 4, 2, 16}},
+      {10, DType::F32, TensorRole::Input, {8}},
+      {11, DType::F32, TensorRole::Output, {8}},
+  };
+  program.operations = {
+      {1, Opcode::Attention, {1, 2, 3}, {4},
+       {Attribute::u64(AttrKey::Implementation, 1U)}},
+      {2, Opcode::Attention, {1, 2, 3}, {5},
+       {Attribute::u64(AttrKey::Implementation, 2U)}},
+      {3, Opcode::Attention, {6, 7, 8}, {9},
+       {Attribute::u64(AttrKey::Implementation, 2U)}},
+      {4, Opcode::Gelu, {10}, {11},
+       {Attribute::u64(AttrKey::Approximation,
+                       static_cast<std::uint64_t>(
+                           GeluApproximation::QuickSigmoid))}},
+  };
+  // Deterministic pseudo-random values in [-1, 1) from a small LCG.
+  std::uint32_t state = 20260901U;
+  auto values = [&](std::size_t count) {
+    std::vector<float> result(count);
+    for (auto &value : result) {
+      state = state * 1664525U + 1013904223U;
+      value = static_cast<float>(state >> 8) / 8388608.0F - 1.0F;
+    }
+    return result;
+  };
+  dif::runtime::TensorMap bindings;
+  bindings.emplace(1, float_tensor(DType::BF16, {4, 2, 16}, values(128)));
+  bindings.emplace(2, float_tensor(DType::BF16, {6, 2, 16}, values(192)));
+  bindings.emplace(3, float_tensor(DType::BF16, {6, 2, 16}, values(192)));
+  bindings.emplace(6, float_tensor(DType::BF16, {2, 4, 2, 16}, values(256)));
+  bindings.emplace(7, float_tensor(DType::BF16, {2, 6, 2, 16}, values(384)));
+  bindings.emplace(8, float_tensor(DType::BF16, {2, 6, 2, 16}, values(384)));
+  const std::vector<float> gelu_input{-3.0F, -1.5F, -0.5F, 0.0F,
+                                      0.5F,  1.0F,  2.0F,  4.0F};
+  bindings.emplace(10, f32_tensor({8}, gelu_input));
+  dif::runtime::RunOptions options;
+  options.warmups = 0;
+  options.iterations = 1;
+  options.minimum_free_bytes = 0;
+  const auto reference =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  const auto gelu = float_values(reference.outputs.at(11));
+  for (std::size_t index = 0; index < gelu_input.size(); ++index) {
+    const auto x = gelu_input[index];
+    const auto expected = x / (1.0F + std::exp(-1.702F * x));
+    expect(std::abs(gelu[index] - expected) <= 1.0e-6F,
+           "CPU quick-sigmoid GELU is x * sigmoid(1.702 x)");
+  }
+  // The CPU reference of the two unbatched forms is one function; the
+  // batched form must match its per-batch unbatched twin on every row.
+  const auto unbatched = float_values(reference.outputs.at(4));
+  expect(unbatched == float_values(reference.outputs.at(5)),
+         "CPU rectangular attention is implementation-independent");
+  if (!dif::runtime::cuda_available())
+    return;
+  const auto candidate =
+      dif::runtime::make_cuda_executor()->run(program, bindings, options);
+  float maximum_error = 0.0F;
+  std::cout << "GATE rectangular_attention backend=" << candidate.backend_name
+            << " device=" << candidate.device_name;
+  for (const auto tensor_id : {4U, 5U, 9U, 11U}) {
+    const auto expected = float_values(reference.outputs.at(tensor_id));
+    const auto actual = float_values(candidate.outputs.at(tensor_id));
+    expect(expected.size() == actual.size(),
+           "CUDA rectangular attention output size parity");
+    float tensor_error = 0.0F;
+    const std::string message =
+        "CUDA rectangular attention / quick GELU numerical parity (tensor " +
+        std::to_string(tensor_id) + ")";
+    for (std::size_t index = 0;
+         index < std::min(expected.size(), actual.size()); ++index) {
+      const auto error = std::abs(expected[index] - actual[index]);
+      tensor_error = std::max(tensor_error, error);
+      expect(error <= (tensor_id == 11U ? 1.0e-5F : 1.5e-2F),
+             message.c_str());
+    }
+    maximum_error = std::max(maximum_error, tensor_error);
+    std::cout << " t" << tensor_id << "_max_abs=" << tensor_error;
+  }
+  std::cout << " max_abs=" << maximum_error << "\n";
+}
+
 void test_vae_normalization_primitives() {
   using namespace dif::ir;
   Program program;
@@ -4733,6 +4832,7 @@ int main() {
   test_krea2_rotary_layout_mask_and_broadcast_oracle();
   test_krea2_cudnn_masked_gqa_creator_oracle();
   test_new_primitives_cuda_parity();
+  test_rectangular_attention_and_quick_gelu_cuda_parity();
   test_vae_normalization_primitives();
   test_generic_image_vae_primitives();
   test_group_norm_and_reflect_padding_primitives();

@@ -103,6 +103,9 @@ void gelu(const ir::Operation &op, TensorMap &tensors) {
       store_float(out, i,
                   0.5F * value *
                       (1.0F + std::erf(value * 0.7071067811865475F)));
+    } else if (approximation == ir::GeluApproximation::QuickSigmoid) {
+      // x * sigmoid(1.702 x): the CLIP text tower's activation.
+      store_float(out, i, value / (1.0F + std::exp(-1.702F * value)));
     } else {
       const auto cubic = value * value * value;
       const auto inner =
@@ -1878,10 +1881,13 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
-  std::vector<float> probabilities(sequence);
+  // Cross-attention keys carry their own row count (verified equal to the
+  // query rows when causal).
+  const auto kv_sequence = k.dims[batched ? 1U : 0U];
+  std::vector<float> probabilities(kv_sequence);
   for (std::uint64_t b = 0; b < batch; ++b) {
     for (std::uint64_t query = 0; query < sequence; ++query) {
-      const auto key_end = causal ? query + 1U : sequence;
+      const auto key_end = causal ? query + 1U : kv_sequence;
       for (std::uint64_t head = 0; head < heads; ++head) {
       const auto kv_head = head / group;
       float maximum = -std::numeric_limits<float>::infinity();
@@ -1891,13 +1897,15 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
           score = std::fma(
               load_float(q_tensor,
                          ((b * sequence + query) * heads + head) * dim + d),
-              load_float(k,
-                         ((b * sequence + key) * kv_heads + kv_head) * dim + d),
+              load_float(k, ((b * kv_sequence + key) * kv_heads + kv_head) *
+                                    dim +
+                                d),
               score);
         }
         score *= scale;
         if (bias)
-          score += load_float(*bias, (b * sequence + query) * sequence + key);
+          score += load_float(*bias,
+                              (b * sequence + query) * kv_sequence + key);
         probabilities[key] = score;
         maximum = std::max(maximum, score);
       }
@@ -1919,8 +1927,9 @@ void attention(const ir::Operation &op, TensorMap &tensors) {
           const auto probability = probabilities[key] / denominator;
           value = std::fma(
               probability,
-              load_float(v,
-                         ((b * sequence + key) * kv_heads + kv_head) * dim + d),
+              load_float(v, ((b * kv_sequence + key) * kv_heads + kv_head) *
+                                    dim +
+                                d),
               value);
         }
         store_float(out,

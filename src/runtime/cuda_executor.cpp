@@ -817,6 +817,8 @@ struct CudnnAttentionKey {
   ir::DType dtype{};
   std::uint64_t batch{};
   std::uint64_t sequence{};
+  // Key/value row count; equal to `sequence` for self-attention.
+  std::uint64_t kv_sequence{};
   std::uint64_t heads{};
   std::uint64_t kv_heads{};
   std::uint64_t head_dim{};
@@ -838,6 +840,7 @@ struct CudnnAttentionKeyHash {
     mix(static_cast<std::uint64_t>(key.dtype));
     mix(key.batch);
     mix(key.sequence);
+    mix(key.kv_sequence);
     mix(key.heads);
     mix(key.kv_heads);
     mix(key.head_dim);
@@ -7719,9 +7722,13 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     const auto batch = batched ? dims[0] : 1U;
     const auto sequence = dims[batched ? 1U : 0U];
     const auto heads = dims[batched ? 2U : 1U];
+    // The probability row spans the KEY rows (cross-attention keys may
+    // carry their own count).
+    const auto kv_sequence =
+        program.tensor(op.inputs[1])->dims[batched ? 1U : 0U];
     block = std::min<unsigned>(block, 256U);
     grid = static_cast<unsigned>(batch * sequence * heads);
-    shared = static_cast<unsigned>((block + sequence) * sizeof(float));
+    shared = static_cast<unsigned>((block + kv_sequence) * sizeof(float));
   } else {
     const auto count = program.tensor(op.outputs[0])->element_count();
     grid = static_cast<unsigned>((count + block - 1U) / block);
@@ -8619,17 +8626,20 @@ public:
            !options.h3_int8_attention_hybrid))
         continue;
       const auto *query = program_.tensor(op.inputs.at(0));
-      if (!query)
-        fail("cuDNN attention references a missing query tensor");
+      const auto *key_tensor = program_.tensor(op.inputs.at(1));
+      if (!query || !key_tensor)
+        fail("cuDNN attention references a missing query or key tensor");
       const bool batched = query->dims.size() == 4U;
       const auto batch = batched ? query->dims.at(0) : 1U;
       const auto sequence = query->dims.at(batched ? 1U : 0U);
+      const auto kv_sequence = key_tensor->dims.at(batched ? 1U : 0U);
       const auto heads = query->dims.at(batched ? 2U : 1U);
       const auto head_dim = query->dims.at(batched ? 3U : 2U);
       const CudnnAttentionKey key{
           query->dtype,
           batch,
           sequence,
+          kv_sequence,
           heads,
           op.u64(ir::AttrKey::KvHeads, heads),
           head_dim,
@@ -8642,9 +8652,12 @@ public:
       };
       auto found = cudnn_plan_cache.find(key);
       if (found == cudnn_plan_cache.end()) {
+        // Zero keeps the plan's historical square contract; a differing
+        // key row count is the cross-attention (rectangular) form.
         auto plan = std::make_shared<CudnnAttentionPlan>(
             *query, key.kv_heads, std::bit_cast<double>(key.scale_bits),
-            key.causal, key.additive_bias, key.heuristic);
+            key.causal, key.additive_bias, key.heuristic,
+            key.kv_sequence == key.sequence ? 0U : key.kv_sequence);
         found = cudnn_plan_cache.emplace(key, std::move(plan)).first;
       }
       cudnn_attention_plans_.emplace(op.id, found->second);
@@ -8718,6 +8731,7 @@ public:
       const CudnnAttentionKey key{
           query->dtype,
           1U,
+          sequence,
           sequence,
           heads,
           op.u64(ir::AttrKey::KvHeads, heads),

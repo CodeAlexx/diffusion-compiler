@@ -181,7 +181,12 @@ enum class AttrKey : std::uint32_t {
 // Gelu carries an explicit approximation because exact-erf and tanh GELU are
 // observably different source semantics. Krea 2 and Qwen vision blocks use
 // the tanh form; Qwen vision mergers use the exact erf form.
-enum class GeluApproximation : std::uint64_t { Tanh = 1, ExactErf = 2 };
+// QuickSigmoid is the CLIP text tower's x * sigmoid(1.702 x) ("quick_gelu").
+enum class GeluApproximation : std::uint64_t {
+  Tanh = 1,
+  ExactErf = 2,
+  QuickSigmoid = 3
+};
 
 enum class LinearBiasMode : std::uint64_t { Epilogue = 1, Addmm = 2 };
 

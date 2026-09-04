@@ -117,8 +117,11 @@ void verify_operation(const Program &program, const Operation &op) {
         (approximation->bits !=
              static_cast<std::uint64_t>(GeluApproximation::Tanh) &&
          approximation->bits !=
-             static_cast<std::uint64_t>(GeluApproximation::ExactErf)))
-      fail("gelu requires an explicit tanh or exact-erf approximation");
+             static_cast<std::uint64_t>(GeluApproximation::ExactErf) &&
+         approximation->bits !=
+             static_cast<std::uint64_t>(GeluApproximation::QuickSigmoid)))
+      fail("gelu requires an explicit tanh, exact-erf, or quick-sigmoid "
+           "approximation");
     return;
   }
 
@@ -1282,18 +1285,27 @@ void verify_operation(const Program &program, const Operation &op) {
     if (kv_heads == 0U || q.dims[head_axis] % kv_heads != 0U)
       fail("attention KvHeads must be nonzero and divide the query head "
            "count");
+    // Cross-attention: K/V may carry their own row count (text keys under
+    // image queries). Everything else — batch, head-dim, dtype — matches the
+    // query, and a causal mask keeps the historical square contract.
     auto expected_kv = q.dims;
     expected_kv[head_axis] = kv_heads;
-    if (k.dtype != q.dtype || k.dims != expected_kv)
-      fail("attention k/v must match query batch/sequence/head-dim with KvHeads heads");
+    expected_kv[sequence_axis] = k.dims[sequence_axis];
+    const auto kv_sequence = k.dims[sequence_axis];
+    if (k.dtype != q.dtype || k.dims != expected_kv || kv_sequence == 0U)
+      fail("attention k/v must match query batch/head-dim with KvHeads heads "
+           "and a nonzero key row count");
+    if (kv_sequence != q.dims[sequence_axis] &&
+        op.boolean(AttrKey::Causal, false))
+      fail("causal attention requires equal query and key row counts");
     if (op.inputs.size() == 4U) {
       const auto &bias = tensor_or_fail(program, op.inputs[3], op);
       const auto batch = q.dims.size() == 4U ? q.dims[0] : 1U;
       const auto sequence = q.dims[sequence_axis];
       if (q.dims.size() != 4U || bias.dtype != q.dtype ||
           bias.dims != std::vector<std::uint64_t>{batch, 1U, sequence,
-                                                  sequence})
-        fail("attention additive bias must be [B,1,S,S] in the query dtype");
+                                                  kv_sequence})
+        fail("attention additive bias must be [B,1,S,Skv] in the query dtype");
     }
     const auto implementation = op.u64(AttrKey::Implementation, 1U);
     if (implementation != 1U && implementation != 2U &&
