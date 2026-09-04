@@ -10701,6 +10701,17 @@ public:
       fail("lazy resident upload is fixed when the plan is prepared");
     if (options.persistent_state != state_)
       fail("persistent state is fixed when the plan is prepared");
+    const std::unordered_set<std::uint32_t> wanted(
+        options.requested_outputs.begin(), options.requested_outputs.end());
+    for (const auto id : options.requested_outputs) {
+      const auto *desc = program_.tensor(id);
+      if (!desc || !desc->has_role(ir::TensorRole::Output))
+        fail("requested output " + std::to_string(id) +
+             " is not a program output");
+      if (state_outputs_.contains(id))
+        fail("requested output " + std::to_string(id) +
+             " is persistent state; read it with capture_persistent_state");
+    }
     auto requested_captures = options.capture_intermediate_tensors;
     std::sort(requested_captures.begin(), requested_captures.end());
     if (requested_captures != capture_intermediate_tensors_)
@@ -11935,6 +11946,10 @@ public:
       for (const auto &desc : program_.tensors) {
         if (!desc.has_role(ir::TensorRole::Output))
           continue;
+        if (state_outputs_.contains(desc.id))
+          continue;
+        if (!wanted.empty() && !wanted.contains(desc.id))
+          continue;
         check(counted_memcpy_dtoh(base + offset, buffers_.at(desc.id),
                                   desc.byte_count(), context_.stream()),
               "cuMemcpyDtoHAsync pinned output");
@@ -11957,6 +11972,8 @@ public:
         // undo the entire point of the mechanism, so it is not offered as an
         // output at all -- capture_persistent_state() is the way to read it.
         if (state_outputs_.contains(desc.id))
+          continue;
+        if (!wanted.empty() && !wanted.contains(desc.id))
           continue;
         auto tensor = zeros(desc);
         check(counted_memcpy_dtoh(tensor.mutable_data(), buffers_.at(desc.id),

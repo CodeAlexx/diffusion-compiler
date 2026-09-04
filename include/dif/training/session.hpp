@@ -74,6 +74,10 @@ struct TrainingStepResult {
   // Whatever the program produced besides the carried state -- gradients, a
   // prediction. The state itself is NOT here: it stays on the device.
   runtime::TensorMap outputs;
+  // What the runtime actually submitted for this step: launches, library
+  // dispatches, every copy, every host-blocking synchronization. A step time
+  // without these is a number nobody can act on.
+  runtime::LaunchTelemetry telemetry;
 };
 
 class TrainingSession {
@@ -81,9 +85,14 @@ public:
   // `initial` seeds everything the program needs once: constants, the
   // starting parameters, and zeroed optimizer state. After this the session
   // owns the state and a step supplies only its batch.
+  // `reads` names the outputs a step actually looks at, beyond the loss.
+  // Leaving it empty is the point: a step reads its loss and nothing else,
+  // and every gradient stays on the device where the optimizer consumes it.
+  // Naming a gradient here is what a gate does, and it costs a copy.
   TrainingSession(TrainingPlan plan, runtime::Executor &executor,
                   const runtime::TensorMap &initial,
-                  runtime::RunOptions options);
+                  runtime::RunOptions options,
+                  std::vector<std::uint32_t> reads = {});
 
   // Runs one step. `batch` carries only what genuinely changes.
   TrainingStepResult step(const runtime::TensorMap &batch);

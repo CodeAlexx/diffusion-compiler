@@ -79,8 +79,14 @@ runtime::Tensor step_counter(std::uint64_t value) {
 TrainingSession::TrainingSession(TrainingPlan plan,
                                  runtime::Executor &executor,
                                  const runtime::TensorMap &initial,
-                                 runtime::RunOptions options)
+                                 runtime::RunOptions options,
+                                 std::vector<std::uint32_t> reads)
     : plan_(std::move(plan)), options_(std::move(options)) {
+  // The loss is always read -- it is what a step reports. Everything else is
+  // opt-in, so a gradient the optimizer already consumed on the device is not
+  // copied to a host nobody reads it from.
+  options_.requested_outputs = std::move(reads);
+  options_.requested_outputs.push_back(plan_.loss_tensor);
   // The declaration comes from the plan, so it cannot disagree with the
   // program it describes.
   options_.persistent_state = plan_.persistent_state();
@@ -119,6 +125,7 @@ TrainingStepResult TrainingSession::step(const runtime::TensorMap &batch) {
       result.persistent_state_host_to_device_bytes;
   step_result.persistent_state_device_to_host_bytes =
       result.persistent_state_device_to_host_bytes;
+  step_result.telemetry = result.run_telemetry;
   step_result.outputs = std::move(result.outputs);
   ++completed_steps_;
   step_result.completed_steps = completed_steps_;

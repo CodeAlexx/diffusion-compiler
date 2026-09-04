@@ -222,14 +222,20 @@ int run_dit_lora(const dif::json::Value &configuration,
         batch.emplace(desc.id, inputs.at(desc.id));
   }
   const auto wall_start = std::chrono::steady_clock::now();
+  // This tool writes the gradients and the prediction for the gate, so it
+  // asks for them. A trainer that only reports a loss asks for nothing.
+  std::vector<std::uint32_t> reads{build.prediction_output};
+  for (const auto &binding : build.optimizer_bindings)
+    reads.push_back(binding.gradient_output);
   dif::training::TrainingSession session(std::move(plan), *executor, inputs,
-                                         options);
+                                         options, std::move(reads));
   if (!resume_path.empty())
     session.restore(resume_checkpoint);
   std::filesystem::create_directories(output);
   std::vector<float> losses;
   std::uint64_t state_host_to_device = 0U;
   std::uint64_t state_device_to_host = 0U;
+  dif::runtime::LaunchTelemetry last_telemetry;
   dif::runtime::TensorMap step_outputs;
   for (std::uint64_t step = 0U; step < steps; ++step) {
     auto result = session.step(batch);
@@ -244,6 +250,7 @@ int run_dit_lora(const dif::json::Value &configuration,
             output / ("grad1-" + std::to_string(index) + ".diftensor"));
     state_host_to_device += result.persistent_state_host_to_device_bytes;
     state_device_to_host += result.persistent_state_device_to_host_bytes;
+    last_telemetry = result.telemetry;
     step_outputs = std::move(result.outputs);
   }
   // Read the state back once, on purpose, so the frozen-base check, the
@@ -300,6 +307,25 @@ int run_dit_lora(const dif::json::Value &configuration,
             << " resident_bytes=" << session.persistent_state_bytes()
             << " step_h2d_bytes=" << state_host_to_device
             << " step_d2h_bytes=" << state_device_to_host << "\n";
+  {
+    // Per step, in the same units the reference trainer reports, so the two
+    // can be compared without translating.
+    const auto &t = last_telemetry;
+    const double per_step = static_cast<double>(steps);
+    std::cout << "STEP_TELEMETRY steps=" << steps
+              << " ms_per_step="
+              << std::chrono::duration<double, std::milli>(wall_stop -
+                                                           wall_start)
+                         .count() /
+                     per_step
+              << " launches_per_step=" << t.kernel_launches
+              << " gemms_per_step=" << (t.cublaslt_matmuls + t.cublas_gemms)
+              << " h2d_per_step=" << t.h2d_copies
+              << " h2d_bytes_per_step=" << t.h2d_bytes
+              << " d2h_per_step=" << t.d2h_copies
+              << " d2h_bytes_per_step=" << t.d2h_bytes
+              << " syncs_per_step=" << t.host_stream_synchronizes << "\n";
+  }
   std::cout << "DIT_LORA_TRAIN PASS backend=" << executor->name()
             << " blocks=" << config.blocks << " steps=" << steps
             << " completed_steps=" << completed_steps
@@ -476,8 +502,11 @@ int main(int argc, char **argv) {
           batch.emplace(desc.id, inputs.at(desc.id));
     }
     const auto wall_start = std::chrono::steady_clock::now();
+    std::vector<std::uint32_t> reads;
+    for (const auto &binding : build.optimizer_bindings)
+      reads.push_back(binding.gradient_output);
     dif::training::TrainingSession session(std::move(plan), *executor, inputs,
-                                           options);
+                                           options, std::move(reads));
     std::filesystem::create_directories(output);
     std::vector<float> losses;
     std::uint64_t state_host_to_device = 0U;

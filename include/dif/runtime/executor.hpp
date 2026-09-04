@@ -63,6 +63,14 @@ struct RunOptions {
   // plan-shaping options. A prepared execution refuses a run whose persistent
   // state differs from the one it was prepared with.
   std::vector<PersistentStateBinding> persistent_state;
+  // The outputs a caller actually reads. Empty means all of them, which is
+  // the historical behaviour and stays the default.
+  //
+  // A training step produces a gradient per parameter that the optimizer
+  // consumes ON THE DEVICE; copying them to the host every step so nobody
+  // looks at them is pure load-path cost, and load paths are where the time
+  // hides. Naming what is wanted lets the rest stay put.
+  std::vector<std::uint32_t> requested_outputs;
   // Absorb an unbiased Linear's exclusive, immediately-adjacent BiasAdd into
   // the cuBLASLt bias epilogue: one library launch, no materialized
   // intermediate. Ids name the Linear operations (explicit = candidate

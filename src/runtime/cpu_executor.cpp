@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 #include <vector>
 
 namespace dif::runtime {
@@ -4125,19 +4126,35 @@ public:
     result.maximum_milliseconds = *std::max_element(elapsed.begin(), elapsed.end());
     result.mean_milliseconds =
         std::accumulate(elapsed.begin(), elapsed.end(), 0.0) / elapsed.size();
-    for (const auto &desc : program_.tensors) {
-      if (desc.has_role(ir::TensorRole::Output))
-        result.outputs.emplace(desc.id, std::move(final_tensors.at(desc.id)));
+    // The same contract as the device path: name what you read, or take
+    // everything. On the CPU nothing is copied either way, but a caller must
+    // see the same set of outputs from both backends or a gate that passes on
+    // one will fail on the other.
+    const std::unordered_set<std::uint32_t> wanted(
+        options.requested_outputs.begin(), options.requested_outputs.end());
+    for (const auto id : options.requested_outputs) {
+      const auto *desc = program_.tensor(id);
+      if (!desc || !desc->has_role(ir::TensorRole::Output))
+        fail("requested output " + std::to_string(id) +
+             " is not a program output");
     }
-    // The value this step wrote becomes the value the next step reads. The
-    // state never leaves the executor, so nothing is copied across the host
-    // boundary and both counters stay at zero.
+    // The value this step wrote becomes the value the next step reads. Taken
+    // from the executed tensors and taken FIRST, before any output is moved
+    // out of them: a caller naming the outputs it reads must not be able to
+    // drop the state carry by omitting a tensor it never asked to see.
     for (const auto &binding : state_) {
-      const auto produced = result.outputs.find(binding.output);
-      if (produced == result.outputs.end())
+      const auto produced = final_tensors.find(binding.output);
+      if (produced == final_tensors.end())
         fail("persistent state destination " + std::to_string(binding.output) +
              " was not produced by the run");
       state_values_.insert_or_assign(binding.input, produced->second);
+    }
+    for (const auto &desc : program_.tensors) {
+      if (!desc.has_role(ir::TensorRole::Output))
+        continue;
+      if (!wanted.empty() && !wanted.contains(desc.id))
+        continue;
+      result.outputs.emplace(desc.id, std::move(final_tensors.at(desc.id)));
     }
     result.persistent_state_bytes = state_bytes_;
     result.persistent_state_host_to_device_bytes = 0U;
