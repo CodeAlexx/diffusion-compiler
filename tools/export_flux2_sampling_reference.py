@@ -26,6 +26,17 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 
+# Creator geometry per model (flux2/model.py Klein9BParams / Flux2Params).
+# klein9b: batch-two CFG sampler (guidance applied outside the model).
+# dev: guidance-distilled, batch one, guidance fed through guidance_in.
+GEOMETRY = {
+    "klein9b": dict(hidden=4096, heads=32, double=8, single=24, context=12288,
+                    guidance_embed=False, cfg=True,
+                    revision="32773329fbe7e81a90ef971740e8ba4b0364ecf3"),
+    "dev": dict(hidden=6144, heads=48, double=8, single=48, context=15360,
+                guidance_embed=True, cfg=False,
+                revision="26afe3a78bb242c0a8bb181dcc8937bb16e5c66c"),
+}
 HIDDEN = 4096
 HEADS = 32
 SOURCE_COMMIT = "50fe5162777813d869182b139e83b10743caef15"
@@ -45,6 +56,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--guidance", type=float, default=4.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--capture-every", type=int, default=0)
+    parser.add_argument("--model", choices=sorted(GEOMETRY), default="klein9b")
     return parser.parse_args()
 
 
@@ -84,6 +96,10 @@ def main() -> None:
     if args.capture_every < 0:
         raise SystemExit("capture-every must be nonnegative")
 
+    geometry = GEOMETRY[args.model]
+    global HIDDEN, HEADS, MODEL_REVISION
+    HIDDEN, HEADS = geometry["hidden"], geometry["heads"]
+    MODEL_REVISION = geometry["revision"]
     source = args.creator_source.resolve()
     sys.path.insert(0, str(source / "src"))
     from flux2.autoencoder import AutoEncoder, AutoEncoderParams
@@ -111,8 +127,8 @@ def main() -> None:
     schedule = replay["timesteps"].float().tolist()
     if initial.ndim != 2 or initial.shape[1] != 128:
         raise SystemExit("initial_image_tokens must be [L,128]")
-    if positive.shape != negative.shape or positive.shape != (512, 12288):
-        raise SystemExit("conditioning tensors must both be [512,12288]")
+    if positive.shape != negative.shape or positive.shape != (512, geometry["context"]):
+        raise SystemExit(f"conditioning tensors must both be [512,{geometry['context']}]")
     if len(schedule) < 2 or schedule[0] != 1.0 or schedule[-1] != 0.0:
         raise SystemExit("native schedule must include exact 1.0 and 0.0 endpoints")
 
@@ -120,10 +136,13 @@ def main() -> None:
     latent_side = math.isqrt(image_tokens)
     if latent_side * latent_side != image_tokens:
         raise SystemExit("image token count must be a square")
-    batch = 2
+    batch = 2 if geometry["cfg"] else 1
     latent = initial.unsqueeze(0).to(device)
-    latent = torch.cat((latent, latent), dim=0)
-    conditioning = torch.stack((negative, positive), dim=0).to(device)
+    if geometry["cfg"]:
+        latent = torch.cat((latent, latent), dim=0)
+        conditioning = torch.stack((negative, positive), dim=0).to(device)
+    else:
+        conditioning = positive.unsqueeze(0).to(device)
     image_positions, text_positions = positions(
         batch, image_tokens, positive.shape[0], device
     )
@@ -161,6 +180,15 @@ def main() -> None:
                 F.silu(linear(embedded, "time_in.in_layer.weight")),
                 "time_in.out_layer.weight",
             )
+            if geometry["guidance_embed"]:
+                guidance_t = torch.full(
+                    (batch,), args.guidance, device=device, dtype=torch.bfloat16
+                )
+                vector = vector + linear(
+                    F.silu(linear(timestep_embedding(guidance_t, 256),
+                                  "guidance_in.in_layer.weight")),
+                    "guidance_in.out_layer.weight",
+                )
             modulation_input = F.silu(vector)
 
             def modulation(name: str, chunks: int):
@@ -186,7 +214,7 @@ def main() -> None:
                 text_positions
             )
 
-            for depth in range(8):
+            for depth in range(geometry["double"]):
                 prefix = f"double_blocks.{depth}."
                 with torch.device("meta"):
                     block = DoubleStreamBlock(HIDDEN, HEADS, 3.0)
@@ -210,7 +238,7 @@ def main() -> None:
 
             sequence = torch.cat((text, image), dim=1)
             pe_full = torch.cat((pe_text, pe_image), dim=2)
-            for depth in range(24):
+            for depth in range(geometry["single"]):
                 prefix = f"single_blocks.{depth}."
                 with torch.device("meta"):
                     block = SingleStreamBlock(HIDDEN, HEADS, 3.0)
@@ -248,11 +276,14 @@ def main() -> None:
             ):
                 started = time.perf_counter()
                 prediction = forward(latent, conditioning, current)
-                unconditional, conditional = prediction.chunk(2)
-                guided = unconditional + args.guidance * (
-                    conditional - unconditional
-                )
-                guided = torch.cat((guided, guided), dim=0)
+                if geometry["cfg"]:
+                    unconditional, conditional = prediction.chunk(2)
+                    guided = unconditional + args.guidance * (
+                        conditional - unconditional
+                    )
+                    guided = torch.cat((guided, guided), dim=0)
+                else:
+                    guided = prediction  # guidance already embedded
                 latent = latent + (following - current) * guided
                 elapsed = (time.perf_counter() - started) * 1000.0
                 timings.append(elapsed)
@@ -307,7 +338,8 @@ def main() -> None:
         {name: value.contiguous() for name, value in captures.items()},
         args.output_state,
         metadata={
-            "oracle": "black-forest-labs/flux2 matched batch-two CFG sampler",
+            "oracle": f"black-forest-labs/flux2 {args.model} matched sampler",
+            "model": args.model,
             "source_commit": SOURCE_COMMIT,
             "model_revision": MODEL_REVISION,
             "vae_revision": VAE_REVISION,
@@ -321,7 +353,8 @@ def main() -> None:
         },
     )
     report = {
-        "oracle": "black-forest-labs/flux2 matched batch-two CFG sampler",
+        "oracle": f"black-forest-labs/flux2 {args.model} matched sampler",
+        "model": args.model,
         "source_commit": SOURCE_COMMIT,
         "model_revision": MODEL_REVISION,
         "vae_revision": VAE_REVISION,

@@ -3310,6 +3310,20 @@ DenoiseResult denoise(const Arguments &arguments,
   dif::frontend::Flux2KleinTransformerConfig config;
   if (dev)
     config.geometry = dif::frontend::flux2_dev_geometry();
+  // The executed depth is the geometry's full depth: the config defaults are
+  // Klein's 8+24 and would silently truncate [dev] (8+48) to half its single
+  // blocks. Truncated ladders are a parity-harness concern, not this tool's.
+  config.double_depth = config.geometry.double_depth;
+  config.single_depth = config.geometry.single_depth;
+  std::cerr << "FLUX2_TRANSFORMER_GEOMETRY model="
+            << (dev ? "dev" : "klein9b")
+            << " hidden=" << config.geometry.hidden
+            << " heads=" << config.geometry.heads
+            << " double_depth=" << config.double_depth
+            << " single_depth=" << config.single_depth
+            << " context=" << config.geometry.context_width
+            << " guidance_embedding=" << (config.geometry.guidance_embedding ? 1 : 0)
+            << '\n';
   // [dev] is guidance-distilled: one conditional pass with the guidance
   // embedded, no CFG batch. Klein runs the CFG pair as before.
   config.batch_size = dev ? 1U : 2U;
@@ -3336,7 +3350,8 @@ DenoiseResult denoise(const Arguments &arguments,
     bindings.emplace(transformer.guidance_input,
                      scalar(dif::ir::DType::BF16, arguments.guidance));
   bindings.emplace(transformer.position_ids_input,
-                   position_ids(image_tokens, 512U, latent_width, 2U));
+                   position_ids(image_tokens, config.text_tokens, latent_width,
+                                config.batch_size));
   for (std::size_t index = 0U;
        index < transformer.checkpoint_tensors.size(); ++index) {
     auto tensor = dif::weights::map_safetensor(
