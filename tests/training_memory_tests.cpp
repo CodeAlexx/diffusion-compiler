@@ -9,6 +9,7 @@
 #include "dif/ir/verify.hpp"
 #include "dif/support/error.hpp"
 #include "dif/training/memory.hpp"
+#include "dif/training/session.hpp"
 
 #include <iostream>
 #include <string>

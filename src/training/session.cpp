@@ -1,5 +1,7 @@
 #include "dif/training/session.hpp"
 
+#include "dif/training/memory.hpp"
+
 #include "dif/runtime/scalar.hpp"
 #include "dif/support/error.hpp"
 
@@ -99,6 +101,8 @@ TrainingSession::TrainingSession(TrainingPlan plan,
     const auto *desc = plan_.program.tensor(binding.input);
     state_bytes_ += desc->byte_count();
   }
+  // Static, so it is computed once rather than per step.
+  memory_ = analyze_memory(plan_);
 }
 
 TrainingStepResult TrainingSession::step(const runtime::TensorMap &batch) {
@@ -127,9 +131,46 @@ TrainingStepResult TrainingSession::step(const runtime::TensorMap &batch) {
       result.persistent_state_device_to_host_bytes;
   step_result.telemetry = result.run_telemetry;
   step_result.outputs = std::move(result.outputs);
+  if (device_name_.empty())
+    device_name_ = result.device_name;
+  step_result.phases = attribute_phases(result.trace_events, plan_.program,
+                                       plan_.forward_operations,
+                                       plan_.optimizer_operations);
   ++completed_steps_;
   step_result.completed_steps = completed_steps_;
   return step_result;
+}
+
+TrainingStepReport
+TrainingSession::report(const TrainingStepResult &result) const {
+  TrainingStepReport report;
+  report.backend = prepared_->name();
+  report.device = device_name_;
+  report.plan_fingerprint = hex_digest(plan_.fingerprint());
+  report.trainable_tensors = plan_.bindings.size();
+  for (const auto &binding : plan_.bindings) {
+    const auto *parameter = plan_.program.tensor(binding.parameter_input);
+    if (parameter)
+      report.trainable_parameters += parameter->element_count();
+  }
+  report.completed_steps = result.completed_steps;
+  report.optimizer_applied = result.optimizer_applied;
+  report.accumulation_index = result.accumulation_index;
+  report.loss = result.loss;
+  report.gradient_norm = result.gradient_norm;
+  report.nonfinite_count = result.nonfinite_count;
+  report.step_milliseconds = result.step_milliseconds;
+  report.telemetry = result.telemetry;
+  report.persistent_state_bytes = state_bytes_;
+  if (result.phases) {
+    report.forward_milliseconds = result.phases->forward_milliseconds;
+    report.backward_milliseconds = result.phases->backward_milliseconds;
+    report.optimizer_milliseconds = result.phases->optimizer_milliseconds;
+    report.transfer_milliseconds = result.phases->transfer_milliseconds;
+  }
+  report.planned_device_bytes = memory_.planned_bytes;
+  report.peak_device_bytes = memory_.live_peak_bytes;
+  return report;
 }
 
 Checkpoint TrainingSession::capture() const {

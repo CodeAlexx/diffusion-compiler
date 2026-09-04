@@ -118,6 +118,7 @@ add_library(difcore
     src/training/step.cpp
     src/training/session.cpp
     src/training/memory.cpp
+    src/training/report.cpp
     src/training/recompute.cpp
     src/training/accumulate.cpp
     src/training/checkpoint.cpp
@@ -469,6 +470,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_training_gradient_tests tests/training_gradient_tests.cpp)
   target_link_libraries(dif_training_gradient_tests PRIVATE difcore)
   add_test(NAME dif_training_gradient_tests COMMAND dif_training_gradient_tests)
+
+  add_executable(dif_training_report_tests tests/training_report_tests.cpp)
+  target_link_libraries(dif_training_report_tests PRIVATE difcore)
+  add_test(NAME dif_training_report_tests COMMAND dif_training_report_tests)
 
   add_executable(dif_lora_transform_tests tests/lora_transform_tests.cpp)
   target_link_libraries(dif_lora_transform_tests PRIVATE difcore)

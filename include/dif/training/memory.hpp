@@ -3,11 +3,14 @@
 #include "dif/compiler/memory_plan.hpp"
 #include "dif/target/profile.hpp"
 #include "dif/training/recompute.hpp"
-#include "dif/training/session.hpp"
 
 #include <cstdint>
 
 namespace dif::training {
+
+// Declared, not included: a plan is only ever passed by reference here, and
+// including session.hpp would make the two headers depend on each other.
+struct TrainingPlan;
 
 // What a training step's memory is actually spent on.
 //

@@ -6,11 +6,15 @@
 #include "dif/support/sha256.hpp"
 #include "dif/training/accumulate.hpp"
 #include "dif/training/checkpoint.hpp"
+#include "dif/training/memory.hpp"
+#include "dif/training/report.hpp"
 #include "dif/training/step.hpp"
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace dif::training {
@@ -68,6 +72,20 @@ struct TrainingStepResult {
   float loss{};
   double step_milliseconds{};
   std::uint64_t completed_steps{};
+  // Which micro-batch of an accumulation group this was, and whether the
+  // optimizer ran at the end of it. A plain training step applies its
+  // optimizer every time, so these are 0 and true until accumulation is
+  // driven through the session.
+  std::uint64_t accumulation_index{};
+  bool optimizer_applied{true};
+  // Absent unless something computed it. The session does not: a gradient
+  // norm costs a reduction and a readback, and a step that reports one it did
+  // not measure is worse than a step that admits it has none.
+  std::optional<double> gradient_norm;
+  // Nonfinite values SEEN. The session checks its loss and nothing else,
+  // because the gradients stay on the device where nobody reads them -- so a
+  // zero here means "the loss was finite", not "the step was clean".
+  std::uint64_t nonfinite_count{};
   // Zero on an ordinary step. Reported rather than assumed.
   std::uint64_t persistent_state_host_to_device_bytes{};
   std::uint64_t persistent_state_device_to_host_bytes{};
@@ -78,6 +96,9 @@ struct TrainingStepResult {
   // dispatches, every copy, every host-blocking synchronization. A step time
   // without these is a number nobody can act on.
   runtime::LaunchTelemetry telemetry;
+  // Present only when the run was traced. An untraced step reports no phase
+  // split rather than a split of zeros.
+  std::optional<PhaseTimes> phases;
 };
 
 class TrainingSession {
@@ -103,6 +124,17 @@ public:
   // different program.
   void restore(const Checkpoint &checkpoint);
 
+  // A machine-readable record of the step just run. The session fills in
+  // everything it owns -- identity, plan fingerprint, what the runtime
+  // submitted, what it holds resident -- and leaves the rest for the driver,
+  // which is the only thing that knows the model's name or where its
+  // checkpoint went. Phase times appear only if the run was traced.
+  TrainingStepReport report(const TrainingStepResult &result) const;
+
+  // The plan's static memory analysis, computed once. Every step reports the
+  // same numbers because the plan does not change between them.
+  const TrainingMemoryReport &memory() const { return memory_; }
+
   std::uint64_t completed_steps() const { return completed_steps_; }
   const TrainingPlan &plan() const { return plan_; }
   std::uint64_t persistent_state_bytes() const { return state_bytes_; }
@@ -111,6 +143,10 @@ private:
   TrainingPlan plan_;
   runtime::RunOptions options_;
   std::unique_ptr<runtime::PreparedExecution> prepared_;
+  TrainingMemoryReport memory_;
+  // What the runtime said it ran on, taken from the first step rather than
+  // guessed at by a caller.
+  std::string device_name_;
   std::uint64_t completed_steps_{};
   std::uint64_t state_bytes_{};
 };

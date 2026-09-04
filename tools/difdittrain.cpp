@@ -15,6 +15,7 @@
 #include "dif/support/sha256.hpp"
 #include "dif/training/checkpoint.hpp"
 #include "dif/training/session.hpp"
+#include "dif/training/report.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -69,6 +70,37 @@ void atomic_write_checkpoint(const dif::training::Checkpoint &checkpoint,
     throw;
   }
 }
+
+
+// The per-step record, appended as it happens rather than accumulated and
+// written at the end -- a run that dies at step 400 should still leave the
+// 399 steps it did behind. One JSON object per line, so a reader can stream
+// it without a parser that understands the whole file.
+class StepRecordWriter {
+public:
+  StepRecordWriter(const std::filesystem::path &path, std::string model)
+      : stream_(path, std::ios::binary | std::ios::trunc),
+        model_(std::move(model)) {
+    if (!stream_)
+      dif::fail("cannot write the training report to " + path.string());
+  }
+
+  void append(const dif::training::TrainingSession &session,
+              const dif::training::TrainingStepResult &result) {
+    auto report = session.report(result);
+    report.model = model_;
+    last_ = report.json();
+    stream_ << last_ << "\n";
+    stream_.flush();
+  }
+
+  const std::string &last() const { return last_; }
+
+private:
+  std::ofstream stream_;
+  std::string model_;
+  std::string last_;
+};
 
 int run_dit_lora(const dif::json::Value &configuration,
                  const std::filesystem::path &fixture,
@@ -237,8 +269,10 @@ int run_dit_lora(const dif::json::Value &configuration,
   std::uint64_t state_device_to_host = 0U;
   dif::runtime::LaunchTelemetry last_telemetry;
   dif::runtime::TensorMap step_outputs;
+  StepRecordWriter records(output / "training-report.jsonl", "dit-lora");
   for (std::uint64_t step = 0U; step < steps; ++step) {
     auto result = session.step(batch);
+    records.append(session, result);
     const auto loss = result.loss;
     losses.push_back(loss);
     if (step == 0U && resume_path.empty())
@@ -326,6 +360,7 @@ int run_dit_lora(const dif::json::Value &configuration,
               << " d2h_bytes_per_step=" << t.d2h_bytes
               << " syncs_per_step=" << t.host_stream_synchronizes << "\n";
   }
+  std::cout << "STEP_REPORT " << records.last() << "\n";
   std::cout << "DIT_LORA_TRAIN PASS backend=" << executor->name()
             << " blocks=" << config.blocks << " steps=" << steps
             << " completed_steps=" << completed_steps
@@ -512,8 +547,10 @@ int main(int argc, char **argv) {
     std::uint64_t state_host_to_device = 0U;
     std::uint64_t state_device_to_host = 0U;
     dif::runtime::TensorMap step_outputs;
+    StepRecordWriter records(output / "training-report.jsonl", "dit");
     for (std::uint64_t step = 0U; step < steps; ++step) {
       auto result = session.step(batch);
+      records.append(session, result);
       losses.push_back(result.loss);
       if (step == 0U)
         for (std::size_t index = 0U; index < build.optimizer_bindings.size();
@@ -551,6 +588,7 @@ int main(int argc, char **argv) {
               << " resident_bytes=" << session.persistent_state_bytes()
               << " step_h2d_bytes=" << state_host_to_device
               << " step_d2h_bytes=" << state_device_to_host << "\n";
+    std::cout << "STEP_REPORT " << records.last() << "\n";
     std::cout << "DIT_TRAIN PASS backend=" << executor->name()
               << " blocks=" << config.blocks << " steps=" << steps
               << " parameters=" << build.parameters.size()

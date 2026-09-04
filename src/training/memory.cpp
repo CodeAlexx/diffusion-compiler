@@ -1,5 +1,7 @@
 #include "dif/training/memory.hpp"
 
+#include "dif/training/session.hpp"
+
 #include "dif/support/error.hpp"
 
 #include <algorithm>
