@@ -85,6 +85,7 @@ add_library(difcore
     src/opt/bindings.cpp
     src/opt/gate.cpp
     src/opt/physical_format.cpp
+    src/opt/lora.cpp
     src/opt/plan.cpp
     src/opt/rewrite.cpp
     src/opt/search.cpp
@@ -468,6 +469,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_training_gradient_tests tests/training_gradient_tests.cpp)
   target_link_libraries(dif_training_gradient_tests PRIVATE difcore)
   add_test(NAME dif_training_gradient_tests COMMAND dif_training_gradient_tests)
+
+  add_executable(dif_lora_transform_tests tests/lora_transform_tests.cpp)
+  target_link_libraries(dif_lora_transform_tests PRIVATE difcore)
+  add_test(NAME dif_lora_transform_tests COMMAND dif_lora_transform_tests)
 
   add_executable(dif_training_memory_tests tests/training_memory_tests.cpp)
   target_link_libraries(dif_training_memory_tests PRIVATE difcore)
