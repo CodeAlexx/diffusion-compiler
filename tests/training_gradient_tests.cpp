@@ -279,6 +279,79 @@ Case group_norm_case() {
   return c;
 }
 
+// RMS norm with shared-vector modulation, the form the Krea 2 blocks use.
+// The vector is broadcast across the rows of its group AND feeds both the
+// scale and the shift, so its gradient is a sum over the group of (normalized
+// + 1). Dropping either term, or confusing the vector's per-group reduction
+// with delta's reduction over everything, fails here.
+Case shared_vector_modulate_case(std::uint64_t vectors) {
+  Case c;
+  const std::uint64_t rows = 4U;
+  const std::uint64_t columns = 5U;
+  const std::vector<std::uint64_t> x_shape{rows, columns};
+  const std::vector<std::uint64_t> vector_shape{vectors, columns};
+  const std::vector<std::uint64_t> delta_shape{2U, columns};
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, x_shape},
+                       {2U, DType::F32, TensorRole::Input, {columns}},
+                       {3U, DType::F32, TensorRole::Input, vector_shape},
+                       {4U, DType::F32, TensorRole::Input, delta_shape},
+                       {5U, DType::F32, TensorRole::Internal, x_shape},
+                       {6U, DType::F32, TensorRole::Input, x_shape},
+                       {7U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::RmsNormModulate, {1U, 2U, 3U, 4U}, {5U},
+       {Attribute::u64(AttrKey::ModulationLayout,
+                       static_cast<std::uint64_t>(
+                           dif::ir::ModulationLayout::SharedVectorDelta)),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-5),
+        // A nonzero weight offset, so a gradient that forgets it fails.
+        Attribute::f64(AttrKey::WeightOffset, 1.0)}},
+      {2U, Opcode::MseLoss, {5U, 6U}, {7U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(x_shape, 433U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor({columns}, 439U, 0.5F));
+  c.inputs.emplace(3U, f32_tensor(vector_shape, 443U, 0.5F));
+  c.inputs.emplace(4U, f32_tensor(delta_shape, 449U, 0.5F));
+  c.inputs.emplace(6U, f32_tensor(x_shape, 457U, 1.0F));
+  c.loss = 7U;
+  c.targets = {1U, 2U, 3U, 4U};
+  return c;
+}
+
+// The rotary embedding, in both pairing conventions and with a rotated range
+// shorter than the head so the untouched tail is exercised too. F32 tables
+// under BF16 activations is the shape the frontends actually use, but a
+// difference quotient in BF16 is noise, so the dtypes here are F32 and the
+// mixed-storage case is checked for backend agreement instead.
+Case rotary_apply_case(bool half_split, std::uint64_t pairs) {
+  Case c;
+  const std::uint64_t batch = 2U;
+  const std::uint64_t sequence = 3U;
+  const std::uint64_t heads = 2U;
+  const std::uint64_t dim = 8U;
+  const std::vector<std::uint64_t> x_shape{batch, sequence, heads, dim};
+  const std::vector<std::uint64_t> table{batch, sequence, pairs};
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, x_shape},
+                       {2U, DType::F32, TensorRole::Input, table},
+                       {3U, DType::F32, TensorRole::Input, table},
+                       {4U, DType::F32, TensorRole::Internal, x_shape},
+                       {5U, DType::F32, TensorRole::Input, x_shape},
+                       {6U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::RotaryApply, {1U, 2U, 3U}, {4U},
+       {Attribute::u64(AttrKey::RotaryLayout,
+                       static_cast<std::uint64_t>(
+                           half_split ? dif::ir::RotaryLayout::HalfSplit
+                                      : dif::ir::RotaryLayout::Interleaved))}},
+      {2U, Opcode::MseLoss, {4U, 5U}, {6U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(x_shape, 409U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor(table, 419U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor(table, 421U, 1.0F));
+  c.inputs.emplace(5U, f32_tensor(x_shape, 431U, 1.0F));
+  c.loss = 6U;
+  c.targets = {1U};
+  return c;
+}
+
 // The index and permutation operations a denoiser carries. Each produces
 // several outputs, so each also exercises the reverse sweep collecting a
 // gradient per output: the outputs are summed elementwise before the loss, so
@@ -964,6 +1037,60 @@ void check_backends(const std::string &label, const Case &c) {
   }
 }
 
+// Runs a program AS WRITTEN on both backends and compares its outputs. Some
+// backward kernels cannot be reached through their own forward in a test: the
+// CUDA shared-vector rms_norm_modulate forward admits only the production
+// 6144-wide BF16 reduction, so a differentiable F32 case cannot execute on
+// CUDA at all. The gradient itself is still checked on the CPU by finite
+// differences; this is what keeps the generated kernel honest alongside it.
+void check_program_backends(const std::string &label, const Program &program,
+                            const dif::runtime::TensorMap &inputs,
+                            const std::vector<std::uint32_t> &outputs) {
+  if (!dif::runtime::cuda_available())
+    return;
+  dif::ir::verify(program);
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  const auto reference =
+      dif::runtime::make_cpu_executor()->run(program, inputs, options);
+  const auto candidate =
+      dif::runtime::make_cuda_executor()->run(program, inputs, options);
+  for (const auto id : outputs) {
+    const auto &expected = reference.outputs.at(id);
+    const auto &actual = candidate.outputs.at(id);
+    double worst = 0.0;
+    double scale = 1.0e-6;
+    for (std::uint64_t index = 0U; index < expected.element_count(); ++index)
+      scale = std::max(scale,
+                       static_cast<double>(std::abs(
+                           dif::runtime::load_float(expected, index))));
+    for (std::uint64_t index = 0U; index < expected.element_count(); ++index)
+      worst = std::max(
+          worst, static_cast<double>(
+                     std::abs(dif::runtime::load_float(expected, index) -
+                              dif::runtime::load_float(actual, index))) /
+                     scale);
+    expect(worst <= 2.0e-5,
+           label + " output " + std::to_string(id) +
+               ": CPU and CUDA differ by " + std::to_string(worst) +
+               " of the range");
+    std::cout << "  " << label << " output " << id << ": backends agree to "
+              << worst << "\n";
+  }
+}
+
+// A gradient whose forward cannot execute on CUDA at the test's shape: the
+// finite-difference check still runs on the CPU, and the generated kernel is
+// covered by check_program_backends instead.
+void run_gradients_only(const std::string &label, const Case &c) {
+  dif::ir::verify(c.program);
+  check_gradients(label, c.program, c.inputs, c.loss, c.targets, 8.0e-3,
+                  3.0e-5 * c.gradient_budget_scale,
+                  3.0e-3 * c.gradient_budget_scale);
+}
+
 void run(const std::string &label, const Case &c) {
   dif::ir::verify(c.program);
   check_gradients(label, c.program, c.inputs, c.loss, c.targets, 8.0e-3,
@@ -1039,6 +1166,45 @@ Case mixed_dtype_rope_case(bool interleaved) {
   return c;
 }
 
+// The shared-vector backward on its own, run on both backends. Its forward
+// cannot reach CUDA at this shape, but the backward operation has no such
+// restriction, so the generated kernel is compared against the CPU reference
+// directly rather than left unexercised.
+void shared_vector_modulate_backend_check() {
+  const std::uint64_t rows = 4U;
+  const std::uint64_t columns = 6U;
+  const std::uint64_t vectors = 2U;
+  const std::vector<std::uint64_t> x_shape{rows, columns};
+  const std::vector<std::uint64_t> vector_shape{vectors, columns};
+  const std::vector<std::uint64_t> delta_shape{2U, columns};
+  Program program;
+  program.tensors = {{1U, DType::F32, TensorRole::Input, x_shape},
+                     {2U, DType::F32, TensorRole::Input, x_shape},
+                     {3U, DType::F32, TensorRole::Input, {columns}},
+                     {4U, DType::F32, TensorRole::Input, vector_shape},
+                     {5U, DType::F32, TensorRole::Input, delta_shape},
+                     {6U, DType::F32, TensorRole::Output, x_shape},
+                     {7U, DType::F32, TensorRole::Output, {columns}},
+                     {8U, DType::F32, TensorRole::Output, vector_shape},
+                     {9U, DType::F32, TensorRole::Output, delta_shape}};
+  program.operations = {
+      {1U, Opcode::RmsNormModulateBackward, {1U, 2U, 3U, 4U, 5U},
+       {6U, 7U, 8U, 9U},
+       {Attribute::u64(AttrKey::ModulationLayout,
+                       static_cast<std::uint64_t>(
+                           dif::ir::ModulationLayout::SharedVectorDelta)),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-5),
+        Attribute::f64(AttrKey::WeightOffset, 1.0)}}};
+  dif::runtime::TensorMap inputs;
+  inputs.emplace(1U, f32_tensor(x_shape, 461U, 1.0F));
+  inputs.emplace(2U, f32_tensor(x_shape, 463U, 1.0F));
+  inputs.emplace(3U, f32_tensor({columns}, 467U, 0.5F));
+  inputs.emplace(4U, f32_tensor(vector_shape, 479U, 0.5F));
+  inputs.emplace(5U, f32_tensor(delta_shape, 487U, 0.5F));
+  check_program_backends("shared vector modulate backward", program, inputs,
+                         {6U, 7U, 8U, 9U});
+}
+
 } // namespace
 
 int main() {
@@ -1055,6 +1221,15 @@ int main() {
   run("conv2d strided", conv2d_case(2U, 1U, 1U));
   run("conv2d unpadded", conv2d_case(1U, 0U, 1U));
   run("conv2d grouped", conv2d_case(1U, 1U, 2U));
+  run_gradients_only("shared vector modulate",
+                     shared_vector_modulate_case(4U));
+  run_gradients_only("shared vector modulate broadcast",
+                     shared_vector_modulate_case(2U));
+  shared_vector_modulate_backend_check();
+  run("rotary apply half split", rotary_apply_case(true, 4U));
+  run("rotary apply interleaved", rotary_apply_case(false, 4U));
+  run("rotary apply partial", rotary_apply_case(false, 3U));
+  run("rotary apply half split partial", rotary_apply_case(true, 3U));
   run("select row chunks", select_row_chunks_case(2U));
   run("select row chunks four", select_row_chunks_case(4U));
   run("indexed update rows", indexed_update_rows_case());

@@ -291,8 +291,38 @@ AutodiffResult differentiate(const ir::Program &forward,
           ir::AttrKey::ModulationLayout,
           static_cast<std::uint64_t>(
               ir::ModulationLayout::ExplicitScaleShift)));
-      if (layout == ir::ModulationLayout::SharedVectorDelta)
-        fail("shared-vector rms_norm_modulate backward is not implemented");
+      if (layout == ir::ModulationLayout::SharedVectorDelta) {
+        // x, weight, vector, delta -- and all four learn. The vector feeds
+        // both the scale and the shift, so one backward operation produces
+        // every gradient rather than the reductions each recomputing the row
+        // statistic they share.
+        const auto x = operation.inputs[0];
+        const auto weight = operation.inputs[1];
+        const auto vector = operation.inputs[2];
+        const auto delta = operation.inputs[3];
+        const auto grad_input = add_tensor(*result.program.tensor(x));
+        const auto grad_weight = add_tensor(*result.program.tensor(weight));
+        const auto grad_vector = add_tensor(*result.program.tensor(vector));
+        const auto grad_delta = add_tensor(*result.program.tensor(delta));
+        add_operation(
+            ir::Opcode::RmsNormModulateBackward,
+            {grad_output, x, weight, vector, delta},
+            {grad_input, grad_weight, grad_vector, grad_delta},
+            {ir::Attribute::u64(
+                 ir::AttrKey::ModulationLayout,
+                 static_cast<std::uint64_t>(
+                     ir::ModulationLayout::SharedVectorDelta)),
+             ir::Attribute::f64(ir::AttrKey::Epsilon,
+                                operation.f64(ir::AttrKey::Epsilon, 1.0e-5)),
+             ir::Attribute::f64(
+                 ir::AttrKey::WeightOffset,
+                 operation.f64(ir::AttrKey::WeightOffset, 0.0))});
+        accumulate(x, grad_input);
+        accumulate(weight, grad_weight);
+        accumulate(vector, grad_vector);
+        accumulate(delta, grad_delta);
+        break;
+      }
       const bool weighted = operation.inputs.size() == 4U;
       const auto x = operation.inputs[0];
       const auto scale = operation.inputs[weighted ? 2U : 1U];
@@ -612,6 +642,21 @@ AutodiffResult differentiate(const ir::Program &forward,
                       {grad_bias});
         accumulate(operation.inputs[2], grad_bias);
       }
+      break;
+    }
+    case ir::Opcode::RotaryApply: {
+      // The cos/sin tables are position tables, not learnable values; only
+      // the rotated activation carries a gradient. The pairing convention is
+      // stamped from the forward so the two cannot unrotate different ways.
+      const auto x = operation.inputs[0];
+      const auto grad_input = add_tensor(*result.program.tensor(x));
+      std::vector<ir::Attribute> attributes;
+      if (const auto *layout = operation.find(ir::AttrKey::RotaryLayout))
+        attributes.push_back(*layout);
+      add_operation(ir::Opcode::RotaryApplyBackward,
+                    {grad_output, operation.inputs[1], operation.inputs[2]},
+                    {grad_input}, std::move(attributes));
+      accumulate(x, grad_input);
       break;
     }
     case ir::Opcode::SelectRowChunks: {

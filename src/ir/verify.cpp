@@ -210,6 +210,28 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::RotaryApplyBackward) {
+    expect_counts(op, 3, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &cos = tensor_or_fail(program, op.inputs[1], op);
+    const auto &sin = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(grad_output, grad_input, op);
+    check_accumulator_f32(op);
+    // The tables are commonly F32 under BF16 activations, exactly as the
+    // forward admits them.
+    if (!supported_float(grad_output.dtype) ||
+        grad_output.dims.size() != 4U ||
+        (cos.dtype != grad_output.dtype && cos.dtype != DType::F32) ||
+        sin.dtype != cos.dtype || cos.dims != sin.dims ||
+        cos.dims.size() != 3U || cos.dims[0] != grad_output.dims[0] ||
+        cos.dims[1] != grad_output.dims[1] ||
+        2U * cos.dims[2] > grad_output.dims[3])
+      fail("rotary_apply_backward requires float [B,S,H,D] and cos/sin "
+           "[B,S,pairs] with 2*pairs <= D");
+    return;
+  }
+
   if (op.opcode == Opcode::RotaryApply) {
     expect_counts(op, 3, 1);
     const auto &input = tensor_or_fail(program, op.inputs[0], op);
@@ -1782,6 +1804,44 @@ void verify_operation(const Program &program, const Operation &op) {
   }
 
   if (op.opcode == Opcode::RmsNormModulateBackward) {
+    // The backward branches on the same layout attribute the forward does,
+    // because they describe one operation and must not drift apart.
+    const auto modulation_layout = static_cast<ModulationLayout>(op.u64(
+        AttrKey::ModulationLayout,
+        static_cast<std::uint64_t>(ModulationLayout::ExplicitScaleShift)));
+    if (modulation_layout == ModulationLayout::SharedVectorDelta) {
+      expect_counts(op, 5, 4);
+      const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+      const auto &x = tensor_or_fail(program, op.inputs[1], op);
+      const auto &weight = tensor_or_fail(program, op.inputs[2], op);
+      const auto &vector = tensor_or_fail(program, op.inputs[3], op);
+      const auto &delta = tensor_or_fail(program, op.inputs[4], op);
+      const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+      const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);
+      const auto &grad_vector = tensor_or_fail(program, op.outputs[2], op);
+      const auto &grad_delta = tensor_or_fail(program, op.outputs[3], op);
+      same_shape_dtype(x, grad_output, op);
+      same_shape_dtype(x, grad_input, op);
+      same_shape_dtype(weight, grad_weight, op);
+      same_shape_dtype(vector, grad_vector, op);
+      same_shape_dtype(delta, grad_delta, op);
+      check_accumulator_f32(op);
+      if (!supported_float(x.dtype) || x.dims.size() != 2U ||
+          weight.dtype != x.dtype || weight.dims.size() != 1U ||
+          weight.dims[0] != x.dims[1] || vector.dtype != x.dtype ||
+          vector.dims.size() != 2U || vector.dims[1] != x.dims[1] ||
+          vector.dims[0] == 0U || x.dims[0] % vector.dims[0] != 0U ||
+          delta.dtype != x.dtype || delta.dims.size() != 2U ||
+          delta.dims[0] != 2U || delta.dims[1] != x.dims[1])
+        fail("shared-vector rms_norm_modulate_backward requires x [rows,"
+             "hidden], weight [hidden], vector [batch,hidden], delta "
+             "[2,hidden]");
+      if (!(op.f64(AttrKey::Epsilon, 1.0e-5) > 0.0) ||
+          !std::isfinite(op.f64(AttrKey::WeightOffset, 0.0)))
+        fail("shared-vector rms_norm_modulate_backward has invalid norm "
+             "attributes");
+      return;
+    }
     const bool weighted = op.inputs.size() == 4U;
     if ((op.inputs.size() != 3U && op.inputs.size() != 4U) ||
         op.outputs.size() != op.inputs.size())

@@ -995,6 +995,42 @@ Program batch11_program(std::string_view which) {
                            {Attribute::f64(AttrKey::Epsilon, 1.0e-5)}}};
     return program;
   }
+  if (which == "rotary_apply_backward_half_split" ||
+      which == "rotary_apply_backward_interleaved") {
+    // F32 tables under BF16 activations, the shape the frontends use.
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 4, 2, 8}},
+                       {2, DType::F32, TensorRole::Input, {1, 4, 3}},
+                       {3, DType::F32, TensorRole::Input, {1, 4, 3}},
+                       {4, DType::BF16, TensorRole::Output, {1, 4, 2, 8}}};
+    program.operations = {
+        {1, Opcode::RotaryApplyBackward, {1, 2, 3}, {4},
+         {Attribute::u64(
+             AttrKey::RotaryLayout,
+             static_cast<std::uint64_t>(
+                 which == "rotary_apply_backward_half_split"
+                     ? RotaryLayout::HalfSplit
+                     : RotaryLayout::Interleaved))}}};
+    return program;
+  }
+  if (which == "rms_norm_modulate_shared_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Constant, {8}},
+                       {4, DType::BF16, TensorRole::Input, {2, 8}},
+                       {5, DType::BF16, TensorRole::Constant, {2, 8}},
+                       {6, DType::BF16, TensorRole::Output, {4, 8}},
+                       {7, DType::BF16, TensorRole::Output, {8}},
+                       {8, DType::BF16, TensorRole::Output, {2, 8}},
+                       {9, DType::BF16, TensorRole::Output, {2, 8}}};
+    program.operations = {
+        {1, Opcode::RmsNormModulateBackward, {1, 2, 3, 4, 5}, {6, 7, 8, 9},
+         {Attribute::u64(
+              AttrKey::ModulationLayout,
+              static_cast<std::uint64_t>(ModulationLayout::SharedVectorDelta)),
+          Attribute::f64(AttrKey::Epsilon, 1.0e-5),
+          Attribute::f64(AttrKey::WeightOffset, 1.0)}}};
+    return program;
+  }
   if (which == "select_row_chunks_backward" ||
       which == "select_row_chunks_backward_four") {
     const std::uint64_t chunks =
@@ -1303,6 +1339,9 @@ std::vector<Case> corpus() {
       {"channel_rms_norm_backward", [] { return batch11_program("channel_rms_norm_backward"); }},
       {"channel_rms_norm_backward_frozen", [] { return batch11_program("channel_rms_norm_backward_frozen"); }},
       {"pad_reflect_backward", [] { return batch11_program("pad_reflect_backward"); }},
+      {"rotary_apply_backward_half_split", [] { return batch11_program("rotary_apply_backward_half_split"); }},
+      {"rotary_apply_backward_interleaved", [] { return batch11_program("rotary_apply_backward_interleaved"); }},
+      {"rms_norm_modulate_shared_backward", [] { return batch11_program("rms_norm_modulate_shared_backward"); }},
       {"select_row_chunks_backward", [] { return batch11_program("select_row_chunks_backward"); }},
       {"select_row_chunks_backward_four", [] { return batch11_program("select_row_chunks_backward_four"); }},
       {"indexed_update_rows_backward", [] { return batch11_program("indexed_update_rows_backward"); }},

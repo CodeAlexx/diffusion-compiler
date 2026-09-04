@@ -1176,6 +1176,47 @@ void emit_layer_norm_modulate_backward(std::ostringstream &out,
   out << std::setprecision(9);
 }
 
+void emit_rotary_apply_backward(std::ostringstream &out,
+                                const ir::Program &program,
+                                const ir::Operation &op) {
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto *table = program.tensor(op.inputs[1]);
+  const auto text = [](std::uint64_t value) { return std::to_string(value); };
+  const auto dim = grad_output->dims[3];
+  const auto pairs = table->dims[2];
+  const bool half_split =
+      op.u64(ir::AttrKey::RotaryLayout, 0U) ==
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit);
+  // HalfSplit pairs lane p with p+pairs; Interleaved pairs 2p with 2p+1.
+  // Both are generated, so the kernel carries no runtime layout branch.
+  const std::string pair_index =
+      half_split ? "d < " + text(pairs) + "ULL ? d : d - " + text(pairs) + "ULL"
+                 : "d / 2ULL";
+  const std::string is_leading =
+      half_split ? "d < " + text(pairs) + "ULL" : "(d % 2ULL) == 0ULL";
+  const std::string second_offset =
+      half_split ? "d + " + text(pairs) + "ULL" : "d + 1ULL";
+  const std::string first_offset =
+      half_split ? "d - " + text(pairs) + "ULL" : "d - 1ULL";
+  out << render_kernel_template(
+      "rotary_apply_backward",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(grad_output->dtype)},
+       {"table", typed_scalar(table->dtype)},
+       {"count", text(grad_output->element_count())},
+       {"dim", text(dim)},
+       {"heads", text(grad_output->dims[2])},
+       {"pairs", text(pairs)},
+       {"rotated", text(2U * pairs)},
+       {"pair_index", pair_index},
+       {"is_leading", is_leading},
+       {"second_offset", second_offset},
+       {"first_offset", first_offset},
+       {"load", typed_load(grad_output->dtype)},
+       {"table_load", typed_load(table->dtype)},
+       {"store", typed_store(grad_output->dtype)}});
+}
+
 void emit_select_row_chunks_backward(std::ostringstream &out,
                                      const ir::Program &program,
                                      const ir::Operation &op) {
@@ -2463,6 +2504,35 @@ void emit_rms_norm_backward(std::ostringstream &out,
   out << std::setprecision(9) << std::defaultfloat;
 }
 
+void emit_rms_norm_modulate_shared_backward(std::ostringstream &out,
+                                            const ir::Program &program,
+                                            const ir::Operation &op) {
+  const auto *x = program.tensor(op.inputs[1]);
+  const auto *vector = program.tensor(op.inputs[3]);
+  const auto *delta = program.tensor(op.inputs[4]);
+  const auto rows = x->dims[0];
+  const auto columns = x->dims[1];
+  const auto vectors = vector->dims[0];
+  std::ostringstream epsilon;
+  epsilon << std::scientific << std::setprecision(9)
+          << static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  std::ostringstream offset;
+  offset << std::scientific << std::setprecision(9)
+         << static_cast<float>(op.f64(ir::AttrKey::WeightOffset, 0.0));
+  out << render_kernel_template(
+      "rms_norm_modulate_shared_backward",
+      {{"function", function_name(op)},
+       {"count", std::to_string(x->element_count())},
+       {"columns", std::to_string(columns)},
+       {"rows", std::to_string(rows)},
+       {"rows_per_vector", std::to_string(rows / vectors)},
+       {"vector_count", std::to_string(vector->element_count())},
+       {"delta_count", std::to_string(delta->element_count())},
+       {"epsilon", epsilon.str()},
+       {"offset", offset.str()}});
+  out << std::setprecision(9) << std::defaultfloat;
+}
+
 void emit_rms_norm_modulate_backward(std::ostringstream &out,
                                      const ir::Program &program,
                                      const ir::Operation &op) {
@@ -3562,7 +3632,14 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       emit_rms_norm_backward(source, program, op);
       break;
     case ir::Opcode::RmsNormModulateBackward:
-      emit_rms_norm_modulate_backward(source, program, op);
+      if (static_cast<ir::ModulationLayout>(
+              op.u64(ir::AttrKey::ModulationLayout,
+                     static_cast<std::uint64_t>(
+                         ir::ModulationLayout::ExplicitScaleShift))) ==
+          ir::ModulationLayout::SharedVectorDelta)
+        emit_rms_norm_modulate_shared_backward(source, program, op);
+      else
+        emit_rms_norm_modulate_backward(source, program, op);
       break;
     case ir::Opcode::SwiGluBackward:
       emit_swiglu_backward(source, program, op);
@@ -3578,6 +3655,9 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::LayerNormModulateBackward:
       emit_layer_norm_modulate_backward(source, program, op);
+      break;
+    case ir::Opcode::RotaryApplyBackward:
+      emit_rotary_apply_backward(source, program, op);
       break;
     case ir::Opcode::SelectRowChunksBackward:
       emit_select_row_chunks_backward(source, program, op);

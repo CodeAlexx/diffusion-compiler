@@ -800,6 +800,115 @@ void rotary_apply(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+void rms_norm_modulate_shared_backward(const ir::Operation &op,
+                                       TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &x = tensors.at(op.inputs[1]);
+  const auto &weight = tensors.at(op.inputs[2]);
+  const auto &vector = tensors.at(op.inputs[3]);
+  const auto &delta = tensors.at(op.inputs[4]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  auto &grad_weight = tensors.at(op.outputs[1]);
+  auto &grad_vector = tensors.at(op.outputs[2]);
+  auto &grad_delta = tensors.at(op.outputs[3]);
+  const auto rows = x.dims[0];
+  const auto columns = x.dims[1];
+  const auto vectors = vector.dims[0];
+  const auto rows_per_vector = rows / vectors;
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto offset =
+      static_cast<float>(op.f64(ir::AttrKey::WeightOffset, 0.0));
+  std::vector<float> weight_gradient(static_cast<std::size_t>(columns), 0.0F);
+  std::vector<float> vector_gradient(
+      static_cast<std::size_t>(vector.element_count()), 0.0F);
+  std::vector<float> delta_gradient(
+      static_cast<std::size_t>(delta.element_count()), 0.0F);
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    const auto base = row * columns;
+    const auto vbase = row / rows_per_vector * columns;
+    float squared = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto value = load_float(x, base + column);
+      squared += value * value;
+    }
+    const auto inverse =
+        1.0F / std::sqrt(squared / static_cast<float>(columns) + epsilon);
+    float dot = 0.0F;
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto modulated =
+          load_float(grad_output, base + column) *
+          (1.0F + load_float(vector, vbase + column) +
+           load_float(delta, column));
+      dot += modulated * (load_float(weight, column) + offset) *
+             load_float(x, base + column);
+    }
+    for (std::uint64_t column = 0U; column < columns; ++column) {
+      const auto upstream = load_float(grad_output, base + column);
+      const auto modulated =
+          upstream * (1.0F + load_float(vector, vbase + column) +
+                      load_float(delta, column));
+      const auto value = load_float(x, base + column);
+      const auto weighted = modulated * (load_float(weight, column) + offset);
+      store_float(grad_input, base + column,
+                  weighted * inverse - value * inverse * inverse * inverse *
+                                           dot / static_cast<float>(columns));
+      const auto rms = value * inverse;
+      const auto normalized = rms * (load_float(weight, column) + offset);
+      weight_gradient[static_cast<std::size_t>(column)] += modulated * rms;
+      // The vector feeds BOTH the scale and the shift.
+      vector_gradient[static_cast<std::size_t>(vbase + column)] +=
+          upstream * (normalized + 1.0F);
+      delta_gradient[static_cast<std::size_t>(column)] +=
+          upstream * normalized;
+      delta_gradient[static_cast<std::size_t>(columns + column)] += upstream;
+    }
+  }
+  for (std::uint64_t column = 0U; column < columns; ++column)
+    store_float(grad_weight, column,
+                weight_gradient[static_cast<std::size_t>(column)]);
+  for (std::uint64_t index = 0U; index < vector.element_count(); ++index)
+    store_float(grad_vector, index,
+                vector_gradient[static_cast<std::size_t>(index)]);
+  for (std::uint64_t index = 0U; index < delta.element_count(); ++index)
+    store_float(grad_delta, index,
+                delta_gradient[static_cast<std::size_t>(index)]);
+}
+
+void rotary_apply_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &cosine = tensors.at(op.inputs[1]);
+  const auto &sine = tensors.at(op.inputs[2]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto batch = grad_output.dims[0];
+  const auto sequence = grad_output.dims[1];
+  const auto heads = grad_output.dims[2];
+  const auto dim = grad_output.dims[3];
+  const auto pairs = cosine.dims[2];
+  const bool half_split =
+      op.u64(ir::AttrKey::RotaryLayout, 0U) ==
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit);
+  for (std::uint64_t b = 0; b < batch; ++b)
+    for (std::uint64_t token = 0; token < sequence; ++token) {
+      const auto table_base = (b * sequence + token) * pairs;
+      for (std::uint64_t head = 0; head < heads; ++head) {
+        const auto base = ((b * sequence + token) * heads + head) * dim;
+        for (std::uint64_t pair = 0; pair < pairs; ++pair) {
+          const auto first_index = half_split ? pair : 2U * pair;
+          const auto second_index = half_split ? pair + pairs : 2U * pair + 1U;
+          const auto c = load_float(cosine, table_base + pair);
+          const auto s = load_float(sine, table_base + pair);
+          const auto first = load_float(grad_output, base + first_index);
+          const auto second = load_float(grad_output, base + second_index);
+          // The transpose of (c,-s; s,c).
+          store_float(grad_input, base + first_index, first * c + second * s);
+          store_float(grad_input, base + second_index, second * c - first * s);
+        }
+        for (std::uint64_t d = 2U * pairs; d < dim; ++d)
+          store_float(grad_input, base + d, load_float(grad_output, base + d));
+      }
+    }
+}
+
 void boolean_mask_to_bias(const ir::Operation &op, TensorMap &tensors) {
   const auto &mask = tensors.at(op.inputs[0]);
   auto &out = tensors.at(op.outputs[0]);
@@ -3684,6 +3793,9 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
     case ir::Opcode::GroupNormBackwardAffine:
       group_norm_backward_affine(op, tensors);
       break;
+    case ir::Opcode::RotaryApplyBackward:
+      rotary_apply_backward(op, tensors);
+      break;
     case ir::Opcode::SelectRowChunksBackward:
       select_row_chunks_backward(op, tensors);
       break;
@@ -3807,7 +3919,15 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       rms_norm_backward(op, tensors);
       break;
     case ir::Opcode::RmsNormModulateBackward:
-      rms_norm_modulate_backward(op, tensors);
+      // One opcode, two layouts, exactly as the forward has.
+      if (static_cast<ir::ModulationLayout>(
+              op.u64(ir::AttrKey::ModulationLayout,
+                     static_cast<std::uint64_t>(
+                         ir::ModulationLayout::ExplicitScaleShift))) ==
+          ir::ModulationLayout::SharedVectorDelta)
+        rms_norm_modulate_shared_backward(op, tensors);
+      else
+        rms_norm_modulate_backward(op, tensors);
       break;
     case ir::Opcode::SwiGluBackward:
       swiglu_backward(op, tensors);

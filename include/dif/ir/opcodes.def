@@ -219,3 +219,7 @@ DIF_OPCODE(SelectRowChunksBackward, 94, "select_row_chunks_backward", None)
 DIF_OPCODE(IndexedUpdateRowsBackward, 95, "indexed_update_rows_backward", None)
 DIF_OPCODE(H3InterleaveQkvWeight, 96, "h3_interleave_qkv_weight", DataMovement)
 DIF_OPCODE(H3AdaLNSelectBackward, 97, "h3_adaln_select_backward", None)
+// Gradient of the rotary embedding: the rotation transpose. The pairing
+// convention travels on the operation, because a gradient that unrotates the
+// other way is silently wrong.
+DIF_OPCODE(RotaryApplyBackward, 98, "rotary_apply_backward", None)
