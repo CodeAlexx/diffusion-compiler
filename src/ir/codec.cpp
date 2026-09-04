@@ -126,6 +126,25 @@ bool Attribute::as_bool() const {
   return bits != 0U;
 }
 
+std::uint64_t group_norm_block_size(const Operation &operation,
+                                    const TensorDesc &input) {
+  if (const auto *explicit_size = operation.find(AttrKey::BlockSize))
+    return explicit_size->as_u64();
+  if (input.dims.size() < 2U)
+    return 256U;
+  const auto groups = operation.u64(AttrKey::Groups, 1U);
+  if (groups == 0U || input.dims[1] % groups != 0U)
+    return 256U;
+  std::uint64_t elements = input.dims[1] / groups;
+  for (std::size_t axis = 2U; axis < input.dims.size(); ++axis)
+    elements *= input.dims[axis];
+  if (elements >= 65536U)
+    return 1024U;
+  if (elements >= 16384U)
+    return 512U;
+  return 256U;
+}
+
 std::size_t dtype_size(DType dtype) {
   switch (dtype) {
   case DType::F32:
@@ -208,6 +227,13 @@ bool Operation::boolean(AttrKey key, bool fallback) const {
 }
 
 const TensorDesc *Program::tensor(std::uint32_t id) const {
+  // Frontends hand ids out sequentially, so the descriptor is almost always
+  // at id - 1. Verification and lowering look up once per operand, which
+  // makes a plain scan quadratic in the program size: an SDXL text tower
+  // (1036 tensors, 517 operations) spent fifteen seconds in here. The scan
+  // stays as the fallback for programs whose ids are not sequential.
+  if (id != 0U && id <= tensors.size() && tensors[id - 1U].id == id)
+    return &tensors[id - 1U];
   const auto it = std::find_if(tensors.begin(), tensors.end(),
                                [id](const TensorDesc &desc) { return desc.id == id; });
   return it == tensors.end() ? nullptr : &*it;

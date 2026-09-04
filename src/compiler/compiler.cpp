@@ -318,7 +318,7 @@ void emit_group_norm(std::ostringstream &out, const ir::Program &program,
   for (std::size_t axis = 2U; axis < input->dims.size(); ++axis)
     inner *= input->dims[axis];
   const auto elements = channels_per_group * inner;
-  const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  const auto block = ir::group_norm_block_size(op, *input);
   const auto epsilon =
       static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
   std::ostringstream epsilon_literal;

@@ -7021,10 +7021,19 @@ void write_text(const std::filesystem::path &path, const std::string &text) {
     fail("cannot write PTX cache file: " + path.string());
 }
 
-std::string compile_ptx(const std::string &source, int major, int minor,
-                        const std::filesystem::path &cache_directory,
-                        std::string &source_hash) {
-  // The cache key covers everything that changes the PTX: the source, the
+// Compile the generated CUDA to a module image for this exact GPU and cache
+// that image.
+//
+// Caching PTX instead leaves the driver to compile it to machine code at
+// every cuModuleLoadDataEx, which for a program carrying a thousand-odd
+// kernels costs seconds of preparation on every single run. Asking NVRTC for
+// a cubin (a real sm_XX target rather than a virtual compute_XX one) moves
+// that work into the cache. Toolkits or architectures that cannot produce a
+// cubin fall back to PTX, which the driver still accepts.
+std::string compile_module(const std::string &source, int major, int minor,
+                           const std::filesystem::path &cache_directory,
+                           std::string &source_hash) {
+  // The cache key covers everything that changes the image: the source, the
   // architecture, the NVRTC version (two toolkits coexist on this host), and
   // the exact option list (Flame lesson: flags are part of the numerics
   // contract; a cache keyed on name/arch alone served stale PTX).
@@ -7032,11 +7041,11 @@ std::string compile_ptx(const std::string &source, int major, int minor,
   int nvrtc_minor = 0;
   (void)nvrtcVersion(&nvrtc_major, &nvrtc_minor);
   const std::string key_material =
-      source + "\ncompute_" + std::to_string(major) + std::to_string(minor) +
+      source + "\nsm_" + std::to_string(major) + std::to_string(minor) +
       "\nnvrtc=" + std::to_string(nvrtc_major) + "." +
       std::to_string(nvrtc_minor) +
       "\noptions=--std=c++17;--gpu-architecture;--include-path;--restrict" +
-      "\nnvrtc-v2";
+      "\nnvrtc-v3-cubin";
   const auto key_bytes = std::span<const std::uint8_t>(
       reinterpret_cast<const std::uint8_t *>(key_material.data()), key_material.size());
   source_hash = hex_digest(sha256(key_bytes));
@@ -7044,8 +7053,12 @@ std::string compile_ptx(const std::string &source, int major, int minor,
                              ? std::filesystem::temp_directory_path() / "dif-ptx-cache"
                              : cache_directory;
   std::filesystem::create_directories(directory);
+  const auto cubin_file = directory / (source_hash + ".cubin");
+  auto cached = read_text(cubin_file);
+  if (!cached.empty())
+    return cached;
   const auto cache_file = directory / (source_hash + ".ptx");
-  auto cached = read_text(cache_file);
+  cached = read_text(cache_file);
   if (!cached.empty())
     return cached;
 
@@ -7053,7 +7066,7 @@ std::string compile_ptx(const std::string &source, int major, int minor,
   check(nvrtcCreateProgram(&program, source.c_str(), "candidate.cu", 0, nullptr,
                            nullptr),
         "nvrtcCreateProgram");
-  const std::string architecture = "--gpu-architecture=compute_" +
+  const std::string architecture = "--gpu-architecture=sm_" +
                                    std::to_string(major) + std::to_string(minor);
   const std::string include_path =
       std::string("--include-path=") + DIF_CUDA_INCLUDE_DIR;
@@ -7069,6 +7082,15 @@ std::string compile_ptx(const std::string &source, int major, int minor,
   if (compile_result != NVRTC_SUCCESS) {
     (void)nvrtcDestroyProgram(&program);
     fail("NVRTC compilation failed: " + log);
+  }
+  std::size_t cubin_size = 0;
+  if (nvrtcGetCUBINSize(program, &cubin_size) == NVRTC_SUCCESS &&
+      cubin_size != 0U) {
+    std::string cubin(cubin_size, '\0');
+    check(nvrtcGetCUBIN(program, cubin.data()), "nvrtcGetCUBIN");
+    check(nvrtcDestroyProgram(&program), "nvrtcDestroyProgram");
+    write_text(cubin_file, cubin);
+    return cubin;
   }
   std::size_t ptx_size = 0;
   check(nvrtcGetPTXSize(program, &ptx_size), "nvrtcGetPTXSize");
@@ -7609,16 +7631,43 @@ private:
 void upload_resident_constants(const ir::Program &program,
                                const TensorMap &inputs,
                                DeviceBuffers &buffers, CUstream stream) {
+  std::vector<std::uint32_t> resident;
+  std::size_t largest = 0U;
   for (const auto &desc : program.tensors) {
-    if (!desc.has_role(ir::TensorRole::Constant))
+    if (!desc.has_role(ir::TensorRole::Constant) ||
+        desc.has_role(ir::TensorRole::Streamed) || !buffers.contains(desc.id))
       continue;
-    if (desc.has_role(ir::TensorRole::Streamed))
-      continue;
-    if (!buffers.contains(desc.id))
-      continue;
-    const auto &tensor = inputs.at(desc.id);
-    check(counted_memcpy_htod(buffers.at(desc.id), tensor.data(),
-                            tensor.byte_size(), stream),
+    resident.push_back(desc.id);
+    largest = std::max(largest, inputs.at(desc.id).byte_size());
+  }
+  if (resident.empty())
+    return;
+  // Ask the kernel to read every mapped constant ahead of the copies. The
+  // driver's copy out of a mapping otherwise faults the file in one page at
+  // a time, which on a cold checkpoint costs seconds per gigabyte; issuing
+  // the read-ahead first lets the drive stream while earlier tensors upload.
+  // Weights already in the page cache are untouched by this.
+  for (const auto id : resident) {
+    const auto &tensor = inputs.at(id);
+    if (tensor.is_mapped())
+      tensor.prefetch_mapped_pages();
+  }
+  // The copies themselves are plain reads out of the mapping. Three
+  // alternatives measured worse on this host and are recorded so they are
+  // not retried for a one-shot run:
+  //   * staging every weight through a pinned buffer adds a host copy for no
+  //     gain once the pages are warm (8.4 s against 6.6 s);
+  //   * O_DIRECT reads bypass the page cache, so the next run re-reads the
+  //     whole checkpoint from the drive in many small pieces (24.5 s);
+  //   * page-locking the mapping with cuMemHostRegister, which is what a
+  //     long-lived server wants, costs more to fault and pin than it saves
+  //     on a single upload (18-22 s).
+  // A process that prepares once and samples many times should page-lock;
+  // that belongs to the caller's lifetime policy, not to this copy.
+  for (const auto id : resident) {
+    const auto &tensor = inputs.at(id);
+    check(counted_memcpy_htod(buffers.at(id), tensor.data(),
+                              tensor.byte_size(), stream),
           "cuMemcpyHtoDAsync");
   }
 }
@@ -7713,6 +7762,7 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     shared = block * sizeof(float);
   } else if (op.opcode == ir::Opcode::GroupNorm) {
     const auto *input = program.tensor(op.inputs[0]);
+    block = static_cast<unsigned>(ir::group_norm_block_size(op, *input));
     grid = static_cast<unsigned>(input->dims[0] *
                                  op.u64(ir::AttrKey::Groups, 1U));
     shared = 2U * block * sizeof(float);
@@ -9179,9 +9229,23 @@ public:
              std::to_string(target_profile_.compute_minor) +
              "); see difopt --formats-table");
     }
-    const auto ptx = compile_ptx(generated.source, major, minor,
+    // Preparation phase clock. Which phase dominates is not obvious from
+    // outside (the CUDA API accounts for well under a fifth of it on a large
+    // program), so the numbers are reported when profiling is on.
+    const auto phase_start = std::chrono::steady_clock::now();
+    auto phase_since = [](std::chrono::steady_clock::time_point since) {
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - since)
+          .count();
+    };
+    auto phase_mark = phase_start;
+    const auto ptx = compile_module(generated.source, major, minor,
                                  options.cache_directory, source_hash_);
+    prepare_phase_compile_ms_ = phase_since(phase_mark);
+    phase_mark = std::chrono::steady_clock::now();
     module_ = std::make_unique<Module>(ptx);
+    prepare_phase_module_ms_ = phase_since(phase_mark);
+    phase_mark = std::chrono::steady_clock::now();
     if (!materialized_f32_attention_plans_.empty())
       check(cuModuleGetFunction(
                 &materialized_f32_attention_softmax_, module_->get(),
@@ -9816,14 +9880,21 @@ public:
         const auto *input = program_.tensor(plan_operation.inputs.at(0));
         const auto *weight = program_.tensor(plan_operation.inputs.at(1));
         const auto *output = program_.tensor(plan_operation.outputs.at(0));
+        // Two Linear operations with the same dtype, shape and epilogue take
+        // the same cuBLASLt plan. Sharing used to be BF16-only, which made an
+        // F16 model build one plan per operation: an SDXL UNet paid 743
+        // heuristic queries where 40 shapes exist. The key carries the dtype,
+        // so BF16 programs keep the exact key text they had.
         const auto shareable = allow_restore && input && weight && output &&
-                               input->dtype == ir::DType::BF16;
+                               (input->dtype == ir::DType::BF16 ||
+                                input->dtype == ir::DType::F16);
         std::string key;
         if (shareable) {
           const auto rows = input->dims.at(0);
           const auto inner = input->element_count() / rows;
           const auto width = weight->dims.at(0);
-          key = "bf16|m=" + std::to_string(rows) +
+          key = std::string(ir::dtype_name(input->dtype)) +
+                "|m=" + std::to_string(rows) +
                 "|n=" + std::to_string(width) +
                 "|k=" + std::to_string(inner) +
                 "|bias=" +
@@ -9874,6 +9945,8 @@ public:
       const auto unique_plan_count =
           static_cast<std::uint64_t>(shared_plans.size()) +
           isolated_plan_count;
+      prepare_phase_linear_plans_ms_ = phase_since(phase_mark);
+      phase_mark = std::chrono::steady_clock::now();
       std::cerr << "CUDA_LINEAR_PLAN_POOL operations="
                 << linear_operation_count
                 << " unique=" << unique_plan_count
@@ -10051,7 +10124,11 @@ public:
           std::max<long>(0L, after.ru_majflt - before.ru_majflt));
     }
     const auto resident_h2d_start = std::chrono::steady_clock::now();
+    prepare_phase_rest_ms_ = phase_since(phase_mark);
+    phase_mark = std::chrono::steady_clock::now();
     upload_resident_constants(program_, constants_, buffers_, context_.stream());
+    prepare_phase_issue_ms_ = phase_since(phase_mark);
+    phase_mark = std::chrono::steady_clock::now();
     constexpr std::size_t h3_resident_staging_slots = 2U;
     std::array<std::unique_ptr<PinnedHostWorkspace>,
                h3_resident_staging_slots>
@@ -10285,6 +10362,18 @@ public:
     }
     check(counted_stream_synchronize(context_.stream()),
           "resident constant upload synchronization");
+    prepare_phase_upload_ms_ = phase_since(phase_mark);
+    // Reported on request rather than under profiling, whose per-operation
+    // events change the very thing being measured.
+    if (options.profile_pipeline ||
+        std::getenv("DIF_PREPARE_PHASES") != nullptr)
+      std::cerr << "CUDA_PREPARE_PHASES compile_ms=" << prepare_phase_compile_ms_
+                << " module_load_ms=" << prepare_phase_module_ms_
+                << " linear_plans_ms=" << prepare_phase_linear_plans_ms_
+                << " other_plans_and_alloc_ms=" << prepare_phase_rest_ms_
+                << " weight_read_and_issue_ms=" << prepare_phase_issue_ms_
+                << " weight_upload_ms=" << prepare_phase_upload_ms_
+                << " total_ms=" << phase_since(phase_start) << "\n";
     if (convrot_resident_)
       for (auto &plan : convrot_int8_linear_plans_) {
         plan.weight.discard_mapped_pages();
@@ -12060,6 +12149,12 @@ private:
   double preparation_trace_milliseconds_{};
   double preparation_milliseconds_{};
   double resident_upload_milliseconds_{};
+  double prepare_phase_compile_ms_{};
+  double prepare_phase_module_ms_{};
+  double prepare_phase_linear_plans_ms_{};
+  double prepare_phase_rest_ms_{};
+  double prepare_phase_issue_ms_{};
+  double prepare_phase_upload_ms_{};
   double resident_host_prefault_milliseconds_{};
   double resident_h2d_milliseconds_{};
   std::uint64_t resident_minor_page_faults_{};

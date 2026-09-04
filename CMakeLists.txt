@@ -240,7 +240,8 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   endif()
   if(DIF_ENABLE_CUDNN AND DIF_CUDNN_INCLUDE_DIR AND DIF_CUDNN_LIBRARY)
     target_sources(difcore PRIVATE src/runtime/cudnn_attention.cpp
-                                   src/runtime/cudnn_conv.cpp)
+                                   src/runtime/cudnn_conv.cpp
+                                   src/runtime/cudnn_handle.cpp)
     target_include_directories(
         difcore SYSTEM PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cudnn_frontend/include"
@@ -391,6 +392,9 @@ target_link_libraries(difflux2block PRIVATE difcore)
 add_executable(difsdxlstage tools/difsdxlstage.cpp)
 target_link_libraries(difsdxlstage PRIVATE difcore)
 install(TARGETS difsdxlstage RUNTIME DESTINATION bin)
+
+add_executable(difsdxlsample tools/difsdxlsample.cpp)
+install(TARGETS difsdxlsample RUNTIME DESTINATION bin)
 
 add_executable(difflux2sample tools/difflux2sample.cpp)
 target_link_libraries(difflux2sample PRIVATE difcore)
@@ -602,6 +606,7 @@ target_compile_options(
     $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>)
 target_link_libraries(dif_text PUBLIC difcore)
 target_link_libraries(difflux2sample PRIVATE dif_text)
+target_link_libraries(difsdxlsample PRIVATE dif_text)
 
 add_executable(diftokenize tools/diftokenize.cpp)
 target_link_libraries(diftokenize PRIVATE dif_text)

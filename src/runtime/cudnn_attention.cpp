@@ -1,5 +1,6 @@
 #include "dif/runtime/cudnn_attention.hpp"
 
+#include "dif/runtime/cudnn_handle.hpp"
 #include "dif/support/error.hpp"
 
 #include <cudnn_frontend.h>
@@ -57,8 +58,7 @@ struct CudnnAttentionPlan::Impl {
 
   ~Impl() {
     graph.reset();
-    if (handle)
-      (void)cudnnDestroy(handle);
+    // The handle is shared and outlives the plan.
   }
 };
 
@@ -91,7 +91,8 @@ CudnnAttentionPlan::CudnnAttentionPlan(const ir::TensorDesc &query,
   if (!(scale > 0.0))
     fail("cuDNN attention scale must be positive");
 
-  check(cudnnCreate(&impl_->handle), "cudnnCreate");
+  // Shared per-thread handle: see cudnn_handle.hpp.
+  impl_->handle = shared_cudnn_handle();
   impl_->graph = std::make_shared<fe::graph::Graph>();
   impl_->graph
       ->set_io_data_type(query.dtype == ir::DType::BF16
@@ -275,8 +276,7 @@ struct CudnnAttentionBackwardPlan::Impl {
 
   ~Impl() {
     graph.reset();
-    if (handle)
-      (void)cudnnDestroy(handle);
+    // The handle is shared and outlives the plan.
   }
 };
 
@@ -296,7 +296,8 @@ CudnnAttentionBackwardPlan::CudnnAttentionBackwardPlan(
   if (!(scale > 0.0))
     fail("cuDNN attention backward scale must be positive");
 
-  check(cudnnCreate(&impl_->handle), "cudnnCreate");
+  // Shared per-thread handle: see cudnn_handle.hpp.
+  impl_->handle = shared_cudnn_handle();
   impl_->graph = std::make_shared<fe::graph::Graph>();
   impl_->graph
       ->set_io_data_type(query.dtype == ir::DType::BF16

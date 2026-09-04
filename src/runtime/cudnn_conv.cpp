@@ -1,5 +1,6 @@
 #include "dif/runtime/cudnn_conv.hpp"
 
+#include "dif/runtime/cudnn_handle.hpp"
 #include "dif/support/error.hpp"
 
 #include <cudnn.h>
@@ -55,6 +56,9 @@ struct CudnnConv2dPlan::Impl {
   cudnnConvolutionFwdAlgo_t algorithm{};
   std::size_t workspace{};
   bool biased{};
+  // Shapes and the chosen algorithm, so a library failure names the
+  // convolution instead of only its status.
+  std::string description;
 
   ~Impl() {
     if (convolution)
@@ -67,8 +71,7 @@ struct CudnnConv2dPlan::Impl {
       (void)cudnnDestroyTensorDescriptor(output);
     if (input)
       (void)cudnnDestroyTensorDescriptor(input);
-    if (handle)
-      (void)cudnnDestroy(handle);
+    // The handle is shared and outlives the plan.
   }
 };
 
@@ -85,7 +88,8 @@ CudnnConv2dPlan::CudnnConv2dPlan(
       input.dtype != output.dtype)
     fail("cuDNN Conv2d requires matching NCHW/OIHW rank-4 tensors");
   const auto dtype = data_type(input.dtype);
-  check(cudnnCreate(&impl_->handle), "cudnnCreate Conv2d");
+  // Shared per-thread handle: see cudnn_handle.hpp.
+  impl_->handle = shared_cudnn_handle();
   check(cudnnCreateTensorDescriptor(&impl_->input),
         "cudnnCreateTensorDescriptor Conv2d input");
   check(cudnnCreateTensorDescriptor(&impl_->output),
@@ -158,8 +162,28 @@ CudnnConv2dPlan::CudnnConv2dPlan(
              ? "cuDNN Conv2d has no deterministic algorithm within its workspace limit"
              : "cuDNN Conv2d has no algorithm within its workspace limit");
   impl_->algorithm = selected->algo;
+  // The v7 heuristic returns the math type that belongs with each
+  // algorithm. Applying the algorithm while leaving the descriptor on the
+  // math type used for the query is a parameter mismatch: cuDNN rejects
+  // the launch (a 256-channel 3x3 convolution at 256x256 in BF16 chose an
+  // algorithm wanting default math and failed with BAD_PARAM).
+  check(cudnnSetConvolutionMathType(impl_->convolution, selected->mathType),
+        "cudnnSetConvolutionMathType Conv2d (selected algorithm)");
   impl_->workspace = selected->memory;
   impl_->biased = biased;
+  const auto shape = [](const std::vector<std::uint64_t> &dims) {
+    std::string text = "[";
+    for (std::size_t index = 0; index < dims.size(); ++index)
+      text += (index ? "," : "") + std::to_string(dims[index]);
+    return text + "]";
+  };
+  impl_->description =
+      " input=" + shape(input.dims) + " weight=" + shape(weight.dims) +
+      " output=" + shape(output.dims) + " stride=" + std::to_string(stride_h) +
+      "x" + std::to_string(stride_w) + " pad=" + std::to_string(pad_h) + "x" +
+      std::to_string(pad_w) + " groups=" + std::to_string(groups) +
+      " algorithm=" + std::to_string(static_cast<int>(impl_->algorithm)) +
+      " workspace=" + std::to_string(impl_->workspace);
 }
 
 CudnnConv2dPlan::~CudnnConv2dPlan() = default;
@@ -179,14 +203,15 @@ void CudnnConv2dPlan::execute(std::uintptr_t input, std::uintptr_t weight,
         "cudnnSetStream Conv2d");
   constexpr float one = 1.0F;
   constexpr float zero = 0.0F;
-  check(cudnnConvolutionForward(
-            impl_->handle, &one, impl_->input,
-            reinterpret_cast<const void *>(input), impl_->weight,
-            reinterpret_cast<const void *>(weight), impl_->convolution,
-            impl_->algorithm, reinterpret_cast<void *>(workspace),
-            impl_->workspace, &zero, impl_->output,
-            reinterpret_cast<void *>(output)),
-        "cudnnConvolutionForward Conv2d");
+  const auto status = cudnnConvolutionForward(
+      impl_->handle, &one, impl_->input,
+      reinterpret_cast<const void *>(input), impl_->weight,
+      reinterpret_cast<const void *>(weight), impl_->convolution,
+      impl_->algorithm, reinterpret_cast<void *>(workspace), impl_->workspace,
+      &zero, impl_->output, reinterpret_cast<void *>(output));
+  if (status != CUDNN_STATUS_SUCCESS)
+    fail("cudnnConvolutionForward Conv2d" + impl_->description + ": " +
+         cudnnGetErrorString(status));
   if (impl_->biased)
     check(cudnnAddTensor(impl_->handle, &one, impl_->bias,
                          reinterpret_cast<const void *>(bias), &one,
@@ -216,8 +241,7 @@ struct CudnnConv3dPlan::Impl {
       (void)cudnnDestroyTensorDescriptor(output);
     if (input)
       (void)cudnnDestroyTensorDescriptor(input);
-    if (handle)
-      (void)cudnnDestroy(handle);
+    // The handle is shared and outlives the plan.
   }
 };
 
@@ -235,7 +259,8 @@ CudnnConv3dPlan::CudnnConv3dPlan(
       input.dtype != output.dtype)
     fail("cuDNN Conv3d requires matching NCDHW/OIDHW rank-5 tensors");
   const auto dtype = data_type(input.dtype);
-  check(cudnnCreate(&impl_->handle), "cudnnCreate Conv3d");
+  // Shared per-thread handle: see cudnn_handle.hpp.
+  impl_->handle = shared_cudnn_handle();
   check(cudnnCreateTensorDescriptor(&impl_->input),
         "cudnnCreateTensorDescriptor Conv3d input");
   check(cudnnCreateTensorDescriptor(&impl_->output),
@@ -322,6 +347,13 @@ CudnnConv3dPlan::CudnnConv3dPlan(
              ? "cuDNN Conv3d has no deterministic algorithm within its workspace limit"
              : "cuDNN Conv3d has no algorithm within its workspace limit");
   impl_->algorithm = selected->algo;
+  // The v7 heuristic returns the math type that belongs with each
+  // algorithm. Applying the algorithm while leaving the descriptor on the
+  // math type used for the query is a parameter mismatch: cuDNN rejects
+  // the launch (a 256-channel 3x3 convolution at 256x256 in BF16 chose an
+  // algorithm wanting default math and failed with BAD_PARAM).
+  check(cudnnSetConvolutionMathType(impl_->convolution, selected->mathType),
+        "cudnnSetConvolutionMathType Conv3d (selected algorithm)");
   impl_->workspace = selected->memory;
   impl_->biased = biased;
 }

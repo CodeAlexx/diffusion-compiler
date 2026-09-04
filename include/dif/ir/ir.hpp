@@ -310,6 +310,16 @@ struct Program {
   const TensorDesc *tensor(std::uint32_t id) const;
 };
 
+// Group normalization reduces one block per (batch, group), so a single
+// block covers channels_per_group * trailing elements on its own. A decoder
+// normalizing a megapixel plane therefore leaves a large GPU running a few
+// dozen blocks of 256 threads. Absent an explicit BlockSize, scale the block
+// with the work: measured on an SDXL VAE decode at 1024x1024, a 1024-thread
+// block cut the decode from 341 ms to 250 ms. Small programs keep 256, so
+// their generated source is unchanged.
+std::uint64_t group_norm_block_size(const Operation &operation,
+                                    const TensorDesc &input);
+
 std::size_t dtype_size(DType dtype);
 std::string_view dtype_name(DType dtype);
 std::string_view opcode_name(Opcode opcode);
