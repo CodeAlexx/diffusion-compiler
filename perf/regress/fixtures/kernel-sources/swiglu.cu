@@ -46,9 +46,17 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
+// y = value * round(silu(gate)); value and gate are the two halves of a
+// packed window [start, start + 2*width) of the input's last dimension.
 extern "C" __global__ void dif_op_1(const dif_scalar* x, dif_scalar* y) {
-  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
-  if(i<32ULL){ unsigned long long row=i/8ULL, col=i%8ULL; float value=dif_load(x,row*16ULL+0ULL+col); float gate=dif_load(x,row*16ULL+8ULL+col); float activated=dif_round(dif_silu(gate));dif_store(y,i,value*activated);}
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    unsigned long long row = i / 8ULL, col = i % 8ULL;
+    float value = dif_load(x, row * 16ULL + 0ULL + col);
+    float gate = dif_load(x, row * 16ULL + 8ULL + col);
+    float activated = dif_round(dif_silu(gate));
+    dif_store(y, i, value * activated);
+  }
 }
 #undef dif_scalar
 #undef dif_load

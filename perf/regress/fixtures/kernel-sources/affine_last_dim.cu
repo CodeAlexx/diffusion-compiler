@@ -46,7 +46,17 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* x,const dif_scalar* scale,dif_scalar* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL){unsigned long long col=i%8ULL;float value=dif_round(dif_load(x,i)*dif_load(scale,col));dif_store(y,i,value);}}
+// y = round(x * scale[col]) (+ round(bias[col])) with the storage-dtype
+// rounding after each step, matching the creator's eager boundaries.
+extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* scale, dif_scalar* y) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    unsigned long long col = i % 8ULL;
+    float value = dif_round(dif_load(x, i) * dif_load(scale, col));
+    
+    dif_store(y, i, value);
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

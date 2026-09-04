@@ -46,7 +46,16 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* grad_output,dif_scalar* grad_bias){unsigned long long column=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(column<8ULL){float value=0.0f;for(unsigned long long row=0ULL;row<4ULL;++row)value+=dif_load(grad_output,row*8ULL+column);dif_store(grad_bias,column,value);}}
+// One thread per column sums the output gradient down the rows.
+extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, dif_scalar* grad_bias) {
+  unsigned long long column = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (column < 8ULL) {
+    float value = 0.0f;
+    for (unsigned long long row = 0ULL; row < 4ULL; ++row)
+      value += dif_load(grad_output, row * 8ULL + column);
+    dif_store(grad_bias, column, value);
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

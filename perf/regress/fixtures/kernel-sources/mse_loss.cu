@@ -46,7 +46,17 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_f32
 #define dif_store dif_store_f32
 #define dif_round dif_round_f32
-extern "C" __global__ void dif_op_1(const dif_bf16* prediction,const dif_bf16* target,dif_f32* loss){if(blockIdx.x==0U&&threadIdx.x==0U){float sum=0.0f;for(unsigned long long i=0ULL;i<32ULL;++i){float d=dif_load_bf16(prediction,i)-dif_load_bf16(target,i);sum=fmaf(d,d,sum);}dif_store_f32(loss,0ULL,sum/32.0f);}}
+// Serial reference reduction on one thread: the training-loss oracle path.
+extern "C" __global__ void dif_op_1(const dif_bf16* prediction, const dif_bf16* target, dif_f32* loss) {
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    float sum = 0.0f;
+    for (unsigned long long i = 0ULL; i < 32ULL; ++i) {
+      float d = dif_load_bf16(prediction, i) - dif_load_bf16(target, i);
+      sum = fmaf(d, d, sum);
+    }
+    dif_store_f32(loss, 0ULL, sum / 32.0f);
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

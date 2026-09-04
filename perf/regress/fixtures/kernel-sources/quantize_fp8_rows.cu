@@ -1,0 +1,45 @@
+
+typedef float dif_f32;
+typedef unsigned short dif_bf16;
+typedef unsigned short dif_f16;
+extern "C" __device__ float dif_load_f32(const dif_f32* value, unsigned long long index) {
+  return value[index];
+}
+extern "C" __device__ void dif_store_f32(dif_f32* value, unsigned long long index, float input) {
+  value[index] = input;
+}
+extern "C" __device__ float dif_round_f32(float input) { return input; }
+extern "C" __device__ float dif_load_bf16(const dif_bf16* value, unsigned long long index) {
+  return __uint_as_float((unsigned int)value[index] << 16U);
+}
+extern "C" __device__ void dif_store_bf16(dif_bf16* value, unsigned long long index, float input) {
+  unsigned int bits = __float_as_uint(input);
+  unsigned int rounding = 0x7fffU + ((bits >> 16U) & 1U);
+  value[index] = (dif_bf16)((bits + rounding) >> 16U);
+}
+extern "C" __device__ float dif_round_bf16(float input) {
+  unsigned int bits = __float_as_uint(input);
+  unsigned int rounding = 0x7fffU + ((bits >> 16U) & 1U);
+  return __uint_as_float(((bits + rounding) >> 16U) << 16U);
+}
+extern "C" __device__ float dif_load_f16(const dif_f16* value, unsigned long long index) {
+  float result;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(value[index]));
+  return result;
+}
+extern "C" __device__ void dif_store_f16(dif_f16* value, unsigned long long index, float input) {
+  dif_f16 result;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(input));
+  value[index] = result;
+}
+extern "C" __device__ float dif_round_f16(float input) {
+  dif_f16 rounded;
+  float result;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(rounded) : "f"(input));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(rounded));
+  return result;
+}
+extern "C" __device__ float dif_silu(float x) {
+  return x / (1.0f + expf(-x));
+}
+extern "C" __global__ void dif_op_1(const dif_bf16* x,unsigned char* q,float* scales){__shared__ float maximums[256];unsigned long long row=blockIdx.x;unsigned tid=threadIdx.x;if(row>=4ULL)return;unsigned long long base=row*64ULL;float maximum=0.0f;for(unsigned long long column=tid;column<64ULL;column+=256ULL){maximum=fmaxf(maximum,fabsf(dif_load_bf16(x,base+column)));}maximums[tid]=maximum;__syncthreads();for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);__syncthreads();}float scale=fmaxf(maximums[0]/448.0f,1.0e-30f);if(tid==0U)scales[row]=scale;for(unsigned long long column=tid;column<64ULL;column+=256ULL){float value=dif_load_bf16(x,base+column)/scale;unsigned short pair;asm("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}\n":"=h"(pair):"f"(value),"f"(0.0f));q[base+column]=(unsigned char)pair;}}

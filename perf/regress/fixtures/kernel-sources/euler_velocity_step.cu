@@ -46,7 +46,16 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* sample,const dif_scalar* velocity,const dif_f32* current,const dif_f32* next,dif_scalar* output){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL){float dt=__fsub_rn(dif_load_f32(next,0ULL),dif_load_f32(current,0ULL));float scaled=dif_round(__fmul_rn(dt,dif_load(velocity,i)));dif_store(output,i,__fadd_rn(dif_load(sample,i),scaled));}}
+// output = sample + round_dtype((next - current) * velocity), each step
+// rounded explicitly (the generic velocity-form Euler update).
+extern "C" __global__ void dif_op_1(const dif_scalar* sample, const dif_scalar* velocity, const dif_f32* current, const dif_f32* next, dif_scalar* output) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    float dt = __fsub_rn(dif_load_f32(next, 0ULL), dif_load_f32(current, 0ULL));
+    float scaled = dif_round(__fmul_rn(dt, dif_load(velocity, i)));
+    dif_store(output, i, __fadd_rn(dif_load(sample, i), scaled));
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

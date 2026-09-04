@@ -46,7 +46,11 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* x,dif_scalar* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL)dif_store(y,i,dif_load(x,i));}
+// Physical reshape: a straight copy in row-major order.
+extern "C" __global__ void dif_op_1(const dif_scalar* x, dif_scalar* y) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) dif_store(y, i, dif_load(x, i));
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

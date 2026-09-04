@@ -1725,10 +1725,14 @@ void test_new_primitives_cuda_parity() {
   const auto reference =
       dif::runtime::make_cpu_executor()->run(program, bindings, options);
   const auto generated = dif::compiler::emit_cuda(program);
-  expect(generated.source.find("const dif_f32* x,dif_bf16* y") !=
-             std::string::npos &&
-             generated.source.find("const dif_bf16* x,dif_f32* y") !=
-                 std::string::npos,
+  // Kernel text is formatted for reading (templates), so compare tokens,
+  // not whitespace: the Cast signature must be typed per side.
+  std::string compact;
+  for (const char c : generated.source)
+    if (c != ' ' && c != '\n' && c != '\t')
+      compact.push_back(c);
+  expect(compact.find("constdif_f32*x,dif_bf16*y") != std::string::npos &&
+             compact.find("constdif_bf16*x,dif_f32*y") != std::string::npos,
          "CUDA lowering emits typed f32/bf16 Cast boundaries");
   if (!dif::runtime::cuda_available())
     return;

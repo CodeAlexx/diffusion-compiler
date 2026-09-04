@@ -48,7 +48,7 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_round dif_round_f32
 extern "C" __global__ void dif_op_1(const dif_scalar* a, const dif_scalar* b, dif_scalar* y) {
   unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < 32ULL) dif_store(y,i,dif_load(a,i)*dif_load(b,i));
+  if (i < 32ULL) dif_store(y, i, dif_load(a,i)*dif_load(b,i));
 }
 #undef dif_scalar
 #undef dif_load

@@ -46,8 +46,15 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
+// y = residual + round(gate * branch); gate rows broadcast over
+// rows_per_gate consecutive input rows.
 extern "C" __global__ void dif_op_1(const dif_scalar* residual, const dif_scalar* branch, const dif_scalar* gate, dif_scalar* y) {
-  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x; if(i<32ULL){unsigned long long row=i/8ULL,gate_index=(row/1ULL)*8ULL+i%8ULL;dif_store(y,i,dif_load(residual,i)+dif_round(dif_load(gate,gate_index)*dif_load(branch,i)));}
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    unsigned long long row = i / 8ULL,
+                       gate_index = (row / 1ULL) * 8ULL + i % 8ULL;
+    dif_store(y, i, dif_load(residual, i) + dif_round(dif_load(gate, gate_index) * dif_load(branch, i)));
+  }
 }
 #undef dif_scalar
 #undef dif_load

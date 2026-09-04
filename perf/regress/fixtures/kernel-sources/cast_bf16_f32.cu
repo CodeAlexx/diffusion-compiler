@@ -42,4 +42,8 @@ extern "C" __device__ float dif_round_f16(float input) {
 extern "C" __device__ float dif_silu(float x) {
   return x / (1.0f + expf(-x));
 }
-extern "C" __global__ void dif_op_1(const dif_bf16* x,dif_f32* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL)dif_store_f32(y,i,dif_load_bf16(x,i));}
+// Storage-dtype conversion through the typed load/store helpers.
+extern "C" __global__ void dif_op_1(const dif_bf16* x, dif_f32* y) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) dif_store_f32(y, i, dif_load_bf16(x, i));
+}

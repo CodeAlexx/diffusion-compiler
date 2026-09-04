@@ -1,0 +1,71 @@
+
+typedef float dif_f32;
+typedef unsigned short dif_bf16;
+typedef unsigned short dif_f16;
+extern "C" __device__ float dif_load_f32(const dif_f32* value, unsigned long long index) {
+  return value[index];
+}
+extern "C" __device__ void dif_store_f32(dif_f32* value, unsigned long long index, float input) {
+  value[index] = input;
+}
+extern "C" __device__ float dif_round_f32(float input) { return input; }
+extern "C" __device__ float dif_load_bf16(const dif_bf16* value, unsigned long long index) {
+  return __uint_as_float((unsigned int)value[index] << 16U);
+}
+extern "C" __device__ void dif_store_bf16(dif_bf16* value, unsigned long long index, float input) {
+  unsigned int bits = __float_as_uint(input);
+  unsigned int rounding = 0x7fffU + ((bits >> 16U) & 1U);
+  value[index] = (dif_bf16)((bits + rounding) >> 16U);
+}
+extern "C" __device__ float dif_round_bf16(float input) {
+  unsigned int bits = __float_as_uint(input);
+  unsigned int rounding = 0x7fffU + ((bits >> 16U) & 1U);
+  return __uint_as_float(((bits + rounding) >> 16U) << 16U);
+}
+extern "C" __device__ float dif_load_f16(const dif_f16* value, unsigned long long index) {
+  float result;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(value[index]));
+  return result;
+}
+extern "C" __device__ void dif_store_f16(dif_f16* value, unsigned long long index, float input) {
+  dif_f16 result;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(input));
+  value[index] = result;
+}
+extern "C" __device__ float dif_round_f16(float input) {
+  dif_f16 rounded;
+  float result;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(rounded) : "f"(input));
+  asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(rounded));
+  return result;
+}
+extern "C" __device__ float dif_silu(float x) {
+  return x / (1.0f + expf(-x));
+}
+#define dif_scalar dif_f32
+#define dif_load dif_load_f32
+#define dif_store dif_store_f32
+#define dif_round dif_round_f32
+// Sinusoidal timestep embedding with the creator's frequency shift, scale,
+// max period and sin/cos ordering folded into literals by the emitter.
+extern "C" __global__ void dif_op_1(const dif_f32* timesteps, dif_f32* y) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 64ULL) {
+    unsigned long long row = i / 16ULL, column = i % 16ULL;
+    if (column >= 16ULL) {
+      dif_store_f32(y, i, 0.0f);
+      return;
+    }
+    unsigned long long component = column % 8ULL;
+    float exponent = (-9.210340500e+00f * (float)component) / 7.000000000e+00f;
+    float frequency = expf(exponent);
+    float scaled_timestep = dif_load_f32(timesteps, row) * 1.000000000e+03f;
+    float angle = scaled_timestep * frequency;
+    float s = sinf(angle), c = cosf(angle);
+    dif_store_f32(y, i, (column < 8ULL ? s : c));
+  }
+}
+#undef dif_scalar
+#undef dif_load
+#undef dif_store
+#undef dif_round

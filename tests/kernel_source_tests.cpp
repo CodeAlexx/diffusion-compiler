@@ -243,6 +243,208 @@ Program batch3_program(std::string_view which) {
   return program;
 }
 
+
+Program batch4_program(std::string_view which) {
+  Program program;
+  auto op = [&](Opcode opcode, std::vector<std::uint32_t> inputs,
+                std::vector<std::uint32_t> outputs,
+                std::vector<Attribute> attributes = {}) {
+    program.operations = {{1, opcode, std::move(inputs), std::move(outputs),
+                           std::move(attributes)}};
+  };
+  if (which == "upsample_nearest_2d") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 3, 4}},
+                       {2, DType::BF16, TensorRole::Output, {1, 2, 6, 8}}};
+    op(Opcode::UpsampleNearest2d, {1}, {2},
+       {Attribute::u64(AttrKey::ScaleH, 2U), Attribute::u64(AttrKey::ScaleW, 2U)});
+  } else if (which == "broadcast_to") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 8}},
+                       {2, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::BroadcastTo, {1}, {2});
+  } else if (which == "broadcast_to_rank") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {8}},
+                       {2, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::BroadcastTo, {1}, {2});
+  } else if (which == "slice") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Output, {4, 3}}};
+    op(Opcode::Slice, {1}, {2},
+       {Attribute::u64(AttrKey::Axis, 1U), Attribute::u64(AttrKey::Start, 2U)});
+  } else if (which == "rotary_frequency" || which == "rotary_frequency_theta") {
+    program.tensors = {{1, DType::F32, TensorRole::Input, {1, 4, 2}},
+                       {2, DType::I32, TensorRole::Constant, {3}},
+                       {3, DType::I32, TensorRole::Constant, {3}},
+                       {4, DType::I32, TensorRole::Constant, {2}},
+                       {5, DType::F32, TensorRole::Output, {1, 4, 3}},
+                       {6, DType::F32, TensorRole::Output, {1, 4, 3}}};
+    std::vector<Attribute> attributes;
+    if (which == "rotary_frequency_theta")
+      attributes = {Attribute::f64(AttrKey::Theta, 1.0e9),
+                    Attribute::f64(AttrKey::Ntk, 1.5)};
+    op(Opcode::RotaryFrequency, {1, 2, 3, 4}, {5, 6}, attributes);
+  } else if (which == "boolean_mask_to_bias" || which == "boolean_mask_to_bias_keys_only") {
+    program.tensors = {{1, DType::Bool, TensorRole::Input, {2, 4}},
+                       {2, DType::BF16, TensorRole::Output, {2, 1, 4, 4}}};
+    std::vector<Attribute> attributes;
+    if (which == "boolean_mask_to_bias_keys_only")
+      attributes = {Attribute::boolean(AttrKey::MaskQueries, false)};
+    op(Opcode::BooleanMaskToBias, {1}, {2}, attributes);
+  } else if (which == "boolean_mask_to_bias_matrix") {
+    program.tensors = {{1, DType::Bool, TensorRole::Input, {2, 4, 4}},
+                       {2, DType::F32, TensorRole::Output, {2, 1, 4, 4}}};
+    op(Opcode::BooleanMaskToBias, {1}, {2});
+  } else if (which == "gather_rows") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {5, 8}},
+                       {2, DType::I32, TensorRole::Input, {3}},
+                       {3, DType::BF16, TensorRole::Output, {3, 8}}};
+    op(Opcode::GatherRows, {1, 2}, {3});
+  } else if (which == "indexed_update_rows") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {5, 8}},
+                       {2, DType::BF16, TensorRole::Input, {2, 8}},
+                       {3, DType::I32, TensorRole::Input, {5}},
+                       {4, DType::BF16, TensorRole::Output, {5, 8}}};
+    op(Opcode::IndexedUpdateRows, {1, 2, 3}, {4});
+  } else if (which == "select_row_chunks") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {6, 16}},
+                       {2, DType::I32, TensorRole::Input, {3}},
+                       {3, DType::BF16, TensorRole::Output, {3, 8}},
+                       {4, DType::BF16, TensorRole::Output, {3, 8}}};
+    op(Opcode::SelectRowChunks, {1, 2}, {3, 4});
+  } else if (which == "sinusoidal_timestep" || which == "sinusoidal_timestep_flip") {
+    program.tensors = {{1, DType::F32, TensorRole::Input, {4}},
+                       {2, DType::F32, TensorRole::Output, {4, 16}}};
+    std::vector<Attribute> attributes{Attribute::f64(AttrKey::Scale, 1000.0)};
+    if (which == "sinusoidal_timestep_flip")
+      attributes.push_back(Attribute::boolean(AttrKey::FlipSinToCos, true));
+    op(Opcode::SinusoidalTimestep, {1}, {2}, attributes);
+  } else if (which == "rotary_position") {
+    program.tensors = {{1, DType::F32, TensorRole::Input, {4, 2}},
+                       {2, DType::F32, TensorRole::Constant, {3}},
+                       {3, DType::BF16, TensorRole::Output, {4, 12}},
+                       {4, DType::BF16, TensorRole::Output, {4, 12}}};
+    op(Opcode::RotaryPosition, {1, 2}, {3, 4});
+  } else if (which == "permute") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {2, 3, 4}},
+                       {2, DType::BF16, TensorRole::Output, {4, 2, 3}}};
+    op(Opcode::Permute, {1}, {2},
+       {Attribute::u64(AttrKey::Permutation0, 2U),
+        Attribute::u64(AttrKey::Permutation1, 0U),
+        Attribute::u64(AttrKey::Permutation2, 1U)});
+  } else if (which == "concat") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 3}},
+                       {2, DType::BF16, TensorRole::Input, {4, 5}},
+                       {3, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::Concat, {1, 2}, {3}, {Attribute::u64(AttrKey::Axis, 1U)});
+  } else if (which == "concat_axis0_three") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 8}},
+                       {2, DType::BF16, TensorRole::Input, {2, 8}},
+                       {3, DType::BF16, TensorRole::Input, {1, 8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::Concat, {1, 2, 3}, {4}, {Attribute::u64(AttrKey::Axis, 0U)});
+  } else {
+    fail("unknown batch4 corpus program " + std::string(which));
+  }
+  return program;
+}
+
+
+Program batch5_program(std::string_view which) {
+  Program program;
+  auto op = [&](Opcode opcode, std::vector<std::uint32_t> inputs,
+                std::vector<std::uint32_t> outputs,
+                std::vector<Attribute> attributes = {}) {
+    program.operations = {{1, opcode, std::move(inputs), std::move(outputs),
+                           std::move(attributes)}};
+  };
+  if (which == "dequantize_int8_blocks") {
+    program.tensors = {{1, DType::I8, TensorRole::Constant, {4, 64}},
+                       {2, DType::F32, TensorRole::Constant, {4, 2}},
+                       {3, DType::BF16, TensorRole::Output, {4, 64}}};
+    op(Opcode::DequantizeInt8Blocks, {1, 2}, {3},
+       {Attribute::u64(AttrKey::BlockSize, 32U)});
+  } else if (which == "quantize_fp8_rows") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 64}},
+                       {2, DType::FP8E4M3, TensorRole::Output, {4, 64}},
+                       {3, DType::F32, TensorRole::Output, {4}}};
+    op(Opcode::QuantizeFp8Rows, {1}, {2, 3});
+  } else if (which == "linear_fp8_scaled") {
+    program.tensors = {{1, DType::FP8E4M3, TensorRole::Input, {4, 64}},
+                       {2, DType::FP8E4M3, TensorRole::Constant, {8, 64}},
+                       {3, DType::F32, TensorRole::Input, {4}},
+                       {4, DType::F32, TensorRole::Constant, {8}},
+                       {5, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::LinearFp8Scaled, {1, 2, 3, 4}, {5});
+  } else if (which == "mse_loss_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::F32, TensorRole::Input, {1}},
+                       {4, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::MseLossBackward, {1, 2, 3}, {4}, {accumulate_f32()});
+  } else if (which == "linear_backward_input") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Constant, {8, 16}},
+                       {3, DType::BF16, TensorRole::Output, {4, 16}}};
+    op(Opcode::LinearBackwardInput, {1, 2}, {3}, {accumulate_f32()});
+  } else if (which == "linear_backward_weight") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 16}},
+                       {3, DType::BF16, TensorRole::Output, {8, 16}}};
+    op(Opcode::LinearBackwardWeight, {1, 2}, {3}, {accumulate_f32()});
+  } else if (which == "linear_addmm_prefill") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 16}},
+                       {2, DType::BF16, TensorRole::Constant, {8, 16}},
+                       {3, DType::BF16, TensorRole::Constant, {8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::Linear, {1, 2, 3}, {4},
+       {Attribute::u64(AttrKey::LinearBiasMode,
+                       static_cast<std::uint64_t>(LinearBiasMode::Addmm))});
+  } else if (which == "h3_adaln_select") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {3, 144}},
+                       {2, DType::I32, TensorRole::Input, {4}}};
+    std::vector<std::uint32_t> outputs;
+    for (std::uint32_t o = 0U; o < 6U; ++o) {
+      program.tensors.push_back({3U + o, DType::BF16, TensorRole::Output, {4, 8}});
+      outputs.push_back(3U + o);
+    }
+    op(Opcode::H3AdaLNSelect, {1, 2}, outputs);
+  } else if (which == "h3_deinterleave_qkv") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 48}},
+                       {2, DType::BF16, TensorRole::Output, {4, 2, 8}},
+                       {3, DType::BF16, TensorRole::Output, {4, 2, 8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 2, 8}}};
+    op(Opcode::H3DeinterleaveQkv, {1}, {2, 3, 4});
+  } else if (which == "h3_deinterleave_qkv_weight") {
+    program.tensors = {{1, DType::BF16, TensorRole::Constant, {48, 32}},
+                       {2, DType::BF16, TensorRole::Output, {16, 32}},
+                       {3, DType::BF16, TensorRole::Output, {16, 32}},
+                       {4, DType::BF16, TensorRole::Output, {16, 32}}};
+    op(Opcode::H3DeinterleaveQkvWeight, {1}, {2, 3, 4},
+       {Attribute::u64(AttrKey::Heads, 2U), Attribute::u64(AttrKey::HeadDim, 8U)});
+  } else if (which == "rms_norm_backward" || which == "rms_norm_backward_weight") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Constant, {8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 8}}};
+    std::vector<std::uint32_t> outputs{4};
+    if (which == "rms_norm_backward_weight") {
+      program.tensors.push_back({5, DType::BF16, TensorRole::Output, {8}});
+      outputs.push_back(5);
+    }
+    op(Opcode::RmsNormBackward, {1, 2, 3}, outputs,
+       {accumulate_f32(), Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "swiglu_backward" || which == "swiglu_backward_gate_first") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 16}},
+                       {3, DType::BF16, TensorRole::Output, {4, 16}}};
+    op(Opcode::SwiGluBackward, {1, 2}, {3},
+       {accumulate_f32(),
+        Attribute::boolean(AttrKey::GateFirst, which == "swiglu_backward_gate_first")});
+  } else {
+    fail("unknown batch5 corpus program " + std::string(which));
+  }
+  return program;
+}
+
 std::vector<Case> corpus() {
   using Q = Int8RowQuantization;
   return {
@@ -334,6 +536,40 @@ std::vector<Case> corpus() {
       {"snake_beta", [] { return batch3_program("snake_beta"); }},
       {"cast_bf16_f32", [] { return batch3_program("cast_bf16_f32"); }},
       {"cast_f32_bf16", [] { return batch3_program("cast_f32_bf16"); }},
+      // batch 4: data movement, embeddings, masks
+      {"upsample_nearest_2d", [] { return batch4_program("upsample_nearest_2d"); }},
+      {"broadcast_to", [] { return batch4_program("broadcast_to"); }},
+      {"broadcast_to_rank", [] { return batch4_program("broadcast_to_rank"); }},
+      {"slice", [] { return batch4_program("slice"); }},
+      {"rotary_frequency", [] { return batch4_program("rotary_frequency"); }},
+      {"rotary_frequency_theta", [] { return batch4_program("rotary_frequency_theta"); }},
+      {"boolean_mask_to_bias", [] { return batch4_program("boolean_mask_to_bias"); }},
+      {"boolean_mask_to_bias_keys_only", [] { return batch4_program("boolean_mask_to_bias_keys_only"); }},
+      {"boolean_mask_to_bias_matrix", [] { return batch4_program("boolean_mask_to_bias_matrix"); }},
+      {"gather_rows", [] { return batch4_program("gather_rows"); }},
+      {"indexed_update_rows", [] { return batch4_program("indexed_update_rows"); }},
+      {"select_row_chunks", [] { return batch4_program("select_row_chunks"); }},
+      {"sinusoidal_timestep", [] { return batch4_program("sinusoidal_timestep"); }},
+      {"sinusoidal_timestep_flip", [] { return batch4_program("sinusoidal_timestep_flip"); }},
+      {"rotary_position", [] { return batch4_program("rotary_position"); }},
+      {"permute", [] { return batch4_program("permute"); }},
+      {"concat", [] { return batch4_program("concat"); }},
+      {"concat_axis0_three", [] { return batch4_program("concat_axis0_three"); }},
+      // batch 5: low-bit codecs, training backward ops, H3 layout ops
+      {"dequantize_int8_blocks", [] { return batch5_program("dequantize_int8_blocks"); }},
+      {"quantize_fp8_rows", [] { return batch5_program("quantize_fp8_rows"); }},
+      {"linear_fp8_scaled", [] { return batch5_program("linear_fp8_scaled"); }},
+      {"mse_loss_backward", [] { return batch5_program("mse_loss_backward"); }},
+      {"linear_backward_input", [] { return batch5_program("linear_backward_input"); }},
+      {"linear_backward_weight", [] { return batch5_program("linear_backward_weight"); }},
+      {"linear_addmm_prefill", [] { return batch5_program("linear_addmm_prefill"); }},
+      {"h3_adaln_select", [] { return batch5_program("h3_adaln_select"); }},
+      {"h3_deinterleave_qkv", [] { return batch5_program("h3_deinterleave_qkv"); }},
+      {"h3_deinterleave_qkv_weight", [] { return batch5_program("h3_deinterleave_qkv_weight"); }},
+      {"rms_norm_backward", [] { return batch5_program("rms_norm_backward"); }},
+      {"rms_norm_backward_weight", [] { return batch5_program("rms_norm_backward_weight"); }},
+      {"swiglu_backward", [] { return batch5_program("swiglu_backward"); }},
+      {"swiglu_backward_gate_first", [] { return batch5_program("swiglu_backward_gate_first"); }},
   };
 }
 

@@ -388,17 +388,19 @@ void emit_upsample_nearest_2d(std::ostringstream &out,
   const auto output_w = output->dims[3];
   const auto scale_h = op.u64(ir::AttrKey::ScaleH, 1U);
   const auto scale_w = op.u64(ir::AttrKey::ScaleW, 1U);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << output->element_count() << "ULL){unsigned long long ow=i%"
-      << output_w << "ULL,oh=(i/" << output_w << "ULL)%" << output_h
-      << "ULL,c=(i/" << output_w * output_h << "ULL)%" << channels
-      << "ULL,b=i/" << channels * output_h * output_w
-      << "ULL;unsigned long long source=((b*" << channels
-      << "ULL+c)*" << input_h << "ULL+oh/" << scale_h << "ULL)*"
-      << input_w << "ULL+ow/" << scale_w
-      << "ULL;dif_store(y,i,dif_load(x,source));}}\n";
+  out << render_kernel_template(
+      "upsample_nearest_2d",
+      {{"function", function_name(op)},
+       {"count", std::to_string(output->element_count())},
+       {"output_w", std::to_string(output_w)},
+       {"output_h", std::to_string(output_h)},
+       {"output_hw", std::to_string(output_w * output_h)},
+       {"channels", std::to_string(channels)},
+       {"output_chw", std::to_string(channels * output_h * output_w)},
+       {"input_h", std::to_string(input_h)},
+       {"scale_h", std::to_string(scale_h)},
+       {"input_w", std::to_string(input_w)},
+       {"scale_w", std::to_string(scale_w)}});
 }
 
 void emit_pad_constant(std::ostringstream &out, const ir::Program &program,
@@ -507,16 +509,16 @@ void emit_snake_beta(std::ostringstream &out, const ir::Program &program,
   const auto channels = input->dims[1];
   const auto length = input->dims[2];
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-9));
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* la,const dif_scalar* lb,"
-         "dif_scalar* y){unsigned long long i=(unsigned long long)blockIdx.x*"
-         "blockDim.x+threadIdx.x;if(i<" << count << "ULL){"
-      << "unsigned long long c=(i/" << length << "ULL)%" << channels << "ULL;"
-      << "float alpha=expf(dif_load(la,c));"
-      << "float ib=1.0f/(expf(dif_load(lb,c))+" << epsilon << "f);"
-      << "float xv=dif_load(x,i);float s=sinf(alpha*xv);"
-      << "dif_store(y,i,xv+ib*s*s);}}\n" << std::defaultfloat;
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9) << epsilon;
+  out << render_kernel_template(
+      "snake_beta", {{"function", function_name(op)},
+                     {"count", std::to_string(count)},
+                     {"length", std::to_string(length)},
+                     {"channels", std::to_string(channels)},
+                     {"epsilon", epsilon_literal.str()}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_header(std::ostringstream &out) {
@@ -626,11 +628,13 @@ void emit_cast(std::ostringstream &out, const ir::Program &program,
                          ? "dif_store_f32"
                          : output->dtype == ir::DType::BF16 ? "dif_store_bf16"
                                                             : "dif_store_f16";
-  out << "extern \"C\" __global__ void " << function_name(op) << "(const "
-      << type(input->dtype) << "* x," << type(output->dtype)
-      << "* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<"
-      << count << "ULL)" << store << "(y,i," << load << "(x,i));}\n";
+  out << render_kernel_template(
+      "cast", {{"function", function_name(op)},
+               {"input_type", type(input->dtype)},
+               {"output_type", type(output->dtype)},
+               {"count", std::to_string(count)},
+               {"load", load},
+               {"store", store}});
 }
 
 void emit_quantize_int8_rows(std::ostringstream &out,
@@ -901,10 +905,10 @@ void emit_quantize_fp8_blocks32(std::ostringstream &out,
 void emit_elementwise(std::ostringstream &out, const ir::Program &program,
                       const ir::Operation &op, const char *expression) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* a, const dif_scalar* b, dif_scalar* y) {\n"
-      << "  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n"
-      << "  if (i < " << count << "ULL) dif_store(y,i," << expression << ");\n}\n";
+  out << render_kernel_template(
+      "elementwise", {{"function", function_name(op)},
+                      {"count", std::to_string(count)},
+                      {"expression", expression}});
 }
 
 void emit_affine_last_dim(std::ostringstream &out,
@@ -912,17 +916,18 @@ void emit_affine_last_dim(std::ostringstream &out,
                           const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto width = program.tensor(op.inputs[1])->dims[0];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << (op.inputs.size() == 3U
-              ? "(const dif_scalar* x,const dif_scalar* scale,const dif_scalar* bias,dif_scalar* y){"
-              : "(const dif_scalar* x,const dif_scalar* scale,dif_scalar* y){")
-      << "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long col=i%" << width
-      << "ULL;float value=dif_round(dif_load(x,i)*dif_load(scale,col));"
-      << (op.inputs.size() == 3U ? "value=dif_round(value+dif_load(bias,col));"
-                                 : "")
-      << "dif_store(y,i,value);}}\n";
+  const bool biased = op.inputs.size() == 3U;
+  out << render_kernel_template(
+      "affine_last_dim",
+      {{"function", function_name(op)},
+       {"parameters",
+        biased ? "const dif_scalar* x, const dif_scalar* scale, "
+                 "const dif_scalar* bias, dif_scalar* y"
+               : "const dif_scalar* x, const dif_scalar* scale, dif_scalar* y"},
+       {"count", std::to_string(count)},
+       {"width", std::to_string(width)},
+       {"bias", biased ? "value = dif_round(value + dif_load(bias, col));"
+                       : ""}});
 }
 
 void emit_clamp(std::ostringstream &out, const ir::Program &program,
@@ -930,12 +935,16 @@ void emit_clamp(std::ostringstream &out, const ir::Program &program,
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto lower = static_cast<float>(op.f64(ir::AttrKey::Lower, 0.0));
   const auto upper = static_cast<float>(op.f64(ir::AttrKey::Upper, 1.0));
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL)dif_store(y,i,fminf(" << upper << "f,fmaxf(" << lower
-      << "f,dif_load(x,i))));}\n" << std::defaultfloat;
+  std::ostringstream lower_literal, upper_literal;
+  lower_literal << std::scientific << std::setprecision(9) << lower;
+  upper_literal << std::scientific << std::setprecision(9) << upper;
+  out << render_kernel_template(
+      "clamp", {{"function", function_name(op)},
+                {"count", std::to_string(count)},
+                {"lower", lower_literal.str()},
+                {"upper", upper_literal.str()}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_silu(std::ostringstream &out, const ir::Program &program,
@@ -1001,20 +1010,17 @@ const char *typed_store(ir::DType dtype) {
 void emit_sigmoid(std::ostringstream &out, const ir::Program &program,
                   const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count
-      << "ULL){float v=dif_load(x,i);dif_store(y,i,1.0f/(1.0f+expf(-v)));}}\n";
+  out << render_kernel_template(
+      "sigmoid", {{"function", function_name(op)},
+                  {"count", std::to_string(count)}});
 }
 
 void emit_reshape(std::ostringstream &out, const ir::Program &program,
                   const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL)dif_store(y,i,dif_load(x,i));}\n";
+  out << render_kernel_template(
+      "reshape", {{"function", function_name(op)},
+                  {"count", std::to_string(count)}});
 }
 
 void emit_broadcast_to(std::ostringstream &out, const ir::Program &program,
@@ -1025,18 +1031,19 @@ void emit_broadcast_to(std::ostringstream &out, const ir::Program &program,
   std::vector<std::uint64_t> strides(input->dims.size(), 1U);
   for (std::size_t axis = input->dims.size(); axis-- > 1U;)
     strides[axis - 1U] = strides[axis] * input->dims[axis];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << output->element_count()
-      << "ULL){unsigned long long coordinate=i,source=0ULL,at=0ULL;";
+  std::string axes;
   for (std::size_t axis = output->dims.size(); axis-- > 0U;) {
-    out << "at=coordinate%" << output->dims[axis]
-        << "ULL;coordinate/=" << output->dims[axis] << "ULL;";
+    axes += "    at = coordinate % " + std::to_string(output->dims[axis]) +
+            "ULL; coordinate /= " + std::to_string(output->dims[axis]) +
+            "ULL;\n";
     if (axis >= rank_pad && input->dims[axis - rank_pad] != 1U)
-      out << "source+=at*" << strides[axis - rank_pad] << "ULL;";
+      axes += "    source += at * " +
+              std::to_string(strides[axis - rank_pad]) + "ULL;\n";
   }
-  out << "dif_store(y,i,dif_load(x,source));}}\n";
+  out << render_kernel_template(
+      "broadcast_to", {{"function", function_name(op)},
+                       {"count", std::to_string(output->element_count())},
+                       {"axes", axes}});
 }
 
 void emit_slice(std::ostringstream &out, const ir::Program &program,
@@ -1049,19 +1056,19 @@ void emit_slice(std::ostringstream &out, const ir::Program &program,
   std::vector<std::uint64_t> strides(input->dims.size(), 1U);
   for (std::size_t axis = input->dims.size(); axis-- > 1U;)
     strides[axis - 1U] = strides[axis] * input->dims[axis];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << output->element_count()
-      << "ULL){unsigned long long coordinate=i,source=0ULL,at=0ULL;";
+  std::string axes;
   for (std::size_t axis = output->dims.size(); axis-- > 0U;) {
-    out << "at=coordinate%" << output->dims[axis]
-        << "ULL;coordinate/=" << output->dims[axis] << "ULL;";
+    axes += "    at = coordinate % " + std::to_string(output->dims[axis]) +
+            "ULL; coordinate /= " + std::to_string(output->dims[axis]) +
+            "ULL;\n";
     if (axis == selected)
-      out << "at+=" << start << "ULL;";
-    out << "source+=at*" << strides[axis] << "ULL;";
+      axes += "    at += " + std::to_string(start) + "ULL;\n";
+    axes += "    source += at * " + std::to_string(strides[axis]) + "ULL;\n";
   }
-  out << "dif_store(y,i,dif_load(x,source));}}\n";
+  out << render_kernel_template(
+      "slice", {{"function", function_name(op)},
+                {"count", std::to_string(output->element_count())},
+                {"axes", axes}});
 }
 
 void emit_rotary_frequency(std::ostringstream &out,
@@ -1072,25 +1079,20 @@ void emit_rotary_frequency(std::ostringstream &out,
   const auto sequence = positions->dims[1];
   const auto axes = positions->dims[2];
   const auto pairs = output->dims[2];
-  out << std::setprecision(17)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_f32* positions,const int* pair_axes,const int* "
-         "pair_indices,const int* axis_dims,dif_f32* cosine,dif_f32* sine){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<"
-      << output->element_count() << "ULL){unsigned long long pair=i%" << pairs
-      << "ULL,token=(i/" << pairs << "ULL)%" << sequence
-      << "ULL,batch=i/(" << pairs << "ULL*" << sequence
-      << "ULL);int axis=pair_axes[pair],component=pair_indices[pair],"
-         "axis_dim=axis_dims[axis];float scale=(2.0f*(float)component)/"
-         "(float)axis_dim;float omega=1.0f/powf((float)("
-      << op.f64(ir::AttrKey::Theta, 10000.0) << "*"
-      << op.f64(ir::AttrKey::Ntk, 1.0)
-      << "),scale);float angle=dif_load_f32(positions,(batch*"
-      << sequence << "ULL+token)*" << axes
-      << "ULL+(unsigned long long)axis)*omega;dif_store_f32(cosine,i,"
-         "cosf(angle));dif_store_f32(sine,i,sinf(angle));}}\n"
-      << std::defaultfloat;
+  std::ostringstream theta_literal, ntk_literal;
+  theta_literal << std::setprecision(17) << op.f64(ir::AttrKey::Theta, 10000.0);
+  ntk_literal << std::setprecision(17) << op.f64(ir::AttrKey::Ntk, 1.0);
+  out << render_kernel_template(
+      "rotary_frequency",
+      {{"function", function_name(op)},
+       {"count", std::to_string(output->element_count())},
+       {"pairs", std::to_string(pairs)},
+       {"sequence", std::to_string(sequence)},
+       {"axes", std::to_string(axes)},
+       {"theta", theta_literal.str()},
+       {"ntk", ntk_literal.str()}});
+  // The historical emitter left the stream at precision 17, defaultfloat.
+  out << std::setprecision(17) << std::defaultfloat;
 }
 
 void emit_rotary_apply(std::ostringstream &out, const ir::Program &program,
@@ -1158,24 +1160,23 @@ void emit_boolean_mask_to_bias(std::ostringstream &out,
   const auto sequence = output->dims[2];
   const bool vector_mask = mask->dims.size() == 2U;
   const bool mask_queries = op.boolean(ir::AttrKey::MaskQueries, true);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const unsigned char* mask," << typed_scalar(output->dtype)
-      << "* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<"
-      << output->element_count() << "ULL){unsigned long long key=i%"
-      << sequence << "ULL,query=(i/" << sequence << "ULL)%" << sequence
-      << "ULL,batch=i/(" << sequence << "ULL*" << sequence
-      << "ULL);bool valid=";
+  const auto seq = std::to_string(sequence);
+  std::string valid;
   if (vector_mask) {
     if (mask_queries)
-      out << "mask[batch*" << sequence << "ULL+query]&&";
-    out << "mask[batch*" << sequence << "ULL+key]";
+      valid += "mask[batch * " + seq + "ULL + query] && ";
+    valid += "mask[batch * " + seq + "ULL + key]";
+  } else {
+    valid = "mask[(batch * " + seq + "ULL + query) * " + seq + "ULL + key]";
   }
-  else
-    out << "mask[(batch*" << sequence << "ULL+query)*" << sequence
-        << "ULL+key]";
-  out << ";" << typed_store(output->dtype)
-      << "(y,i,valid?0.0f:-__int_as_float(0x7f800000));}}\n";
+  out << render_kernel_template(
+      "boolean_mask_to_bias",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(output->dtype)},
+       {"count", std::to_string(output->element_count())},
+       {"sequence", seq},
+       {"valid", valid},
+       {"store", typed_store(output->dtype)}});
 }
 
 void emit_mse_loss(std::ostringstream &out, const ir::Program &program,
@@ -1183,16 +1184,13 @@ void emit_mse_loss(std::ostringstream &out, const ir::Program &program,
   const auto *prediction = program.tensor(op.inputs[0]);
   const auto *loss = program.tensor(op.outputs[0]);
   const auto count = prediction->element_count();
-  const auto *scalar = typed_scalar(prediction->dtype);
-  const auto *load = typed_load(prediction->dtype);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const " << scalar << "* prediction,const " << scalar
-      << "* target," << typed_scalar(loss->dtype) << "* loss){"
-         "if(blockIdx.x==0U&&threadIdx.x==0U){float sum=0.0f;for(unsigned long long i=0ULL;i<"
-      << count
-      << "ULL;++i){float d=" << load << "(prediction,i)-" << load
-      << "(target,i);sum=fmaf(d,d,sum);}" << typed_store(loss->dtype)
-      << "(loss,0ULL,sum/" << count << ".0f);}}\n";
+  out << render_kernel_template(
+      "mse_loss", {{"function", function_name(op)},
+                   {"scalar", typed_scalar(prediction->dtype)},
+                   {"loss_scalar", typed_scalar(loss->dtype)},
+                   {"count", std::to_string(count)},
+                   {"load", typed_load(prediction->dtype)},
+                   {"store", typed_store(loss->dtype)}});
 }
 
 void emit_mse_loss_backward(std::ostringstream &out,
@@ -1264,25 +1262,18 @@ void emit_bias_backward(std::ostringstream &out, const ir::Program &program,
   const auto *grad_output = program.tensor(op.inputs[0]);
   const auto width = program.tensor(op.outputs[0])->dims[0];
   const auto rows = grad_output->element_count() / width;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,dif_scalar* grad_bias){unsigned long long column="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(column<"
-      << width
-      << "ULL){float value=0.0f;for(unsigned long long row=0ULL;row<" << rows
-      << "ULL;++row)value+=dif_load(grad_output,row*" << width
-      << "ULL+column);dif_store(grad_bias,column,value);}}\n";
+  out << render_kernel_template(
+      "bias_backward", {{"function", function_name(op)},
+                        {"width", std::to_string(width)},
+                        {"rows", std::to_string(rows)}});
 }
 
 void emit_silu_backward(std::ostringstream &out, const ir::Program &program,
                         const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* grad_output,dif_scalar* grad_input){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count
-      << "ULL){float value=dif_load(x,i),sigmoid=1.0f/(1.0f+expf(-value));"
-         "float derivative=sigmoid*(1.0f+value*(1.0f-sigmoid));"
-         "dif_store(grad_input,i,dif_load(grad_output,i)*derivative);}}\n";
+  out << render_kernel_template(
+      "silu_backward", {{"function", function_name(op)},
+                        {"count", std::to_string(count)}});
 }
 
 void emit_adamw_update(std::ostringstream &out, const ir::Program &program,
@@ -1335,12 +1326,14 @@ void emit_fill(std::ostringstream &out, const ir::Program &program,
                const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto value = static_cast<float>(op.f64(ir::AttrKey::Value, 0.0));
-  out << std::setprecision(17) << "extern \"C\" __global__ void "
-      << function_name(op)
-      << "(dif_scalar* y){unsigned long long i=(unsigned long long)blockIdx.x*"
-         "blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL)dif_store(y,i," << std::scientific
-      << std::setprecision(9) << value << "f);}\n" << std::defaultfloat;
+  std::ostringstream value_literal;
+  value_literal << std::scientific << std::setprecision(9) << value;
+  out << render_kernel_template(
+      "fill", {{"function", function_name(op)},
+               {"count", std::to_string(count)},
+               {"value", value_literal.str()}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_gather_rows(std::ostringstream &out, const ir::Program &program,
@@ -1349,16 +1342,11 @@ void emit_gather_rows(std::ostringstream &out, const ir::Program &program,
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto input_rows = input->dims[0];
   const auto row_width = input->element_count() / input_rows;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const int* indices,dif_scalar* y){unsigned long "
-         "long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << row_width
-      << "ULL,col=i%" << row_width
-      << "ULL;int source=indices[row];if(source>=0&&source<"
-      << input_rows
-      << ")dif_store(y,i,dif_load(x,(unsigned long long)source*"
-      << row_width
-      << "ULL+col));else dif_store(y,i,__int_as_float(0x7fffffff));}}\n";
+  out << render_kernel_template(
+      "gather_rows", {{"function", function_name(op)},
+                      {"count", std::to_string(count)},
+                      {"row_width", std::to_string(row_width)},
+                      {"input_rows", std::to_string(input_rows)}});
 }
 
 void emit_indexed_update_rows(std::ostringstream &out,
@@ -1370,18 +1358,11 @@ void emit_indexed_update_rows(std::ostringstream &out,
   const auto rows = base->dims[0];
   const auto update_rows = updates->dims[0];
   const auto row_width = base->element_count() / rows;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* base,const dif_scalar* updates,const int* map,"
-         "dif_scalar* y){unsigned long long i=(unsigned long long)blockIdx.x*"
-         "blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << row_width
-      << "ULL,col=i%" << row_width
-      << "ULL;int source=map[row];if(source==-1)dif_store(y,i,dif_load(base,i));"
-         "else if(source>=0&&source<"
-      << update_rows
-      << ")dif_store(y,i,dif_load(updates,(unsigned long long)source*"
-      << row_width
-      << "ULL+col));else dif_store(y,i,__int_as_float(0x7fffffff));}}\n";
+  out << render_kernel_template(
+      "indexed_update_rows", {{"function", function_name(op)},
+                              {"count", std::to_string(count)},
+                              {"row_width", std::to_string(row_width)},
+                              {"update_rows", std::to_string(update_rows)}});
 }
 
 void emit_select_row_chunks(std::ostringstream &out,
@@ -1393,22 +1374,22 @@ void emit_select_row_chunks(std::ostringstream &out,
   const auto rows = values->dims[0];
   const auto width = output->dims[1];
   const auto source_width = values->dims[1];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* values,const int* indices";
-  for (std::size_t chunk = 0; chunk < op.outputs.size(); ++chunk)
-    out << ",dif_scalar* o" << chunk;
-  out << "){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << width
-      << "ULL,col=i%" << width << "ULL;int source=indices[row];";
+  std::string outputs, chunks;
   for (std::size_t chunk = 0; chunk < op.outputs.size(); ++chunk) {
-    out << "if(source>=0&&source<" << rows << ")dif_store(o" << chunk
-        << ",i,dif_load(values,(unsigned long long)source*" << source_width
-        << "ULL+" << chunk * width
-        << "ULL+col));else dif_store(o" << chunk
-        << ",i,__int_as_float(0x7fffffff));";
+    const auto o = "o" + std::to_string(chunk);
+    outputs += ", dif_scalar* " + o;
+    chunks += "    if (source >= 0 && source < " + std::to_string(rows) +
+              ") dif_store(" + o + ", i, dif_load(values, (unsigned long long)source * " +
+              std::to_string(source_width) + "ULL + " +
+              std::to_string(chunk * width) + "ULL + col));\n    else dif_store(" +
+              o + ", i, __int_as_float(0x7fffffff));\n";
   }
-  out << "}}\n";
+  out << render_kernel_template(
+      "select_row_chunks", {{"function", function_name(op)},
+                            {"outputs", outputs},
+                            {"count", std::to_string(count)},
+                            {"width", std::to_string(width)},
+                            {"chunks", chunks}});
 }
 
 void emit_sinusoidal_timestep(std::ostringstream &out,
@@ -1426,23 +1407,26 @@ void emit_sinusoidal_timestep(std::ostringstream &out,
       static_cast<float>(op.f64(ir::AttrKey::MaxPeriod, 10000.0));
   const auto log_period = static_cast<float>(std::log(max_period));
   const auto denominator = static_cast<float>(half) - shift;
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_f32* timesteps,dif_f32* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << width
-      << "ULL,column=i%" << width << "ULL;if(column>=" << 2U * half
-      << "ULL){dif_store_f32(y,i,0.0f);return;}unsigned long long component="
-         "column%"
-      << half << "ULL;float exponent=(-" << log_period
-      << "f*(float)component)/" << denominator
-      << "f;float frequency=expf(exponent);float scaled_timestep="
-      << "dif_load_f32(timesteps,row)*" << scale
-      << "f;float angle=scaled_timestep*frequency;float s=sinf(angle),"
-         "c=cosf(angle);dif_store_f32(y,i,"
-      << (flip ? "(column<" + std::to_string(half) + "ULL?c:s)"
-               : "(column<" + std::to_string(half) + "ULL?s:c)")
-      << ");}}\n" << std::defaultfloat;
+  const auto literal = [](float value) {
+    std::ostringstream text;
+    text << std::scientific << std::setprecision(9) << value;
+    return text.str();
+  };
+  const auto half_text = std::to_string(half);
+  out << render_kernel_template(
+      "sinusoidal_timestep",
+      {{"function", function_name(op)},
+       {"count", std::to_string(count)},
+       {"width", std::to_string(width)},
+       {"paired", std::to_string(2U * half)},
+       {"half", half_text},
+       {"log_period", literal(log_period)},
+       {"denominator", literal(denominator)},
+       {"scale", literal(scale)},
+       {"select", flip ? "(column < " + half_text + "ULL ? c : s)"
+                       : "(column < " + half_text + "ULL ? s : c)"}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_rotary_position(std::ostringstream &out,
@@ -1464,33 +1448,24 @@ void emit_rotary_position(std::ostringstream &out,
                          ? "dif_store_f32"
                          : output->dtype == ir::DType::BF16 ? "dif_store_bf16"
                                                             : "dif_store_f16";
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_f32* positions,const dif_f32* inv_freq," << output_type
-      << "* cosine," << output_type
-      << "* sine){unsigned long long i=(unsigned long long)blockIdx.x*"
-         "blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << width
-      << "ULL,column=i%" << width << "ULL,component=column%"
-      << unrepeated_width << "ULL,axis=component/" << frequencies
-      << "ULL,frequency=component%" << frequencies
-      << "ULL;float angle=dif_load_f32(positions,row*" << axes
-      << "ULL+axis)*dif_load_f32(inv_freq,frequency);" << store
-      << "(cosine,i,cosf(angle));" << store << "(sine,i,sinf(angle));}}\n";
+  out << render_kernel_template(
+      "rotary_position",
+      {{"function", function_name(op)},
+       {"output_type", output_type},
+       {"count", std::to_string(count)},
+       {"width", std::to_string(width)},
+       {"unrepeated_width", std::to_string(unrepeated_width)},
+       {"frequencies", std::to_string(frequencies)},
+       {"axes", std::to_string(axes)},
+       {"store", store}});
 }
 
 void emit_linear_blend(std::ostringstream &out, const ir::Program &program,
                        const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* left,const dif_scalar* right,const dif_f32* factor,"
-         "dif_scalar* output){unsigned long long i=(unsigned long long)blockIdx.x*"
-         "blockDim.x+threadIdx.x;if(i<"
-      << count
-      << "ULL){float f=dif_load_f32(factor,0ULL),left_value=dif_load(left,i),"
-         "right_value=dif_load(right,i);float complement=__fsub_rn(1.0f,f);"
-         "float weighted_left=__fmul_rn(f,left_value);float weighted_right="
-         "__fmul_rn(complement,right_value);dif_store(output,i,__fadd_rn("
-         "weighted_left,weighted_right));}}\n";
+  out << render_kernel_template(
+      "linear_blend", {{"function", function_name(op)},
+                       {"count", std::to_string(count)}});
 }
 
 void emit_flow_euler_step(std::ostringstream &out,
@@ -1498,35 +1473,20 @@ void emit_flow_euler_step(std::ostringstream &out,
                           const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto step = op.u64(ir::AttrKey::StepIndex, 0U);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* sample,const dif_scalar* velocity,const dif_f32* "
-         "timesteps,const dif_f32* sigmas,dif_scalar* output){unsigned long "
-         "long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){float timestep=dif_load_f32(timesteps," << step
-      << "ULL),sigma=dif_load_f32(sigmas," << step
-      << "ULL),sigma_next=dif_load_f32(sigmas," << step + 1U
-      << "ULL),sample_value=dif_load(sample,i),velocity_value=dif_load(velocity,"
-         "i),sigma_from_timestep=__fsub_rn(1.0f,timestep),ratio=sigma_next/sigma;"
-         "float velocity_delta=__fmul_rn(sigma_from_timestep,velocity_value);"
-         "float denoised=__fadd_rn(sample_value,velocity_delta);float complement="
-         "__fsub_rn(1.0f,ratio);float weighted_sample=__fmul_rn(ratio,sample_value);"
-         "float weighted_denoised=__fmul_rn(complement,denoised);dif_store(output,"
-         "i,__fadd_rn(weighted_sample,weighted_denoised));}}\n";
+  out << render_kernel_template(
+      "flow_euler_step", {{"function", function_name(op)},
+                          {"count", std::to_string(count)},
+                          {"step", std::to_string(step)},
+                          {"next_step", std::to_string(step + 1U)}});
 }
 
 void emit_euler_velocity_step(std::ostringstream &out,
                               const ir::Program &program,
                               const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* sample,const dif_scalar* velocity,const dif_f32* "
-         "current,const dif_f32* next,dif_scalar* output){unsigned long long "
-         "i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count
-      << "ULL){float dt=__fsub_rn(dif_load_f32(next,0ULL),"
-         "dif_load_f32(current,0ULL));float scaled=dif_round(__fmul_rn(dt,"
-         "dif_load(velocity,i)));dif_store(output,i,__fadd_rn("
-         "dif_load(sample,i),scaled));}}\n";
+  out << render_kernel_template(
+      "euler_velocity_step", {{"function", function_name(op)},
+                              {"count", std::to_string(count)}});
 }
 
 void emit_permute(std::ostringstream &out, const ir::Program &program,
@@ -1537,20 +1497,20 @@ void emit_permute(std::ostringstream &out, const ir::Program &program,
   std::vector<std::uint64_t> input_strides(rank, 1U);
   for (std::size_t axis = rank - 1U; axis > 0U; --axis)
     input_strides[axis - 1U] = input_strides[axis] * input->dims[axis];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* input,dif_scalar* output){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << output->element_count()
-      << "ULL){unsigned long long remaining=i,source=0ULL,coordinate;";
+  std::string axes;
   for (std::size_t reverse = rank; reverse-- > 0U;) {
     const auto key = static_cast<ir::AttrKey>(
         static_cast<std::uint32_t>(ir::AttrKey::Permutation0) + reverse);
     const auto input_axis = op.u64(key, 0U);
-    out << "coordinate=remaining%" << output->dims[reverse]
-        << "ULL;remaining/=" << output->dims[reverse]
-        << "ULL;source+=coordinate*" << input_strides[input_axis] << "ULL;";
+    axes += "    coordinate = remaining % " +
+            std::to_string(output->dims[reverse]) + "ULL; remaining /= " +
+            std::to_string(output->dims[reverse]) + "ULL; source += coordinate * " +
+            std::to_string(input_strides[input_axis]) + "ULL;\n";
   }
-  out << "dif_store(output,i,dif_load(input,source));}}\n";
+  out << render_kernel_template(
+      "permute", {{"function", function_name(op)},
+                  {"count", std::to_string(output->element_count())},
+                  {"axes", axes}});
 }
 
 void emit_concat(std::ostringstream &out, const ir::Program &program,
@@ -1561,30 +1521,29 @@ void emit_concat(std::ostringstream &out, const ir::Program &program,
   for (std::size_t dimension = axis + 1U; dimension < output->dims.size();
        ++dimension)
     inner *= output->dims[dimension];
-  out << "extern \"C\" __global__ void " << function_name(op) << "(";
-  for (std::size_t input = 0U; input < op.inputs.size(); ++input) {
-    if (input != 0U)
-      out << ',';
-    out << "const dif_scalar* input" << input;
-  }
-  out << ",dif_scalar* output){unsigned long long i=(unsigned long long)"
-         "blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << output->element_count()
-      << "ULL){unsigned long long inner_index=i%" << inner
-      << "ULL,axis_coordinate=(i/" << inner << "ULL)%"
-      << output->dims[axis] << "ULL,outer=i/(" << output->dims[axis]
-      << "ULL*" << inner << "ULL),source=0ULL;";
+  std::string parameters;
+  for (std::size_t input = 0U; input < op.inputs.size(); ++input)
+    parameters += "const dif_scalar* input" + std::to_string(input) + ", ";
+  parameters += "dif_scalar* output";
+  std::string selection;
   std::uint64_t offset = 0U;
   for (std::size_t input = 0U; input < op.inputs.size(); ++input) {
     const auto input_axis = program.tensor(op.inputs[input])->dims[axis];
-    out << (input == 0U ? "if" : "else if") << "(axis_coordinate<"
-        << offset + input_axis << "ULL){source=(outer*" << input_axis
-        << "ULL+(axis_coordinate-" << offset << "ULL))*" << inner
-        << "ULL+inner_index;dif_store(output,i,dif_load(input" << input
-        << ",source));}";
+    selection += std::string(input == 0U ? "    if" : "    else if") +
+                 " (axis_coordinate < " + std::to_string(offset + input_axis) +
+                 "ULL) {\n      source = (outer * " + std::to_string(input_axis) +
+                 "ULL + (axis_coordinate - " + std::to_string(offset) + "ULL)) * " +
+                 std::to_string(inner) + "ULL + inner_index;\n      dif_store(output, i, dif_load(input" +
+                 std::to_string(input) + ", source));\n    }\n";
     offset += input_axis;
   }
-  out << "}}\n";
+  out << render_kernel_template(
+      "concat", {{"function", function_name(op)},
+                 {"parameters", parameters},
+                 {"count", std::to_string(output->element_count())},
+                 {"inner", std::to_string(inner)},
+                 {"axis_extent", std::to_string(output->dims[axis])},
+                 {"selection", selection}});
 }
 
 void emit_patchify_3d(std::ostringstream &out, const ir::Program &program,
@@ -2143,29 +2102,24 @@ void emit_swiglu(std::ostringstream &out, const ir::Program &program,
   const auto input_width = program.tensor(op.inputs[0])->dims.back();
   const auto start = op.u64(ir::AttrKey::Start, 0U);
   const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x, dif_scalar* y) {\n"
-      << "  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;\n"
-      << "  if(i<" << count << "ULL){ unsigned long long row=i/" << width
-      << "ULL, col=i%" << width << "ULL; float value=dif_load(x,row*" << input_width
-      << "ULL+" << start + (gate_first ? width : 0U)
-      << "ULL+col); float gate=dif_load(x,row*" << input_width << "ULL+"
-      << start + (gate_first ? 0U : width)
-      << "ULL+col); float activated=dif_round(dif_silu(gate));"
-         "dif_store(y,i,value*activated);}\n}\n";
+  out << render_kernel_template(
+      "swiglu",
+      {{"function", function_name(op)},
+       {"count", std::to_string(count)},
+       {"width", std::to_string(width)},
+       {"input_width", std::to_string(input_width)},
+       {"value_offset", std::to_string(start + (gate_first ? width : 0U))},
+       {"gate_offset", std::to_string(start + (gate_first ? 0U : width))}});
 }
 
 void emit_bias_add(std::ostringstream &out, const ir::Program &program,
                    const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto width = program.tensor(op.inputs[1])->dims[0];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* bias,dif_scalar* y){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
-         "if(i<"
-      << count
-      << "ULL)dif_store(y,i,dif_load(x,i)+dif_load(bias,i%" << width
-      << "ULL));}\n";
+  out << render_kernel_template(
+      "bias_add", {{"function", function_name(op)},
+                   {"count", std::to_string(count)},
+                   {"width", std::to_string(width)}});
 }
 
 void emit_linear_addmm_prefill(std::ostringstream &out,
@@ -2324,16 +2278,11 @@ void emit_residual_gate(std::ostringstream &out, const ir::Program &program,
   const auto rows = count / width;
   const auto gate_rows = gate->element_count() / width;
   const auto rows_per_gate = rows / gate_rows;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* residual, const dif_scalar* branch, const dif_scalar* gate, dif_scalar* y) {\n"
-      << "  unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
-         " if(i<"
-      << count
-      << "ULL){unsigned long long row=i/" << width
-      << "ULL,gate_index=(row/" << rows_per_gate << "ULL)*" << width
-      << "ULL+i%" << width
-      << "ULL;dif_store(y,i,dif_load(residual,i)+"
-         "dif_round(dif_load(gate,gate_index)*dif_load(branch,i)));}\n}\n";
+  out << render_kernel_template(
+      "residual_gate", {{"function", function_name(op)},
+                        {"count", std::to_string(count)},
+                        {"width", std::to_string(width)},
+                        {"rows_per_gate", std::to_string(rows_per_gate)}});
 }
 
 void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
@@ -2794,13 +2743,9 @@ void emit_residual_gate_backward(std::ostringstream &out,
                                  const ir::Program &program,
                                  const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,const dif_scalar* branch,const dif_scalar* gate,dif_scalar* grad_branch,dif_scalar* grad_gate){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count
-      << "ULL){float upstream=dif_load(grad_output,i);"
-         "dif_store(grad_branch,i,upstream*dif_load(gate,i));"
-         "dif_store(grad_gate,i,upstream*dif_load(branch,i));}}\n";
+  out << render_kernel_template(
+      "residual_gate_backward", {{"function", function_name(op)},
+                                 {"count", std::to_string(count)}});
 }
 
 void emit_attention_lse(std::ostringstream &out, const ir::Program &program,

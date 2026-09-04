@@ -46,7 +46,14 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* grad_output,const dif_scalar* branch,const dif_scalar* gate,dif_scalar* grad_branch,dif_scalar* grad_gate){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL){float upstream=dif_load(grad_output,i);dif_store(grad_branch,i,upstream*dif_load(gate,i));dif_store(grad_gate,i,upstream*dif_load(branch,i));}}
+extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_scalar* branch, const dif_scalar* gate, dif_scalar* grad_branch, dif_scalar* grad_gate) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    float upstream = dif_load(grad_output, i);
+    dif_store(grad_branch, i, upstream * dif_load(gate, i));
+    dif_store(grad_gate, i, upstream * dif_load(branch, i));
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store
