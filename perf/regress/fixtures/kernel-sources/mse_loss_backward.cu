@@ -46,7 +46,14 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_bf16* prediction,const dif_bf16* target,const dif_f32* grad_loss,dif_bf16* grad_prediction){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL){float factor=2.0f*dif_load_f32(grad_loss,0ULL)/32.0f;dif_store_bf16(grad_prediction,i,(dif_load_bf16(prediction,i)-dif_load_bf16(target,i))*factor);}}
+// d loss / d prediction = 2 * grad_loss * (prediction - target) / N.
+extern "C" __global__ void dif_op_1(const dif_bf16* prediction, const dif_bf16* target, const dif_f32* grad_loss, dif_bf16* grad_prediction) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    float factor = 2.0f * dif_load_f32(grad_loss, 0ULL) / 32.0f;
+    dif_store_bf16(grad_prediction, i, (dif_load_bf16(prediction, i) - dif_load_bf16(target, i)) * factor);
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

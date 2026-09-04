@@ -46,7 +46,42 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,dif_scalar* grad_input,dif_scalar* grad_weight){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL){unsigned long long row=i/8ULL,base=row*8ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<8ULL;++k){float value=dif_load(x,base+k);ss=fmaf(value,value,ss);}float inv=rsqrtf(ss/8.0f+9.999999975e-07f);float dot=0.0f;for(unsigned long long k=0ULL;k<8ULL;++k)dot=fmaf(dif_load(grad_output,base+k)*dif_load(weight,k),dif_load(x,base+k),dot);float value=dif_load(x,i);float gradient=dif_load(grad_output,i)*dif_load(weight,i-base)*inv-value*inv*inv*inv*dot/8.0f;dif_store(grad_input,i,gradient);if(i<8ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<4ULL;++r){unsigned long long rb=r*8ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<8ULL;++k){float rv=dif_load(x,rb+k);rss=fmaf(rv,rv,rss);}float rinv=rsqrtf(rss/8.0f+9.999999975e-07f);acc=fmaf(dif_load(grad_output,rb+i)*dif_load(x,rb+i),rinv,acc);}dif_store(grad_weight,i,acc);}}}
+// Reference rms_norm backward: one thread per element recomputes the row
+// statistics; the optional weight gradient is reduced over rows by the
+// first `columns` threads.
+extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_scalar* x, const dif_scalar* weight, dif_scalar* grad_input, dif_scalar* grad_weight) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    unsigned long long row = i / 8ULL, base = row * 8ULL;
+    float ss = 0.0f;
+    for (unsigned long long k = 0ULL; k < 8ULL; ++k) {
+      float value = dif_load(x, base + k);
+      ss = fmaf(value, value, ss);
+    }
+    float inv = rsqrtf(ss / 8.0f + 9.999999975e-07f);
+    float dot = 0.0f;
+    for (unsigned long long k = 0ULL; k < 8ULL; ++k)
+      dot = fmaf(dif_load(grad_output, base + k) * dif_load(weight, k), dif_load(x, base + k), dot);
+    float value = dif_load(x, i);
+    float gradient = dif_load(grad_output, i) * dif_load(weight, i - base) * inv - value * inv * inv * inv * dot / 8.0f;
+    dif_store(grad_input, i, gradient);
+        if (i < 8ULL) {
+      float acc = 0.0f;
+      for (unsigned long long r = 0ULL; r < 4ULL; ++r) {
+        unsigned long long rb = r * 8ULL;
+        float rss = 0.0f;
+        for (unsigned long long k = 0ULL; k < 8ULL; ++k) {
+          float rv = dif_load(x, rb + k);
+          rss = fmaf(rv, rv, rss);
+        }
+        float rinv = rsqrtf(rss / 8.0f + 9.999999975e-07f);
+        acc = fmaf(dif_load(grad_output, rb + i) * dif_load(x, rb + i), rinv, acc);
+      }
+      dif_store(grad_weight, i, acc);
+    }
+
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

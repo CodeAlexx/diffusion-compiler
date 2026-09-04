@@ -800,14 +800,12 @@ void emit_dequantize_int8_blocks(std::ostringstream &out,
   const auto columns = input->dims[1];
   const auto scale_columns = scales->dims[1];
   const auto block = op.u64(ir::AttrKey::BlockSize, 0U);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const signed char* x,const float* scales,dif_bf16* y){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << columns
-      << "ULL;unsigned long long column=i%" << columns
-      << "ULL;dif_store_bf16(y,i,(float)x[i]*scales[row*"
-      << scale_columns << "ULL+column/" << block << "ULL]);}}\n";
+  out << render_kernel_template(
+      "dequantize_int8_blocks", {{"function", function_name(op)},
+                                 {"count", std::to_string(count)},
+                                 {"columns", std::to_string(columns)},
+                                 {"scale_columns", std::to_string(scale_columns)},
+                                 {"block", std::to_string(block)}});
 }
 
 void emit_quantize_fp8_rows(std::ostringstream &out,
@@ -816,26 +814,10 @@ void emit_quantize_fp8_rows(std::ostringstream &out,
   const auto *input = program.tensor(op.inputs[0]);
   const auto columns = input->dims.back();
   const auto rows = input->element_count() / columns;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_bf16* x,unsigned char* q,float* scales){"
-         "__shared__ float maximums[256];unsigned long long row=blockIdx.x;"
-         "unsigned tid=threadIdx.x;if(row>="
-      << rows
-      << "ULL)return;unsigned long long base=row*" << columns
-      << "ULL;float maximum=0.0f;for(unsigned long long column=tid;column<"
-      << columns
-      << "ULL;column+=256ULL){maximum=fmaxf(maximum,fabsf(dif_load_bf16(x,"
-         "base+column)));}maximums[tid]=maximum;__syncthreads();"
-         "for(unsigned active=128U;active>0U;active>>=1U){if(tid<active)"
-         "maximums[tid]=fmaxf(maximums[tid],maximums[tid+active]);"
-         "__syncthreads();}float scale=fmaxf(maximums[0]/448.0f,1.0e-30f);"
-         "if(tid==0U)scales[row]=scale;for(unsigned long long column=tid;"
-         "column<"
-      << columns
-      << "ULL;column+=256ULL){float value=dif_load_bf16(x,base+column)/scale;"
-         "unsigned short pair;asm(\"{cvt.rn.satfinite.e4m3x2.f32 %0, %2, "
-         "%1;}\\n\":\"=h\"(pair):\"f\"(value),\"f\"(0.0f));"
-         "q[base+column]=(unsigned char)pair;}}\n";
+  out << render_kernel_template(
+      "quantize_fp8_rows", {{"function", function_name(op)},
+                            {"rows", std::to_string(rows)},
+                            {"columns", std::to_string(columns)}});
 }
 
 void emit_linear_fp8_output_scale(std::ostringstream &out,
@@ -846,13 +828,10 @@ void emit_linear_fp8_output_scale(std::ostringstream &out,
   const auto rows = input->element_count() / input->dims.back();
   const auto columns = weight->dims.front();
   const auto count = rows * columns;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const unsigned char* x,const unsigned char* w,const float* rs,"
-         "const float* cs,dif_bf16* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << columns
-      << "ULL;unsigned long long column=i%" << columns
-      << "ULL;dif_store_bf16(y,i,dif_load_bf16(y,i)*rs[row]*cs[column]);}}\n";
+  out << render_kernel_template(
+      "linear_fp8_output_scale", {{"function", function_name(op)},
+                                  {"count", std::to_string(count)},
+                                  {"columns", std::to_string(columns)}});
 }
 
 void emit_quantize_fp8_blocks32(std::ostringstream &out,
@@ -1200,20 +1179,16 @@ void emit_mse_loss_backward(std::ostringstream &out,
   const auto *grad_loss = program.tensor(op.inputs[2]);
   const auto *grad_prediction = program.tensor(op.outputs[0]);
   const auto count = grad_prediction->element_count();
-  const auto *scalar = typed_scalar(prediction->dtype);
-  const auto *load = typed_load(prediction->dtype);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const " << scalar << "* prediction,const " << scalar
-      << "* target,const " << typed_scalar(grad_loss->dtype)
-      << "* grad_loss," << typed_scalar(grad_prediction->dtype)
-      << "* grad_prediction){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count
-      << "ULL){float factor=2.0f*" << typed_load(grad_loss->dtype)
-      << "(grad_loss,0ULL)/" << count << ".0f;"
-      << typed_store(grad_prediction->dtype) << "(grad_prediction,i,("
-      << load << "(prediction,i)-" << load
-      << "(target,i))*factor);}}\n";
+  out << render_kernel_template(
+      "mse_loss_backward",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(prediction->dtype)},
+       {"grad_loss_scalar", typed_scalar(grad_loss->dtype)},
+       {"grad_scalar", typed_scalar(grad_prediction->dtype)},
+       {"count", std::to_string(count)},
+       {"grad_loss_load", typed_load(grad_loss->dtype)},
+       {"grad_store", typed_store(grad_prediction->dtype)},
+       {"load", typed_load(prediction->dtype)}});
 }
 
 void emit_linear_backward_input(std::ostringstream &out,
@@ -1223,16 +1198,11 @@ void emit_linear_backward_input(std::ostringstream &out,
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto inner = weight->dims[1];
   const auto outputs = weight->dims[0];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,const dif_scalar* weight,dif_scalar* grad_input){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << inner
-      << "ULL,column=i%" << inner
-      << "ULL;float value=0.0f;for(unsigned long long output=0ULL;output<"
-      << outputs
-      << "ULL;++output)value=fmaf(dif_load(grad_output,row*" << outputs
-      << "ULL+output),dif_load(weight,output*" << inner
-      << "ULL+column),value);dif_store(grad_input,i,value);}}\n";
+  out << render_kernel_template(
+      "linear_backward_input", {{"function", function_name(op)},
+                                {"count", std::to_string(count)},
+                                {"inner", std::to_string(inner)},
+                                {"outputs", std::to_string(outputs)}});
 }
 
 void emit_linear_backward_weight(std::ostringstream &out,
@@ -1246,15 +1216,12 @@ void emit_linear_backward_weight(std::ostringstream &out,
   const auto outputs = grad_weight->dims[0];
   const auto inner = grad_weight->dims[1];
   const auto rows = input->element_count() / inner;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,const dif_scalar* input,dif_scalar* grad_weight){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long output=i/" << inner
-      << "ULL,column=i%" << inner
-      << "ULL;float value=0.0f;for(unsigned long long row=0ULL;row<" << rows
-      << "ULL;++row)value=fmaf(dif_load(grad_output,row*" << outputs
-      << "ULL+output),dif_load(input,row*" << inner
-      << "ULL+column),value);dif_store(grad_weight,i,value);}}\n";
+  out << render_kernel_template(
+      "linear_backward_weight", {{"function", function_name(op)},
+                                 {"count", std::to_string(count)},
+                                 {"inner", std::to_string(inner)},
+                                 {"rows", std::to_string(rows)},
+                                 {"outputs", std::to_string(outputs)}});
 }
 
 void emit_bias_backward(std::ostringstream &out, const ir::Program &program,
@@ -2127,12 +2094,10 @@ void emit_linear_addmm_prefill(std::ostringstream &out,
                                const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto width = program.tensor(op.inputs[2])->element_count();
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* bias,"
-         "dif_scalar* y){(void)x;(void)weight;unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL)dif_store(y,i,dif_load(bias,i%" << width
-      << "ULL));}\n";
+  out << render_kernel_template(
+      "linear_addmm_prefill", {{"function", function_name(op)},
+                               {"count", std::to_string(count)},
+                               {"width", std::to_string(width)}});
 }
 
 void emit_h3_adaln_select(std::ostringstream &out, const ir::Program &program,
@@ -2140,26 +2105,10 @@ void emit_h3_adaln_select(std::ostringstream &out, const ir::Program &program,
   const auto &shape = program.tensor(op.outputs[0])->dims;
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto hidden = shape[1];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* projected,const int* indices,dif_scalar* o0,"
-         "dif_scalar* o1,dif_scalar* o2,dif_scalar* o3,dif_scalar* o4,"
-         "dif_scalar* o5){unsigned long long i=(unsigned long long)blockIdx.x*"
-         "blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << hidden
-      << "ULL,col=i%" << hidden
-      << "ULL,table=(unsigned long long)indices[row];"
-         "dif_store(o0,i,dif_load(projected,(table*6ULL+0ULL)*"
-      << hidden
-      << "ULL+col));dif_store(o1,i,dif_load(projected,(table*6ULL+1ULL)*"
-      << hidden
-      << "ULL+col));dif_store(o2,i,dif_load(projected,(table*6ULL+2ULL)*"
-      << hidden
-      << "ULL+col));dif_store(o3,i,dif_load(projected,(table*6ULL+3ULL)*"
-      << hidden
-      << "ULL+col));dif_store(o4,i,dif_load(projected,(table*6ULL+4ULL)*"
-      << hidden
-      << "ULL+col));dif_store(o5,i,dif_load(projected,(table*6ULL+5ULL)*"
-      << hidden << "ULL+col));}}\n";
+  out << render_kernel_template(
+      "h3_adaln_select", {{"function", function_name(op)},
+                          {"count", std::to_string(count)},
+                          {"hidden", std::to_string(hidden)}});
 }
 
 void emit_h3_deinterleave_qkv(std::ostringstream &out,
@@ -2170,17 +2119,14 @@ void emit_h3_deinterleave_qkv(std::ostringstream &out,
   const auto heads = shape[1];
   const auto dim = shape[2];
   const auto packed = 3U * heads * dim;
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* q,dif_scalar* k,dif_scalar* v){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
-         "if(i<"
-      << count << "ULL){unsigned long long row=i/" << heads * dim
-      << "ULL,within=i%" << heads * dim << "ULL,head=within/" << dim
-      << "ULL,d=within%" << dim << "ULL,base=row*" << packed
-      << "ULL+head*" << 3U * dim
-      << "ULL+d;dif_store(q,i,dif_load(x,base));dif_store(k,i,dif_load(x,base+"
-      << dim
-      << "ULL));dif_store(v,i,dif_load(x,base+" << 2U * dim << "ULL));}}\n";
+  out << render_kernel_template(
+      "h3_deinterleave_qkv", {{"function", function_name(op)},
+                              {"count", std::to_string(count)},
+                              {"head_width", std::to_string(heads * dim)},
+                              {"dim", std::to_string(dim)},
+                              {"packed", std::to_string(packed)},
+                              {"triple_dim", std::to_string(3U * dim)},
+                              {"double_dim", std::to_string(2U * dim)}});
 }
 
 void emit_h3_deinterleave_qkv_weight(std::ostringstream &out,
@@ -2190,19 +2136,14 @@ void emit_h3_deinterleave_qkv_weight(std::ostringstream &out,
   const auto count = program.tensor(op.outputs[0])->element_count();
   const auto dim = op.u64(ir::AttrKey::HeadDim, 0U);
   const auto hidden = shape[1];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* packed,dif_scalar* q,dif_scalar* k,dif_scalar* v){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;"
-         "if(i<"
-      << count << "ULL){unsigned long long row=i/" << hidden
-      << "ULL,col=i%" << hidden << "ULL,head=row/" << dim
-      << "ULL,d=row%" << dim << "ULL,base=((head*3ULL)*" << dim
-      << "ULL+d)*" << hidden
-      << "ULL+col;dif_store(q,i,dif_load(packed,base));"
-         "dif_store(k,i,dif_load(packed,base+"
-      << dim * hidden
-      << "ULL));dif_store(v,i,dif_load(packed,base+" << 2U * dim * hidden
-      << "ULL));}}\n";
+  out << render_kernel_template(
+      "h3_deinterleave_qkv_weight",
+      {{"function", function_name(op)},
+       {"count", std::to_string(count)},
+       {"hidden", std::to_string(hidden)},
+       {"dim", std::to_string(dim)},
+       {"dim_hidden", std::to_string(dim * hidden)},
+       {"double_dim_hidden", std::to_string(2U * dim * hidden)}});
 }
 
 void emit_dequantize_int4(std::ostringstream &out,
@@ -2503,34 +2444,25 @@ void emit_rms_norm_backward(std::ostringstream &out,
   const auto count = rows * columns;
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
   const bool weight_grad = op.outputs.size() == 2U;
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,dif_scalar* grad_input"
-      << (weight_grad ? ",dif_scalar* grad_weight" : "")
-      << "){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << columns
-      << "ULL,base=row*" << columns
-      << "ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k){float value=dif_load(x,base+k);ss=fmaf(value,value,ss);}"
-         "float inv=rsqrtf(ss/"
-      << columns << ".0f+" << epsilon
-      << "f);float dot=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k)dot=fmaf(dif_load(grad_output,base+k)*dif_load(weight,k),"
-         "dif_load(x,base+k),dot);float value=dif_load(x,i);"
-         "float gradient=dif_load(grad_output,i)*dif_load(weight,i-base)*inv-"
-         "value*inv*inv*inv*dot/"
-      << columns << ".0f;dif_store(grad_input,i,gradient);";
-  if (weight_grad)
-    out << "if(i<" << columns
-        << "ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<" << rows
-        << "ULL;++r){unsigned long long rb=r*" << columns
-        << "ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<" << columns
-        << "ULL;++k){float rv=dif_load(x,rb+k);rss=fmaf(rv,rv,rss);}"
-           "float rinv=rsqrtf(rss/"
-        << columns << ".0f+" << epsilon
-        << "f);acc=fmaf(dif_load(grad_output,rb+i)*dif_load(x,rb+i),rinv,acc);}"
-           "dif_store(grad_weight,i,acc);}";
-  out << "}}\n" << std::defaultfloat;
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9) << epsilon;
+  const std::string weight_gradient =
+      weight_grad ? render_kernel_template(
+                        "rms_norm_backward_weight",
+                        {{"columns", std::to_string(columns)},
+                         {"rows", std::to_string(rows)},
+                         {"epsilon", epsilon_literal.str()}})
+                  : std::string{};
+  out << render_kernel_template(
+      "rms_norm_backward",
+      {{"function", function_name(op)},
+       {"weight_parameter", weight_grad ? ", dif_scalar* grad_weight" : ""},
+       {"count", std::to_string(count)},
+       {"columns", std::to_string(columns)},
+       {"epsilon", epsilon_literal.str()},
+       {"weight_gradient", weight_gradient}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_rms_norm_modulate_backward(std::ostringstream &out,
@@ -2589,26 +2521,17 @@ void emit_swiglu_backward(std::ostringstream &out, const ir::Program &program,
   const auto input_width = program.tensor(op.inputs[1])->dims.back();
   const auto start = op.u64(ir::AttrKey::Start, 0U);
   const bool gate_first = op.boolean(ir::AttrKey::GateFirst, false);
-  // Thread i owns one element of the packed [.., 2W] input gradient; the
-  // value half receives silu(gate)*g, the gate half dsilu(gate)*value*g.
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,const dif_scalar* x,dif_scalar* grad_input){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << input_width
-      << "ULL,col=i%" << input_width << "ULL;if(col<" << start
-      << "ULL||col>=" << start + width * 2U
-      << "ULL){dif_store(grad_input,i,0.0f);return;}unsigned long long lane=col-"
-      << start << "ULL,cw=lane<" << width << "ULL?lane:lane-" << width
-      << "ULL,base=row*" << input_width << "ULL+" << start
-      << "ULL;float value=dif_load(x,base+" << (gate_first ? width : 0U)
-      << "ULL+cw);float gate=dif_load(x,base+" << (gate_first ? 0U : width)
-      << "ULL+cw);float sigmoid=1.0f/(1.0f+expf(-gate));"
-         "float upstream=dif_load(grad_output,row*"
-      << width << "ULL+cw);int is_value_slot=lane"
-      << (gate_first ? ">=" : "<") << width
-      << "ULL;float gradient=is_value_slot?gate*sigmoid*upstream:"
-         "sigmoid*(1.0f+gate*(1.0f-sigmoid))*value*upstream;"
-         "dif_store(grad_input,i,gradient);}}\n";
+  out << render_kernel_template(
+      "swiglu_backward",
+      {{"function", function_name(op)},
+       {"count", std::to_string(count)},
+       {"input_width", std::to_string(input_width)},
+       {"start", std::to_string(start)},
+       {"window_end", std::to_string(start + width * 2U)},
+       {"width", std::to_string(width)},
+       {"value_offset", std::to_string(gate_first ? width : 0U)},
+       {"gate_offset", std::to_string(gate_first ? 0U : width)},
+       {"value_slot_test", gate_first ? ">=" : "<"}});
 }
 
 void emit_qk_norm_rope_backward(std::ostringstream &out,

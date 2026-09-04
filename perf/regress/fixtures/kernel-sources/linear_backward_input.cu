@@ -46,7 +46,18 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* grad_output,const dif_scalar* weight,dif_scalar* grad_input){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<64ULL){unsigned long long row=i/16ULL,column=i%16ULL;float value=0.0f;for(unsigned long long output=0ULL;output<8ULL;++output)value=fmaf(dif_load(grad_output,row*8ULL+output),dif_load(weight,output*16ULL+column),value);dif_store(grad_input,i,value);}}
+// grad_input[row, k] = sum_n grad_output[row, n] * weight[n, k] (reference
+// form: one thread per output element, serial fmaf accumulation).
+extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_scalar* weight, dif_scalar* grad_input) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 64ULL) {
+    unsigned long long row = i / 16ULL, column = i % 16ULL;
+    float value = 0.0f;
+    for (unsigned long long output = 0ULL; output < 8ULL; ++output)
+      value = fmaf(dif_load(grad_output, row * 8ULL + output), dif_load(weight, output * 16ULL + column), value);
+    dif_store(grad_input, i, value);
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

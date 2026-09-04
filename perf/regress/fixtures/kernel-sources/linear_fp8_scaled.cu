@@ -42,4 +42,14 @@ extern "C" __device__ float dif_round_f16(float input) {
 extern "C" __device__ float dif_silu(float x) {
   return x / (1.0f + expf(-x));
 }
-extern "C" __global__ void dif_op_1(const unsigned char* x,const unsigned char* w,const float* rs,const float* cs,dif_bf16* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL){unsigned long long row=i/8ULL;unsigned long long column=i%8ULL;dif_store_bf16(y,i,dif_load_bf16(y,i)*rs[row]*cs[column]);}}
+// Epilogue for the FP8 GEMM: the raw BF16 product in y is rescaled in place
+// by the row and column dequantization scales (x and w are the GEMM
+// operands, unused here).
+extern "C" __global__ void dif_op_1(const unsigned char* x, const unsigned char* w, const float* rs, const float* cs, dif_bf16* y) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    unsigned long long row = i / 8ULL;
+    unsigned long long column = i % 8ULL;
+    dif_store_bf16(y, i, dif_load_bf16(y, i) * rs[row] * cs[column]);
+  }
+}

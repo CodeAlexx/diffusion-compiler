@@ -46,7 +46,20 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* projected,const int* indices,dif_scalar* o0,dif_scalar* o1,dif_scalar* o2,dif_scalar* o3,dif_scalar* o4,dif_scalar* o5){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<32ULL){unsigned long long row=i/8ULL,col=i%8ULL,table=(unsigned long long)indices[row];dif_store(o0,i,dif_load(projected,(table*6ULL+0ULL)*8ULL+col));dif_store(o1,i,dif_load(projected,(table*6ULL+1ULL)*8ULL+col));dif_store(o2,i,dif_load(projected,(table*6ULL+2ULL)*8ULL+col));dif_store(o3,i,dif_load(projected,(table*6ULL+3ULL)*8ULL+col));dif_store(o4,i,dif_load(projected,(table*6ULL+4ULL)*8ULL+col));dif_store(o5,i,dif_load(projected,(table*6ULL+5ULL)*8ULL+col));}}
+// Select the six adaLN modulation rows [shift, scale, gate x2] for each
+// token from the projected table [T, 18H] by the token's table index.
+extern "C" __global__ void dif_op_1(const dif_scalar* projected, const int* indices, dif_scalar* o0, dif_scalar* o1, dif_scalar* o2, dif_scalar* o3, dif_scalar* o4, dif_scalar* o5) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 32ULL) {
+    unsigned long long row = i / 8ULL, col = i % 8ULL, table = (unsigned long long)indices[row];
+    dif_store(o0, i, dif_load(projected, (table * 6ULL + 0ULL) * 8ULL + col));
+    dif_store(o1, i, dif_load(projected, (table * 6ULL + 1ULL) * 8ULL + col));
+    dif_store(o2, i, dif_load(projected, (table * 6ULL + 2ULL) * 8ULL + col));
+    dif_store(o3, i, dif_load(projected, (table * 6ULL + 3ULL) * 8ULL + col));
+    dif_store(o4, i, dif_load(projected, (table * 6ULL + 4ULL) * 8ULL + col));
+    dif_store(o5, i, dif_load(projected, (table * 6ULL + 5ULL) * 8ULL + col));
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

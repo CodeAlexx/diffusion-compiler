@@ -42,4 +42,12 @@ extern "C" __device__ float dif_round_f16(float input) {
 extern "C" __device__ float dif_silu(float x) {
   return x / (1.0f + expf(-x));
 }
-extern "C" __global__ void dif_op_1(const signed char* x,const float* scales,dif_bf16* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<256ULL){unsigned long long row=i/64ULL;unsigned long long column=i%64ULL;dif_store_bf16(y,i,(float)x[i]*scales[row*2ULL+column/32ULL]);}}
+// Row-major INT8 weights with one F32 scale per `block` adjacent K values.
+extern "C" __global__ void dif_op_1(const signed char* x, const float* scales, dif_bf16* y) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 256ULL) {
+    unsigned long long row = i / 64ULL;
+    unsigned long long column = i % 64ULL;
+    dif_store_bf16(y, i, (float)x[i] * scales[row * 2ULL + column / 32ULL]);
+  }
+}

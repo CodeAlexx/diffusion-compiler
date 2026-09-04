@@ -46,7 +46,18 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* packed,dif_scalar* q,dif_scalar* k,dif_scalar* v){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<512ULL){unsigned long long row=i/32ULL,col=i%32ULL,head=row/8ULL,d=row%8ULL,base=((head*3ULL)*8ULL+d)*32ULL+col;dif_store(q,i,dif_load(packed,base));dif_store(k,i,dif_load(packed,base+256ULL));dif_store(v,i,dif_load(packed,base+512ULL));}}
+// Packed projection weight [3N, K] with per-head (q,k,v) row interleaving
+// -> three [N, K] weights.
+extern "C" __global__ void dif_op_1(const dif_scalar* packed, dif_scalar* q, dif_scalar* k, dif_scalar* v) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 512ULL) {
+    unsigned long long row = i / 32ULL, col = i % 32ULL, head = row / 8ULL,
+                       d = row % 8ULL, base = ((head * 3ULL) * 8ULL + d) * 32ULL + col;
+    dif_store(q, i, dif_load(packed, base));
+    dif_store(k, i, dif_load(packed, base + 256ULL));
+    dif_store(v, i, dif_load(packed, base + 512ULL));
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store

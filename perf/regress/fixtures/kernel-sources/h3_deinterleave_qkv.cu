@@ -46,7 +46,17 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-extern "C" __global__ void dif_op_1(const dif_scalar* x,dif_scalar* q,dif_scalar* k,dif_scalar* v){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<64ULL){unsigned long long row=i/16ULL,within=i%16ULL,head=within/8ULL,d=within%8ULL,base=row*48ULL+head*24ULL+d;dif_store(q,i,dif_load(x,base));dif_store(k,i,dif_load(x,base+8ULL));dif_store(v,i,dif_load(x,base+16ULL));}}
+// Packed [T, 3*H*D] with per-head (q,k,v) interleaving -> q, k, v [T, H, D].
+extern "C" __global__ void dif_op_1(const dif_scalar* x, dif_scalar* q, dif_scalar* k, dif_scalar* v) {
+  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < 64ULL) {
+    unsigned long long row = i / 16ULL, within = i % 16ULL, head = within / 8ULL,
+                       d = within % 8ULL, base = row * 48ULL + head * 24ULL + d;
+    dif_store(q, i, dif_load(x, base));
+    dif_store(k, i, dif_load(x, base + 8ULL));
+    dif_store(v, i, dif_load(x, base + 16ULL));
+  }
+}
 #undef dif_scalar
 #undef dif_load
 #undef dif_store
