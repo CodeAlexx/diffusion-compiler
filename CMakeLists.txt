@@ -337,6 +337,9 @@ target_link_libraries(difditops PRIVATE difcore)
 add_executable(difdittrain tools/difdittrain.cpp)
 target_link_libraries(difdittrain PRIVATE difcore)
 
+add_executable(difkrea2train tools/difkrea2train.cpp)
+target_link_libraries(difkrea2train PRIVATE difcore)
+
 add_executable(diftrain tools/diftrain.cpp)
 target_link_libraries(diftrain PRIVATE difcore)
 

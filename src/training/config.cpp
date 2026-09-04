@@ -201,6 +201,10 @@ std::vector<std::uint64_t> parse_resolutions(const TrainingConfig &config) {
 TrainingRun read_run(const TrainingConfig &config) {
   TrainingRun run;
   run.source = config.source();
+  // Read so it is not reported as a knob nobody read. Nothing depends on it
+  // yet; a config that names a schema this trainer does not know is not
+  // thereby wrong.
+  (void)config.text_or("schema", "");
   run.model_type = config.text("model_type");
   run.checkpoint = config.path("checkpoint");
   run.vae = config.path_or("vae", {});

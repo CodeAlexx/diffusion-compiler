@@ -1,0 +1,48 @@
+{
+  "schema": "diffusion-compiler.training.v1",
+  "model_type": "krea2",
+
+  "checkpoint": "/home/alex/.serenity/models/checkpoints/krea2-raw.safetensors",
+  "vae": "/home/alex/.serenity/models/vae/qwen-image",
+  "dataset_path": "/home/alex/eri2_stage_512",
+  "dataset_cache_dir": "/home/alex/eri2_stage_512",
+  "workspace_dir": "/home/alex/mojodiffusion/output/krea2_dc_lora",
+  "validation_prompts_file": "krea2_samples.json",
+  "save_filename_prefix": "krea2_dc",
+
+  "inner_dim": 6144,
+  "in_channels": 64,
+  "joint_attention_dim": 2560,
+  "out_channels": 64,
+  "num_double": 0,
+  "num_single": 28,
+  "num_heads": 48,
+  "head_dim": 128,
+  "mlp_hidden": 16384,
+  "timestep_dim": 256,
+
+  "resolution": "512",
+  "batch_size": 1,
+  "max_steps": 2000,
+  "save_every": 500,
+  "sample_every": 500,
+  "seed": 42,
+
+  "network_algorithm": "lora",
+  "lora_rank": 16,
+  "lora_alpha": 16,
+  "learning_rate": 0.0001,
+  "learning_rate_scheduler": "constant",
+  "learning_rate_warmup_steps": 0,
+  "max_grad_norm": 1.0,
+  "timestep_shift": 1.0,
+  "caption_dropout_prob": 0.0,
+  "quantized_resident": "fp8_e4m3",
+  "optimizer": {
+    "optimizer": "ADAMW",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "eps": 1e-08,
+    "weight_decay": 0.01
+  }
+}

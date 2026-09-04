@@ -1,0 +1,17 @@
+{
+  "schema": "diffusion-compiler.sample_prompts.v1",
+  "defaults": {
+    "sample_every": 500,
+    "sample_at_start": true,
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "cfg": 3.5,
+    "seed": 42,
+    "negative": ""
+  },
+  "prompts": [
+    {"id": "garden", "prompt": "vrtlEri2 woman in a sunlit garden", "seed": 42},
+    {"id": "portrait", "prompt": "vrtlEri2 close portrait, soft window light", "seed": 43}
+  ]
+}
