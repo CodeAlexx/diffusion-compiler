@@ -995,6 +995,47 @@ Program batch11_program(std::string_view which) {
                            {Attribute::f64(AttrKey::Epsilon, 1.0e-5)}}};
     return program;
   }
+  if (which == "channel_rms_norm_backward" ||
+      which == "channel_rms_norm_backward_frozen") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {2, 4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {2, 4, 8}},
+                       {3, DType::BF16, TensorRole::Constant, {4}},
+                       {4, DType::BF16, TensorRole::Output, {2, 4, 8}}};
+    std::vector<std::uint32_t> outputs{4};
+    // The frozen variant declares no gamma gradient at all, which is what a
+    // frozen gamma looks like in the IR.
+    if (which == "channel_rms_norm_backward") {
+      program.tensors.push_back({5, DType::BF16, TensorRole::Output, {4}});
+      outputs.push_back(5);
+    }
+    program.operations = {{1, Opcode::ChannelRmsNormBackward, {1, 2, 3},
+                           outputs,
+                           {Attribute::u64(AttrKey::Axis, 1U),
+                            Attribute::f64(AttrKey::Epsilon, 1.0e-12)}}};
+    return program;
+  }
+  if (which == "pad_reflect_backward" ||
+      which == "pad_reflect_backward_volumetric") {
+    const bool volumetric = which == "pad_reflect_backward_volumetric";
+    // Asymmetric extents on every axis, so the generated inverse mapping
+    // cannot pass by symmetry.
+    std::vector<Attribute> attributes{Attribute::u64(AttrKey::PadTop, 1U),
+                                      Attribute::u64(AttrKey::PadBottom, 3U),
+                                      Attribute::u64(AttrKey::PadWest, 2U),
+                                      Attribute::u64(AttrKey::PadEast, 2U)};
+    if (volumetric) {
+      attributes.push_back(Attribute::u64(AttrKey::PadFront, 2U));
+      attributes.push_back(Attribute::u64(AttrKey::PadBack, 1U));
+      program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 7, 9, 10}},
+                         {2, DType::BF16, TensorRole::Output, {1, 2, 4, 5, 6}}};
+    } else {
+      program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 9, 10}},
+                         {2, DType::BF16, TensorRole::Output, {1, 2, 5, 6}}};
+    }
+    program.operations = {
+        {1, Opcode::PadReflectBackward, {1}, {2}, std::move(attributes)}};
+    return program;
+  }
   if (which == "gather_rows_backward") {
     program.tensors = {{1, DType::BF16, TensorRole::Input, {6, 4}},
                        {2, DType::I32, TensorRole::Input, {6}},
@@ -1202,6 +1243,10 @@ std::vector<Case> corpus() {
       {"clamp_backward_open", [] { return batch11_program("clamp_backward_open"); }},
       {"sigmoid_backward", [] { return batch11_program("sigmoid_backward"); }},
       {"gather_rows_backward", [] { return batch11_program("gather_rows_backward"); }},
+      {"channel_rms_norm_backward", [] { return batch11_program("channel_rms_norm_backward"); }},
+      {"channel_rms_norm_backward_frozen", [] { return batch11_program("channel_rms_norm_backward_frozen"); }},
+      {"pad_reflect_backward", [] { return batch11_program("pad_reflect_backward"); }},
+      {"pad_reflect_backward_volumetric", [] { return batch11_program("pad_reflect_backward_volumetric"); }},
       {"layer_norm_modulate_backward", [] { return batch11_program("layer_norm_modulate_backward"); }},
       {"layer_norm_modulate_backward_broadcast", [] { return batch11_program("layer_norm_modulate_backward_broadcast"); }},
       // batch 10: batched and cross attention, all three kernels

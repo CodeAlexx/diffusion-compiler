@@ -2410,6 +2410,33 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::ChannelRmsNormBackward) {
+    if (op.inputs.size() != 3U || op.outputs.empty() || op.outputs.size() > 2U)
+      fail("channel_rms_norm_backward expects grad_output, x, gamma and one "
+           "or two outputs");
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &gamma = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    const auto axis = op.u64(AttrKey::Axis, 1U);
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-12);
+    if (!supported_float(input.dtype) || input.dims.size() < 2U ||
+        axis >= input.dims.size() || gamma.dtype != input.dtype ||
+        gamma.dims != std::vector<std::uint64_t>{input.dims[axis]} ||
+        !(epsilon > 0.0))
+      fail("channel_rms_norm_backward requires float tensors, [C] gamma, a "
+           "valid axis, and positive epsilon");
+    if (op.outputs.size() == 2U) {
+      const auto &grad_gamma = tensor_or_fail(program, op.outputs[1], op);
+      if (grad_gamma.dtype != gamma.dtype || grad_gamma.dims != gamma.dims)
+        fail("channel_rms_norm_backward gamma gradient must match gamma");
+    }
+    return;
+  }
+
   if (op.opcode == Opcode::GroupNorm) {
     expect_counts(op, 3, 1);
     const auto &input = tensor_or_fail(program, op.inputs[0], op);
@@ -2429,6 +2456,44 @@ void verify_operation(const Program &program, const Operation &op) {
         !std::isfinite(epsilon) || block == 0U || block > 1024U ||
         (block & (block - 1U)) != 0U)
       fail("group_norm requires matching NCHW/NCDHW float tensors, [C] affine vectors, valid groups, and positive epsilon");
+    return;
+  }
+
+  if (op.opcode == Opcode::PadReflectBackward) {
+    expect_counts(op, 1, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    check_accumulator_f32(op);
+    if (!supported_float(grad_input.dtype) ||
+        grad_output.dtype != grad_input.dtype ||
+        (grad_input.dims.size() != 4U && grad_input.dims.size() != 5U) ||
+        grad_output.dims.size() != grad_input.dims.size())
+      fail("pad_reflect_backward requires matching float NCHW or NCDHW "
+           "tensors");
+    const auto front = op.u64(AttrKey::PadFront, 0U);
+    const auto back = op.u64(AttrKey::PadBack, 0U);
+    const auto top = op.u64(AttrKey::PadTop, 0U);
+    const auto bottom = op.u64(AttrKey::PadBottom, 0U);
+    const auto west = op.u64(AttrKey::PadWest, 0U);
+    const auto east = op.u64(AttrKey::PadEast, 0U);
+    // The same extent rule the forward enforces: a reflection cannot reach
+    // past the far edge of what it is reflecting.
+    const auto rank = grad_input.dims.size();
+    if ((rank == 4U && (front != 0U || back != 0U)) ||
+        (rank == 5U &&
+         (front >= grad_input.dims[2] || back >= grad_input.dims[2])) ||
+        top >= grad_input.dims[rank - 2U] ||
+        bottom >= grad_input.dims[rank - 2U] ||
+        west >= grad_input.dims.back() || east >= grad_input.dims.back())
+      fail("pad_reflect_backward extents must be smaller than their source "
+           "dimensions");
+    auto expected = grad_input.dims;
+    if (rank == 5U)
+      expected[2] += front + back;
+    expected[rank - 2U] += top + bottom;
+    expected.back() += west + east;
+    if (grad_output.dims != expected)
+      fail("pad_reflect_backward geometry does not match its attributes");
     return;
   }
 

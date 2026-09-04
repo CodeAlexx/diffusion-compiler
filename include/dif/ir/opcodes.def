@@ -204,3 +204,11 @@ DIF_OPCODE(LayerNormModulateBackward, 88, "layer_norm_modulate_backward", None)
 DIF_OPCODE(Conv3dBackwardInput, 89, "conv3d_backward_input", None)
 DIF_OPCODE(Conv3dBackwardWeight, 90, "conv3d_backward_weight", None)
 DIF_OPCODE(Conv3dBackwardBias, 91, "conv3d_backward_bias", None)
+// Gradient of RMS normalization across a channel axis. One operation with an
+// optional gamma gradient, because the two reduce over different axes and
+// would otherwise each recompute the same fiber statistic.
+DIF_OPCODE(ChannelRmsNormBackward, 92, "channel_rms_norm_backward", None)
+// Gradient of reflect padding. The forward is a gather in which the elements
+// just inside each edge are read more than once, so the gradient sums those
+// reads back -- as a gather over the input, which keeps the sum deterministic.
+DIF_OPCODE(PadReflectBackward, 93, "pad_reflect_backward", None)

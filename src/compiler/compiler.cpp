@@ -1176,6 +1176,77 @@ void emit_layer_norm_modulate_backward(std::ostringstream &out,
   out << std::setprecision(9);
 }
 
+void emit_pad_reflect_backward(std::ostringstream &out,
+                               const ir::Program &program,
+                               const ir::Operation &op) {
+  const auto *grad_input = program.tensor(op.outputs[0]);
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto rank = grad_input->dims.size();
+  const auto text = [](std::uint64_t value) { return std::to_string(value); };
+  // A rank-4 tensor is the rank-5 form with a depth of one, so one kernel
+  // covers both.
+  out << render_kernel_template(
+      "pad_reflect_backward",
+      {{"function", function_name(op)},
+       {"count", text(grad_input->element_count())},
+       {"in_t", text(rank == 5U ? grad_input->dims[2] : 1U)},
+       {"in_h", text(grad_input->dims[rank - 2U])},
+       {"in_w", text(grad_input->dims.back())},
+       {"out_t", text(rank == 5U ? grad_output->dims[2] : 1U)},
+       {"out_h", text(grad_output->dims[rank - 2U])},
+       {"out_w", text(grad_output->dims.back())},
+       {"front", text(op.u64(ir::AttrKey::PadFront, 0U))},
+       {"back", text(op.u64(ir::AttrKey::PadBack, 0U))},
+       {"top", text(op.u64(ir::AttrKey::PadTop, 0U))},
+       {"bottom", text(op.u64(ir::AttrKey::PadBottom, 0U))},
+       {"west", text(op.u64(ir::AttrKey::PadWest, 0U))},
+       {"east", text(op.u64(ir::AttrKey::PadEast, 0U))}});
+}
+
+void emit_channel_rms_norm_backward(std::ostringstream &out,
+                                    const ir::Program &program,
+                                    const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[1]);
+  const auto axis = op.u64(ir::AttrKey::Axis, 1U);
+  const auto channels = input->dims[axis];
+  std::uint64_t inner = 1U;
+  for (std::size_t index = static_cast<std::size_t>(axis + 1U);
+       index < input->dims.size(); ++index)
+    inner *= input->dims[index];
+  const auto count = input->element_count();
+  const auto fibers = count / channels;
+  const bool gamma_grad = op.outputs.size() == 2U;
+  // Scientific notation always carries a decimal point, so a whole-number
+  // scale like sqrt(4) cannot render as "2" and glue into the invalid
+  // literal "2f".
+  std::ostringstream epsilon;
+  epsilon << std::scientific << std::setprecision(9)
+          << static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-12));
+  std::ostringstream scale;
+  scale << std::scientific << std::setprecision(9)
+        << std::sqrt(static_cast<float>(channels));
+  const std::string gamma_gradient =
+      gamma_grad ? render_kernel_template(
+                       "channel_rms_norm_backward_gamma",
+                       {{"channels", std::to_string(channels)},
+                        {"inner", std::to_string(inner)},
+                        {"fibers", std::to_string(fibers)},
+                        {"epsilon", epsilon.str()},
+                        {"scale", scale.str()}})
+                 : std::string{};
+  out << render_kernel_template(
+      "channel_rms_norm_backward",
+      {{"function", function_name(op)},
+       {"count", std::to_string(count)},
+       {"channels", std::to_string(channels)},
+       {"inner", std::to_string(inner)},
+       {"epsilon", epsilon.str()},
+       {"scale", scale.str()},
+       {"gamma_parameter", gamma_grad ? ", dif_scalar* grad_gamma" : ""},
+       {"gamma_gradient", gamma_gradient}});
+  out << std::setprecision(9) << std::defaultfloat;
+}
+
 void emit_gather_rows_backward(std::ostringstream &out,
                                const ir::Program &program,
                                const ir::Operation &op) {
@@ -3405,6 +3476,12 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::LayerNormModulateBackward:
       emit_layer_norm_modulate_backward(source, program, op);
+      break;
+    case ir::Opcode::PadReflectBackward:
+      emit_pad_reflect_backward(source, program, op);
+      break;
+    case ir::Opcode::ChannelRmsNormBackward:
+      emit_channel_rms_norm_backward(source, program, op);
       break;
     case ir::Opcode::GatherRowsBackward:
       emit_gather_rows_backward(source, program, op);

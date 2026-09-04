@@ -7950,6 +7950,8 @@ public:
         case ir::Opcode::AttentionLse:
         case ir::Opcode::AttentionBackward:
         case ir::Opcode::LayerNormModulateBackward:
+        case ir::Opcode::PadReflectBackward:
+        case ir::Opcode::ChannelRmsNormBackward:
         case ir::Opcode::GatherRowsBackward:
         case ir::Opcode::SigmoidBackward:
         case ir::Opcode::ClampBackward:

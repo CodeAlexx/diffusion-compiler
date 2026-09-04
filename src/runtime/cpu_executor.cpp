@@ -1093,6 +1093,66 @@ void conv2d_backward_bias(const ir::Operation &op, TensorMap &tensors) {
 
 // The 3-D gradients are the 2-D ones over the same walker: only the rank of
 // the tensors they are handed differs.
+void channel_rms_norm_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &input = tensors.at(op.inputs[1]);
+  const auto &gamma = tensors.at(op.inputs[2]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  auto *grad_gamma =
+      op.outputs.size() == 2U ? &tensors.at(op.outputs[1]) : nullptr;
+  const auto axis = op.u64(ir::AttrKey::Axis, 1U);
+  const auto channels = input.dims[axis];
+  const auto epsilon =
+      static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-12));
+  std::uint64_t inner = 1U;
+  for (std::size_t index = static_cast<std::size_t>(axis + 1U);
+       index < input.dims.size(); ++index)
+    inner *= input.dims[index];
+  const auto outer = input.element_count() / (channels * inner);
+  const auto scale = std::sqrt(static_cast<float>(channels));
+  std::vector<float> gamma_gradient(grad_gamma ? channels : 0U, 0.0F);
+  for (std::uint64_t leading = 0U; leading < outer; ++leading) {
+    for (std::uint64_t trailing = 0U; trailing < inner; ++trailing) {
+      const auto fiber = leading * channels * inner + trailing;
+      float squared = 0.0F;
+      for (std::uint64_t channel = 0U; channel < channels; ++channel) {
+        const auto value = load_float(input, fiber + channel * inner);
+        squared += value * value;
+      }
+      const auto length = std::sqrt(squared);
+      const auto denominator = std::max(length, epsilon);
+      // Below the clamp the forward is linear in the input, so the gradient
+      // is too; the branch here is the branch the forward took.
+      float projected = 0.0F;
+      if (length > epsilon)
+        for (std::uint64_t channel = 0U; channel < channels; ++channel)
+          projected += load_float(grad_output, fiber + channel * inner) *
+                       load_float(gamma, channel) *
+                       load_float(input, fiber + channel * inner) * scale;
+      for (std::uint64_t channel = 0U; channel < channels; ++channel) {
+        const auto index = fiber + channel * inner;
+        const auto own = load_float(grad_output, index) *
+                         load_float(gamma, channel) * scale;
+        const auto value = load_float(input, index);
+        const auto gradient =
+            length > epsilon
+                ? own / denominator -
+                      value * projected /
+                          (denominator * denominator * denominator)
+                : own / denominator;
+        store_float(grad_input, index, gradient);
+        if (grad_gamma)
+          gamma_gradient[static_cast<std::size_t>(channel)] +=
+              load_float(grad_output, index) * value * scale / denominator;
+      }
+    }
+  }
+  if (grad_gamma)
+    for (std::uint64_t channel = 0U; channel < channels; ++channel)
+      store_float(*grad_gamma, channel,
+                  gamma_gradient[static_cast<std::size_t>(channel)]);
+}
+
 void conv3d_backward_input(const ir::Operation &op, TensorMap &tensors) {
   const auto &grad_output = tensors.at(op.inputs[0]);
   const auto &weight = tensors.at(op.inputs[1]);
@@ -3070,6 +3130,47 @@ std::uint64_t reflect_coordinate(std::uint64_t position,
   return 2U * length - 2U - shifted;
 }
 
+void pad_reflect_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto rank = grad_input.dims.size();
+  const auto front = op.u64(ir::AttrKey::PadFront, 0U);
+  const auto top = op.u64(ir::AttrKey::PadTop, 0U);
+  const auto west = op.u64(ir::AttrKey::PadWest, 0U);
+  // A rank-4 tensor is the rank-5 form with a depth of one: the flat layout
+  // is identical, so one loop serves both.
+  const auto input_t = rank == 5U ? grad_input.dims[2] : 1U;
+  const auto input_h = grad_input.dims[rank - 2U];
+  const auto input_w = grad_input.dims.back();
+  const auto output_t = rank == 5U ? grad_output.dims[2] : 1U;
+  const auto output_h = grad_output.dims[rank - 2U];
+  const auto output_w = grad_output.dims.back();
+  const auto planes = grad_input.dims[0] * grad_input.dims[1];
+  // Sum into the input rather than scattering out of the output: the same
+  // answer, reached in an order that does not depend on scheduling.
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_input.element_count()), 0.0F);
+  for (std::uint64_t plane = 0U; plane < planes; ++plane)
+    for (std::uint64_t t = 0U; t < output_t; ++t) {
+      const auto source_t = reflect_coordinate(t, front, input_t);
+      for (std::uint64_t y = 0U; y < output_h; ++y) {
+        const auto source_y = reflect_coordinate(y, top, input_h);
+        for (std::uint64_t x = 0U; x < output_w; ++x) {
+          const auto source_x = reflect_coordinate(x, west, input_w);
+          const auto target =
+              ((plane * output_t + t) * output_h + y) * output_w + x;
+          const auto source =
+              ((plane * input_t + source_t) * input_h + source_y) * input_w +
+              source_x;
+          accumulator[static_cast<std::size_t>(source)] +=
+              load_float(grad_output, target);
+        }
+      }
+    }
+  for (std::size_t index = 0U; index < accumulator.size(); ++index)
+    store_float(grad_input, index, accumulator[index]);
+}
+
 void pad_reflect(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[0]);
   auto &out = tensors.at(op.outputs[0]);
@@ -3472,6 +3573,12 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::GroupNormBackwardAffine:
       group_norm_backward_affine(op, tensors);
+      break;
+    case ir::Opcode::PadReflectBackward:
+      pad_reflect_backward(op, tensors);
+      break;
+    case ir::Opcode::ChannelRmsNormBackward:
+      channel_rms_norm_backward(op, tensors);
       break;
     case ir::Opcode::Conv3dBackwardInput:
       conv3d_backward_input(op, tensors);

@@ -610,6 +610,49 @@ AutodiffResult differentiate(const ir::Program &forward,
       }
       break;
     }
+    case ir::Opcode::PadReflect: {
+      // Every pad extent is stamped from the forward, because the gradient
+      // has to fold back exactly the reflections the forward made.
+      const auto x = operation.inputs[0];
+      const auto grad_input = add_tensor(*result.program.tensor(x));
+      std::vector<ir::Attribute> attributes;
+      for (const auto key :
+           {ir::AttrKey::PadFront, ir::AttrKey::PadBack, ir::AttrKey::PadTop,
+            ir::AttrKey::PadBottom, ir::AttrKey::PadWest,
+            ir::AttrKey::PadEast})
+        attributes.push_back(
+            ir::Attribute::u64(key, operation.u64(key, 0U)));
+      add_operation(ir::Opcode::PadReflectBackward, {grad_output},
+                    {grad_input}, std::move(attributes));
+      accumulate(x, grad_input);
+      break;
+    }
+    case ir::Opcode::ChannelRmsNorm: {
+      const auto x = operation.inputs[0];
+      const auto gamma = operation.inputs[1];
+      const auto grad_input = add_tensor(*result.program.tensor(x));
+      std::vector<std::uint32_t> outputs{grad_input};
+      std::uint32_t grad_gamma = 0U;
+      const bool needs_gamma =
+          requested.contains(gamma) || produced.contains(gamma);
+      if (needs_gamma) {
+        grad_gamma = add_tensor(*result.program.tensor(gamma));
+        outputs.push_back(grad_gamma);
+      }
+      // Axis and epsilon are stamped from the forward's own values: the
+      // gradient's clamp branch has to be the branch the forward took.
+      add_operation(ir::Opcode::ChannelRmsNormBackward,
+                    {grad_output, x, gamma}, std::move(outputs),
+                    {ir::Attribute::u64(ir::AttrKey::Axis,
+                                        operation.u64(ir::AttrKey::Axis, 1U)),
+                     ir::Attribute::f64(
+                         ir::AttrKey::Epsilon,
+                         operation.f64(ir::AttrKey::Epsilon, 1.0e-12))});
+      accumulate(x, grad_input);
+      if (needs_gamma)
+        accumulate(gamma, grad_gamma);
+      break;
+    }
     case ir::Opcode::PadConstant: {
       // Padding a tensor with a constant adds values the input never
       // influenced, so its gradient is the crop back to the input's own

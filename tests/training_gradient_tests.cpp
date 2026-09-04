@@ -270,6 +270,77 @@ Case group_norm_case() {
   return c;
 }
 
+// Reflect padding. The elements just inside each edge are read more than
+// once, so their gradient is a SUM -- and the corners are read by the
+// reflections of two or three axes at once, which is where an inverse mapping
+// that handles each axis but not their product goes wrong. Extents are
+// asymmetric so no symmetry can hide a swapped edge.
+Case pad_reflect_case(bool volumetric) {
+  Case c;
+  const std::uint64_t channels = 2U;
+  const std::uint64_t depth = 4U;
+  const std::uint64_t height = 5U;
+  const std::uint64_t width = 6U;
+  const std::uint64_t front = 2U, back = 1U, top = 1U, bottom = 3U;
+  const std::uint64_t west = 2U, east = 2U;
+  std::vector<std::uint64_t> x_shape{1U, channels};
+  std::vector<std::uint64_t> y_shape{1U, channels};
+  if (volumetric) {
+    x_shape.push_back(depth);
+    y_shape.push_back(depth + front + back);
+  }
+  x_shape.push_back(height);
+  x_shape.push_back(width);
+  y_shape.push_back(height + top + bottom);
+  y_shape.push_back(width + west + east);
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, x_shape},
+                       {2U, DType::F32, TensorRole::Internal, y_shape},
+                       {3U, DType::F32, TensorRole::Input, y_shape},
+                       {4U, DType::F32, TensorRole::Output, {1U}}};
+  std::vector<Attribute> attributes{Attribute::u64(AttrKey::PadTop, top),
+                                    Attribute::u64(AttrKey::PadBottom, bottom),
+                                    Attribute::u64(AttrKey::PadWest, west),
+                                    Attribute::u64(AttrKey::PadEast, east)};
+  if (volumetric) {
+    attributes.push_back(Attribute::u64(AttrKey::PadFront, front));
+    attributes.push_back(Attribute::u64(AttrKey::PadBack, back));
+  }
+  c.program.operations = {
+      {1U, Opcode::PadReflect, {1U}, {2U}, std::move(attributes)},
+      {2U, Opcode::MseLoss, {2U, 3U}, {4U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(x_shape, 317U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor(y_shape, 331U, 1.0F));
+  c.loss = 4U;
+  c.targets = {1U};
+  return c;
+}
+
+// RMS normalization across a channel axis. The fiber runs along a strided
+// axis rather than the contiguous last one, so an index that confuses the
+// channel stride with the trailing one is caught here and nowhere else.
+Case channel_rms_norm_case(std::uint64_t axis, bool train_gamma) {
+  Case c;
+  const std::vector<std::uint64_t> shape{2U, 3U, 4U};
+  const auto channels = shape[axis];
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, shape},
+                       {2U, DType::F32, TensorRole::Input, {channels}},
+                       {3U, DType::F32, TensorRole::Internal, shape},
+                       {4U, DType::F32, TensorRole::Input, shape},
+                       {5U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::ChannelRmsNorm, {1U, 2U}, {3U},
+       {Attribute::u64(AttrKey::Axis, axis),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-12)}},
+      {2U, Opcode::MseLoss, {3U, 4U}, {5U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(shape, 307U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor({channels}, 311U, 1.0F));
+  c.inputs.emplace(4U, f32_tensor(shape, 313U, 1.0F));
+  c.loss = 5U;
+  c.targets = train_gamma ? std::vector<std::uint32_t>{1U, 2U}
+                          : std::vector<std::uint32_t>{1U};
+  return c;
+}
+
 // Constant padding: the gradient is the crop back to the input's own region.
 // Asymmetric amounts on every axis, so a rule that confuses the low pad with
 // the high one, or crops the wrong axis, cannot pass by symmetry.
@@ -814,6 +885,11 @@ int main() {
   run("conv2d strided", conv2d_case(2U, 1U, 1U));
   run("conv2d unpadded", conv2d_case(1U, 0U, 1U));
   run("conv2d grouped", conv2d_case(1U, 1U, 2U));
+  run("pad reflect", pad_reflect_case(false));
+  run("pad reflect volumetric", pad_reflect_case(true));
+  run("channel rms norm", channel_rms_norm_case(1U, true));
+  run("channel rms norm frozen gamma", channel_rms_norm_case(1U, false));
+  run("channel rms norm last axis", channel_rms_norm_case(2U, true));
   run("pad constant", pad_constant_case(false));
   run("pad constant volumetric", pad_constant_case(true));
   run("conv3d", conv3d_case(1U, 1U, 1U, 1U, 1U, 3U));

@@ -967,6 +967,8 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::AttentionLse:
     case Opcode::AttentionBackward:
     case Opcode::LayerNormModulateBackward:
+    case Opcode::PadReflectBackward:
+    case Opcode::ChannelRmsNormBackward:
     case Opcode::GatherRowsBackward:
     case Opcode::SigmoidBackward:
     case Opcode::ClampBackward:
