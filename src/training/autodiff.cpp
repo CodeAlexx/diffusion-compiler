@@ -372,16 +372,29 @@ AutodiffResult differentiate(const ir::Program &forward,
         outputs.push_back(grad_weight);
       }
       const auto head_dim = result.program.tensor(x)->dims.back();
+      // Everything that decides HOW the forward rotated travels onto the
+      // backward: the layout, the implementation that selects it, and the
+      // offset into the rotation table.  A backward that falls back to a half
+      // split after an interleaved forward is wrong in a way only a gradient
+      // check catches.  Each one is attached ONLY when the forward carries
+      // it, so a program that never mentioned them differentiates to
+      // byte-identical IR -- the same fingerprint-stability rule the GQA
+      // attribute follows.
+      std::vector<ir::Attribute> rope_attributes{
+          ir::Attribute::f64(ir::AttrKey::Epsilon,
+                             operation.f64(ir::AttrKey::Epsilon, 1.0e-5)),
+          ir::Attribute::u64(ir::AttrKey::RotaryDim,
+                             operation.u64(ir::AttrKey::RotaryDim, head_dim))};
+      for (const auto key : {ir::AttrKey::RotaryLayout,
+                             ir::AttrKey::Implementation, ir::AttrKey::Start})
+        if (const auto *carried = operation.find(key))
+          rope_attributes.push_back(*carried);
       add_operation(
           ir::Opcode::QkNormPartialRopeBackward,
           {grad_output, x, weight, operation.inputs[2],
            operation.inputs[3]},
           std::move(outputs),
-          {ir::Attribute::f64(ir::AttrKey::Epsilon,
-                              operation.f64(ir::AttrKey::Epsilon, 1.0e-5)),
-           ir::Attribute::u64(ir::AttrKey::RotaryDim,
-                              operation.u64(ir::AttrKey::RotaryDim,
-                                            head_dim))});
+          std::move(rope_attributes));
       accumulate(x, grad_input);
       if (needs_weight)
         accumulate(weight, grad_weight);

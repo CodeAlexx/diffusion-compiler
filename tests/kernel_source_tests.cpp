@@ -745,6 +745,22 @@ Program batch8_program(std::string_view which) {
                        {4, DType::F32, TensorRole::Input, {4, 100}},
                        {5, DType::BF16, TensorRole::Output, {4, 2, 200}}};
     op(Opcode::QkNormPartialRope, {1, 2, 3, 4}, {5}, {Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else if (which == "qk_norm_rope_generic_interleaved") {
+    // BF16 q/k with F32 rotation tables through the GENERIC path: interleaved
+    // pairs, and a table longer than the rows with a start offset into it --
+    // the shape a transformer's image stream produces when its tables follow
+    // the text stream.
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 12}},
+                       {2, DType::BF16, TensorRole::Constant, {12}},
+                       {3, DType::F32, TensorRole::Input, {6, 6}},
+                       {4, DType::F32, TensorRole::Input, {6, 6}},
+                       {5, DType::BF16, TensorRole::Output, {4, 2, 12}}};
+    op(Opcode::QkNormPartialRope, {1, 2, 3, 4}, {5},
+       {Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+        Attribute::u64(AttrKey::Implementation, 2U),
+        Attribute::u64(AttrKey::Start, 2U),
+        Attribute::u64(AttrKey::RotaryLayout,
+                       static_cast<std::uint64_t>(RotaryLayout::Interleaved))});
   } else if (which == "lowbit_linear" || which == "lowbit_linear_scaled_biased") {
     const bool extras = which == "lowbit_linear_scaled_biased";
     program.tensors = {{1, DType::I8, TensorRole::Constant, {8, 80}},
@@ -1170,6 +1186,7 @@ std::vector<Case> corpus() {
       {"qk_norm_rope_interleaved128", [] { return batch8_program("qk_norm_rope_interleaved128"); }},
       {"qk_norm_rope_fused128", [] { return batch8_program("qk_norm_rope_fused128"); }},
       {"qk_norm_rope_generic_warp4", [] { return batch8_program("qk_norm_rope_generic_warp4"); }},
+      {"qk_norm_rope_generic_interleaved", [] { return batch8_program("qk_norm_rope_generic_interleaved"); }},
       {"qk_norm_rope_generic_wide", [] { return batch8_program("qk_norm_rope_generic_wide"); }},
       {"lowbit_linear", [] { return batch8_program("lowbit_linear"); }},
       {"lowbit_linear_scaled_biased", [] { return batch8_program("lowbit_linear_scaled_biased"); }},

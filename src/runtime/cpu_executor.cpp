@@ -2103,26 +2103,55 @@ void qk_norm_rope_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto table_width = cosv.dims.back();
   const auto epsilon =
       static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  // The rotation layout and the table's row offset come from the forward
+  // operation, exactly as they do for the forward itself: a gradient that
+  // rotates back the wrong way is silently wrong, not loudly wrong.
+  const auto rotary_layout = static_cast<ir::RotaryLayout>(op.u64(
+      ir::AttrKey::RotaryLayout,
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit)));
+  const bool interleaved =
+      op.u64(ir::AttrKey::Implementation, 1U) == 2U &&
+      rotary_layout == ir::RotaryLayout::Interleaved;
+  const auto input_sequence =
+      input.dims.size() == 4U ? input.dims[1] : input.dims[0];
+  const auto table_sequence =
+      cosv.dims.size() == 3U ? cosv.dims[1] : cosv.dims[0];
+  const auto table_start = op.u64(ir::AttrKey::Start, 0U);
   std::vector<float> rotated_gradient(dim);
   std::vector<float> weight_accumulator(grad_weight ? dim : 0U, 0.0F);
   for (std::uint64_t sequence_index = 0U; sequence_index < sequence;
        ++sequence_index) {
-    const auto table = sequence_index * table_width;
+    const auto table = ((sequence_index / input_sequence) * table_sequence +
+                        table_start + sequence_index % input_sequence) *
+                       table_width;
     for (std::uint64_t head = 0U; head < heads; ++head) {
       const auto base = (sequence_index * heads + head) * dim;
-      for (std::uint64_t d = 0U; d < half; ++d) {
-        const auto second_index = table_width == rotary ? d + half : d;
-        const auto cos_first = load_float(cosv, table + d);
-        const auto sin_first = load_float(sinv, table + d);
-        const auto cos_second = load_float(cosv, table + second_index);
-        const auto sin_second = load_float(sinv, table + second_index);
-        const auto upstream_first = load_float(grad_output, base + d);
-        const auto upstream_second =
-            load_float(grad_output, base + d + half);
-        rotated_gradient[d] =
-            upstream_first * cos_first + upstream_second * sin_second;
-        rotated_gradient[d + half] =
-            -upstream_first * sin_first + upstream_second * cos_second;
+      if (interleaved) {
+        // Adjacent pairs rotate together, so the transpose pairs the same
+        // way and both lanes of a pair read one table entry.
+        for (std::uint64_t pair = 0U; pair < table_width; ++pair) {
+          const auto c = load_float(cosv, table + pair);
+          const auto sine = load_float(sinv, table + pair);
+          const auto even = load_float(grad_output, base + 2U * pair);
+          const auto odd = load_float(grad_output, base + 2U * pair + 1U);
+          rotated_gradient[2U * pair] = even * c + odd * sine;
+          rotated_gradient[2U * pair + 1U] = -even * sine + odd * c;
+        }
+      } else {
+        for (std::uint64_t d = 0U; d < half; ++d) {
+          const auto second_index = table_width == rotary ? d + half : d;
+          const auto cos_first = load_float(cosv, table + d);
+          const auto sin_first = load_float(sinv, table + d);
+          const auto cos_second = load_float(cosv, table + second_index);
+          const auto sin_second = load_float(sinv, table + second_index);
+          const auto upstream_first = load_float(grad_output, base + d);
+          const auto upstream_second =
+              load_float(grad_output, base + d + half);
+          rotated_gradient[d] =
+              upstream_first * cos_first + upstream_second * sin_second;
+          rotated_gradient[d + half] =
+              -upstream_first * sin_first + upstream_second * cos_second;
+        }
       }
       for (std::uint64_t d = rotary; d < dim; ++d)
         rotated_gradient[d] = load_float(grad_output, base + d);

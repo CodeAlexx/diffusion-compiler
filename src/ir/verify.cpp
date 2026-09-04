@@ -1863,26 +1863,40 @@ void verify_operation(const Program &program, const Operation &op) {
     same_shape_dtype(input, grad_output, op);
     same_shape_dtype(input, grad_input, op);
     check_accumulator_f32(op);
-    // The forward admits [S,H,D] and the batched [B,S,H,D]; so must this.
-    // The rotation tables carry one row per (batch, sequence) position, which
-    // is exactly the input's row count divided by its heads, whatever the
-    // rank -- so one comparison serves both.
-    const bool batched = input.dims.size() == 4U;
+    // Whatever the forward admits, this has to admit: the batched
+    // [B,S,H,D] form, F32 rotation tables under half-precision q/k, a table
+    // longer than the rows being rotated, and a start offset into it.  These
+    // are the same checks the forward makes, written the same way, because a
+    // gradient that refuses a shape its own forward accepted is a gradient
+    // that cannot train the model that produced it.
+    const bool compatible_table_rank =
+        input.dims.size() == 4U
+            ? cos.dims.size() == 3U
+            : (cos.dims.size() == 2U ||
+               (cos.dims.size() == 3U && cos.dims[0] == 1U));
     if (!supported_float(input.dtype) ||
         (input.dims.size() != 3U && input.dims.size() != 4U) ||
         weight.dtype != input.dtype || weight.dims.size() != 1U ||
-        weight.dims[0] != input.dims.back() || cos.dtype != input.dtype ||
-        sin.dtype != input.dtype || cos.dims != sin.dims ||
-        cos.dims.size() != (batched ? 3U : 2U) ||
-        cos.element_count() / cos.dims.back() !=
-            input.element_count() / input.dims.back() /
-                input.dims[input.dims.size() - 2U])
+        weight.dims[0] != input.dims.back() ||
+        (cos.dtype != input.dtype && cos.dtype != DType::F32) ||
+        sin.dtype != cos.dtype || cos.dims != sin.dims ||
+        !compatible_table_rank)
       fail("qk_norm_partial_rope_backward requires grad/input [S,H,D] or "
-           "[B,S,H,D], weight [D], and matching cos/sin rows");
+           "[B,S,H,D], weight [D], and compatible cos/sin tables");
     const auto head_dim = input.dims.back();
+    const auto table_width = cos.dims.back();
     const auto rotary = op.u64(AttrKey::RotaryDim, head_dim);
-    if (rotary == 0U || rotary > head_dim || (rotary % 2U) != 0U ||
-        (cos.dims.back() != rotary && cos.dims.back() * 2U != rotary))
+    const auto input_batch = input.dims.size() == 4U ? input.dims[0] : 1U;
+    const auto input_sequence =
+        input.dims.size() == 4U ? input.dims[1] : input.dims[0];
+    const auto table_batch = cos.dims.size() == 3U ? cos.dims[0] : 1U;
+    const auto table_sequence =
+        cos.dims.size() == 3U ? cos.dims[1] : cos.dims[0];
+    const auto table_start = op.u64(AttrKey::Start, 0U);
+    if (table_batch != input_batch || table_start > table_sequence ||
+        input_sequence > table_sequence - table_start || rotary == 0U ||
+        rotary > head_dim || (rotary % 2U) != 0U ||
+        (table_width != rotary && table_width * 2U != rotary))
       fail("qk_norm_partial_rope_backward rotary geometry is inconsistent");
     if (op.outputs.size() == 2U) {
       const auto &grad_weight = tensor_or_fail(program, op.outputs[1], op);

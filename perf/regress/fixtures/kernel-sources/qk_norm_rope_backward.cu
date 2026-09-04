@@ -49,10 +49,13 @@ extern "C" __device__ float dif_silu(float x) {
 // Backward of RMS-normalized, partially rotated q/k: the upstream gradient
 // is rotated back (the generated rot(k) expressions), the norm backward
 // follows, and the optional weight gradient is reduced by the first D threads.
-extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_scalar* x, const dif_scalar* weight, const dif_scalar* cosv, const dif_scalar* sinv, dif_scalar* grad_input) {
+// The rotation layout, the rotation-table dtype and the table's row offset
+// all travel from the forward operation into the generated expressions, so
+// this differentiates the rotation that actually ran rather than a default.
+extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_scalar* x, const dif_scalar* weight, const dif_bf16* cosv, const dif_bf16* sinv, dif_scalar* grad_input) {
   unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < 64ULL) {
-    unsigned long long row = i / 8ULL, d = i % 8ULL, rb = row * 8ULL, tb = (row / 2ULL) * 8ULL;
+    unsigned long long row = i / 8ULL, d = i % 8ULL, rb = row * 8ULL, token = row / 2ULL, tb = token * 8ULL;
     float ss = 0.0f;
     for (unsigned long long k = 0ULL; k < 8ULL; ++k) {
       float value = dif_load(x, rb + k);
@@ -61,10 +64,10 @@ extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_sca
     float inv = rsqrtf(ss / 8.0f + 9.999999975e-07f);
     float dot = 0.0f;
     for (unsigned long long k = 0ULL; k < 8ULL; ++k) {
-      float rotated_gradient = (k < 4ULL ? dif_load(grad_output, rb + k) * dif_load(cosv, tb + k) + dif_load(grad_output, rb + k + 4ULL) * dif_load(sinv, tb + k + 4ULL) : (k < 8ULL ? -dif_load(grad_output, rb + k - 4ULL) * dif_load(sinv, tb + k - 4ULL) + dif_load(grad_output, rb + k) * dif_load(cosv, tb + k) : dif_load(grad_output, rb + k)));
+      float rotated_gradient = (k < 4ULL ? dif_load(grad_output, rb + k) * dif_load_bf16(cosv, tb + k) + dif_load(grad_output, rb + k + 4ULL) * dif_load_bf16(sinv, tb + k + 4ULL) : (k < 8ULL ? -dif_load(grad_output, rb + k - 4ULL) * dif_load_bf16(sinv, tb + k - 4ULL) + dif_load(grad_output, rb + k) * dif_load_bf16(cosv, tb + k) : dif_load(grad_output, rb + k)));
       dot = fmaf(rotated_gradient * dif_load(weight, k), dif_load(x, rb + k), dot);
     }
-    float own_rotated = (d < 4ULL ? dif_load(grad_output, rb + d) * dif_load(cosv, tb + d) + dif_load(grad_output, rb + d + 4ULL) * dif_load(sinv, tb + d + 4ULL) : (d < 8ULL ? -dif_load(grad_output, rb + d - 4ULL) * dif_load(sinv, tb + d - 4ULL) + dif_load(grad_output, rb + d) * dif_load(cosv, tb + d) : dif_load(grad_output, rb + d)));
+    float own_rotated = (d < 4ULL ? dif_load(grad_output, rb + d) * dif_load_bf16(cosv, tb + d) + dif_load(grad_output, rb + d + 4ULL) * dif_load_bf16(sinv, tb + d + 4ULL) : (d < 8ULL ? -dif_load(grad_output, rb + d - 4ULL) * dif_load_bf16(sinv, tb + d - 4ULL) + dif_load(grad_output, rb + d) * dif_load_bf16(cosv, tb + d) : dif_load(grad_output, rb + d)));
     float value = dif_load(x, i);
     dif_store(grad_input, i, own_rotated * dif_load(weight, d) * inv - value * inv * inv * inv * dot / 8.0f);
     

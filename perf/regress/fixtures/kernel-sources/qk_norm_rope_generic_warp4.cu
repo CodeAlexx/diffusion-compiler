@@ -46,15 +46,19 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_f32
 #define dif_store dif_store_f32
 #define dif_round dif_round_f32
-// Generic RMS-normalized, partially rotated (half-split) q/k: one block per
+// Generic RMS-normalized, partially rotated q/k: one block per
 // (sequence, head); the reduction fragment matches the pinned PyTorch
 // oracle's grouping, every product is rounded to the storage dtype.
-extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weight, const dif_scalar* cosv, const dif_scalar* sinv, dif_scalar* y) {
+// The rotation layout and the row offset into the rotation table are
+// generated from the operation's own attributes, so this kernel rotates the
+// way the operation says rather than assuming a half split.
+extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weight, const dif_f32* cosv, const dif_f32* sinv, dif_scalar* y) {
   extern __shared__ float reduction[];
   unsigned long long bh = blockIdx.x;
   if (bh >= 8ULL) return;
   unsigned long long s = bh / 2ULL, h = bh % 2ULL;
   unsigned long long base = (s * 2ULL + h) * 64ULL;
+  unsigned long long tb = s * 32ULL;
   float local = 0.0f;
   // Match the CUDA vectorized RMSNorm reduction used by the pinned PyTorch
   // oracle: one warp consumes four adjacent values per lane, followed by a
@@ -82,15 +86,15 @@ extern "C" __global__ void dif_op_1(const dif_scalar* x, const dif_scalar* weigh
     float result = value;
     if (d < 32ULL) {
       float other = dif_round(dif_load(x, base + d + 32ULL) * inv * dif_load(weight, d + 32ULL));
-      float left = dif_round(value * dif_load(cosv, s * 32ULL + d));
-      float right = dif_round(other * dif_load(sinv, s * 32ULL + d));
+      float left = dif_round(value * dif_load_f32(cosv, tb + d));
+      float right = dif_round(other * dif_load_f32(sinv, tb + d));
       result = dif_round(left - right);
     } else if (d < 64ULL) {
       unsigned long long r = d - 32ULL;
       float other = dif_round(dif_load(x, base + r) * inv * dif_load(weight, r));
       unsigned long long ti = r;
-      float left = dif_round(value * dif_load(cosv, s * 32ULL + ti));
-      float right = dif_round(other * dif_load(sinv, s * 32ULL + ti));
+      float left = dif_round(value * dif_load_f32(cosv, tb + ti));
+      float right = dif_round(other * dif_load_f32(sinv, tb + ti));
       result = dif_round(left + right);
     }
     dif_store(y, base + d, result);

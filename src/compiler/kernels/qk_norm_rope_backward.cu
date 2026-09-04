@@ -1,10 +1,13 @@
 // Backward of RMS-normalized, partially rotated q/k: the upstream gradient
 // is rotated back (the generated rot(k) expressions), the norm backward
 // follows, and the optional weight gradient is reduced by the first D threads.
-extern "C" __global__ void ${function}(const dif_scalar* grad_output, const dif_scalar* x, const dif_scalar* weight, const dif_scalar* cosv, const dif_scalar* sinv, dif_scalar* grad_input${weight_parameter}) {
+// The rotation layout, the rotation-table dtype and the table's row offset
+// all travel from the forward operation into the generated expressions, so
+// this differentiates the rotation that actually ran rather than a default.
+extern "C" __global__ void ${function}(const dif_scalar* grad_output, const dif_scalar* x, const dif_scalar* weight, const ${table_scalar}* cosv, const ${table_scalar}* sinv, dif_scalar* grad_input${weight_parameter}) {
   unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < ${count}ULL) {
-    unsigned long long row = i / ${dim}ULL, d = i % ${dim}ULL, rb = row * ${dim}ULL, tb = (row / ${heads}ULL) * ${table_width}ULL;
+    unsigned long long row = i / ${dim}ULL, d = i % ${dim}ULL, rb = row * ${dim}ULL, token = row / ${heads}ULL, tb = ${table_base};
     float ss = 0.0f;
     for (unsigned long long k = 0ULL; k < ${dim}ULL; ++k) {
       float value = dif_load(x, rb + k);

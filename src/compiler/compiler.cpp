@@ -2153,6 +2153,48 @@ void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
       (dim <= 128U && dim % 4U == 0U)
           ? render_kernel_template("qk_norm_rope_reduce_warp4", {{"dim", text(dim)}})
           : render_kernel_template("qk_norm_rope_reduce_generic", {{"dim", text(dim)}});
+  // The tables may be F32 under BF16 q/k, and may be longer than the rows
+  // being rotated with this operation reading from an offset into them. A
+  // table that lines up one-for-one keeps the bare "s * width" this kernel
+  // always emitted.
+  const std::string table_load = typed_load(program.tensor(op.inputs[2])->dtype);
+  const std::string table_base =
+      (table_sequence == input_sequence && table_start == 0U)
+          ? "s * " + text(table_width) + "ULL"
+          : "(s / " + text(input_sequence) + "ULL * " + text(table_sequence) +
+                "ULL + " + text(table_start) + "ULL + s % " +
+                text(input_sequence) + "ULL) * " + text(table_width) + "ULL";
+  // Interleaved rotation pairs adjacent lanes; the half split pairs a lane
+  // with the one half a head away. Only the generic path needs generating --
+  // the two specialized kernels above are each written for one layout.
+  const std::string rotation =
+      rotary_layout == ir::RotaryLayout::Interleaved
+          ? "if (d < " + text(rotary) +
+                "ULL) {\n"
+                "      unsigned long long p = d / 2ULL, partner = (d % 2ULL == 0ULL) ? d + 1ULL : d - 1ULL;\n"
+                "      float other = dif_round(dif_load(x, base + partner) * inv * dif_load(weight, partner));\n"
+                "      float c = " + table_load + "(cosv, tb + p);\n"
+                "      float sn = " + table_load + "(sinv, tb + p);\n"
+                "      result = (d % 2ULL == 0ULL) ? (value * c - other * sn) : (other * sn + value * c);\n"
+                "    }"
+          : "if (d < " + text(half) +
+                "ULL) {\n"
+                "      float other = dif_round(dif_load(x, base + d + " + text(half) +
+                "ULL) * inv * dif_load(weight, d + " + text(half) + "ULL));\n"
+                "      float left = dif_round(value * " + table_load + "(cosv, tb + d));\n"
+                "      float right = dif_round(other * " + table_load + "(sinv, tb + d));\n"
+                "      result = dif_round(left - right);\n"
+                "    } else if (d < " + text(rotary) +
+                "ULL) {\n"
+                "      unsigned long long r = d - " + text(half) + "ULL;\n"
+                "      float other = dif_round(dif_load(x, base + r) * inv * dif_load(weight, r));\n"
+                "      unsigned long long ti = " +
+                (table_width == rotary ? std::string("d") : std::string("r")) +
+                ";\n"
+                "      float left = dif_round(value * " + table_load + "(cosv, tb + ti));\n"
+                "      float right = dif_round(other * " + table_load + "(sinv, tb + ti));\n"
+                "      result = dif_round(left + right);\n"
+                "    }";
   out << render_kernel_template(
       "qk_norm_rope",
       {{"function", function_name(op)},
@@ -2161,10 +2203,9 @@ void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
        {"dim", text(dim)},
        {"reduction", reduction},
        {"epsilon", epsilon_literal.str()},
-       {"half", text(half)},
-       {"table_width", text(table_width)},
-       {"rotary", text(rotary)},
-       {"table_index", table_width == rotary ? "d" : "r"}});
+       {"table_base", table_base},
+       {"table_scalar", typed_scalar(program.tensor(op.inputs[2])->dtype)},
+       {"rotation", rotation}});
   out << std::setprecision(17);
 }
 
@@ -2321,25 +2362,67 @@ void emit_qk_norm_rope_backward(std::ostringstream &out,
   const auto sequence = count / dim / heads;
   const auto rotary = op.u64(ir::AttrKey::RotaryDim, dim);
   const auto half = rotary / 2U;
-  const auto table_width = program.tensor(op.inputs[3])->dims.back();
+  const auto *table = program.tensor(op.inputs[3]);
+  const auto table_width = table->dims.back();
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
   const bool weight_grad = op.outputs.size() == 2U;
   const auto text = [](std::uint64_t v) { return std::to_string(v); };
+  // The rotation tables are commonly F32 while q/k are BF16, and they may be
+  // longer than the rows being rotated, with this operation reading from an
+  // offset into them (an image stream whose tables follow the text stream).
+  // Both facts come from the forward operation rather than from a default.
+  const std::string table_load = typed_load(table->dtype);
+  const auto &input_shape = input->dims;
+  const auto input_sequence =
+      input_shape.size() == 4U ? input_shape[1] : input_shape[0];
+  const auto table_sequence =
+      table->dims.size() == 3U ? table->dims[1] : table->dims[0];
+  const auto table_start = op.u64(ir::AttrKey::Start, 0U);
+  // A table that lines up one-for-one with the rows collapses to the bare
+  // "token * width" this kernel always emitted.
+  const std::string table_base =
+      (table_sequence == input_sequence && table_start == 0U)
+          ? "token * " + text(table_width) + "ULL"
+          : "(token / " + text(input_sequence) + "ULL * " +
+                text(table_sequence) + "ULL + " + text(table_start) +
+                "ULL + token % " + text(input_sequence) + "ULL) * " +
+                text(table_width) + "ULL";
+  const auto rotary_layout = static_cast<ir::RotaryLayout>(op.u64(
+      ir::AttrKey::RotaryLayout,
+      static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit)));
   // rot(k): the rotation-transpose of the upstream gradient at offset k of
   // one head row (rb = row base, tb = table base), F32 registers.
   const auto rotated = [&](const std::string &row_base,
                            const std::string &table_base,
                            const std::string &k) {
     const auto half_text = text(half);
+    if (rotary_layout == ir::RotaryLayout::Interleaved) {
+      // Adjacent pairs rotate together, so the transpose pairs the same way:
+      // an even lane takes its own cosine and its partner's sine, an odd lane
+      // takes its partner's negated sine and its own cosine.  Both read the
+      // pair's table entry, which integer division gives either way.
+      const auto pair = table_base + " + " + k + " / 2ULL";
+      return "(" + k + " < " + text(rotary) + "ULL ? ((" + k +
+             " % 2ULL) == 0ULL ? dif_load(grad_output, " + row_base + " + " +
+             k + ") * " + table_load + "(cosv, " + pair +
+             ") + dif_load(grad_output, " + row_base + " + " + k +
+             " + 1ULL) * " + table_load + "(sinv, " + pair +
+             ") : dif_load(grad_output, " + row_base + " + " + k +
+             ") * " + table_load + "(cosv, " + pair +
+             ") - dif_load(grad_output, " + row_base + " + " + k +
+             " - 1ULL) * " + table_load + "(sinv, " + pair +
+             ")) : dif_load(grad_output, " + row_base + " + " + k + "))";
+    }
     return "(" + k + " < " + half_text + "ULL ? dif_load(grad_output, " + row_base +
-           " + " + k + ") * dif_load(cosv, " + table_base + " + " + k +
+           " + " + k + ") * " + table_load + "(cosv, " + table_base + " + " + k +
            ") + dif_load(grad_output, " + row_base + " + " + k + " + " + half_text +
-           "ULL) * dif_load(sinv, " + table_base + " + " +
+           "ULL) * " + table_load + "(sinv, " + table_base + " + " +
            (table_width == rotary ? k + " + " + half_text + "ULL" : k) +
            ") : (" + k + " < " + text(rotary) + "ULL ? -dif_load(grad_output, " +
-           row_base + " + " + k + " - " + half_text + "ULL) * dif_load(sinv, " +
-           table_base + " + " + k + " - " + half_text + "ULL) + dif_load(grad_output, " +
-           row_base + " + " + k + ") * dif_load(cosv, " + table_base + " + " +
+           row_base + " + " + k + " - " + half_text + "ULL) * " + table_load +
+           "(sinv, " + table_base + " + " + k + " - " + half_text +
+           "ULL) + dif_load(grad_output, " +
+           row_base + " + " + k + ") * " + table_load + "(cosv, " + table_base + " + " +
            (table_width == rotary ? k : k + " - " + half_text + "ULL") +
            ") : dif_load(grad_output, " + row_base + " + " + k + ")))";
   };
@@ -2351,7 +2434,7 @@ void emit_qk_norm_rope_backward(std::ostringstream &out,
                         {{"dim", text(dim)},
                          {"rows", text(sequence * heads)},
                          {"heads", text(heads)},
-                         {"table_width", text(table_width)},
+                         {"table_base", table_base},
                          {"epsilon", epsilon_literal.str()},
                          {"rotated_i", rotated("rrb", "rtb", "i")}})
                   : std::string{};
@@ -2359,10 +2442,11 @@ void emit_qk_norm_rope_backward(std::ostringstream &out,
       "qk_norm_rope_backward",
       {{"function", function_name(op)},
        {"weight_parameter", weight_grad ? ", dif_scalar* grad_weight" : ""},
+       {"table_scalar", typed_scalar(table->dtype)},
        {"count", text(count)},
        {"dim", text(dim)},
        {"heads", text(heads)},
-       {"table_width", text(table_width)},
+       {"table_base", table_base},
        {"epsilon", epsilon_literal.str()},
        {"rotated_k", rotated("rb", "tb", "k")},
        {"rotated_d", rotated("rb", "tb", "d")},

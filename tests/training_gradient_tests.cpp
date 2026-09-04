@@ -261,6 +261,60 @@ Case group_norm_case() {
   return c;
 }
 
+// Fused per-head RMS norm plus partial rotary, in the shapes a real
+// transformer uses: interleaved adjacent pairs rather than a half split, a
+// rotation table longer than the rows being rotated with a start offset into
+// it, and the batched [B,S,H,D] form. Each of those was a separate way for
+// the backward to index the wrong table entry.
+Case qk_norm_rope_case(bool interleaved, std::uint64_t table_start,
+                       bool batched) {
+  Case c;
+  const std::uint64_t batch = batched ? 2U : 1U;
+  const std::uint64_t sequence = 3U;
+  const std::uint64_t heads = 2U;
+  const std::uint64_t dim = 4U;
+  const std::uint64_t table_width = interleaved ? dim / 2U : dim;
+  const std::uint64_t table_sequence = sequence + table_start;
+  auto shape = [&](std::vector<std::uint64_t> tail) {
+    std::vector<std::uint64_t> dims;
+    if (batched)
+      dims.push_back(batch);
+    for (const auto value : tail)
+      dims.push_back(value);
+    return dims;
+  };
+  const auto x_shape = shape({sequence, heads, dim});
+  const auto table_shape = shape({table_sequence, table_width});
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, x_shape},
+                       {2U, DType::F32, TensorRole::Input, {dim}},
+                       {3U, DType::F32, TensorRole::Input, table_shape},
+                       {4U, DType::F32, TensorRole::Input, table_shape},
+                       {5U, DType::F32, TensorRole::Internal, x_shape},
+                       {6U, DType::F32, TensorRole::Input, x_shape},
+                       {7U, DType::F32, TensorRole::Output, {1U}}};
+  std::vector<Attribute> attributes{
+      Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+      Attribute::u64(AttrKey::RotaryDim, dim),
+      Attribute::u64(AttrKey::Start, table_start)};
+  if (interleaved) {
+    attributes.push_back(Attribute::u64(AttrKey::Implementation, 2U));
+    attributes.push_back(Attribute::u64(
+        AttrKey::RotaryLayout,
+        static_cast<std::uint64_t>(dif::ir::RotaryLayout::Interleaved)));
+  }
+  c.program.operations = {
+      {1U, Opcode::QkNormPartialRope, {1U, 2U, 3U, 4U}, {5U}, attributes},
+      {2U, Opcode::MseLoss, {5U, 6U}, {7U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(x_shape, 211U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor({dim}, 223U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor(table_shape, 227U, 1.0F));
+  c.inputs.emplace(4U, f32_tensor(table_shape, 229U, 1.0F));
+  c.inputs.emplace(6U, f32_tensor(x_shape, 233U, 1.0F));
+  c.loss = 7U;
+  c.targets = {1U, 2U};
+  return c;
+}
+
 // The gated residual add, with the gate governing several rows at once --
 // how a DiT block gates every token with one per-sample value. The gate
 // gradient is a sum over the rows it governs; the square case is the
@@ -538,9 +592,19 @@ void check_backends(const std::string &label, const Case &c) {
           static_cast<double>(std::abs(dif::runtime::load_float(expected, index) -
                                        dif::runtime::load_float(actual, index))) /
               scale);
-    expect(worst <= 2.0e-5, label + " tensor " + std::to_string(target) +
-                                ": CPU and CUDA differ by " +
-                                std::to_string(worst) + " of the range");
+    // The bar follows the storage the gradient actually lives in. Two
+    // executors running the same program in F32 should agree to F32 rounding;
+    // in BF16 they cannot, because BF16 carries eight mantissa bits and the
+    // two round their intermediates at different points. Holding a BF16
+    // program to an F32 bar would mean either a permanently red test or a
+    // silently skipped one.
+    const double bar = expected.dtype == DType::F32   ? 2.0e-5
+                       : expected.dtype == DType::F16 ? 2.0e-3
+                                                      : 2.0e-2;
+    expect(worst <= bar, label + " tensor " + std::to_string(target) +
+                             ": CPU and CUDA differ by " +
+                             std::to_string(worst) + " of the range (bar " +
+                             std::to_string(bar) + ")");
   }
 }
 
@@ -548,6 +612,73 @@ void run(const std::string &label, const Case &c) {
   dif::ir::verify(c.program);
   check_gradients(label, c.program, c.inputs, c.loss, c.targets);
   check_backends(label, c);
+}
+
+// Some shapes cannot be gradient-checked but must still agree between the
+// backends. A half-precision program is one: a central difference in BF16 is
+// noise, while the two executors running the SAME program still have to
+// produce the same answer. This is how a kernel that reads an F32 table with
+// a BF16 loader gets caught -- the CPU reference reads the table by its own
+// dtype and the generated kernel did not.
+void run_parity(const std::string &label, const Case &c) {
+  dif::ir::verify(c.program);
+  check_backends(label, c);
+}
+
+dif::runtime::Tensor storage_tensor(DType dtype,
+                                    std::vector<std::uint64_t> dims,
+                                    std::uint64_t seed, float amplitude) {
+  const auto reference = f32_tensor(dims, seed, amplitude);
+  std::uint64_t count = 1U;
+  for (const auto dim : dims)
+    count *= dim;
+  dif::runtime::Tensor tensor{dtype, std::move(dims), {}};
+  tensor.bytes.resize(static_cast<std::size_t>(count) *
+                      dif::ir::dtype_size(dtype));
+  tensor.validate();
+  for (std::uint64_t index = 0U; index < reference.element_count(); ++index)
+    dif::runtime::store_float(tensor, index,
+                              dif::runtime::load_float(reference, index));
+  return tensor;
+}
+
+// BF16 q/k with F32 rotation tables, through the generic path: the exact
+// combination the frontends use and the one nothing numerical covered.
+Case mixed_dtype_rope_case(bool interleaved) {
+  Case c;
+  const std::uint64_t sequence = 3U;
+  const std::uint64_t heads = 2U;
+  const std::uint64_t dim = 8U;
+  const std::uint64_t table_width = interleaved ? dim / 2U : dim;
+  const std::vector<std::uint64_t> x_shape{sequence, heads, dim};
+  const std::vector<std::uint64_t> table_shape{sequence, table_width};
+  c.program.tensors = {{1U, DType::BF16, TensorRole::Input, x_shape},
+                       {2U, DType::BF16, TensorRole::Input, {dim}},
+                       {3U, DType::F32, TensorRole::Input, table_shape},
+                       {4U, DType::F32, TensorRole::Input, table_shape},
+                       {5U, DType::BF16, TensorRole::Internal, x_shape},
+                       {6U, DType::BF16, TensorRole::Input, x_shape},
+                       {7U, DType::F32, TensorRole::Output, {1U}}};
+  std::vector<Attribute> attributes{
+      Attribute::f64(AttrKey::Epsilon, 1.0e-6),
+      Attribute::u64(AttrKey::RotaryDim, dim)};
+  if (interleaved) {
+    attributes.push_back(Attribute::u64(AttrKey::Implementation, 2U));
+    attributes.push_back(Attribute::u64(
+        AttrKey::RotaryLayout,
+        static_cast<std::uint64_t>(dif::ir::RotaryLayout::Interleaved)));
+  }
+  c.program.operations = {
+      {1U, Opcode::QkNormPartialRope, {1U, 2U, 3U, 4U}, {5U}, attributes},
+      {2U, Opcode::MseLoss, {5U, 6U}, {7U}, {}}};
+  c.inputs.emplace(1U, storage_tensor(DType::BF16, x_shape, 239U, 1.0F));
+  c.inputs.emplace(2U, storage_tensor(DType::BF16, {dim}, 241U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor(table_shape, 251U, 1.0F));
+  c.inputs.emplace(4U, f32_tensor(table_shape, 257U, 1.0F));
+  c.inputs.emplace(6U, storage_tensor(DType::BF16, x_shape, 263U, 1.0F));
+  c.loss = 7U;
+  c.targets = {1U, 2U};
+  return c;
 }
 
 } // namespace
@@ -566,6 +697,13 @@ int main() {
   run("conv2d strided", conv2d_case(2U, 1U, 1U));
   run("conv2d unpadded", conv2d_case(1U, 0U, 1U));
   run("conv2d grouped", conv2d_case(1U, 1U, 2U));
+  run_parity("qk norm rope bf16 f32 tables", mixed_dtype_rope_case(false));
+  run_parity("qk norm rope bf16 f32 tables interleaved",
+             mixed_dtype_rope_case(true));
+  run("qk norm rope", qk_norm_rope_case(false, 0U, false));
+  run("qk norm rope interleaved", qk_norm_rope_case(true, 0U, false));
+  run("qk norm rope table offset", qk_norm_rope_case(true, 2U, false));
+  run("qk norm rope batched", qk_norm_rope_case(true, 2U, true));
   run("residual gate", residual_gate_case(4U));
   run("residual gate broadcast", residual_gate_case(1U));
   run("layer norm modulate", layer_norm_modulate_case(4U));
