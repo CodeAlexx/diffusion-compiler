@@ -12,6 +12,7 @@ matched framework baseline on the same GPU and workload.
 | FLUX.2 [klein] Base 9B, prompt to PNG | RTX 5080 | **52.809 s** | 99.242 s | **1.879x faster** |
 | Krea 2 Turbo, prompt to PNG | RTX 3090 Ti | **26.58 s** | 59.14 s | **2.225x faster** |
 | MiniMax-H3 FL2VA, prompt to MP4 | RTX 3090 Ti | **89.77 s** | 81.095 s | **1.107x slower** |
+| SDXL base 1.0, prompt to PNG, model resident | RTX 3090 Ti | **7.11 s** | 7.03 s | **parity** |
 
 The model rows are different workloads and hardware targets. Compare native
 with baseline within a row; do not compare raw seconds across rows.
@@ -179,6 +180,49 @@ INT8-only one.
 An exact-output QKV/RMSNorm/RoPE fusion improved isolated hot denoiser timing
 but regressed complete wall to 84.49 seconds warm and 92.05 seconds cold. It was
 removed; local kernel wins do not override the complete-wall result.
+
+## SDXL base 1.0 — RTX 3090 Ti
+
+Same checkpoint file for both runtimes (`sd_xl_base_1.0.safetensors`, fp16),
+same precision route, 1024x1024, 25 steps, cfg 5, euler with the `normal`
+scheduler, seed 20260901, a 719-character prompt that spans two encoder chunks
+and carries a weighted term. The GPU keeps its deliberate 300 W cap. The
+baseline is stock ComfyUI 0.33.0 on torch 2.12.1+cu130.
+
+Both runtimes were started cold and asked for three images in a row, so the
+one-time load appears once and the steady state appears twice.
+
+| | ComfyUI | Diffusion Compiler |
+|---|---:|---:|
+| Load and prepare | ~11.1 s (inside the first image) | **9.76 s** |
+| First image | 18.17 s | 7.12 s after load |
+| Second image | 7.03 s | 7.15 s |
+| Third image | 7.20 s | 7.11 s |
+| Three images, total wall | 32.4 s | **31.2 s** |
+
+This is parity, not a win: per image the two are within two percent of each
+other, and the compiler's advantage on the total is its faster load. Stage
+compute measured on its own, against the same reference modules at the same
+shapes:
+
+| Stage | Reference | Compiler |
+|---|---:|---:|
+| UNet step, batch 2, 128x128 latent, 154 context rows | 239-247 ms | 258 ms |
+| VAE decode, 128x128 latent to 1024x1024 | 247 ms | 250 ms |
+| Both text towers, two chunks | ~150 ms | 44 ms |
+
+**Why there is no easy multiple here.** Half of a UNet step is dense F16 GEMM
+that already runs at 50 to 70 TFLOPS on a part whose dense F16 peak is about
+80, and benchmarking every cuBLASLt algorithm at preparation changed nothing.
+At equal precision the remaining headroom is in fusion and layout, worth some
+percent, not a factor. A quantized route is where a multiple lives, and that
+is a different precision than the baseline, so it does not belong in this row.
+
+**Numerical result.** The compiler's image matches the ComfyUI image at
+PSNR 40.6 dB and SSIM 0.997 with a mean absolute difference under one level
+per channel. Each stage is gated against an oracle built from the reference's
+own modules: the text towers to cosine 1.0000000, the UNet epsilon to cosine
+0.9999999, and the decoded image to cosine 0.9999.
 
 ## Reporting rules
 

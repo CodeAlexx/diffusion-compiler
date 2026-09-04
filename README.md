@@ -47,10 +47,14 @@ checkpoint + frontend  ->  verified DiffIR  ->  compiler / optimizer / memory pl
 | MiniMax-H3 | FL2VA: prompt + two keyframes to H.264/AAC MP4 with audio | RTX 3090 Ti | ConvRot INT8 projections; exact attention on the first three of seven evaluations, INT8 attention on the rest |
 | Krea 2 Turbo | Prompt to 1024x1024 PNG | RTX 3090 Ti | BF16, bit-identical trajectory |
 | FLUX.2 [klein] Base 9B | Prompt to 1024x1024 PNG | RTX 5080 | ConvRot W8A8 plus INT8 weight-only, MXFP8 hooks |
+| FLUX.2 [dev] | Prompt to 1024x1024 PNG | RTX 3090 Ti | SquareQ W4 with INT8 compute from a rank-32 slab, or BF16 streamed |
+| SDXL base 1.0 | Prompt to 1024x1024 PNG | RTX 3090 Ti | F16 denoiser, F16 text towers, BF16 decoder |
 
 Each frontend also carries its conditioners and VAEs natively: Qwen3-VL
 vision/text conditioning, the H3 video encoder, video VAE, and audio VAE, the
-Qwen-Image VAE for Krea 2, and the FLUX.2 VAE. Model checkpoints and generated
+Qwen-Image VAE for Krea 2, the FLUX.2 VAE, and for SDXL a native CLIP
+byte-level BPE tokenizer with the prompt-weight syntax, both CLIP text towers,
+and the KL decoder. Model checkpoints and generated
 artifacts are not distributed in this repository.
 
 **Hardware and software.** NVIDIA RTX 3090 Ti (Ampere, `sm_86`) and RTX 5080
@@ -104,6 +108,7 @@ timings, memory, and comparator disclosures.
 | FLUX.2 [klein] Base 9B, prompt to PNG | RTX 5080 | **52.809 s** | 99.242 s ComfyUI | **1.879x faster** |
 | Krea 2 Turbo, prompt to PNG | RTX 3090 Ti | **26.58 s** | 59.14 s framework | **2.225x faster** |
 | MiniMax-H3 FL2VA, prompt to MP4 | RTX 3090 Ti | **89.77 s** | 81.095 s ComfyUI | **1.107x slower** |
+| SDXL base 1.0, prompt to PNG, model resident | RTX 3090 Ti | **7.11 s** | 7.03 s ComfyUI | **parity** |
 
 FLUX.2 saves 46.433 seconds (46.788%) on the frozen 1024x1024, 50-step
 workload and passes the unchanged numerical and visual gates. It meets the
