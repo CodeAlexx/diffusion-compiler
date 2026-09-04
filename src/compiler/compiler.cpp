@@ -3158,6 +3158,9 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
         op.opcode == ir::Opcode::Conv3d ||
         // The convolution gradients are library plans for the same reason
         // the forward is: cuDNN owns the algorithm choice.
+        op.opcode == ir::Opcode::Conv3dBackwardInput ||
+        op.opcode == ir::Opcode::Conv3dBackwardWeight ||
+        op.opcode == ir::Opcode::Conv3dBackwardBias ||
         op.opcode == ir::Opcode::Conv2dBackwardInput ||
         op.opcode == ir::Opcode::Conv2dBackwardWeight ||
         op.opcode == ir::Opcode::Conv2dBackwardBias ||
@@ -3427,6 +3430,9 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
     case ir::Opcode::Conv2dBackwardInput:
     case ir::Opcode::Conv2dBackwardWeight:
     case ir::Opcode::Conv2dBackwardBias:
+    case ir::Opcode::Conv3dBackwardInput:
+    case ir::Opcode::Conv3dBackwardWeight:
+    case ir::Opcode::Conv3dBackwardBias:
       break;
     case ir::Opcode::ChannelRmsNorm:
       emit_channel_rms_norm(source, program, op);

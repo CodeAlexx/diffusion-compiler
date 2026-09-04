@@ -2,6 +2,7 @@
 
 #include "dif/support/error.hpp"
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -2150,6 +2151,79 @@ void verify_operation(const Program &program, const Operation &op) {
           bias.dims != std::vector<std::uint64_t>{out_channels})
         fail("conv2d bias must be a [C_out] vector of the input dtype");
     }
+    return;
+  }
+
+  if (op.opcode == Opcode::Conv3dBackwardInput ||
+      op.opcode == Opcode::Conv3dBackwardWeight ||
+      op.opcode == Opcode::Conv3dBackwardBias) {
+    const bool bias_gradient = op.opcode == Opcode::Conv3dBackwardBias;
+    expect_counts(op, bias_gradient ? 1U : 2U, 1U);
+    check_accumulator_f32(op);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    if (!supported_float(grad_output.dtype) || grad_output.dims.size() != 5U)
+      fail("conv3d gradients require an NCDHW float output gradient");
+    if (bias_gradient) {
+      const auto &grad_bias = tensor_or_fail(program, op.outputs[0], op);
+      if (grad_bias.dtype != grad_output.dtype ||
+          grad_bias.dims != std::vector<std::uint64_t>{grad_output.dims[1]})
+        fail("conv3d_backward_bias produces a [C_out] vector of the gradient "
+             "dtype");
+      return;
+    }
+    // As in two dimensions: between the operand and the result the whole
+    // forward geometry is present, so it is checked the way the forward is.
+    const auto &operand = tensor_or_fail(program, op.inputs[1], op);
+    const auto &gradient = tensor_or_fail(program, op.outputs[0], op);
+    const auto &input =
+        op.opcode == ir::Opcode::Conv3dBackwardInput ? gradient : operand;
+    const auto &weight =
+        op.opcode == ir::Opcode::Conv3dBackwardInput ? operand : gradient;
+    if (operand.dtype != grad_output.dtype ||
+        gradient.dtype != grad_output.dtype || input.dims.size() != 5U ||
+        weight.dims.size() != 5U)
+      fail("conv3d gradients require NCDHW activations and OIDHW weights of "
+           "one float dtype");
+    const std::array<std::uint64_t, 3> stride{op.u64(AttrKey::StrideT, 1U),
+                                              op.u64(AttrKey::StrideH, 1U),
+                                              op.u64(AttrKey::StrideW, 1U)};
+    const std::array<std::uint64_t, 3> dilation{
+        op.u64(AttrKey::DilationT, 1U), op.u64(AttrKey::DilationH, 1U),
+        op.u64(AttrKey::DilationW, 1U)};
+    const std::array<std::uint64_t, 3> pad_low{op.u64(AttrKey::PadFront, 0U),
+                                               op.u64(AttrKey::PadTop, 0U),
+                                               op.u64(AttrKey::PadWest, 0U)};
+    const std::array<std::uint64_t, 3> pad_high{op.u64(AttrKey::PadBack, 0U),
+                                                op.u64(AttrKey::PadBottom, 0U),
+                                                op.u64(AttrKey::PadEast, 0U)};
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    constexpr auto kLimit = std::uint64_t{1} << 20U;
+    bool valid = groups != 0U;
+    for (std::size_t axis = 0U; axis < 3U; ++axis)
+      valid = valid && stride[axis] != 0U && dilation[axis] != 0U &&
+              stride[axis] <= kLimit && dilation[axis] <= kLimit &&
+              pad_low[axis] <= kLimit && pad_high[axis] <= kLimit;
+    if (!valid)
+      fail("conv3d gradient attributes are invalid or out of range");
+    const auto in_channels = input.dims[1];
+    const auto out_channels = weight.dims[0];
+    if (in_channels % groups != 0U || out_channels % groups != 0U ||
+        weight.dims[1] != in_channels / groups || weight.dims[2] == 0U ||
+        weight.dims[3] == 0U || weight.dims[4] == 0U)
+      fail("conv3d gradient weight/groups geometry is invalid");
+    std::vector<std::uint64_t> expected{input.dims[0], out_channels, 0U, 0U,
+                                        0U};
+    for (std::size_t axis = 0U; axis < 3U; ++axis) {
+      const auto effective =
+          dilation[axis] * (weight.dims[axis + 2U] - 1U) + 1U;
+      const auto padded =
+          input.dims[axis + 2U] + pad_low[axis] + pad_high[axis];
+      if (padded < effective)
+        fail("conv3d gradient kernel does not fit its padded input");
+      expected[axis + 2U] = (padded - effective) / stride[axis] + 1U;
+    }
+    if (grad_output.dims != expected)
+      fail("conv3d gradient geometry does not match its attributes");
     return;
   }
 

@@ -39,6 +39,22 @@ std::vector<ir::Attribute> conv2d_attributes(const ir::Operation &operation) {
   return attributes;
 }
 
+std::vector<ir::Attribute> conv3d_attributes(const ir::Operation &operation) {
+  const std::array<ir::AttrKey, 13> keys{
+      ir::AttrKey::StrideT,    ir::AttrKey::StrideH,   ir::AttrKey::StrideW,
+      ir::AttrKey::DilationT,  ir::AttrKey::DilationH, ir::AttrKey::DilationW,
+      ir::AttrKey::PadFront,   ir::AttrKey::PadBack,   ir::AttrKey::PadTop,
+      ir::AttrKey::PadBottom,  ir::AttrKey::PadWest,   ir::AttrKey::PadEast,
+      ir::AttrKey::Groups};
+  const std::array<std::uint64_t, 13> defaults{1U, 1U, 1U, 1U, 1U, 1U, 0U,
+                                               0U, 0U, 0U, 0U, 0U, 1U};
+  std::vector<ir::Attribute> attributes;
+  for (std::size_t index = 0U; index < keys.size(); ++index)
+    attributes.push_back(ir::Attribute::u64(
+        keys[index], operation.u64(keys[index], defaults[index])));
+  return attributes;
+}
+
 } // namespace
 
 
@@ -589,6 +605,68 @@ AutodiffResult differentiate(const ir::Program &forward,
         const auto grad_bias =
             add_tensor(*result.program.tensor(operation.inputs[2]));
         add_operation(ir::Opcode::Conv2dBackwardBias, {grad_output},
+                      {grad_bias});
+        accumulate(operation.inputs[2], grad_bias);
+      }
+      break;
+    }
+    case ir::Opcode::PadConstant: {
+      // Padding a tensor with a constant adds values the input never
+      // influenced, so its gradient is the crop back to the input's own
+      // region -- and a crop is a Slice, which the IR already has. One Slice
+      // per padded axis, and none at all for an axis that was not padded, so
+      // a pad that touches one axis costs one operation.
+      const auto x = operation.inputs[0];
+      const auto *description = result.program.tensor(x);
+      const auto rank = description->dims.size();
+      const std::array<std::pair<std::size_t, ir::AttrKey>, 3> axes{
+          std::pair{rank - 3U, ir::AttrKey::PadFront},
+          std::pair{rank - 2U, ir::AttrKey::PadTop},
+          std::pair{rank - 1U, ir::AttrKey::PadWest}};
+      auto cropped = grad_output;
+      auto dims = result.program.tensor(grad_output)->dims;
+      for (const auto &[axis, key] : axes) {
+        // A rank-4 pad has no depth axis to crop.
+        if (rank < 5U && key == ir::AttrKey::PadFront)
+          continue;
+        const auto low = operation.u64(key, 0U);
+        if (low == 0U && dims[axis] == description->dims[axis])
+          continue;
+        dims[axis] = description->dims[axis];
+        const auto next = next_tensor++;
+        result.program.tensors.push_back(
+            {next, description->dtype, ir::TensorRole::Internal, dims});
+        add_operation(ir::Opcode::Slice, {cropped}, {next},
+                      {ir::Attribute::u64(ir::AttrKey::Axis, axis),
+                       ir::Attribute::u64(ir::AttrKey::Start, low)});
+        cropped = next;
+      }
+      accumulate(x, cropped);
+      break;
+    }
+    case ir::Opcode::Conv3d: {
+      // The same three gradients as in two dimensions, over the geometry the
+      // forward carried; every attribute is stamped explicitly so the forward
+      // and its gradients can never resolve a different convolution.
+      auto attributes = conv3d_attributes(operation);
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::Conv3dBackwardInput,
+                    {grad_output, operation.inputs[1]}, {grad_input},
+                    attributes);
+      accumulate(operation.inputs[0], grad_input);
+      const auto weight = operation.inputs[1];
+      if (requested.contains(weight) || produced.contains(weight)) {
+        const auto grad_weight = add_tensor(*result.program.tensor(weight));
+        add_operation(ir::Opcode::Conv3dBackwardWeight,
+                      {grad_output, operation.inputs[0]}, {grad_weight},
+                      attributes);
+        accumulate(weight, grad_weight);
+      }
+      if (operation.inputs.size() == 3U) {
+        const auto grad_bias =
+            add_tensor(*result.program.tensor(operation.inputs[2]));
+        add_operation(ir::Opcode::Conv3dBackwardBias, {grad_output},
                       {grad_bias});
         accumulate(operation.inputs[2], grad_bias);
       }

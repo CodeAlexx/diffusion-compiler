@@ -976,6 +976,9 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::BroadcastToBackward:
     case Opcode::GroupNormBackward:
     case Opcode::GroupNormBackwardAffine:
+    case Opcode::Conv3dBackwardInput:
+    case Opcode::Conv3dBackwardWeight:
+    case Opcode::Conv3dBackwardBias:
     case Opcode::Conv2dBackwardInput:
     case Opcode::Conv2dBackwardWeight:
     case Opcode::Conv2dBackwardBias:

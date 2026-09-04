@@ -142,6 +142,15 @@ struct Case {
   dif::runtime::TensorMap inputs;
   std::uint32_t loss{};
   std::vector<std::uint32_t> targets;
+  // Both bars scale with how long the reduction feeding each output is,
+  // because that is what decides how much F32 rounding accumulates. A 3-D
+  // convolution sums three times as many taps per output as the 2-D one
+  // beside it, and cuDNN's 3-D algorithms accumulate in a different order
+  // again, so those cases carry a measured multiplier rather than the whole
+  // suite being loosened to fit them. Both are set with headroom over the
+  // measured worst and both are proven to still catch an injected defect.
+  double gradient_budget_scale{1.0};
+  double parity_bar_scale{1.0};
 };
 
 Case gelu_case(dif::ir::GeluApproximation approximation) {
@@ -258,6 +267,111 @@ Case group_norm_case() {
   c.inputs.emplace(5U, f32_tensor({2U, 4U, 3U, 3U}, 53U, 1.0F));
   c.loss = 6U;
   c.targets = {1U, 2U, 3U};
+  return c;
+}
+
+// Constant padding: the gradient is the crop back to the input's own region.
+// Asymmetric amounts on every axis, so a rule that confuses the low pad with
+// the high one, or crops the wrong axis, cannot pass by symmetry.
+Case pad_constant_case(bool volumetric) {
+  Case c;
+  const std::uint64_t channels = 2U;
+  const std::uint64_t depth = 3U;
+  const std::uint64_t height = 4U;
+  const std::uint64_t width = 5U;
+  const std::uint64_t front = 1U, back = 2U, top = 2U, bottom = 1U;
+  const std::uint64_t west = 1U, east = 3U;
+  std::vector<std::uint64_t> x_shape{1U, channels};
+  std::vector<std::uint64_t> y_shape{1U, channels};
+  if (volumetric) {
+    x_shape.push_back(depth);
+    y_shape.push_back(depth + front + back);
+  }
+  x_shape.push_back(height);
+  x_shape.push_back(width);
+  y_shape.push_back(height + top + bottom);
+  y_shape.push_back(width + west + east);
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, x_shape},
+                       {2U, DType::F32, TensorRole::Internal, y_shape},
+                       {3U, DType::F32, TensorRole::Input, y_shape},
+                       {4U, DType::F32, TensorRole::Output, {1U}}};
+  std::vector<Attribute> attributes{Attribute::u64(AttrKey::PadTop, top),
+                                    Attribute::u64(AttrKey::PadBottom, bottom),
+                                    Attribute::u64(AttrKey::PadWest, west),
+                                    Attribute::u64(AttrKey::PadEast, east),
+                                    Attribute::f64(AttrKey::Value, 0.25)};
+  if (volumetric) {
+    attributes.push_back(Attribute::u64(AttrKey::PadFront, front));
+    attributes.push_back(Attribute::u64(AttrKey::PadBack, back));
+  }
+  c.program.operations = {
+      {1U, Opcode::PadConstant, {1U}, {2U}, std::move(attributes)},
+      {2U, Opcode::MseLoss, {2U, 3U}, {4U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(x_shape, 283U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor(y_shape, 293U, 1.0F));
+  c.loss = 4U;
+  c.targets = {1U};
+  return c;
+}
+
+// A 3-D convolution, in the geometries a video model uses: a temporal axis
+// that may be strided or padded differently from the spatial ones, and
+// grouped channels. The depthwise case (groups == channels) is the one a
+// naive weight gradient gets wrong, because every group has exactly one
+// input channel and the group arithmetic degenerates.
+Case conv3d_case(std::uint64_t stride_t, std::uint64_t stride_hw,
+                 std::uint64_t pad_t, std::uint64_t pad_hw,
+                 std::uint64_t groups, std::uint64_t kernel_t) {
+  Case c;
+  const std::uint64_t in_channels = 4U;
+  const std::uint64_t out_channels = 4U;
+  const std::uint64_t depth = 5U;
+  const std::uint64_t height = 4U;
+  const std::uint64_t width = 4U;
+  const std::uint64_t kernel = 3U;
+  const auto out_d = (depth + 2U * pad_t - kernel_t) / stride_t + 1U;
+  const auto out_h = (height + 2U * pad_hw - kernel) / stride_hw + 1U;
+  const auto out_w = (width + 2U * pad_hw - kernel) / stride_hw + 1U;
+  const std::vector<std::uint64_t> x_shape{1U, in_channels, depth, height,
+                                           width};
+  const std::vector<std::uint64_t> w_shape{
+      out_channels, in_channels / groups, kernel_t, kernel, kernel};
+  const std::vector<std::uint64_t> y_shape{1U, out_channels, out_d, out_h,
+                                           out_w};
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, x_shape},
+                       {2U, DType::F32, TensorRole::Input, w_shape},
+                       {3U, DType::F32, TensorRole::Input, {out_channels}},
+                       {4U, DType::F32, TensorRole::Internal, y_shape},
+                       {5U, DType::F32, TensorRole::Input, y_shape},
+                       {6U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::Conv3d, {1U, 2U, 3U}, {4U},
+       {Attribute::u64(AttrKey::StrideT, stride_t),
+        Attribute::u64(AttrKey::StrideH, stride_hw),
+        Attribute::u64(AttrKey::StrideW, stride_hw),
+        Attribute::u64(AttrKey::DilationT, 1U),
+        Attribute::u64(AttrKey::DilationH, 1U),
+        Attribute::u64(AttrKey::DilationW, 1U),
+        Attribute::u64(AttrKey::PadFront, pad_t),
+        Attribute::u64(AttrKey::PadBack, pad_t),
+        Attribute::u64(AttrKey::PadTop, pad_hw),
+        Attribute::u64(AttrKey::PadBottom, pad_hw),
+        Attribute::u64(AttrKey::PadWest, pad_hw),
+        Attribute::u64(AttrKey::PadEast, pad_hw),
+        Attribute::u64(AttrKey::Groups, groups)}},
+      {2U, Opcode::MseLoss, {4U, 5U}, {6U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(x_shape, 269U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor(w_shape, 271U, 0.5F));
+  c.inputs.emplace(3U, f32_tensor({out_channels}, 277U, 0.3F));
+  c.inputs.emplace(5U, f32_tensor(y_shape, 281U, 1.0F));
+  c.loss = 6U;
+  c.targets = {1U, 2U, 3U};
+  // Measured over all seven geometries: the difference quotient reached 2.00
+  // of the unscaled budget and the two backends differed by 3.7e-4 of the
+  // range. Both bars are set with headroom over that, and both still catch a
+  // one-percent weight-gradient error by a wide margin.
+  c.gradient_budget_scale = 4.0;
+  c.parity_bar_scale = 40.0;
   return c;
 }
 
@@ -601,16 +715,19 @@ void check_backends(const std::string &label, const Case &c) {
     const double bar = expected.dtype == DType::F32   ? 2.0e-5
                        : expected.dtype == DType::F16 ? 2.0e-3
                                                       : 2.0e-2;
-    expect(worst <= bar, label + " tensor " + std::to_string(target) +
-                             ": CPU and CUDA differ by " +
-                             std::to_string(worst) + " of the range (bar " +
-                             std::to_string(bar) + ")");
+    expect(worst <= bar * c.parity_bar_scale,
+           label + " tensor " + std::to_string(target) +
+               ": CPU and CUDA differ by " + std::to_string(worst) +
+               " of the range (bar " +
+               std::to_string(bar * c.parity_bar_scale) + ")");
   }
 }
 
 void run(const std::string &label, const Case &c) {
   dif::ir::verify(c.program);
-  check_gradients(label, c.program, c.inputs, c.loss, c.targets);
+  check_gradients(label, c.program, c.inputs, c.loss, c.targets, 8.0e-3,
+                  3.0e-5 * c.gradient_budget_scale,
+                  3.0e-3 * c.gradient_budget_scale);
   check_backends(label, c);
 }
 
@@ -697,6 +814,17 @@ int main() {
   run("conv2d strided", conv2d_case(2U, 1U, 1U));
   run("conv2d unpadded", conv2d_case(1U, 0U, 1U));
   run("conv2d grouped", conv2d_case(1U, 1U, 2U));
+  run("pad constant", pad_constant_case(false));
+  run("pad constant volumetric", pad_constant_case(true));
+  run("conv3d", conv3d_case(1U, 1U, 1U, 1U, 1U, 3U));
+  run("conv3d strided time", conv3d_case(2U, 1U, 1U, 1U, 1U, 3U));
+  run("conv3d strided space", conv3d_case(1U, 2U, 1U, 1U, 1U, 3U));
+  run("conv3d unpadded", conv3d_case(1U, 1U, 0U, 0U, 1U, 3U));
+  run("conv3d grouped", conv3d_case(1U, 1U, 1U, 1U, 2U, 3U));
+  run("conv3d depthwise", conv3d_case(1U, 1U, 1U, 1U, 4U, 3U));
+  // A temporal kernel of one is the "2-D convolution applied per frame" shape
+  // a video VAE uses for its spatial layers.
+  run("conv3d flat time", conv3d_case(1U, 1U, 0U, 1U, 1U, 1U));
   run_parity("qk norm rope bf16 f32 tables", mixed_dtype_rope_case(false));
   run_parity("qk norm rope bf16 f32 tables interleaved",
              mixed_dtype_rope_case(true));

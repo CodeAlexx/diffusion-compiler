@@ -7959,6 +7959,9 @@ public:
         case ir::Opcode::BroadcastToBackward:
         case ir::Opcode::GroupNormBackward:
         case ir::Opcode::GroupNormBackwardAffine:
+        case ir::Opcode::Conv3dBackwardInput:
+        case ir::Opcode::Conv3dBackwardWeight:
+        case ir::Opcode::Conv3dBackwardBias:
         case ir::Opcode::Conv2dBackwardInput:
         case ir::Opcode::Conv2dBackwardWeight:
         case ir::Opcode::Conv2dBackwardBias:
@@ -8938,6 +8941,55 @@ public:
       cudnn_workspace_bytes_ =
           std::max(cudnn_workspace_bytes_, plan->workspace_bytes());
       cudnn_conv_backward_plans_.emplace(op.id, std::move(plan));
+    }
+    for (const auto &op : program_.operations) {
+      const bool input_gradient =
+          op.opcode == ir::Opcode::Conv3dBackwardInput;
+      const bool weight_gradient =
+          op.opcode == ir::Opcode::Conv3dBackwardWeight;
+      const bool bias_gradient = op.opcode == ir::Opcode::Conv3dBackwardBias;
+      if (!input_gradient && !weight_gradient && !bias_gradient)
+        continue;
+      const auto *grad_output = program_.tensor(op.inputs.at(0));
+      if (!grad_output)
+        fail("cuDNN Conv3d gradient references a missing output gradient");
+      // As in two dimensions, the operand and the result carry the whole
+      // forward geometry between them; the verifier has established that.
+      const auto *input = grad_output;
+      const auto *weight = grad_output;
+      if (!bias_gradient) {
+        const auto *operand = program_.tensor(op.inputs.at(1));
+        const auto *gradient = program_.tensor(op.outputs.at(0));
+        if (!operand || !gradient)
+          fail("cuDNN Conv3d gradient references a missing tensor");
+        input = input_gradient ? gradient : operand;
+        weight = input_gradient ? operand : gradient;
+      }
+      const auto pad_front = op.u64(ir::AttrKey::PadFront, 0U);
+      const auto pad_top = op.u64(ir::AttrKey::PadTop, 0U);
+      const auto pad_west = op.u64(ir::AttrKey::PadWest, 0U);
+      if (pad_front != op.u64(ir::AttrKey::PadBack, 0U) ||
+          pad_top != op.u64(ir::AttrKey::PadBottom, 0U) ||
+          pad_west != op.u64(ir::AttrKey::PadEast, 0U))
+        fail("cuDNN Conv3d gradient currently requires symmetric spatial "
+             "padding");
+      constexpr std::uint64_t default_workspace = 64ULL * 1024ULL * 1024ULL;
+      const auto limit =
+          op.u64(ir::AttrKey::WorkspaceLimitBytes, default_workspace);
+      auto plan = std::make_shared<CudnnConv3dBackwardPlan>(
+          input_gradient ? CudnnConv3dBackwardPlan::Kind::Input
+          : weight_gradient ? CudnnConv3dBackwardPlan::Kind::Weight
+                            : CudnnConv3dBackwardPlan::Kind::Bias,
+          *input, *weight, *grad_output, op.u64(ir::AttrKey::StrideT, 1U),
+          op.u64(ir::AttrKey::StrideH, 1U), op.u64(ir::AttrKey::StrideW, 1U),
+          pad_front, pad_top, pad_west, op.u64(ir::AttrKey::DilationT, 1U),
+          op.u64(ir::AttrKey::DilationH, 1U),
+          op.u64(ir::AttrKey::DilationW, 1U),
+          op.u64(ir::AttrKey::Groups, 1U), static_cast<std::size_t>(limit),
+          options.deterministic_convolution_algorithms);
+      cudnn_workspace_bytes_ =
+          std::max(cudnn_workspace_bytes_, plan->workspace_bytes());
+      cudnn_conv3d_backward_plans_.emplace(op.id, std::move(plan));
     }
     for (const auto &op : program_.operations) {
       if (op.opcode != ir::Opcode::Conv3d)
@@ -11178,6 +11230,19 @@ public:
             reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
             reinterpret_cast<std::uintptr_t>(context_.stream()));
       }
+      else if (op.opcode == ir::Opcode::Conv3dBackwardInput ||
+               op.opcode == ir::Opcode::Conv3dBackwardWeight ||
+               op.opcode == ir::Opcode::Conv3dBackwardBias) {
+        count_cudnn_convolution_dispatch();
+        cudnn_conv3d_backward_plans_.at(op.id)->execute(
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+            op.inputs.size() == 2U
+                ? static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1)))
+                : 0U,
+            static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+            reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
+            reinterpret_cast<std::uintptr_t>(context_.stream()));
+      }
       else if (op.opcode == ir::Opcode::Conv2dBackwardInput ||
                op.opcode == ir::Opcode::Conv2dBackwardWeight ||
                op.opcode == ir::Opcode::Conv2dBackwardBias) {
@@ -12209,6 +12274,8 @@ private:
       cudnn_conv_backward_plans_;
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv3dPlan>>
       cudnn_conv3d_plans_;
+  std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv3dBackwardPlan>>
+      cudnn_conv3d_backward_plans_;
 #endif
   std::string device_name_;
   target::TargetProfile target_profile_;

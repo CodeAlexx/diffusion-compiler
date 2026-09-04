@@ -100,4 +100,40 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// The three 3-D convolution gradients. Same contract as the 2-D ones: the
+// geometry the forward plan took, the same v7 heuristic, and the math type it
+// returns applied to the descriptor.
+class CudnnConv3dBackwardPlan {
+public:
+  enum class Kind { Input, Weight, Bias };
+
+  CudnnConv3dBackwardPlan(Kind kind, const ir::TensorDesc &input,
+                          const ir::TensorDesc &weight,
+                          const ir::TensorDesc &grad_output,
+                          std::uint64_t stride_t, std::uint64_t stride_h,
+                          std::uint64_t stride_w, std::uint64_t pad_t,
+                          std::uint64_t pad_h, std::uint64_t pad_w,
+                          std::uint64_t dilation_t, std::uint64_t dilation_h,
+                          std::uint64_t dilation_w, std::uint64_t groups,
+                          std::size_t workspace_limit_bytes,
+                          bool deterministic = false);
+  ~CudnnConv3dBackwardPlan();
+
+  CudnnConv3dBackwardPlan(const CudnnConv3dBackwardPlan &) = delete;
+  CudnnConv3dBackwardPlan &operator=(const CudnnConv3dBackwardPlan &) = delete;
+  CudnnConv3dBackwardPlan(CudnnConv3dBackwardPlan &&) noexcept;
+  CudnnConv3dBackwardPlan &operator=(CudnnConv3dBackwardPlan &&) noexcept;
+
+  std::size_t workspace_bytes() const;
+  // `operand` is the weight for an input gradient and the input for a weight
+  // gradient; a bias gradient reads only the output gradient.
+  void execute(std::uintptr_t grad_output, std::uintptr_t operand,
+               std::uintptr_t gradient, std::uintptr_t workspace,
+               std::uintptr_t stream);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 } // namespace dif::runtime

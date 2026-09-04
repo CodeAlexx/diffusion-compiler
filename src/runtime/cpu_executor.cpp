@@ -918,78 +918,120 @@ void silu_backward(const ir::Operation &op, TensorMap &tensors) {
 
 // The three convolution gradients share the forward's loop nest and its
 // index arithmetic; only the tensor each iteration accumulates into differs.
-struct Conv2dGeometry {
-  std::uint64_t stride_h, stride_w, dilation_h, dilation_w;
-  std::uint64_t pad_top, pad_west, groups;
-  std::uint64_t batch, in_channels, input_h, input_w;
-  std::uint64_t out_channels, kernel_h, kernel_w, output_h, output_w;
-  std::uint64_t in_per_group, out_per_group;
+// One convolution geometry for both ranks. A 2-D convolution is a 3-D one
+// whose leading spatial axis is absent, and every gradient below walks the
+// same taps, so there is one walker rather than one per rank.
+struct ConvGeometry {
+  std::size_t spatial{};
+  std::array<std::uint64_t, 3> stride{}, dilation{}, pad{};
+  std::array<std::uint64_t, 3> input{}, kernel{}, output{};
+  std::uint64_t groups{}, batch{}, in_channels{}, out_channels{};
+  std::uint64_t in_per_group{}, out_per_group{};
+  std::uint64_t input_positions{1U}, output_positions{1U}, kernel_taps{1U};
 };
 
-Conv2dGeometry conv2d_geometry(const ir::Operation &op,
-                               const ir::TensorDesc &input,
-                               const ir::TensorDesc &weight,
-                               const ir::TensorDesc &grad_output) {
-  Conv2dGeometry geometry{};
-  geometry.stride_h = op.u64(ir::AttrKey::StrideH, 1U);
-  geometry.stride_w = op.u64(ir::AttrKey::StrideW, 1U);
-  geometry.dilation_h = op.u64(ir::AttrKey::DilationH, 1U);
-  geometry.dilation_w = op.u64(ir::AttrKey::DilationW, 1U);
-  geometry.pad_top = op.u64(ir::AttrKey::PadTop, 0U);
-  geometry.pad_west = op.u64(ir::AttrKey::PadWest, 0U);
+ConvGeometry conv_geometry(const ir::Operation &op,
+                           const ir::TensorDesc &input,
+                           const ir::TensorDesc &weight,
+                           const ir::TensorDesc &grad_output) {
+  ConvGeometry geometry{};
+  geometry.spatial = input.dims.size() - 2U;
+  // The attribute names differ by rank -- a 3-D convolution names its leading
+  // axis "time" and pads it front and back -- so the keys are chosen here and
+  // nothing downstream has to know which rank it is looking at.
+  static constexpr std::array<ir::AttrKey, 3> k3_stride{
+      ir::AttrKey::StrideT, ir::AttrKey::StrideH, ir::AttrKey::StrideW};
+  static constexpr std::array<ir::AttrKey, 3> k3_dilation{
+      ir::AttrKey::DilationT, ir::AttrKey::DilationH, ir::AttrKey::DilationW};
+  static constexpr std::array<ir::AttrKey, 3> k3_pad{
+      ir::AttrKey::PadFront, ir::AttrKey::PadTop, ir::AttrKey::PadWest};
+  static constexpr std::array<ir::AttrKey, 2> k2_stride{ir::AttrKey::StrideH,
+                                                        ir::AttrKey::StrideW};
+  static constexpr std::array<ir::AttrKey, 2> k2_dilation{
+      ir::AttrKey::DilationH, ir::AttrKey::DilationW};
+  static constexpr std::array<ir::AttrKey, 2> k2_pad{ir::AttrKey::PadTop,
+                                                     ir::AttrKey::PadWest};
+  for (std::size_t axis = 0U; axis < geometry.spatial; ++axis) {
+    const auto stride_key =
+        geometry.spatial == 3U ? k3_stride[axis] : k2_stride[axis];
+    const auto dilation_key =
+        geometry.spatial == 3U ? k3_dilation[axis] : k2_dilation[axis];
+    const auto pad_key = geometry.spatial == 3U ? k3_pad[axis] : k2_pad[axis];
+    geometry.stride[axis] = op.u64(stride_key, 1U);
+    geometry.dilation[axis] = op.u64(dilation_key, 1U);
+    geometry.pad[axis] = op.u64(pad_key, 0U);
+    geometry.input[axis] = input.dims[axis + 2U];
+    geometry.kernel[axis] = weight.dims[axis + 2U];
+    geometry.output[axis] = grad_output.dims[axis + 2U];
+    geometry.input_positions *= geometry.input[axis];
+    geometry.output_positions *= geometry.output[axis];
+    geometry.kernel_taps *= geometry.kernel[axis];
+  }
   geometry.groups = op.u64(ir::AttrKey::Groups, 1U);
   geometry.batch = input.dims[0];
   geometry.in_channels = input.dims[1];
-  geometry.input_h = input.dims[2];
-  geometry.input_w = input.dims[3];
   geometry.out_channels = weight.dims[0];
-  geometry.kernel_h = weight.dims[2];
-  geometry.kernel_w = weight.dims[3];
-  geometry.output_h = grad_output.dims[2];
-  geometry.output_w = grad_output.dims[3];
   geometry.in_per_group = geometry.in_channels / geometry.groups;
   geometry.out_per_group = geometry.out_channels / geometry.groups;
   return geometry;
 }
 
 // Walks every (batch, out channel, out position, in channel, kernel tap) the
-// forward touched, handing the visitor the two flat indices involved.
+// forward touched, handing the visitor the three flat indices involved. The
+// spatial position and the kernel tap are carried as odometers, so the same
+// loop nest serves two and three dimensions.
 template <typename Visit>
-void conv2d_taps(const Conv2dGeometry &g, Visit &&visit) {
+void conv_taps(const ConvGeometry &g, Visit &&visit) {
+  std::array<std::uint64_t, 3> position{};
+  std::array<std::uint64_t, 3> tap{};
+  std::array<std::uint64_t, 3> source{};
   for (std::uint64_t b = 0U; b < g.batch; ++b)
     for (std::uint64_t oc = 0U; oc < g.out_channels; ++oc) {
       const auto group = oc / g.out_per_group;
-      for (std::uint64_t oh = 0U; oh < g.output_h; ++oh)
-        for (std::uint64_t ow = 0U; ow < g.output_w; ++ow) {
-          const auto output_index =
-              ((b * g.out_channels + oc) * g.output_h + oh) * g.output_w + ow;
-          for (std::uint64_t ic = 0U; ic < g.in_per_group; ++ic) {
-            const auto source_channel = group * g.in_per_group + ic;
-            for (std::uint64_t kh = 0U; kh < g.kernel_h; ++kh) {
-              const auto ih =
-                  static_cast<std::int64_t>(oh * g.stride_h + kh * g.dilation_h) -
-                  static_cast<std::int64_t>(g.pad_top);
-              if (ih < 0 || ih >= static_cast<std::int64_t>(g.input_h))
-                continue;
-              for (std::uint64_t kw = 0U; kw < g.kernel_w; ++kw) {
-                const auto iw =
-                    static_cast<std::int64_t>(ow * g.stride_w + kw * g.dilation_w) -
-                    static_cast<std::int64_t>(g.pad_west);
-                if (iw < 0 || iw >= static_cast<std::int64_t>(g.input_w))
-                  continue;
-                const auto input_index =
-                    ((b * g.in_channels + source_channel) * g.input_h +
-                     static_cast<std::uint64_t>(ih)) *
-                        g.input_w +
-                    static_cast<std::uint64_t>(iw);
-                const auto weight_index =
-                    ((oc * g.in_per_group + ic) * g.kernel_h + kh) * g.kernel_w +
-                    kw;
-                visit(output_index, input_index, weight_index);
-              }
+      position.fill(0U);
+      for (std::uint64_t o = 0U; o < g.output_positions; ++o) {
+        const auto output_index =
+            (b * g.out_channels + oc) * g.output_positions + o;
+        for (std::uint64_t ic = 0U; ic < g.in_per_group; ++ic) {
+          const auto source_channel = group * g.in_per_group + ic;
+          tap.fill(0U);
+          for (std::uint64_t k = 0U; k < g.kernel_taps; ++k) {
+            bool inside = true;
+            for (std::size_t axis = 0U; axis < g.spatial && inside; ++axis) {
+              const auto coordinate =
+                  static_cast<std::int64_t>(position[axis] * g.stride[axis] +
+                                            tap[axis] * g.dilation[axis]) -
+                  static_cast<std::int64_t>(g.pad[axis]);
+              if (coordinate < 0 ||
+                  coordinate >= static_cast<std::int64_t>(g.input[axis]))
+                inside = false;
+              else
+                source[axis] = static_cast<std::uint64_t>(coordinate);
+            }
+            if (inside) {
+              std::uint64_t flat = 0U;
+              for (std::size_t axis = 0U; axis < g.spatial; ++axis)
+                flat = flat * g.input[axis] + source[axis];
+              const auto input_index =
+                  (b * g.in_channels + source_channel) * g.input_positions +
+                  flat;
+              const auto weight_index =
+                  (oc * g.in_per_group + ic) * g.kernel_taps + k;
+              visit(output_index, input_index, weight_index);
+            }
+            for (std::size_t axis = g.spatial; axis-- > 0U;) {
+              if (++tap[axis] < g.kernel[axis])
+                break;
+              tap[axis] = 0U;
             }
           }
         }
+        for (std::size_t axis = g.spatial; axis-- > 0U;) {
+          if (++position[axis] < g.output[axis])
+            break;
+          position[axis] = 0U;
+        }
+      }
     }
 }
 
@@ -997,15 +1039,15 @@ void conv2d_backward_input(const ir::Operation &op, TensorMap &tensors) {
   const auto &grad_output = tensors.at(op.inputs[0]);
   const auto &weight = tensors.at(op.inputs[1]);
   auto &grad_input = tensors.at(op.outputs[0]);
-  const auto geometry = conv2d_geometry(
+  const auto geometry = conv_geometry(
       op, {0U, grad_input.dtype, 0U, grad_input.dims},
       {0U, weight.dtype, 0U, weight.dims},
       {0U, grad_output.dtype, 0U, grad_output.dims});
   std::vector<float> accumulator(
       static_cast<std::size_t>(grad_input.element_count()), 0.0F);
-  conv2d_taps(geometry, [&](std::uint64_t output_index,
-                            std::uint64_t input_index,
-                            std::uint64_t weight_index) {
+  conv_taps(geometry, [&](std::uint64_t output_index,
+                          std::uint64_t input_index,
+                          std::uint64_t weight_index) {
     accumulator[static_cast<std::size_t>(input_index)] +=
         load_float(grad_output, output_index) * load_float(weight, weight_index);
   });
@@ -1017,15 +1059,15 @@ void conv2d_backward_weight(const ir::Operation &op, TensorMap &tensors) {
   const auto &grad_output = tensors.at(op.inputs[0]);
   const auto &input = tensors.at(op.inputs[1]);
   auto &grad_weight = tensors.at(op.outputs[0]);
-  const auto geometry = conv2d_geometry(
+  const auto geometry = conv_geometry(
       op, {0U, input.dtype, 0U, input.dims},
       {0U, grad_weight.dtype, 0U, grad_weight.dims},
       {0U, grad_output.dtype, 0U, grad_output.dims});
   std::vector<float> accumulator(
       static_cast<std::size_t>(grad_weight.element_count()), 0.0F);
-  conv2d_taps(geometry, [&](std::uint64_t output_index,
-                            std::uint64_t input_index,
-                            std::uint64_t weight_index) {
+  conv_taps(geometry, [&](std::uint64_t output_index,
+                          std::uint64_t input_index,
+                          std::uint64_t weight_index) {
     accumulator[static_cast<std::size_t>(weight_index)] +=
         load_float(grad_output, output_index) * load_float(input, input_index);
   });
@@ -1045,6 +1087,65 @@ void conv2d_backward_bias(const ir::Operation &op, TensorMap &tensors) {
       for (std::uint64_t index = 0U; index < plane; ++index)
         total += load_float(grad_output,
                             (b * channels + channel) * plane + index);
+    store_float(grad_bias, channel, total);
+  }
+}
+
+// The 3-D gradients are the 2-D ones over the same walker: only the rank of
+// the tensors they are handed differs.
+void conv3d_backward_input(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto geometry = conv_geometry(
+      op, {0U, grad_input.dtype, 0U, grad_input.dims},
+      {0U, weight.dtype, 0U, weight.dims},
+      {0U, grad_output.dtype, 0U, grad_output.dims});
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_input.element_count()), 0.0F);
+  conv_taps(geometry, [&](std::uint64_t output_index,
+                          std::uint64_t input_index,
+                          std::uint64_t weight_index) {
+    accumulator[static_cast<std::size_t>(input_index)] +=
+        load_float(grad_output, output_index) * load_float(weight, weight_index);
+  });
+  for (std::size_t index = 0U; index < accumulator.size(); ++index)
+    store_float(grad_input, index, accumulator[index]);
+}
+
+void conv3d_backward_weight(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &input = tensors.at(op.inputs[1]);
+  auto &grad_weight = tensors.at(op.outputs[0]);
+  const auto geometry = conv_geometry(
+      op, {0U, input.dtype, 0U, input.dims},
+      {0U, grad_weight.dtype, 0U, grad_weight.dims},
+      {0U, grad_output.dtype, 0U, grad_output.dims});
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_weight.element_count()), 0.0F);
+  conv_taps(geometry, [&](std::uint64_t output_index,
+                          std::uint64_t input_index,
+                          std::uint64_t weight_index) {
+    accumulator[static_cast<std::size_t>(weight_index)] +=
+        load_float(grad_output, output_index) * load_float(input, input_index);
+  });
+  for (std::size_t index = 0U; index < accumulator.size(); ++index)
+    store_float(grad_weight, index, accumulator[index]);
+}
+
+void conv3d_backward_bias(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  auto &grad_bias = tensors.at(op.outputs[0]);
+  const auto batch = grad_output.dims[0];
+  const auto channels = grad_output.dims[1];
+  const auto volume =
+      grad_output.dims[2] * grad_output.dims[3] * grad_output.dims[4];
+  for (std::uint64_t channel = 0U; channel < channels; ++channel) {
+    float total = 0.0F;
+    for (std::uint64_t b = 0U; b < batch; ++b)
+      for (std::uint64_t index = 0U; index < volume; ++index)
+        total += load_float(grad_output,
+                            (b * channels + channel) * volume + index);
     store_float(grad_bias, channel, total);
   }
 }
@@ -3371,6 +3472,15 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::GroupNormBackwardAffine:
       group_norm_backward_affine(op, tensors);
+      break;
+    case ir::Opcode::Conv3dBackwardInput:
+      conv3d_backward_input(op, tensors);
+      break;
+    case ir::Opcode::Conv3dBackwardWeight:
+      conv3d_backward_weight(op, tensors);
+      break;
+    case ir::Opcode::Conv3dBackwardBias:
+      conv3d_backward_bias(op, tensors);
       break;
     case ir::Opcode::Conv2dBackwardInput:
       conv2d_backward_input(op, tensors);

@@ -198,3 +198,9 @@ DIF_OPCODE(GatherRowsBackward, 87, "gather_rows_backward", None)
 // otherwise each recompute: elementwise for the input, down every row for the
 // affine pair, and across one modulation group for the modulation pair.
 DIF_OPCODE(LayerNormModulateBackward, 88, "layer_norm_modulate_backward", None)
+// Gradient of a 3-D convolution with respect to its input, its weight, and
+// its bias. Three operations for the same reason the 2-D ones are three: a
+// frozen weight or an absent bias simply is not emitted.
+DIF_OPCODE(Conv3dBackwardInput, 89, "conv3d_backward_input", None)
+DIF_OPCODE(Conv3dBackwardWeight, 90, "conv3d_backward_weight", None)
+DIF_OPCODE(Conv3dBackwardBias, 91, "conv3d_backward_bias", None)
