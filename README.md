@@ -33,9 +33,14 @@ checkpoint + frontend  ->  verified DiffIR  ->  compiler / optimizer / memory pl
 - **Operators.** BF16/F16/F32 and integer execution, attention with GQA and
   masks, multi-axis rotary encoding, normalization, modulation, activations,
   layout operations, convolution, VAE primitives, and PNG/MP4/WAV handoff.
-- **Training.** Reverse-mode autodiff, gradient accumulation, AdamW state
-  transitions, checkpoint/resume, and LoRA through the same DiffIR and runtime
-  used for inference.
+- **Training.** A step is one program. Reverse-mode autodiff, the optimizer
+  update, gradient accumulation over micro-batches and recompute all compose
+  into a single graph over one tensor namespace, so the memory planner sees
+  activations, gradients and optimizer state together. Half-precision
+  checkpoints train through F32 master weights, gradients are checked against
+  central differences of the forward program they claim to differentiate, and
+  LoRA, checkpoint/resume and AdamW state transitions run through the same
+  DiffIR and runtime as inference.
 - **Tools.** A command-line suite for compiling, inspecting, running, tuning,
   benchmarking, tracing, bisecting, quality-gating, and regression-testing
   programs, plus per-model frontends. See [USAGE.md](USAGE.md).
@@ -49,6 +54,10 @@ checkpoint + frontend  ->  verified DiffIR  ->  compiler / optimizer / memory pl
 | FLUX.2 [klein] Base 9B | Prompt to 1024x1024 PNG | RTX 5080 | ConvRot W8A8 plus INT8 weight-only, MXFP8 hooks |
 | FLUX.2 [dev] | Prompt to 1024x1024 PNG | RTX 3090 Ti | SquareQ W4 with INT8 compute from a rank-32 slab, or BF16 streamed |
 | SDXL base 1.0 | Prompt to 1024x1024 PNG | RTX 3090 Ti | F16 denoiser, F16 text towers, BF16 decoder |
+
+The SDXL UNet and VAE decoder also differentiate end to end: 2417 forward
+operations become 6623, producing all 1680 weight gradients, and the composed
+training step trains every F16 parameter through an F32 master.
 
 Each frontend also carries its conditioners and VAEs natively: Qwen3-VL
 vision/text conditioning, the H3 video encoder, video VAE, and audio VAE, the

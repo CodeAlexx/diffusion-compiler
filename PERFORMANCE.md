@@ -224,6 +224,38 @@ per channel. Each stage is gated against an oracle built from the reference's
 own modules: the text towers to cosine 1.0000000, the UNet epsilon to cosine
 0.9999999, and the decoded image to cosine 0.9999.
 
+## Training step memory — SDXL UNet, RTX 3090 Ti
+
+What a training step costs is planned before it runs, so it can be measured
+without a card large enough to hold it. All figures are the memory plan's
+total for the SDXL UNet at 64x64 latent, batch 1, 77 context rows, with every
+one of the 1680 weights as a differentiation target.
+
+| Program | Operations | Planned |
+|---|---:|---:|
+| Forward only | 2416 | 4.84 GiB |
+| Forward and backward | 6623 | 11.57 GiB |
+| Forward and backward, 32-segment recompute | 9015 | 10.09 GiB |
+| Full step with AdamW and F32 masters | 11663 | 73.96 GiB |
+
+**Read this honestly.** The planner is already within 0.5 percent of its own
+lower bound, the largest total of bytes simultaneously live, so there was no
+packing win available. Recompute takes 13 percent off the differentiated
+program: the activations held across the forward-backward boundary are about
+1.4 GiB of it and recompute recovers nearly all of them, while weights and
+gradients are the rest and no scheduling can touch those. The full step at
+74 GiB is what fully fine-tuning a 2.57-billion-parameter model with AdamW
+costs, and it is the reason LoRA exists rather than a shortcoming of the plan.
+
+Gradients are gated against central differences of the forward program they
+claim to differentiate, then for CPU-versus-CUDA agreement, over nineteen
+cases at worst 0.44 of the admission budget. The budget was measured first and
+then tightened threefold, and it has teeth: an omitted group-norm mean term
+fails at 54 times budget, a one-percent convolution weight-gradient error at
+3.1 times, and a dropped batch offset in batched attention at twice the value
+range. Recompute is held to byte equality rather than a tolerance, and four
+micro-batches of three match one batch of twelve to 4.2e-06 relative.
+
 ## Reporting rules
 
 - Freeze checkpoint, prompt, seed, resolution, steps, guidance, scheduler, and
