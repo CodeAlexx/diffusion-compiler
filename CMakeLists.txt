@@ -114,6 +114,7 @@ add_library(difcore
     src/quality/metrics.cpp
     src/tune/database.cpp
     src/training/autodiff.cpp
+    src/training/step.cpp
     src/training/checkpoint.cpp
     src/weights/safetensors.cpp
     src/weights/bundle.cpp
@@ -463,6 +464,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_training_gradient_tests tests/training_gradient_tests.cpp)
   target_link_libraries(dif_training_gradient_tests PRIVATE difcore)
   add_test(NAME dif_training_gradient_tests COMMAND dif_training_gradient_tests)
+
+  add_executable(dif_training_step_tests tests/training_step_tests.cpp)
+  target_link_libraries(dif_training_step_tests PRIVATE difcore)
+  add_test(NAME dif_training_step_tests COMMAND dif_training_step_tests)
 
   add_executable(dif_autodiff_tests tests/autodiff_tests.cpp)
   target_link_libraries(dif_autodiff_tests PRIVATE difcore)

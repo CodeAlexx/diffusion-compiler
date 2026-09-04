@@ -5,6 +5,7 @@
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
 #include "dif/training/autodiff.hpp"
+#include "dif/training/step.hpp"
 #include "dif/weights/safetensors.hpp"
 
 #include <algorithm>
@@ -157,69 +158,22 @@ make_lora_flow_training(const LoraFlowTrainingConfig &config) {
                 {build.prediction_output, build.target_velocity_input},
                 {build.loss_output});
 
-  const auto differentiated = training::differentiate(
-      forward, build.loss_output, adapter_parameters);
-  build.program = differentiated.program;
-
-  next_tensor = 1U;
-  next_operation = 1U;
-  for (const auto &tensor : build.program.tensors)
-    next_tensor = std::max(next_tensor, tensor.id + 1U);
-  for (const auto &operation : build.program.operations)
-    next_operation = std::max(next_operation, operation.id + 1U);
-  build.step_input = next_tensor++;
-  build.program.tensors.push_back(
-      {build.step_input, ir::DType::I32,
-       ir::TensorRole::Input | ir::TensorRole::OptimizerState, {1U}});
-
-  // Adapter-only AdamW.  A and B are matrices; the frozen base never enters
-  // the optimizer, so there is no bias parameter group in this vertical.
-  for (const auto parameter_id : adapter_parameters) {
-    const auto parameter_dims = build.program.tensor(parameter_id)->dims;
-    OptimizerBinding binding;
-    binding.parameter_input = parameter_id;
-    binding.gradient_output = differentiated.gradients.at(parameter_id);
-    binding.first_moment_input = next_tensor++;
-    binding.second_moment_input = next_tensor++;
-    binding.parameter_output = next_tensor++;
-    binding.first_moment_output = next_tensor++;
-    binding.second_moment_output = next_tensor++;
-    build.program.tensors.push_back(
-        {binding.first_moment_input, ir::DType::F32,
-         ir::TensorRole::Input | ir::TensorRole::OptimizerState,
-         parameter_dims});
-    build.program.tensors.push_back(
-        {binding.second_moment_input, ir::DType::F32,
-         ir::TensorRole::Input | ir::TensorRole::OptimizerState,
-         parameter_dims});
-    build.program.tensors.push_back(
-        {binding.parameter_output, ir::DType::F32,
-         ir::TensorRole::Output | ir::TensorRole::Parameter,
-         parameter_dims});
-    build.program.tensors.push_back(
-        {binding.first_moment_output, ir::DType::F32,
-         ir::TensorRole::Output | ir::TensorRole::OptimizerState,
-         parameter_dims});
-    build.program.tensors.push_back(
-        {binding.second_moment_output, ir::DType::F32,
-         ir::TensorRole::Output | ir::TensorRole::OptimizerState,
-         parameter_dims});
-    build.program.operations.push_back(
-        {next_operation++,
-         ir::Opcode::AdamWUpdate,
-         {binding.parameter_input, binding.gradient_output,
-          binding.first_moment_input, binding.second_moment_input,
-          build.step_input},
-         {binding.parameter_output, binding.first_moment_output,
-          binding.second_moment_output},
-         {ir::Attribute::f64(ir::AttrKey::LearningRate, config.learning_rate),
-          ir::Attribute::f64(ir::AttrKey::Beta1, config.beta1),
-          ir::Attribute::f64(ir::AttrKey::Beta2, config.beta2),
-          ir::Attribute::f64(ir::AttrKey::Epsilon, config.epsilon),
-          ir::Attribute::f64(ir::AttrKey::WeightDecay,
-                             config.weight_decay)}});
-    build.optimizer_bindings.push_back(binding);
-  }
+  // Forward, backward and the AdamW update compose into ONE program with one
+  // tensor namespace, so the memory planner sees the activations, the
+  // gradients and the optimizer state at the same time.
+  const training::OptimizerHyperparameters hyperparameters{
+      config.learning_rate, config.beta1, config.beta2, config.epsilon,
+      config.weight_decay};
+  auto step = training::build_training_step(forward, build.loss_output,
+                                            adapter_parameters, hyperparameters);
+  build.program = std::move(step.program);
+  build.step_input = step.step_input;
+  for (const auto &binding : step.bindings)
+    build.optimizer_bindings.push_back(
+        {binding.parameter_input, binding.gradient_output,
+         binding.first_moment_input, binding.second_moment_input,
+         binding.parameter_output, binding.first_moment_output,
+         binding.second_moment_output});
   ir::verify(build.program);
   return build;
 }
