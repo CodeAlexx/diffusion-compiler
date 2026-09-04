@@ -23,6 +23,7 @@
 #include "dif/runtime/executor.hpp"
 #include "dif/training/autodiff.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -349,6 +350,79 @@ void the_gradient_reads_int8_directly() {
             << reference << "\n";
 }
 
+// The tiled kernel has edge cases the naive one it replaced did not: a tile
+// that hangs off the end of the gradient, of the weight, or of the
+// contraction. The shapes below are deliberately not multiples of the tile,
+// so every guard is exercised, and the CPU reference is the oracle.
+void the_gpu_kernel_agrees_with_the_reference() {
+  auto cuda = dif::runtime::make_cuda_executor();
+  if (!cuda) {
+    std::cout << "SKIP: no CUDA device\n";
+    return;
+  }
+  // rows, inner, outputs -- none a multiple of 32, one below a tile, one just
+  // over, and one realistic width.
+  const std::vector<std::array<std::uint64_t, 3>> shapes{
+      {70U, 100U, 90U}, {31U, 33U, 65U}, {64U, 6144U, 1536U}};
+  auto cpu = dif::runtime::make_cpu_executor();
+  std::mt19937 generator(7U);
+  std::normal_distribution<float> normal(0.0F, 0.5F);
+  for (const auto &shape : shapes) {
+    const auto rows = shape[0], inner = shape[1], outputs = shape[2];
+    Program program;
+    program.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {rows, outputs}},
+        {2U, DType::I8, TensorRole::Constant, {outputs, inner}},
+        {3U, DType::F32, TensorRole::Constant, {outputs}},
+        {4U, DType::BF16, TensorRole::Output, {rows, inner}}};
+    program.operations = {
+        {1U, Opcode::LinearInt8WeightScaledBackwardInput, {1U, 2U, 3U}, {4U},
+         {}}};
+    dif::ir::verify(program);
+
+    std::vector<float> gradient(rows * outputs);
+    for (auto &value : gradient)
+      value = normal(generator);
+    std::vector<float> weight_values(outputs * inner);
+    for (auto &value : weight_values)
+      value = normal(generator);
+    const auto quantized = dif::compiler::quantize_int8_weight(
+        bf16_tensor({outputs, inner}, weight_values));
+
+    dif::runtime::TensorMap inputs;
+    inputs.emplace(1U, bf16_tensor({rows, outputs}, gradient));
+    inputs.emplace(2U, quantized.weight);
+    inputs.emplace(3U, quantized.scales);
+    dif::runtime::RunOptions options;
+    const auto reference =
+        cpu->prepare(program, inputs, options)->run(inputs, options)
+            .outputs.at(4U);
+    const auto actual =
+        cuda->prepare(program, inputs, options)->run(inputs, options)
+            .outputs.at(4U);
+    // Both accumulate over n in increasing order with the same fused
+    // multiply-adds, so this is an equality, not a tolerance.
+    const auto *left =
+        reinterpret_cast<const std::uint16_t *>(reference.data());
+    const auto *right =
+        reinterpret_cast<const std::uint16_t *>(actual.data());
+    std::uint64_t mismatches = 0U;
+    double worst = 0.0;
+    for (std::uint64_t index = 0U; index < rows * inner; ++index) {
+      if (left[index] != right[index])
+        ++mismatches;
+      worst = std::max(worst, std::abs(static_cast<double>(from_bf16(
+                                           left[index])) -
+                                       from_bf16(right[index])));
+    }
+    expect(mismatches == 0U,
+           "CUDA matches the CPU reference bit for bit at " +
+               std::to_string(rows) + "x" + std::to_string(inner) + "x" +
+               std::to_string(outputs) + " (worst " + std::to_string(worst) +
+               ", " + std::to_string(mismatches) + " differing)");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -356,6 +430,7 @@ int main() {
   the_rewrite_leaves_no_dequantization();
   the_rewrite_refuses_what_it_must_not_convert();
   the_gradient_reads_int8_directly();
+  the_gpu_kernel_agrees_with_the_reference();
   if (failures != 0) {
     std::cerr << failures << " INT8 residency failure(s)\n";
     return 1;

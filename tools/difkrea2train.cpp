@@ -15,6 +15,7 @@
 // Everything a run produces goes under the config's workspace_dir and
 // nowhere else: adapters, samples, checkpoints and the per-step record.
 
+#include "dif/compiler/int8.hpp"
 #include "dif/frontend/krea2_training.hpp"
 #include "dif/support/error.hpp"
 #include "dif/runtime/device_probe.hpp"
@@ -24,10 +25,20 @@
 #include "dif/training/report.hpp"
 #include "dif/training/session.hpp"
 
+#include "dif/runtime/tensor.hpp"
+#include "dif/weights/safetensors.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <random>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -110,6 +121,7 @@ int main(int argc, char **argv) {
   std::string backend = "cuda";
   std::uint64_t step_override = 0U;
   bool plan_only = false;
+  bool trace = false;
 
   for (int index = 1; index < argc; ++index) {
     const std::string flag = argv[index];
@@ -123,6 +135,8 @@ int main(int argc, char **argv) {
       step_override = std::stoull(argument(argc, argv, index));
     else if (flag == "--plan-only")
       plan_only = true;
+    else if (flag == "--trace")
+      trace = true;
     else
       usage("unknown argument " + flag);
   }
@@ -162,8 +176,31 @@ int main(int argc, char **argv) {
                    "sampled\n";
     }
 
-    const auto build = dif::frontend::build_krea2_training(config);
+    auto build = dif::frontend::build_krea2_training(config);
     report_cost(build, run, backend);
+
+    // Apply the recompute the report just described. Reporting a
+    // segmentation that fits and then running the one that does not is worse
+    // than not reporting it at all.
+    if (!plan_only && backend != "cpu") {
+      dif::training::RecomputePolicy policy;
+      policy.budget = dif::runtime::probe_runtime_budget(
+          dif::runtime::probe_target(dif::runtime::ProbeBackend::Cuda));
+      dif::ir::Program segmented;
+      const auto choice =
+          dif::training::choose_recompute(build.plan, policy, &segmented);
+      if (choice.segments > 1U) {
+        if (!choice.within_budget)
+          std::cout << "KREA2_NOTE running anyway at the closest "
+                       "segmentation; it is expected to exceed the budget\n";
+        build.plan = dif::training::plan_from_composed(
+            std::move(segmented), build.plan.step_input, build.plan.loss_tensor,
+            build.plan.bindings);
+        std::cout << "KREA2_RECOMPUTE_APPLIED segments=" << choice.segments
+                  << " operations=" << build.plan.program.operations.size()
+                  << " planned_gib=" << choice.planned_bytes / kGiB << "\n";
+      }
+    }
 
     // A misspelled knob does nothing and says nothing, so say it here --
     // after everything that reads has read, or every architecture key would
@@ -187,8 +224,274 @@ int main(int argc, char **argv) {
                 "there and nowhere else");
     std::filesystem::create_directories(run.workspace);
     std::cout << "KREA2_WORKSPACE " << run.workspace << "\n";
-    dif::fail("training steps are not wired to a dataset yet; use "
-              "--plan-only, which reports exactly what a step would cost");
+
+    // ---- the weights ----------------------------------------------------
+    const auto load_start = std::chrono::steady_clock::now();
+    const auto checkpoint = dif::weights::read_safetensors(run.checkpoint);
+    dif::runtime::TensorMap bindings;
+    const auto bind_checkpoint = [&](const std::string &name,
+                                     dif::ir::DType wanted) {
+      auto tensor = dif::weights::map_safetensor(checkpoint, name);
+      if (tensor.dtype != wanted)
+        tensor = dif::runtime::convert_float_tensor(tensor, wanted);
+      return tensor;
+    };
+    for (const auto &[id, name] : build.frozen) {
+      const auto *description = build.plan.program.tensor(id);
+      auto tensor = bind_checkpoint(name, description->dtype);
+      if (description->dims != tensor.dims)
+        dif::fail("checkpoint tensor " + name + " does not have the shape "
+                  "the graph gives it");
+      bindings.insert_or_assign(id, std::move(tensor));
+    }
+    // Quantized ONCE, here, on the way in. Nothing converts them again.
+    double worst_relative_error = 0.0;
+    for (const auto &weight : build.resident) {
+      const auto source = bind_checkpoint(weight.name, dif::ir::DType::BF16);
+      auto quantized = dif::compiler::quantize_int8_weight(source);
+      if (quantized.squared_reference > 0.0)
+        worst_relative_error =
+            std::max(worst_relative_error,
+                     std::sqrt(quantized.squared_error /
+                               quantized.squared_reference));
+      bindings.insert_or_assign(weight.weight, std::move(quantized.weight));
+      bindings.insert_or_assign(weight.scales, std::move(quantized.scales));
+    }
+    const auto load_stop = std::chrono::steady_clock::now();
+    std::cout << "KREA2_WEIGHTS frozen=" << build.frozen.size()
+              << " resident=" << build.resident.size()
+              << " format=" << (build.resident_format.empty()
+                                    ? std::string("bf16")
+                                    : build.resident_format)
+              << " bytes_before=" << build.resident_bytes_before
+              << " bytes_after=" << build.resident_bytes_after
+              << " worst_relative_quantization_error=" << worst_relative_error
+              << " load_seconds="
+              << std::chrono::duration<double>(load_stop - load_start).count()
+              << "\n";
+
+    // The rotary tables: derived from the geometry, not read from the
+    // checkpoint, exactly as the sampler derives them.
+    {
+      const auto i32 = [](std::vector<std::int32_t> values) {
+        dif::runtime::Tensor tensor;
+        tensor.dtype = dif::ir::DType::I32;
+        tensor.dims = {static_cast<std::uint64_t>(values.size())};
+        tensor.bytes.resize(values.size() * sizeof(std::int32_t));
+        std::memcpy(tensor.mutable_data(), values.data(),
+                    tensor.bytes.size());
+        return tensor;
+      };
+      std::vector<std::int32_t> pair_axes;
+      std::vector<std::int32_t> pair_indices;
+      for (std::int32_t axis = 0; axis < 3; ++axis) {
+        const std::int32_t dimension = axis == 0 ? 32 : 48;
+        for (std::int32_t pair = 0; pair < dimension / 2; ++pair) {
+          pair_axes.push_back(axis);
+          pair_indices.push_back(pair);
+        }
+      }
+      bindings.insert_or_assign(build.rotary_pair_axes,
+                                i32(std::move(pair_axes)));
+      bindings.insert_or_assign(build.rotary_pair_indices,
+                                i32(std::move(pair_indices)));
+      bindings.insert_or_assign(build.rotary_axis_dims, i32({32, 48, 48}));
+    }
+
+    // Anything else the graph declares constant and nothing has filled is a
+    // mistake worth naming now rather than at prepare time.
+    for (const auto &tensor : build.plan.program.tensors)
+      if (tensor.has_role(dif::ir::TensorRole::Constant) &&
+          !bindings.contains(tensor.id))
+        dif::fail("constant tensor " + std::to_string(tensor.id) +
+                  " is filled by nothing; the loader does not know what it "
+                  "holds");
+
+    // ---- the adapters and their optimizer state -------------------------
+    // A is small and random, B is zero, so the adapted model starts exactly
+    // equal to the frozen one. Starting anywhere else means step 0 is
+    // already a different model than the checkpoint.
+    std::mt19937 generator(static_cast<std::uint32_t>(run.seed));
+    std::normal_distribution<float> normal(
+        0.0F, 1.0F / std::sqrt(static_cast<float>(run.lora_rank)));
+    std::set<std::uint32_t> down_tensors;
+    for (const auto &site : build.sites)
+      down_tensors.insert(site.down);
+    const auto fill = [&](std::uint32_t id, bool random) {
+      const auto *description = build.plan.program.tensor(id);
+      dif::runtime::Tensor tensor;
+      tensor.dtype = description->dtype;
+      tensor.dims = description->dims;
+      tensor.bytes.assign(description->byte_count(), static_cast<unsigned char>(0));
+      if (random && description->dtype == dif::ir::DType::F32) {
+        auto *values = reinterpret_cast<float *>(tensor.mutable_data());
+        for (std::uint64_t index = 0U; index < description->element_count();
+             ++index)
+          values[index] = normal(generator);
+      }
+      return tensor;
+    };
+    for (const auto &binding : build.plan.bindings) {
+      bindings.insert_or_assign(
+          binding.parameter_input,
+          fill(binding.parameter_input,
+               down_tensors.contains(binding.parameter_input)));
+      bindings.insert_or_assign(binding.first_moment_input,
+                                fill(binding.first_moment_input, false));
+      bindings.insert_or_assign(binding.second_moment_input,
+                                fill(binding.second_moment_input, false));
+    }
+
+    // ---- the batch ------------------------------------------------------
+    // Synthetic, and labelled as such. No dataset is wired yet, so this
+    // exercises the step, not the data: a falling loss here says the
+    // machinery works, and says nothing whatever about image quality.
+    const auto random_tensor = [&](std::uint32_t id) {
+      const auto *description = build.plan.program.tensor(id);
+      dif::runtime::Tensor tensor;
+      tensor.dtype = description->dtype;
+      tensor.dims = description->dims;
+      tensor.bytes.assign(description->byte_count(), static_cast<unsigned char>(0));
+      std::normal_distribution<float> unit(0.0F, 1.0F);
+      if (description->dtype == dif::ir::DType::BF16) {
+        auto *values =
+            reinterpret_cast<std::uint16_t *>(tensor.mutable_data());
+        for (std::uint64_t index = 0U; index < description->element_count();
+             ++index) {
+          const float value = unit(generator);
+          std::uint32_t bits = 0U;
+          std::memcpy(&bits, &value, sizeof(bits));
+          values[index] = static_cast<std::uint16_t>(bits >> 16U);
+        }
+      } else if (description->dtype == dif::ir::DType::F32) {
+        auto *values = reinterpret_cast<float *>(tensor.mutable_data());
+        for (std::uint64_t index = 0U; index < description->element_count();
+             ++index)
+          values[index] = unit(generator);
+      }
+      return tensor;
+    };
+    dif::runtime::TensorMap batch;
+    batch.emplace(build.clean_latents, random_tensor(build.clean_latents));
+    batch.emplace(build.noise, random_tensor(build.noise));
+    batch.emplace(build.context, random_tensor(build.context));
+    // A timestep in (0,1), and positions and validity that describe the
+    // sequence the graph was built for.
+    {
+      const auto *description = build.plan.program.tensor(build.timestep);
+      dif::runtime::Tensor timestep;
+      timestep.dtype = description->dtype;
+      timestep.dims = description->dims;
+      timestep.bytes.assign(description->byte_count(), static_cast<unsigned char>(0));
+      auto *values =
+          reinterpret_cast<std::uint16_t *>(timestep.mutable_data());
+      for (std::uint64_t index = 0U; index < description->element_count();
+           ++index) {
+        const float value = 0.5F;
+        std::uint32_t bits = 0U;
+        std::memcpy(&bits, &value, sizeof(bits));
+        values[index] = static_cast<std::uint16_t>(bits >> 16U);
+      }
+      batch.emplace(build.timestep, std::move(timestep));
+    }
+    for (const auto &tensor : build.plan.program.tensors)
+      if (tensor.has_role(dif::ir::TensorRole::Input) &&
+          !bindings.contains(tensor.id) && !batch.contains(tensor.id) &&
+          tensor.id != build.plan.step_input)
+        batch.emplace(tensor.id, random_tensor(tensor.id));
+
+    // ---- the run --------------------------------------------------------
+    auto executor = backend == "cpu" ? dif::runtime::make_cpu_executor()
+                                     : dif::runtime::make_cuda_executor();
+    dif::runtime::RunOptions options;
+    options.warmups = 0U;
+    options.iterations = 1U;
+    options.trace_events = trace;
+    // One map, not a copy of one. The weights are eleven gigabytes.
+    for (const auto &[id, tensor] : batch)
+      bindings.insert_or_assign(id, tensor);
+    const auto prepare_start = std::chrono::steady_clock::now();
+    dif::training::TrainingSession session(build.plan, *executor,
+                                           std::move(bindings), options);
+    const auto prepare_stop = std::chrono::steady_clock::now();
+    std::cout << "KREA2_PREPARE seconds="
+              << std::chrono::duration<double>(prepare_stop - prepare_start)
+                     .count()
+              << " resident_state_bytes=" << session.persistent_state_bytes()
+              << "\n";
+
+    std::ofstream record(run.workspace / "training-report.jsonl",
+                         std::ios::binary | std::ios::trunc);
+    float first_loss = 0.0F;
+    float last_loss = 0.0F;
+    double total_milliseconds = 0.0;
+    const auto wall_start = std::chrono::steady_clock::now();
+    for (std::uint64_t step = 0U; step < run.max_steps; ++step) {
+      const auto result = session.step(batch);
+      auto report = session.report(result);
+      report.model = "krea2";
+      report.checkpoint = run.checkpoint.string();
+      report.physical_formats = build.resident_format;
+      record << report.json() << "\n";
+      record.flush();
+      total_milliseconds += result.step_milliseconds;
+      if (step == 0U)
+        first_loss = result.loss;
+      last_loss = result.loss;
+      if (!result.trace_events.empty()) {
+        // Where the time actually went, by opcode. Guessing twice was
+        // expensive; this is the measurement.
+        std::map<std::string, std::pair<double, std::uint64_t>> by_opcode;
+        double traced = 0.0;
+        for (const auto &event : result.trace_events) {
+          const auto elapsed = event.host_end_ms - event.host_start_ms;
+          if (elapsed <= 0.0)
+            continue;
+          auto &entry = by_opcode[event.opcode.empty() ? event.category
+                                                       : event.opcode];
+          entry.first += elapsed;
+          ++entry.second;
+          traced += elapsed;
+        }
+        std::vector<std::pair<std::string, std::pair<double, std::uint64_t>>>
+            ranked(by_opcode.begin(), by_opcode.end());
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto &left, const auto &right) {
+                    return left.second.first > right.second.first;
+                  });
+        std::cout << "KREA2_HOT traced_ms=" << traced << "\n";
+        for (std::size_t index = 0U;
+             index < ranked.size() && index < 12U; ++index)
+          std::cout << "  " << ranked[index].first << " ms="
+                    << ranked[index].second.first
+                    << " launches=" << ranked[index].second.second
+                    << " share="
+                    << 100.0 * ranked[index].second.first / traced << "%\n";
+        std::cout << std::flush;
+      }
+      if (result.phases)
+        std::cout << "KREA2_PHASES forward_ms="
+                  << result.phases->forward_milliseconds
+                  << " backward_ms=" << result.phases->backward_milliseconds
+                  << " optimizer_ms=" << result.phases->optimizer_milliseconds
+                  << " transfer_ms=" << result.phases->transfer_milliseconds
+                  << std::endl;
+      if (step % 10U == 0U || step + 1U == run.max_steps)
+        std::cout << "KREA2_STEP " << (step + 1U) << "/" << run.max_steps
+                  << " loss=" << result.loss
+                  << " ms=" << result.step_milliseconds
+                  << " state_h2d=" << result.persistent_state_host_to_device_bytes
+                  << " state_d2h=" << result.persistent_state_device_to_host_bytes
+                  << std::endl;
+    }
+    const auto wall_stop = std::chrono::steady_clock::now();
+    const double wall =
+        std::chrono::duration<double>(wall_stop - wall_start).count();
+    std::cout << "KREA2_SMOKE steps=" << run.max_steps
+              << " first_loss=" << first_loss << " final_loss=" << last_loss
+              << " seconds_per_step=" << wall / static_cast<double>(run.max_steps)
+              << " wall_seconds=" << wall
+              << " data=synthetic\n";
   } catch (const std::exception &error) {
     std::cerr << "difkrea2train: " << error.what() << "\n";
     return 1;

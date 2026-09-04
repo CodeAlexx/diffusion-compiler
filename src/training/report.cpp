@@ -12,6 +12,13 @@ attribute_phases(const std::vector<runtime::TraceEvent> &events,
                  std::size_t optimizer_operations) {
   if (events.empty())
     return std::nullopt;
+  // A plan that does not know where its phases begin cannot have them
+  // attributed. Splitting on boundaries of zero would put every operation in
+  // the last phase and report it with total confidence, which is worse than
+  // reporting nothing: a wrong number gets acted on.
+  if (forward_operations == 0U || optimizer_operations <= forward_operations ||
+      optimizer_operations > program.operations.size())
+    return std::nullopt;
   // Where each operation sits in the program, so an event can be placed in a
   // phase by the operation it belongs to rather than by its name.
   std::unordered_map<std::uint32_t, std::size_t> position;

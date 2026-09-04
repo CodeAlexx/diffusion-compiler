@@ -547,11 +547,17 @@ void linear_int8_weight_scaled_backward_input(const ir::Operation &op,
   for (std::uint64_t row = 0U; row < rows; ++row)
     for (std::uint64_t index = 0U; index < inner; ++index) {
       float accumulator = 0.0F;
+      // Fused, because the GPU kernel fuses. A separate multiply and add
+      // rounds twice where this rounds once, and over a contraction 1536
+      // terms long that difference is visible in the output -- so the two
+      // would agree only to a tolerance, and a tolerance is a much weaker
+      // thing to test than an equality.
       for (std::uint64_t column = 0U; column < columns; ++column)
-        accumulator +=
-            load_float(grad_output, row * columns + column) *
-            (static_cast<float>(weight_values[column * inner + index]) *
-             load_float(scales, column));
+        accumulator = std::fma(
+            load_float(grad_output, row * columns + column),
+            static_cast<float>(weight_values[column * inner + index]) *
+                load_float(scales, column),
+            accumulator);
       store_float(grad_input, row * inner + index, accumulator);
     }
 }

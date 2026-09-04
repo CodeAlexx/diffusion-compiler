@@ -1106,12 +1106,13 @@ void emit_linear_int8_weight_scaled_backward_input(std::ostringstream &out,
                                                    const ir::Program &program,
                                                    const ir::Operation &op) {
   const auto *weight = program.tensor(op.inputs[1]);
-  const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto inner = weight->dims[1];
+  const auto rows = program.tensor(op.outputs[0])->element_count() / inner;
   out << render_kernel_template(
       "linear_int8_weight_scaled_backward_input",
       {{"function", function_name(op)},
-       {"count", std::to_string(count)},
-       {"inner", std::to_string(weight->dims[1])},
+       {"rows", std::to_string(rows)},
+       {"inner", std::to_string(inner)},
        {"outputs", std::to_string(weight->dims[0])}});
 }
 

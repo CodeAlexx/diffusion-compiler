@@ -1,5 +1,6 @@
 #include "dif/frontend/krea2_training.hpp"
 
+#include "dif/compiler/int8.hpp"
 #include "dif/support/error.hpp"
 #include "dif/weights/safetensors.hpp"
 
@@ -130,10 +131,17 @@ build_krea2_training(const training::TrainingConfig &config) {
     training::verify_architecture(weights::read_safetensors(run.checkpoint),
                                   architecture.claims, config.source());
 
+  // Training keeps its weights resident. Streaming them would re-stage the
+  // whole base through the host on every step, which is the cost the
+  // resident format and the persistent state both exist to remove.
+  build.config.streamed_constants = false;
   auto denoiser = make_krea2_denoiser(build.config);
   build.context = denoiser.context_input;
   build.positions = denoiser.positions_input;
   build.validity_mask = denoiser.validity_mask_input;
+  build.rotary_pair_axes = denoiser.rotary_pair_axes;
+  build.rotary_pair_indices = denoiser.rotary_pair_indices;
+  build.rotary_axis_dims = denoiser.rotary_axis_dims;
 
   // Which Linears a LoRA adapts: the eight per block the checkpoint names,
   // found through the frontend's own provenance rather than by matching
@@ -173,6 +181,42 @@ build_krea2_training(const training::TrainingConfig &config) {
   build.sites = std::move(adapted.sites);
   build.site_names = std::move(names);
 
+  // The resident format the config asked for, actually applied. Naming a
+  // format and then building the graph in BF16 anyway is how a request like
+  // this quietly does nothing.
+  std::map<std::uint32_t, std::string> name_of_weight;
+  for (std::size_t index = 0U; index < denoiser.checkpoint_tensors.size();
+       ++index)
+    name_of_weight.emplace(denoiser.checkpoint_tensors[index],
+                           denoiser.checkpoint_names[index]);
+  build.resident_format = run.resident_format;
+  if (!run.resident_format.empty()) {
+    if (run.resident_format != "int8" && run.resident_format != "int_w8a8")
+      fail("'quantized_resident' asks for '" + run.resident_format +
+           "', which this compiler does not consume directly. The formats "
+           "it can feed to a matmul without converting first are 'int8' and "
+           "'int_w8a8'; anything else would be dequantized once per linear "
+           "per step, which is the cost a resident format exists to avoid.");
+    // The 224 adapted base linears ARE the base: they are 12.16 of its 12.42
+    // billion parameters.
+    std::vector<std::uint32_t> frozen_linears;
+    for (const auto &site : build.sites)
+      frozen_linears.push_back(site.operation);
+    auto resident =
+        compiler::rewrite_int8_weight_only(adapted.program, frozen_linears);
+    for (const auto &entry : resident.entries) {
+      const auto found = name_of_weight.find(entry.source_tensor_id);
+      if (found == name_of_weight.end())
+        fail("a weight made resident has no checkpoint name");
+      build.resident.push_back(
+          {found->second, entry.weight_tensor_id, entry.scales_tensor_id});
+      name_of_weight.erase(found);
+    }
+    build.resident_bytes_before = resident.bytes_before;
+    build.resident_bytes_after = resident.bytes_after;
+    adapted.program = std::move(resident.program);
+  }
+
   // The objective. The denoiser's own timestep is reused rather than
   // duplicated, so the noise level it is told about is the one it was given.
   auto objective = training::add_flow_matching_loss(
@@ -192,10 +236,9 @@ build_krea2_training(const training::TrainingConfig &config) {
   build.plan = training::compile(objective.program, build.loss,
                                  adapted.parameters, hyperparameters);
 
-  for (std::size_t index = 0U; index < denoiser.checkpoint_tensors.size();
-       ++index)
-    build.frozen.emplace_back(denoiser.checkpoint_tensors[index],
-                              denoiser.checkpoint_names[index]);
+  // Whatever was not made resident is bound as it comes off disk.
+  for (const auto &[id, name] : name_of_weight)
+    build.frozen.emplace_back(id, name);
   return build;
 }
 

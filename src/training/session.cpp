@@ -80,7 +80,7 @@ runtime::Tensor step_counter(std::uint64_t value) {
 
 TrainingSession::TrainingSession(TrainingPlan plan,
                                  runtime::Executor &executor,
-                                 const runtime::TensorMap &initial,
+                                 runtime::TensorMap initial,
                                  runtime::RunOptions options,
                                  std::vector<std::uint32_t> reads)
     : plan_(std::move(plan)), options_(std::move(options)) {
@@ -92,11 +92,12 @@ TrainingSession::TrainingSession(TrainingPlan plan,
   // The declaration comes from the plan, so it cannot disagree with the
   // program it describes.
   options_.persistent_state = plan_.persistent_state();
-  auto seed = initial;
   // The step counter is an ordinary input the session advances; a caller
   // never sets it.
-  seed.insert_or_assign(plan_.step_input, step_counter(0U));
-  prepared_ = executor.prepare(plan_.program, seed, options_);
+  initial.insert_or_assign(plan_.step_input, step_counter(0U));
+  prepared_ = executor.prepare(plan_.program, initial, options_);
+  // The device holds them now.
+  initial.clear();
   for (const auto &binding : options_.persistent_state) {
     const auto *desc = plan_.program.tensor(binding.input);
     state_bytes_ += desc->byte_count();
@@ -133,6 +134,8 @@ TrainingStepResult TrainingSession::step(const runtime::TensorMap &batch) {
   step_result.outputs = std::move(result.outputs);
   if (device_name_.empty())
     device_name_ = result.device_name;
+  if (options_.trace_events)
+    step_result.trace_events = result.trace_events;
   step_result.phases = attribute_phases(result.trace_events, plan_.program,
                                        plan_.forward_operations,
                                        plan_.optimizer_operations);

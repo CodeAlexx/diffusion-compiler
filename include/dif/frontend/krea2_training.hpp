@@ -60,6 +60,11 @@ struct Krea2TrainingBuild {
   std::uint32_t loss{};
   std::uint32_t velocity{};
   std::uint32_t target{};
+  // The rotary tables. Constants, but not checkpoint weights: the frontend
+  // derives them from the geometry, and a caller has to fill them.
+  std::uint32_t rotary_pair_axes{};
+  std::uint32_t rotary_pair_indices{};
+  std::uint32_t rotary_axis_dims{};
 
   // The adapters, with the checkpoint tensor each one adapts, so an exported
   // adapter can be named the way every other tool expects to read it.
@@ -68,6 +73,19 @@ struct Krea2TrainingBuild {
   // Every weight the checkpoint has to fill, by name. A trainer that guesses
   // this list is a trainer that silently trains against zeros.
   std::vector<std::pair<std::uint32_t, std::string>> frozen;
+
+  // The frozen weights the plan holds in a quantized resident format. The
+  // loader quantizes these ONCE, on the way in; nothing converts them again.
+  // Empty unless the config asked for a resident format.
+  struct ResidentWeight {
+    std::string name;
+    std::uint32_t weight{};  // the quantized tensor the matmul reads
+    std::uint32_t scales{};
+  };
+  std::vector<ResidentWeight> resident;
+  std::string resident_format;
+  std::uint64_t resident_bytes_before{};
+  std::uint64_t resident_bytes_after{};
 };
 
 // Reads everything from the config. When the config names a checkpoint that

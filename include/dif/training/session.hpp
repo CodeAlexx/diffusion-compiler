@@ -99,6 +99,10 @@ struct TrainingStepResult {
   // Present only when the run was traced. An untraced step reports no phase
   // split rather than a split of zeros.
   std::optional<PhaseTimes> phases;
+  // The raw events, when the run was traced. Empty otherwise, and empty is
+  // the normal case: collecting these costs something, so a step that was
+  // not asked to profile does not carry them.
+  std::vector<runtime::TraceEvent> trace_events;
 };
 
 class TrainingSession {
@@ -110,9 +114,12 @@ public:
   // Leaving it empty is the point: a step reads its loss and nothing else,
   // and every gradient stays on the device where the optimizer consumes it.
   // Naming a gradient here is what a gate does, and it costs a copy.
+  // `initial` is taken BY VALUE so a caller with a large one can move it in.
+  // At Krea's scale the seed map is eleven gigabytes; copying it here and
+  // again in the caller is how a run that fits on paper dies to the host
+  // memory limit before its first step.
   TrainingSession(TrainingPlan plan, runtime::Executor &executor,
-                  const runtime::TensorMap &initial,
-                  runtime::RunOptions options,
+                  runtime::TensorMap initial, runtime::RunOptions options,
                   std::vector<std::uint32_t> reads = {});
 
   // Runs one step. `batch` carries only what genuinely changes.
