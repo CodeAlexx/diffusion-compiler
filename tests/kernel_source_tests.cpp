@@ -445,6 +445,125 @@ Program batch5_program(std::string_view which) {
   return program;
 }
 
+
+Program batch6_program(std::string_view which) {
+  Program program;
+  auto op = [&](Opcode opcode, std::vector<std::uint32_t> inputs,
+                std::vector<std::uint32_t> outputs,
+                std::vector<Attribute> attributes = {}) {
+    program.operations = {{1, opcode, std::move(inputs), std::move(outputs),
+                           std::move(attributes)}};
+  };
+  if (which == "channel_rms_norm") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {2, 8, 3}},
+                       {2, DType::BF16, TensorRole::Constant, {8}},
+                       {3, DType::BF16, TensorRole::Output, {2, 8, 3}}};
+    op(Opcode::ChannelRmsNorm, {1, 2}, {3});
+  } else if (which == "group_norm") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 4, 2, 2}},
+                       {2, DType::BF16, TensorRole::Constant, {4}},
+                       {3, DType::BF16, TensorRole::Constant, {4}},
+                       {4, DType::BF16, TensorRole::Output, {1, 4, 2, 2}}};
+    op(Opcode::GroupNorm, {1, 2, 3}, {4}, {Attribute::u64(AttrKey::Groups, 2U)});
+  } else if (which == "pad_constant_4d") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 3, 3}},
+                       {2, DType::BF16, TensorRole::Output, {1, 2, 5, 6}}};
+    op(Opcode::PadConstant, {1}, {2},
+       {Attribute::u64(AttrKey::PadTop, 1U), Attribute::u64(AttrKey::PadBottom, 1U),
+        Attribute::u64(AttrKey::PadWest, 2U), Attribute::u64(AttrKey::PadEast, 1U),
+        Attribute::f64(AttrKey::Value, 0.5)});
+  } else if (which == "pad_constant_5d") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 1, 2, 3, 3}},
+                       {2, DType::BF16, TensorRole::Output, {1, 1, 4, 5, 6}}};
+    op(Opcode::PadConstant, {1}, {2},
+       {Attribute::u64(AttrKey::PadFront, 1U), Attribute::u64(AttrKey::PadBack, 1U),
+        Attribute::u64(AttrKey::PadTop, 1U), Attribute::u64(AttrKey::PadBottom, 1U),
+        Attribute::u64(AttrKey::PadWest, 2U), Attribute::u64(AttrKey::PadEast, 1U)});
+  } else if (which == "pad_reflect_4d") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 4, 4}},
+                       {2, DType::BF16, TensorRole::Output, {1, 2, 6, 6}}};
+    op(Opcode::PadReflect, {1}, {2},
+       {Attribute::u64(AttrKey::PadTop, 1U), Attribute::u64(AttrKey::PadBottom, 1U),
+        Attribute::u64(AttrKey::PadWest, 1U), Attribute::u64(AttrKey::PadEast, 1U)});
+  } else if (which == "pad_reflect_5d") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 1, 3, 4, 4}},
+                       {2, DType::BF16, TensorRole::Output, {1, 1, 5, 6, 6}}};
+    op(Opcode::PadReflect, {1}, {2},
+       {Attribute::u64(AttrKey::PadFront, 1U), Attribute::u64(AttrKey::PadBack, 1U),
+        Attribute::u64(AttrKey::PadTop, 1U), Attribute::u64(AttrKey::PadBottom, 1U),
+        Attribute::u64(AttrKey::PadWest, 1U), Attribute::u64(AttrKey::PadEast, 1U)});
+  } else if (which == "adamw_update" || which == "adamw_update_bf16") {
+    const auto parameter = which == "adamw_update" ? DType::F32 : DType::BF16;
+    const auto gradient = which == "adamw_update" ? DType::BF16 : DType::F32;
+    program.tensors = {{1, parameter, TensorRole::Input, {8}},
+                       {2, gradient, TensorRole::Input, {8}},
+                       {3, DType::F32, TensorRole::Input, {8}},
+                       {4, DType::F32, TensorRole::Input, {8}},
+                       {5, DType::I32, TensorRole::Input, {1}},
+                       {6, parameter, TensorRole::Output, {8}},
+                       {7, DType::F32, TensorRole::Output, {8}},
+                       {8, DType::F32, TensorRole::Output, {8}}};
+    op(Opcode::AdamWUpdate, {1, 2, 3, 4, 5}, {6, 7, 8},
+       {accumulate_f32(), Attribute::f64(AttrKey::LearningRate, 1.0e-4),
+        Attribute::f64(AttrKey::Beta1, 0.9), Attribute::f64(AttrKey::Beta2, 0.999),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-8), Attribute::f64(AttrKey::WeightDecay, 0.01),
+        Attribute::f64(AttrKey::ClipScale, 0.5)});
+  } else if (which == "patchify_3d" || which == "unpatchify_3d") {
+    const bool forward = which == "patchify_3d";
+    program.tensors = {{1, DType::BF16, TensorRole::Input,
+                        forward ? std::vector<std::uint64_t>{1, 2, 4, 4, 4}
+                                : std::vector<std::uint64_t>{8, 16}},
+                       {2, DType::BF16, TensorRole::Output,
+                        forward ? std::vector<std::uint64_t>{8, 16}
+                                : std::vector<std::uint64_t>{1, 2, 4, 4, 4}}};
+    op(forward ? Opcode::Patchify3D : Opcode::Unpatchify3D, {1}, {2},
+       {Attribute::u64(AttrKey::PatchT, 2U), Attribute::u64(AttrKey::PatchH, 2U),
+        Attribute::u64(AttrKey::PatchW, 2U)});
+  } else if (which == "layer_norm" || which == "layer_norm_welford128") {
+    const std::uint64_t columns = which == "layer_norm" ? 8U : 128U;
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, columns}},
+                       {2, DType::BF16, TensorRole::Constant, {columns}},
+                       {3, DType::BF16, TensorRole::Constant, {columns}},
+                       {4, DType::BF16, TensorRole::Output, {4, columns}}};
+    std::vector<Attribute> attributes{Attribute::f64(AttrKey::Epsilon, 1.0e-5)};
+    if (which == "layer_norm_welford128")
+      attributes.push_back(Attribute::u64(AttrKey::BlockSize, 128U));
+    op(Opcode::LayerNorm, {1, 2, 3}, {4}, attributes);
+  } else if (which == "layer_norm_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Constant, {8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 8}},
+                       {5, DType::BF16, TensorRole::Output, {8}},
+                       {6, DType::BF16, TensorRole::Output, {8}}};
+    op(Opcode::LayerNormBackward, {1, 2, 3}, {4, 5, 6},
+       {accumulate_f32(), Attribute::f64(AttrKey::Epsilon, 1.0e-5)});
+  } else if (which == "rms_norm_modulate_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Input, {4, 8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 8}},
+                       {5, DType::BF16, TensorRole::Output, {4, 8}},
+                       {6, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::RmsNormModulateBackward, {1, 2, 3}, {4, 5, 6},
+       {accumulate_f32(), Attribute::f64(AttrKey::Epsilon, 1.0e-5)});
+  } else if (which == "rms_norm_modulate_backward_weighted") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Constant, {8}},
+                       {4, DType::BF16, TensorRole::Input, {4, 8}},
+                       {5, DType::BF16, TensorRole::Output, {4, 8}},
+                       {6, DType::BF16, TensorRole::Output, {4, 8}},
+                       {7, DType::BF16, TensorRole::Output, {4, 8}},
+                       {8, DType::BF16, TensorRole::Output, {8}}};
+    op(Opcode::RmsNormModulateBackward, {1, 2, 3, 4}, {5, 6, 7, 8},
+       {accumulate_f32(), Attribute::f64(AttrKey::Epsilon, 1.0e-5)});
+  } else {
+    fail("unknown batch6 corpus program " + std::string(which));
+  }
+  return program;
+}
+
 std::vector<Case> corpus() {
   using Q = Int8RowQuantization;
   return {
@@ -570,6 +689,22 @@ std::vector<Case> corpus() {
       {"rms_norm_backward_weight", [] { return batch5_program("rms_norm_backward_weight"); }},
       {"swiglu_backward", [] { return batch5_program("swiglu_backward"); }},
       {"swiglu_backward_gate_first", [] { return batch5_program("swiglu_backward_gate_first"); }},
+      // batch 6: norms, padding, AdamW, patchify, layer norm forward/backward
+      {"channel_rms_norm", [] { return batch6_program("channel_rms_norm"); }},
+      {"group_norm", [] { return batch6_program("group_norm"); }},
+      {"pad_constant_4d", [] { return batch6_program("pad_constant_4d"); }},
+      {"pad_constant_5d", [] { return batch6_program("pad_constant_5d"); }},
+      {"pad_reflect_4d", [] { return batch6_program("pad_reflect_4d"); }},
+      {"pad_reflect_5d", [] { return batch6_program("pad_reflect_5d"); }},
+      {"adamw_update", [] { return batch6_program("adamw_update"); }},
+      {"adamw_update_bf16", [] { return batch6_program("adamw_update_bf16"); }},
+      {"patchify_3d", [] { return batch6_program("patchify_3d"); }},
+      {"unpatchify_3d", [] { return batch6_program("unpatchify_3d"); }},
+      {"layer_norm", [] { return batch6_program("layer_norm"); }},
+      {"layer_norm_welford128", [] { return batch6_program("layer_norm_welford128"); }},
+      {"layer_norm_backward", [] { return batch6_program("layer_norm_backward"); }},
+      {"rms_norm_modulate_backward", [] { return batch6_program("rms_norm_modulate_backward"); }},
+      {"rms_norm_modulate_backward_weighted", [] { return batch6_program("rms_norm_modulate_backward_weighted"); }},
   };
 }
 

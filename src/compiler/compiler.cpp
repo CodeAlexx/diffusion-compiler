@@ -307,29 +307,26 @@ void emit_channel_rms_norm(std::ostringstream &out,
   const auto epsilon = static_cast<float>(
       op.f64(ir::AttrKey::Epsilon, 1.0e-12));
   const auto scale = std::sqrt(static_cast<float>(channels));
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* gamma,dif_scalar* y){"
-         "extern __shared__ float reduction[];unsigned long long vector="
-         "(unsigned long long)blockIdx.x;if(vector>="
-      << vectors << "ULL)return;unsigned long long c=threadIdx.x;"
-      << "unsigned long long leading=vector/" << inner
-      << "ULL,trailing=vector%" << inner
-      << "ULL;unsigned long long index=(leading*" << channels
-      << "ULL+c)*" << inner
-      << "ULL+trailing;float value=c<" << channels
-      << "ULL?dif_load(x,index):0.0f;reduction[c]=value*value;"
-         "__syncthreads();";
+  const auto literal = [](float value) {
+    std::ostringstream text;
+    text << std::scientific << std::setprecision(9) << value;
+    return text.str();
+  };
+  std::string reduction;
   for (auto stride = block / 2U; stride != 0U; stride /= 2U)
-    out << "if(c<" << stride << "ULL)reduction[c]+=reduction[c+" << stride
-        << "ULL];__syncthreads();";
-  out << "if(c<" << channels
-      << "ULL){float denominator=fmaxf(sqrtf(reduction[0])," << epsilon
-      << "f);float normalized=dif_round(value/denominator);"
-         "float scaled=dif_round(normalized*"
-      << scale
-      << "f);dif_store(y,index,scaled*dif_load(gamma,c));}}\n"
-      << std::defaultfloat;
+    reduction += "  if (c < " + std::to_string(stride) +
+                 "ULL) reduction[c] += reduction[c + " +
+                 std::to_string(stride) + "ULL];\n  __syncthreads();\n";
+  out << render_kernel_template(
+      "channel_rms_norm", {{"function", function_name(op)},
+                           {"vectors", std::to_string(vectors)},
+                           {"inner", std::to_string(inner)},
+                           {"channels", std::to_string(channels)},
+                           {"reduction", reduction},
+                           {"epsilon", literal(epsilon)},
+                           {"scale", literal(scale)}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_group_norm(std::ostringstream &out, const ir::Program &program,
@@ -345,35 +342,27 @@ void emit_group_norm(std::ostringstream &out, const ir::Program &program,
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
   const auto epsilon =
       static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* bias,dif_scalar* y){"
-         "extern __shared__ float reduction[];unsigned long long vector="
-         "(unsigned long long)blockIdx.x;if(vector>="
-      << input->dims[0] * groups
-      << "ULL)return;unsigned long long lane=threadIdx.x,group=vector%"
-      << groups << "ULL,batch=vector/" << groups
-      << "ULL,base=(batch*" << channels << "ULL+group*"
-      << channels_per_group << "ULL)*" << inner
-      << "ULL;float sum=0.0f,squares=0.0f;for(unsigned long long k=lane;k<"
-      << elements
-      << "ULL;k+=blockDim.x){float v=dif_load(x,base+k);sum+=v;squares=fmaf(v,v,squares);}"
-         "reduction[lane]=sum;reduction[blockDim.x+lane]=squares;__syncthreads();";
-  for (auto stride = block / 2U; stride != 0U; stride /= 2U)
-    out << "if(lane<" << stride
-        << "ULL){reduction[lane]+=reduction[lane+" << stride
-        << "ULL];reduction[blockDim.x+lane]+=reduction[blockDim.x+lane+"
-        << stride << "ULL];}__syncthreads();";
-  out << "float mean=reduction[0]/" << elements
-      << ".0f;float variance=fmaxf(reduction[blockDim.x]/" << elements
-      << ".0f-mean*mean,0.0f);float inv=rsqrtf(variance+" << epsilon
-      << "f);for(unsigned long long k=lane;k<" << elements
-      << "ULL;k+=blockDim.x){unsigned long long channel=group*"
-      << channels_per_group << "ULL+k/" << inner
-      << "ULL;float normalized=(dif_load(x,base+k)-mean)*inv;"
-         "dif_store(y,base+k,fmaf(normalized,dif_load(weight,channel),"
-         "dif_load(bias,channel)));}}\n"
-      << std::defaultfloat;
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9) << epsilon;
+  std::string reduction;
+  for (auto stride = block / 2U; stride != 0U; stride /= 2U) {
+    const auto text = std::to_string(stride);
+    reduction += "  if (lane < " + text + "ULL) {\n    reduction[lane] += reduction[lane + " +
+                 text + "ULL];\n    reduction[blockDim.x + lane] += reduction[blockDim.x + lane + " +
+                 text + "ULL];\n  }\n  __syncthreads();\n";
+  }
+  out << render_kernel_template(
+      "group_norm", {{"function", function_name(op)},
+                     {"vectors", std::to_string(input->dims[0] * groups)},
+                     {"groups", std::to_string(groups)},
+                     {"channels", std::to_string(channels)},
+                     {"channels_per_group", std::to_string(channels_per_group)},
+                     {"inner", std::to_string(inner)},
+                     {"elements", std::to_string(elements)},
+                     {"reduction", reduction},
+                     {"epsilon", epsilon_literal.str()}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_upsample_nearest_2d(std::ostringstream &out,
@@ -410,45 +399,42 @@ void emit_pad_constant(std::ostringstream &out, const ir::Program &program,
   const auto top = op.u64(ir::AttrKey::PadTop, 0U);
   const auto west = op.u64(ir::AttrKey::PadWest, 0U);
   const auto value = static_cast<float>(op.f64(ir::AttrKey::Value, 0.0));
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << output->element_count() << "ULL){";
+  std::ostringstream value_literal;
+  value_literal << std::scientific << std::setprecision(9) << value;
+  const auto &o = output->dims;
+  const auto &in = input->dims;
+  const auto text = [](std::uint64_t v) { return std::to_string(v); };
   if (input->dims.size() == 4U) {
-    out << "unsigned long long ow=i%" << output->dims[3]
-        << "ULL,oh=(i/" << output->dims[3] << "ULL)%" << output->dims[2]
-        << "ULL,c=(i/" << output->dims[2] * output->dims[3] << "ULL)%"
-        << output->dims[1] << "ULL,b=i/"
-        << output->dims[1] * output->dims[2] * output->dims[3]
-        << "ULL;if(oh<" << top << "ULL||oh>=" << top + input->dims[2]
-        << "ULL||ow<" << west << "ULL||ow>=" << west + input->dims[3]
-        << "ULL){dif_store(y,i," << value
-        << "f);return;}unsigned long long source=((b*" << input->dims[1]
-        << "ULL+c)*" << input->dims[2] << "ULL+oh-" << top << "ULL)*"
-        << input->dims[3] << "ULL+ow-" << west
-        << "ULL;dif_store(y,i,dif_load(x,source));}}\n";
+    out << render_kernel_template(
+        "pad_constant_4d",
+        {{"function", function_name(op)},
+         {"count", text(output->element_count())},
+         {"out_w", text(o[3])}, {"out_h", text(o[2])},
+         {"out_hw", text(o[2] * o[3])}, {"out_c", text(o[1])},
+         {"out_chw", text(o[1] * o[2] * o[3])},
+         {"top", text(top)}, {"bottom_edge", text(top + in[2])},
+         {"west", text(west)}, {"east_edge", text(west + in[3])},
+         {"value", value_literal.str()},
+         {"in_c", text(in[1])}, {"in_h", text(in[2])}, {"in_w", text(in[3])}});
   } else {
     const auto front = op.u64(ir::AttrKey::PadFront, 0U);
-    out << "unsigned long long ow=i%" << output->dims[4]
-        << "ULL,oh=(i/" << output->dims[4] << "ULL)%" << output->dims[3]
-        << "ULL,ot=(i/" << output->dims[3] * output->dims[4] << "ULL)%"
-        << output->dims[2] << "ULL,c=(i/"
-        << output->dims[2] * output->dims[3] * output->dims[4] << "ULL)%"
-        << output->dims[1] << "ULL,b=i/"
-        << output->dims[1] * output->dims[2] * output->dims[3] *
-               output->dims[4]
-        << "ULL;if(ot<" << front << "ULL||ot>="
-        << front + input->dims[2] << "ULL||oh<" << top << "ULL||oh>="
-        << top + input->dims[3] << "ULL||ow<" << west << "ULL||ow>="
-        << west + input->dims[4] << "ULL){dif_store(y,i," << value
-        << "f);return;}unsigned long long source=(((b*" << input->dims[1]
-        << "ULL+c)*" << input->dims[2] << "ULL+ot-" << front << "ULL)*"
-        << input->dims[3] << "ULL+oh-" << top << "ULL)*" << input->dims[4]
-        << "ULL+ow-" << west
-        << "ULL;dif_store(y,i,dif_load(x,source));}}\n";
+    out << render_kernel_template(
+        "pad_constant_5d",
+        {{"function", function_name(op)},
+         {"count", text(output->element_count())},
+         {"out_w", text(o[4])}, {"out_h", text(o[3])},
+         {"out_hw", text(o[3] * o[4])}, {"out_t", text(o[2])},
+         {"out_thw", text(o[2] * o[3] * o[4])}, {"out_c", text(o[1])},
+         {"out_cthw", text(o[1] * o[2] * o[3] * o[4])},
+         {"front", text(front)}, {"back_edge", text(front + in[2])},
+         {"top", text(top)}, {"bottom_edge", text(top + in[3])},
+         {"west", text(west)}, {"east_edge", text(west + in[4])},
+         {"value", value_literal.str()},
+         {"in_c", text(in[1])}, {"in_t", text(in[2])}, {"in_h", text(in[3])},
+         {"in_w", text(in[4])}});
   }
-  out << std::defaultfloat;
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_pad_reflect(std::ostringstream &out, const ir::Program &program,
@@ -458,47 +444,31 @@ void emit_pad_reflect(std::ostringstream &out, const ir::Program &program,
   const auto front = op.u64(ir::AttrKey::PadFront, 0U);
   const auto top = op.u64(ir::AttrKey::PadTop, 0U);
   const auto west = op.u64(ir::AttrKey::PadWest, 0U);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,dif_scalar* y){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << output->element_count() << "ULL){";
+  const auto &o = output->dims;
+  const auto &in = input->dims;
+  const auto text = [](std::uint64_t v) { return std::to_string(v); };
   if (input->dims.size() == 4U) {
-    out << "unsigned long long ow=i%" << output->dims[3]
-        << "ULL,oh=(i/" << output->dims[3] << "ULL)%" << output->dims[2]
-        << "ULL,c=(i/" << output->dims[2] * output->dims[3] << "ULL)%"
-        << output->dims[1] << "ULL,b=i/"
-        << output->dims[1] * output->dims[2] * output->dims[3]
-        << "ULL;unsigned long long sy=oh<" << top << "ULL?" << top
-        << "ULL-oh:(oh-" << top << "ULL<" << input->dims[2] << "ULL?oh-"
-        << top << "ULL:2ULL*" << input->dims[2] << "ULL-2ULL-(oh-" << top
-        << "ULL));unsigned long long sx=ow<" << west << "ULL?" << west
-        << "ULL-ow:(ow-" << west << "ULL<" << input->dims[3] << "ULL?ow-"
-        << west << "ULL:2ULL*" << input->dims[3] << "ULL-2ULL-(ow-" << west
-        << "ULL));unsigned long long source=((b*" << input->dims[1]
-        << "ULL+c)*" << input->dims[2] << "ULL+sy)*" << input->dims[3]
-        << "ULL+sx;dif_store(y,i,dif_load(x,source));}}\n";
+    out << render_kernel_template(
+        "pad_reflect_4d",
+        {{"function", function_name(op)},
+         {"count", text(output->element_count())},
+         {"out_w", text(o[3])}, {"out_h", text(o[2])},
+         {"out_hw", text(o[2] * o[3])}, {"out_c", text(o[1])},
+         {"out_chw", text(o[1] * o[2] * o[3])},
+         {"top", text(top)}, {"west", text(west)},
+         {"in_c", text(in[1])}, {"in_h", text(in[2])}, {"in_w", text(in[3])}});
   } else {
-    out << "unsigned long long ow=i%" << output->dims[4]
-        << "ULL,oh=(i/" << output->dims[4] << "ULL)%" << output->dims[3]
-        << "ULL,ot=(i/" << output->dims[3] * output->dims[4] << "ULL)%"
-        << output->dims[2] << "ULL,c=(i/"
-        << output->dims[2] * output->dims[3] * output->dims[4] << "ULL)%"
-        << output->dims[1] << "ULL,b=i/"
-        << output->dims[1] * output->dims[2] * output->dims[3] *
-               output->dims[4]
-        << "ULL;unsigned long long st=ot<" << front << "ULL?" << front
-        << "ULL-ot:(ot-" << front << "ULL<" << input->dims[2] << "ULL?ot-"
-        << front << "ULL:2ULL*" << input->dims[2] << "ULL-2ULL-(ot-" << front
-        << "ULL));unsigned long long sy=oh<" << top << "ULL?" << top
-        << "ULL-oh:(oh-" << top << "ULL<" << input->dims[3] << "ULL?oh-"
-        << top << "ULL:2ULL*" << input->dims[3] << "ULL-2ULL-(oh-" << top
-        << "ULL));unsigned long long sx=ow<" << west << "ULL?" << west
-        << "ULL-ow:(ow-" << west << "ULL<" << input->dims[4] << "ULL?ow-"
-        << west << "ULL:2ULL*" << input->dims[4] << "ULL-2ULL-(ow-" << west
-        << "ULL));unsigned long long source=(((b*" << input->dims[1]
-        << "ULL+c)*" << input->dims[2] << "ULL+st)*" << input->dims[3]
-        << "ULL+sy)*" << input->dims[4]
-        << "ULL+sx;dif_store(y,i,dif_load(x,source));}}\n";
+    out << render_kernel_template(
+        "pad_reflect_5d",
+        {{"function", function_name(op)},
+         {"count", text(output->element_count())},
+         {"out_w", text(o[4])}, {"out_h", text(o[3])},
+         {"out_hw", text(o[3] * o[4])}, {"out_t", text(o[2])},
+         {"out_thw", text(o[2] * o[3] * o[4])}, {"out_c", text(o[1])},
+         {"out_cthw", text(o[1] * o[2] * o[3] * o[4])},
+         {"front", text(front)}, {"top", text(top)}, {"west", text(west)},
+         {"in_c", text(in[1])}, {"in_t", text(in[2])}, {"in_h", text(in[3])},
+         {"in_w", text(in[4])}});
   }
 }
 
@@ -1263,30 +1233,28 @@ void emit_adamw_update(std::ostringstream &out, const ir::Program &program,
   // moment-based update is subtracted, and weight decay is never folded
   // into the gradient ahead of the moment updates (flame's measured LoRA-A
   // "unlearning" runaway).
-  const auto *parameter_scalar = typed_scalar(parameter->dtype);
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const " << parameter_scalar << "* parameter,const "
-      << typed_scalar(gradient->dtype)
-      << "* gradient,const dif_f32* first,const dif_f32* second,const int* completed_steps,"
-      << parameter_scalar
-      << "* updated,dif_f32* updated_first,dif_f32* updated_second){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){float step=(float)(completed_steps[0]+1),beta1="
-      << beta1 << "f,beta2=" << beta2
-      << "f;float grad=" << typed_load(gradient->dtype)
-      << "(gradient,i)*" << clip_scale
-      << "f;float m=beta1*dif_load_f32(first,i)+(1.0f-beta1)*grad;"
-         "float v=beta2*dif_load_f32(second,i)+(1.0f-beta2)*grad*grad;float bias1=1.0f-powf(beta1,step);"
-         "float bias2_sqrt=sqrtf(1.0f-powf(beta2,step));float decayed="
-      << typed_load(parameter->dtype) << "(parameter,i)*(1.0f-"
-      << learning_rate << "f*" << weight_decay
-      << "f);float denominator=sqrtf(v)/bias2_sqrt+" << epsilon
-      << "f;float value=decayed-(" << learning_rate
-      << "f/bias1)*m/denominator;" << typed_store(parameter->dtype)
-      << "(updated,i,value);dif_store_f32(updated_first,i,m);"
-         "dif_store_f32(updated_second,i,v);}}\n"
-      << std::defaultfloat;
+  const auto literal = [](float value) {
+    std::ostringstream text;
+    text << std::scientific << std::setprecision(9) << value;
+    return text.str();
+  };
+  out << render_kernel_template(
+      "adamw_update",
+      {{"function", function_name(op)},
+       {"parameter_scalar", typed_scalar(parameter->dtype)},
+       {"gradient_scalar", typed_scalar(gradient->dtype)},
+       {"count", std::to_string(count)},
+       {"beta1", literal(beta1)},
+       {"beta2", literal(beta2)},
+       {"gradient_load", typed_load(gradient->dtype)},
+       {"clip_scale", literal(clip_scale)},
+       {"parameter_load", typed_load(parameter->dtype)},
+       {"learning_rate", literal(learning_rate)},
+       {"weight_decay", literal(weight_decay)},
+       {"epsilon", literal(epsilon)},
+       {"parameter_store", typed_store(parameter->dtype)}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_fill(std::ostringstream &out, const ir::Program &program,
@@ -1525,36 +1493,22 @@ void emit_patchify_3d(std::ostringstream &out, const ir::Program &program,
   const auto frames = volume->dims[2];
   const auto height = volume->dims[3];
   const auto width = volume->dims[4];
-  const auto output_frames = frames / patch_t;
-  const auto output_height = height / patch_h;
-  const auto output_width = width / patch_w;
-  const auto count = rows->element_count();
-  const auto row_width = rows->dims[1];
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* input,dif_scalar* output){unsigned long long i="
-         "(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << row_width
-      << "ULL,column=i%" << row_width
-      << "ULL,outer=row,patch_x=outer%" << output_width
-      << "ULL;outer/=" << output_width << "ULL;unsigned long long patch_y=outer%"
-      << output_height << "ULL;outer/=" << output_height
-      << "ULL;unsigned long long patch_frame=outer%" << output_frames
-      << "ULL,batch=outer/" << output_frames
-      << "ULL,inner=column,offset_x=inner%" << patch_w << "ULL;inner/="
-      << patch_w << "ULL;unsigned long long offset_y=inner%" << patch_h
-      << "ULL;inner/=" << patch_h
-      << "ULL;unsigned long long offset_t=inner%" << patch_t
-      << "ULL;inner/=" << patch_t
-      << "ULL;unsigned long long channel=inner,frame=patch_frame*" << patch_t
-      << "ULL+offset_t,y=patch_y*" << patch_h
-      << "ULL+offset_y,x=patch_x*" << patch_w
-      << "ULL+offset_x,volume_index=((((batch*" << channels
-      << "ULL+channel)*" << frames << "ULL+frame)*" << height
-      << "ULL+y)*" << width << "ULL+x);"
-      << (inverse
-              ? "dif_store(output,volume_index,dif_load(input,i));"
-              : "dif_store(output,i,dif_load(input,volume_index));")
-      << "}}\n";
+  const auto text = [](std::uint64_t v) { return std::to_string(v); };
+  out << render_kernel_template(
+      "patchify_3d",
+      {{"function", function_name(op)},
+       {"count", text(rows->element_count())},
+       {"row_width", text(rows->dims[1])},
+       {"output_width", text(width / patch_w)},
+       {"output_height", text(height / patch_h)},
+       {"output_frames", text(frames / patch_t)},
+       {"patch_w", text(patch_w)}, {"patch_h", text(patch_h)},
+       {"patch_t", text(patch_t)},
+       {"channels", text(channels)}, {"frames", text(frames)},
+       {"height", text(height)}, {"width", text(width)},
+       {"transfer",
+        inverse ? "dif_store(output, volume_index, dif_load(input, i));"
+                : "dif_store(output, i, dif_load(input, volume_index));"}});
 }
 
 void emit_rms_norm(std::ostringstream &out, const ir::Program &program,
@@ -1630,99 +1584,26 @@ void emit_layer_norm(std::ostringstream &out, const ir::Program &program,
   const auto rows = input->element_count() / columns;
   const auto epsilon = op.f64(ir::AttrKey::Epsilon, 1.0e-5);
   const auto block = op.u64(ir::AttrKey::BlockSize, 256U);
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::setprecision(17) << static_cast<float>(epsilon);
   if (input->dtype == ir::DType::BF16 && columns % 4U == 0U &&
       block == 128U) {
-    const auto suffix = std::to_string(op.id);
-    out << std::setprecision(17)
-        << "struct dif_welford_" << suffix
-        << "{float mean;float sigma2;float count;};\n"
-        << "extern \"C\" __device__ __forceinline__ dif_welford_" << suffix
-        << " dif_welford_online_" << suffix
-        << "(float value,dif_welford_" << suffix
-        << " current){float delta=value-current.mean;float count=current.count+"
-           "1.0f;float mean=current.mean+delta*(1.0f/count);return {mean,"
-           "current.sigma2+delta*(value-mean),count};}\n"
-        << "extern \"C\" __device__ __forceinline__ dif_welford_" << suffix
-        << " dif_welford_combine_" << suffix << "(dif_welford_" << suffix
-        << " data_b,dif_welford_" << suffix
-        << " data_a){float delta=data_b.mean-data_a.mean;float count="
-           "data_a.count+data_b.count;if(count>0.0f){float coefficient="
-           "1.0f/count;float n_a=data_a.count*coefficient;float n_b="
-           "data_b.count*coefficient;return {n_a*data_a.mean+n_b*data_b.mean,"
-           "data_a.sigma2+data_b.sigma2+delta*delta*data_a.count*n_b,count};}"
-           "return {0.0f,0.0f,0.0f};}\n"
-        << "extern \"C\" __global__ void " << function_name(op)
-        << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* "
-           "bias,dif_scalar* y){extern __shared__ float reduction[];unsigned "
-           "long long row=blockIdx.x;if(row>="
-        << rows
-        << "ULL)return;unsigned tid=threadIdx.x,lane=tid&31U,warp=tid>>5U;"
-           "dif_welford_"
-        << suffix
-        << " state={0.0f,0.0f,0.0f};for(unsigned long long pack=tid;pack<"
-        << columns / 4U
-        << "ULL;pack+=128ULL){unsigned long long base=row*" << columns
-        << "ULL+pack*4ULL;state=dif_welford_online_" << suffix
-        << "(dif_load(x,base),state);state=dif_welford_online_" << suffix
-        << "(dif_load(x,base+1ULL),state);state=dif_welford_online_" << suffix
-        << "(dif_load(x,base+2ULL),state);state=dif_welford_online_" << suffix
-        << "(dif_load(x,base+3ULL),state);}for(int offset=16;offset>0;offset>>=1)"
-           "{dif_welford_"
-        << suffix
-        << " other={__shfl_down_sync(0xffffffffU,state.mean,offset),"
-           "__shfl_down_sync(0xffffffffU,state.sigma2,offset),"
-           "__shfl_down_sync(0xffffffffU,state.count,offset)};state="
-           "dif_welford_combine_"
-        << suffix
-        << "(state,other);}float* meansigma=reduction;float* counts=reduction+"
-           "4U;for(unsigned offset=2U;offset>0U;offset>>=1U){if(lane==0U&&"
-           "warp>=offset&&warp<2U*offset){unsigned target=warp-offset;"
-           "meansigma[2U*target]=state.mean;meansigma[2U*target+1U]="
-           "state.sigma2;counts[target]=state.count;}__syncthreads();if(lane=="
-           "0U&&warp<offset){dif_welford_"
-        << suffix
-        << " other={meansigma[2U*warp],meansigma[2U*warp+1U],counts[warp]};"
-           "state=dif_welford_combine_"
-        << suffix
-        << "(state,other);}__syncthreads();}if(tid==0U){meansigma[0]=state.mean;"
-           "meansigma[1]=state.sigma2/"
-        << columns
-        << ".0f;}__syncthreads();float mean=meansigma[0];float inverse=rsqrtf("
-           "meansigma[1]+"
-        << static_cast<float>(epsilon)
-        << "f);for(unsigned long long pack=tid;pack<" << columns / 4U
-        << "ULL;pack+=128ULL){unsigned long long base=row*" << columns
-        << "ULL+pack*4ULL;for(unsigned inner=0U;inner<4U;++inner){"
-           "unsigned long long index=base+inner;float normalized=inverse*("
-           "dif_load(x,index)-mean);dif_store(y,index,dif_load(weight,pack*"
-           "4ULL+inner)*normalized+dif_load(bias,pack*4ULL+inner));}}}\n";
-    return;
+    out << render_kernel_template(
+        "layer_norm_welford", {{"function", function_name(op)},
+                               {"suffix", std::to_string(op.id)},
+                               {"rows", std::to_string(rows)},
+                               {"packs", std::to_string(columns / 4U)},
+                               {"columns", std::to_string(columns)},
+                               {"epsilon", epsilon_literal.str()}});
+  } else {
+    out << render_kernel_template(
+        "layer_norm", {{"function", function_name(op)},
+                       {"rows", std::to_string(rows)},
+                       {"columns", std::to_string(columns)},
+                       {"epsilon", epsilon_literal.str()}});
   }
-  out << std::setprecision(17) << "extern \"C\" __global__ void "
-      << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* weight,const dif_scalar* bias,"
-         "dif_scalar* y){extern __shared__ float reduction[];unsigned long long "
-         "row=blockIdx.x;if(row>="
-      << rows
-      << "ULL)return;float local=0.0f;for(unsigned long long col=threadIdx.x;col<"
-      << columns << "ULL;col+=blockDim.x)local+=dif_load(x,row*" << columns
-      << "ULL+col);reduction[threadIdx.x]=local;__syncthreads();for(unsigned "
-         "stride=blockDim.x/2;stride>0;stride>>=1){if(threadIdx.x<stride)"
-         "reduction[threadIdx.x]+=reduction[threadIdx.x+stride];__syncthreads();}"
-         "float mean=reduction[0]/"
-      << columns
-      << ".0f;__syncthreads();local=0.0f;for(unsigned long long col=threadIdx.x;col<"
-      << columns << "ULL;col+=blockDim.x){float centered=dif_load(x,row*"
-      << columns
-      << "ULL+col)-mean;local+=centered*centered;}reduction[threadIdx.x]=local;"
-         "__syncthreads();for(unsigned stride=blockDim.x/2;stride>0;stride>>=1)"
-         "{if(threadIdx.x<stride)reduction[threadIdx.x]+=reduction[threadIdx.x+"
-         "stride];__syncthreads();}float inv=rsqrtf(reduction[0]/"
-      << columns << ".0f+" << static_cast<float>(epsilon)
-      << "f);for(unsigned long long col=threadIdx.x;col<" << columns
-      << "ULL;col+=blockDim.x){unsigned long long i=row*" << columns
-      << "ULL+col;dif_store(y,i,(dif_load(x,i)-mean)*inv*dif_load(weight,col)+"
-         "dif_load(bias,col));}}\n";
+  // The historical emitter left the stream at precision 17.
+  out << std::setprecision(17);
 }
 
 void emit_layer_norm_modulate(std::ostringstream &out,
@@ -2474,43 +2355,34 @@ void emit_rms_norm_modulate_backward(std::ostringstream &out,
   const auto columns = x->dims[1];
   const auto count = rows * columns;
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << (weighted
-              ? "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,const dif_scalar* scale,dif_scalar* grad_input,dif_scalar* grad_scale,dif_scalar* grad_shift,dif_scalar* grad_weight){"
-              : "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* scale,dif_scalar* grad_input,dif_scalar* grad_scale,dif_scalar* grad_shift){")
-      << "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << columns
-      << "ULL,col=i%" << columns << "ULL,base=row*" << columns
-      << "ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k){float value=dif_load(x,base+k);ss=fmaf(value,value,ss);}"
-         "float inv=rsqrtf(ss/"
-      << columns << ".0f+" << epsilon
-      << "f);float dot=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k)dot=fmaf(dif_load(grad_output,base+k)*(1.0f+dif_load(scale,"
-         "base+k))"
-      << (weighted ? "*dif_load(weight,k)" : "")
-      << ",dif_load(x,base+k),dot);float value=dif_load(x,i);"
-         "float upstream=dif_load(grad_output,i);"
-         "float normed_gradient=upstream*(1.0f+dif_load(scale,i));"
-         "float weight_value="
-      << (weighted ? "dif_load(weight,col);" : "1.0f;")
-      << "dif_store(grad_input,i,normed_gradient*weight_value*inv-"
-         "value*inv*inv*inv*dot/"
-      << columns << ".0f);"
-         "dif_store(grad_scale,i,upstream*value*inv*weight_value);"
-         "dif_store(grad_shift,i,upstream);";
-  if (weighted)
-    out << "if(i<" << columns
-        << "ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<" << rows
-        << "ULL;++r){unsigned long long rb=r*" << columns
-        << "ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<" << columns
-        << "ULL;++k){float rv=dif_load(x,rb+k);rss=fmaf(rv,rv,rss);}"
-           "float rinv=rsqrtf(rss/"
-        << columns << ".0f+" << epsilon
-        << "f);acc=fmaf(dif_load(grad_output,rb+i)*(1.0f+dif_load(scale,rb+i))"
-           "*dif_load(x,rb+i),rinv,acc);}dif_store(grad_weight,i,acc);}";
-  out << "}}\n" << std::defaultfloat;
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9) << epsilon;
+  const std::string weight_gradient =
+      weighted ? render_kernel_template(
+                     "rms_norm_modulate_backward_weight",
+                     {{"columns", std::to_string(columns)},
+                      {"rows", std::to_string(rows)},
+                      {"epsilon", epsilon_literal.str()}})
+               : std::string{};
+  out << render_kernel_template(
+      "rms_norm_modulate_backward",
+      {{"function", function_name(op)},
+       {"parameters",
+        weighted ? "const dif_scalar* grad_output, const dif_scalar* x, "
+                   "const dif_scalar* weight, const dif_scalar* scale, "
+                   "dif_scalar* grad_input, dif_scalar* grad_scale, "
+                   "dif_scalar* grad_shift, dif_scalar* grad_weight"
+                 : "const dif_scalar* grad_output, const dif_scalar* x, "
+                   "const dif_scalar* scale, dif_scalar* grad_input, "
+                   "dif_scalar* grad_scale, dif_scalar* grad_shift"},
+       {"count", std::to_string(count)},
+       {"columns", std::to_string(columns)},
+       {"epsilon", epsilon_literal.str()},
+       {"dot_weight", weighted ? " * dif_load(weight, k)" : ""},
+       {"weight_value", weighted ? "dif_load(weight, col);" : "1.0f;"},
+       {"weight_gradient", weight_gradient}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_swiglu_backward(std::ostringstream &out, const ir::Program &program,
@@ -2616,50 +2488,16 @@ void emit_layer_norm_backward(std::ostringstream &out,
   const auto rows = input->element_count() / columns;
   const auto count = rows * columns;
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
-  // dx = inv*(gw - mean(gw) - xhat*mean(gw*xhat)), mean/inv recomputed from
-  // the original input in F32 (flame's non-affine-LN cancellation lesson).
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,dif_scalar* grad_input,dif_scalar* grad_weight,dif_scalar* grad_bias){"
-         "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << columns
-      << "ULL,base=row*" << columns
-      << "ULL;float mean=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k)mean+=dif_load(x,base+k);mean/=" << columns
-      << ".0f;float variance=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k){float centered=dif_load(x,base+k)-mean;"
-         "variance=fmaf(centered,centered,variance);}float inv=rsqrtf(variance/"
-      << columns << ".0f+" << epsilon
-      << "f);float gradient_mean=0.0f,projected_mean=0.0f;"
-         "for(unsigned long long k=0ULL;k<"
-      << columns
-      << "ULL;++k){float weighted=dif_load(grad_output,base+k)*dif_load(weight,k);"
-         "float normalized=(dif_load(x,base+k)-mean)*inv;"
-         "gradient_mean+=weighted;projected_mean=fmaf(weighted,normalized,"
-         "projected_mean);}gradient_mean/="
-      << columns << ".0f;projected_mean/=" << columns
-      << ".0f;float upstream=dif_load(grad_output,i);"
-         "float weighted=upstream*dif_load(weight,i-base);"
-         "float normalized=(dif_load(x,i)-mean)*inv;"
-         "dif_store(grad_input,i,inv*(weighted-gradient_mean-normalized*"
-         "projected_mean));if(i<"
-      << columns
-      << "ULL){float weight_accumulator=0.0f,bias_accumulator=0.0f;"
-         "for(unsigned long long r=0ULL;r<"
-      << rows << "ULL;++r){unsigned long long rb=r*" << columns
-      << "ULL;float rmean=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k)rmean+=dif_load(x,rb+k);rmean/=" << columns
-      << ".0f;float rvariance=0.0f;for(unsigned long long k=0ULL;k<" << columns
-      << "ULL;++k){float centered=dif_load(x,rb+k)-rmean;"
-         "rvariance=fmaf(centered,centered,rvariance);}float rinv=rsqrtf("
-         "rvariance/"
-      << columns << ".0f+" << epsilon
-      << "f);float g=dif_load(grad_output,rb+i);"
-         "weight_accumulator=fmaf(g,(dif_load(x,rb+i)-rmean)*rinv,"
-         "weight_accumulator);bias_accumulator+=g;}"
-         "dif_store(grad_weight,i,weight_accumulator);"
-         "dif_store(grad_bias,i,bias_accumulator);}}}\n"
-      << std::defaultfloat;
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9) << epsilon;
+  out << render_kernel_template(
+      "layer_norm_backward", {{"function", function_name(op)},
+                              {"count", std::to_string(count)},
+                              {"columns", std::to_string(columns)},
+                              {"epsilon", epsilon_literal.str()},
+                              {"rows", std::to_string(rows)}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_residual_gate_backward(std::ostringstream &out,
