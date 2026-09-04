@@ -995,6 +995,63 @@ Program batch11_program(std::string_view which) {
                            {Attribute::f64(AttrKey::Epsilon, 1.0e-5)}}};
     return program;
   }
+  if (which == "select_row_chunks_backward" ||
+      which == "select_row_chunks_backward_four") {
+    const std::uint64_t chunks =
+        which == "select_row_chunks_backward_four" ? 4U : 2U;
+    program.tensors = {{1, DType::I32, TensorRole::Input, {6}}};
+    std::vector<std::uint32_t> inputs{1};
+    for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
+      program.tensors.push_back(
+          {2U + chunk, DType::BF16, TensorRole::Input, {6, 3}});
+      inputs.push_back(2U + chunk);
+    }
+    program.tensors.push_back(
+        {2U + static_cast<std::uint32_t>(chunks), DType::BF16,
+         TensorRole::Output, {5, chunks * 3U}});
+    program.operations = {
+        {1, Opcode::SelectRowChunksBackward, inputs,
+         {2U + static_cast<std::uint32_t>(chunks)}, {}}};
+    return program;
+  }
+  if (which == "indexed_update_rows_backward" ||
+      which == "indexed_update_rows_backward_base_only") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {5, 4}},
+                       {2, DType::I32, TensorRole::Input, {5}},
+                       {3, DType::BF16, TensorRole::Output, {5, 4}}};
+    std::vector<std::uint32_t> outputs{3};
+    // The base-only variant is a frozen update tensor: no second reduction.
+    if (which == "indexed_update_rows_backward") {
+      program.tensors.push_back({4, DType::BF16, TensorRole::Output, {3, 4}});
+      outputs.push_back(4);
+    }
+    program.operations = {
+        {1, Opcode::IndexedUpdateRowsBackward, {1, 2}, outputs, {}}};
+    return program;
+  }
+  if (which == "h3_interleave_qkv_weight") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {6, 4}},
+                       {2, DType::BF16, TensorRole::Input, {6, 4}},
+                       {3, DType::BF16, TensorRole::Input, {6, 4}},
+                       {4, DType::BF16, TensorRole::Output, {18, 4}}};
+    program.operations = {{1, Opcode::H3InterleaveQkvWeight, {1, 2, 3}, {4},
+                           {Attribute::u64(AttrKey::Heads, 2U),
+                            Attribute::u64(AttrKey::HeadDim, 3U)}}};
+    return program;
+  }
+  if (which == "h3_adaln_select_backward") {
+    program.tensors = {{1, DType::I32, TensorRole::Input, {4}}};
+    std::vector<std::uint32_t> inputs{1};
+    for (std::uint32_t chunk = 0; chunk < 6U; ++chunk) {
+      program.tensors.push_back(
+          {2U + chunk, DType::BF16, TensorRole::Input, {4, 3}});
+      inputs.push_back(2U + chunk);
+    }
+    program.tensors.push_back({8, DType::BF16, TensorRole::Output, {2, 54}});
+    program.operations = {
+        {1, Opcode::H3AdaLNSelectBackward, inputs, {8}, {}}};
+    return program;
+  }
   if (which == "channel_rms_norm_backward" ||
       which == "channel_rms_norm_backward_frozen") {
     program.tensors = {{1, DType::BF16, TensorRole::Input, {2, 4, 8}},
@@ -1246,6 +1303,12 @@ std::vector<Case> corpus() {
       {"channel_rms_norm_backward", [] { return batch11_program("channel_rms_norm_backward"); }},
       {"channel_rms_norm_backward_frozen", [] { return batch11_program("channel_rms_norm_backward_frozen"); }},
       {"pad_reflect_backward", [] { return batch11_program("pad_reflect_backward"); }},
+      {"select_row_chunks_backward", [] { return batch11_program("select_row_chunks_backward"); }},
+      {"select_row_chunks_backward_four", [] { return batch11_program("select_row_chunks_backward_four"); }},
+      {"indexed_update_rows_backward", [] { return batch11_program("indexed_update_rows_backward"); }},
+      {"indexed_update_rows_backward_base_only", [] { return batch11_program("indexed_update_rows_backward_base_only"); }},
+      {"h3_interleave_qkv_weight", [] { return batch11_program("h3_interleave_qkv_weight"); }},
+      {"h3_adaln_select_backward", [] { return batch11_program("h3_adaln_select_backward"); }},
       {"pad_reflect_backward_volumetric", [] { return batch11_program("pad_reflect_backward_volumetric"); }},
       {"layer_norm_modulate_backward", [] { return batch11_program("layer_norm_modulate_backward"); }},
       {"layer_norm_modulate_backward_broadcast", [] { return batch11_program("layer_norm_modulate_backward_broadcast"); }},

@@ -967,6 +967,10 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::AttentionLse:
     case Opcode::AttentionBackward:
     case Opcode::LayerNormModulateBackward:
+    case Opcode::SelectRowChunksBackward:
+    case Opcode::IndexedUpdateRowsBackward:
+    case Opcode::H3InterleaveQkvWeight:
+    case Opcode::H3AdaLNSelectBackward:
     case Opcode::PadReflectBackward:
     case Opcode::ChannelRmsNormBackward:
     case Opcode::GatherRowsBackward:

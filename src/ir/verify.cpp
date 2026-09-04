@@ -1542,6 +1542,97 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::SelectRowChunksBackward) {
+    // Indices first, then one gradient per chunk, mirroring the forward's
+    // output list.
+    if (op.inputs.size() < 2U || op.inputs.size() > 9U ||
+        op.outputs.size() != 1U)
+      fail("select_row_chunks_backward expects indices, one gradient per "
+           "chunk, and one output");
+    const auto &indices = tensor_or_fail(program, op.inputs[1 - 1], op);
+    const auto &grad_values = tensor_or_fail(program, op.outputs[0], op);
+    const auto &first = tensor_or_fail(program, op.inputs[1], op);
+    const auto chunks = op.inputs.size() - 1U;
+    check_accumulator_f32(op);
+    if (indices.dtype != DType::I32 || indices.dims.size() != 1U ||
+        !supported_float(grad_values.dtype) ||
+        grad_values.dims.size() != 2U || first.dtype != grad_values.dtype ||
+        first.dims.size() != 2U || first.dims[0] != indices.dims[0] ||
+        grad_values.dims[1] != chunks * first.dims[1])
+      fail("select_row_chunks_backward requires i32 [S], C float [S,H], and "
+           "float [T,C*H]");
+    for (std::size_t index = 1U; index < op.inputs.size(); ++index)
+      same_shape_dtype(first, tensor_or_fail(program, op.inputs[index], op),
+                       op);
+    return;
+  }
+
+  if (op.opcode == Opcode::IndexedUpdateRowsBackward) {
+    if (op.inputs.size() != 2U || op.outputs.empty() ||
+        op.outputs.size() > 2U)
+      fail("indexed_update_rows_backward expects grad_output, map, and one "
+           "or two outputs");
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &map = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_base = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(grad_output, grad_base, op);
+    check_accumulator_f32(op);
+    if (!supported_float(grad_output.dtype) || grad_output.dims.size() < 2U ||
+        map.dtype != DType::I32 || map.dims.size() != 1U ||
+        map.dims[0] != grad_output.dims[0])
+      fail("indexed_update_rows_backward requires float [S,...] and an i32 "
+           "destination map [S]");
+    if (op.outputs.size() == 2U) {
+      const auto &grad_updates = tensor_or_fail(program, op.outputs[1], op);
+      if (grad_updates.dtype != grad_output.dtype ||
+          grad_updates.dims.size() != grad_output.dims.size() ||
+          !std::equal(grad_output.dims.begin() + 1, grad_output.dims.end(),
+                      grad_updates.dims.begin() + 1))
+        fail("indexed_update_rows_backward update gradient must share the "
+             "row width");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::H3InterleaveQkvWeight) {
+    expect_counts(op, 3, 1);
+    const auto &q = tensor_or_fail(program, op.inputs[0], op);
+    const auto &k = tensor_or_fail(program, op.inputs[1], op);
+    const auto &v = tensor_or_fail(program, op.inputs[2], op);
+    const auto &packed = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(q, k, op);
+    same_shape_dtype(q, v, op);
+    if (!supported_float(packed.dtype) || q.dtype != packed.dtype ||
+        packed.dims.size() != 2U || q.dims.size() != 2U ||
+        packed.dims[0] != 3U * q.dims[0] || packed.dims[1] != q.dims[1])
+      fail("h3_interleave_qkv_weight requires three [N,K] tensors -> [3N,K]");
+    const auto heads = op.u64(AttrKey::Heads, 0U);
+    const auto head_dim = op.u64(AttrKey::HeadDim, 0U);
+    if (heads == 0U || head_dim == 0U || q.dims[0] != heads * head_dim)
+      fail("h3_interleave_qkv_weight head geometry disagrees with N");
+    return;
+  }
+
+  if (op.opcode == Opcode::H3AdaLNSelectBackward) {
+    expect_counts(op, 7, 1);
+    const auto &indices = tensor_or_fail(program, op.inputs[0], op);
+    const auto &first = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_projected = tensor_or_fail(program, op.outputs[0], op);
+    check_accumulator_f32(op);
+    if (indices.dtype != DType::I32 || indices.dims.size() != 1U ||
+        !supported_float(grad_projected.dtype) ||
+        grad_projected.dims.size() != 2U ||
+        first.dtype != grad_projected.dtype || first.dims.size() != 2U ||
+        first.dims[0] != indices.dims[0] ||
+        grad_projected.dims[1] != 18U * first.dims[1])
+      fail("h3_adaln_select_backward requires i32 [S], six float [S,H], and "
+           "float [T,18H]");
+    for (std::size_t index = 2U; index < op.inputs.size(); ++index)
+      same_shape_dtype(first, tensor_or_fail(program, op.inputs[index], op),
+                       op);
+    return;
+  }
+
   if (op.opcode == Opcode::H3AdaLNSelect) {
     expect_counts(op, 2, 6);
     const auto &projected = tensor_or_fail(program, op.inputs[0], op);

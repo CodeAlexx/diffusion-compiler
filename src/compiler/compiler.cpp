@@ -1176,6 +1176,108 @@ void emit_layer_norm_modulate_backward(std::ostringstream &out,
   out << std::setprecision(9);
 }
 
+void emit_select_row_chunks_backward(std::ostringstream &out,
+                                     const ir::Program &program,
+                                     const ir::Operation &op) {
+  const auto *grad_values = program.tensor(op.outputs[0]);
+  const auto *first = program.tensor(op.inputs[1]);
+  const auto chunks = op.inputs.size() - 1U;
+  const auto width = first->dims[1];
+  // One pointer parameter per chunk, and a chain that picks the one this
+  // thread's column falls in. The chain is loop-invariant, so it is resolved
+  // once before the scan rather than inside it.
+  std::string parameters;
+  std::string pointer;
+  for (std::size_t chunk = 0U; chunk < chunks; ++chunk) {
+    const auto name = "g" + std::to_string(chunk);
+    parameters += ", const " + std::string(typed_scalar(grad_values->dtype)) +
+                  "* " + name;
+    pointer += chunk + 1U == chunks
+                   ? name
+                   : "chunk == " + std::to_string(chunk) + "ULL ? " + name +
+                         " : ";
+  }
+  out << render_kernel_template(
+      "select_row_chunks_backward",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(grad_values->dtype)},
+       {"count", std::to_string(grad_values->element_count())},
+       {"source_width", std::to_string(grad_values->dims[1])},
+       {"width", std::to_string(width)},
+       {"rows", std::to_string(first->dims[0])},
+       {"chunk_parameters", parameters},
+       {"chunk_pointer", pointer},
+       {"load", typed_load(grad_values->dtype)},
+       {"store", typed_store(grad_values->dtype)}});
+}
+
+void emit_indexed_update_rows_backward(std::ostringstream &out,
+                                       const ir::Program &program,
+                                       const ir::Operation &op) {
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto *grad_base = program.tensor(op.outputs[0]);
+  const auto rows = grad_output->dims[0];
+  const auto width = grad_output->element_count() / rows;
+  const bool updates = op.outputs.size() == 2U;
+  const std::string load = typed_load(grad_base->dtype);
+  const std::string store = typed_store(grad_base->dtype);
+  const std::string update_gradient =
+      updates ? render_kernel_template(
+                    "indexed_update_rows_backward_updates",
+                    {{"update_count",
+                      std::to_string(
+                          program.tensor(op.outputs[1])->element_count())},
+                     {"width", std::to_string(width)},
+                     {"rows", std::to_string(rows)},
+                     {"load", load},
+                     {"store", store}})
+              : std::string{};
+  out << render_kernel_template(
+      "indexed_update_rows_backward",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(grad_base->dtype)},
+       {"count", std::to_string(grad_base->element_count())},
+       {"width", std::to_string(width)},
+       {"load", load},
+       {"store", store},
+       {"update_parameter",
+        updates ? ", " + std::string(typed_scalar(grad_base->dtype)) +
+                      "* grad_updates"
+                : std::string{}},
+       {"update_gradient", update_gradient}});
+}
+
+void emit_h3_interleave_qkv_weight(std::ostringstream &out,
+                                   const ir::Program &program,
+                                   const ir::Operation &op) {
+  const auto *packed = program.tensor(op.outputs[0]);
+  out << render_kernel_template(
+      "h3_interleave_qkv_weight",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(packed->dtype)},
+       {"count", std::to_string(packed->element_count())},
+       {"hidden", std::to_string(packed->dims[1])},
+       {"head_dim", std::to_string(op.u64(ir::AttrKey::HeadDim, 1U))},
+       {"load", typed_load(packed->dtype)},
+       {"store", typed_store(packed->dtype)}});
+}
+
+void emit_h3_adaln_select_backward(std::ostringstream &out,
+                                   const ir::Program &program,
+                                   const ir::Operation &op) {
+  const auto *grad_projected = program.tensor(op.outputs[0]);
+  const auto *first = program.tensor(op.inputs[1]);
+  out << render_kernel_template(
+      "h3_adaln_select_backward",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(grad_projected->dtype)},
+       {"count", std::to_string(grad_projected->element_count())},
+       {"hidden", std::to_string(first->dims[1])},
+       {"rows", std::to_string(first->dims[0])},
+       {"load", typed_load(grad_projected->dtype)},
+       {"store", typed_store(grad_projected->dtype)}});
+}
+
 void emit_pad_reflect_backward(std::ostringstream &out,
                                const ir::Program &program,
                                const ir::Operation &op) {
@@ -3476,6 +3578,18 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::LayerNormModulateBackward:
       emit_layer_norm_modulate_backward(source, program, op);
+      break;
+    case ir::Opcode::SelectRowChunksBackward:
+      emit_select_row_chunks_backward(source, program, op);
+      break;
+    case ir::Opcode::IndexedUpdateRowsBackward:
+      emit_indexed_update_rows_backward(source, program, op);
+      break;
+    case ir::Opcode::H3InterleaveQkvWeight:
+      emit_h3_interleave_qkv_weight(source, program, op);
+      break;
+    case ir::Opcode::H3AdaLNSelectBackward:
+      emit_h3_adaln_select_backward(source, program, op);
       break;
     case ir::Opcode::PadReflectBackward:
       emit_pad_reflect_backward(source, program, op);

@@ -212,3 +212,10 @@ DIF_OPCODE(ChannelRmsNormBackward, 92, "channel_rms_norm_backward", None)
 // just inside each edge are read more than once, so the gradient sums those
 // reads back -- as a gather over the input, which keeps the sum deterministic.
 DIF_OPCODE(PadReflectBackward, 93, "pad_reflect_backward", None)
+// Gradients of the index and permutation operations a real denoiser carries.
+// Each is written as a gather over its own output so that rows named more
+// than once sum deterministically, without atomics.
+DIF_OPCODE(SelectRowChunksBackward, 94, "select_row_chunks_backward", None)
+DIF_OPCODE(IndexedUpdateRowsBackward, 95, "indexed_update_rows_backward", None)
+DIF_OPCODE(H3InterleaveQkvWeight, 96, "h3_interleave_qkv_weight", DataMovement)
+DIF_OPCODE(H3AdaLNSelectBackward, 97, "h3_adaln_select_backward", None)

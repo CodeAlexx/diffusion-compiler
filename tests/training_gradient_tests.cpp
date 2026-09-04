@@ -62,6 +62,15 @@ dif::runtime::Tensor f32_tensor(std::vector<std::uint64_t> dims,
   return tensor;
 }
 
+dif::runtime::Tensor i32_tensor(std::vector<std::uint64_t> dims,
+                                const std::vector<std::int32_t> &values) {
+  dif::runtime::Tensor tensor{DType::I32, std::move(dims), {}};
+  tensor.bytes.resize(values.size() * sizeof(std::int32_t));
+  std::memcpy(tensor.bytes.data(), values.data(), tensor.bytes.size());
+  tensor.validate();
+  return tensor;
+}
+
 double loss_of(const Program &program, const dif::runtime::TensorMap &inputs,
                std::uint32_t loss_tensor) {
   dif::runtime::RunOptions options;
@@ -267,6 +276,176 @@ Case group_norm_case() {
   c.inputs.emplace(5U, f32_tensor({2U, 4U, 3U, 3U}, 53U, 1.0F));
   c.loss = 6U;
   c.targets = {1U, 2U, 3U};
+  return c;
+}
+
+// The index and permutation operations a denoiser carries. Each produces
+// several outputs, so each also exercises the reverse sweep collecting a
+// gradient per output: the outputs are summed elementwise before the loss, so
+// every one of them carries a gradient back.
+
+// Chunked row gather: index 2 is chosen three times and index 0 twice, so the
+// source rows they name accumulate several contributions; row 3 is never
+// chosen and must come back exactly zero.
+Case select_row_chunks_case(std::size_t chunks) {
+  Case c;
+  const std::uint64_t source_rows = 5U;
+  const std::uint64_t width = 3U;
+  const std::vector<std::int32_t> indices{2, 0, 2, 4, 0, 2};
+  const auto rows = static_cast<std::uint64_t>(indices.size());
+  const std::vector<std::uint64_t> values{source_rows, chunks * width};
+  const std::vector<std::uint64_t> chunk_shape{rows, width};
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, values},
+                       {2U, DType::I32, TensorRole::Input, {rows}}};
+  std::vector<std::uint32_t> outputs;
+  std::uint32_t next = 3U;
+  for (std::size_t chunk = 0U; chunk < chunks; ++chunk) {
+    c.program.tensors.push_back(
+        {next, DType::F32, TensorRole::Internal, chunk_shape});
+    outputs.push_back(next++);
+  }
+  c.program.operations = {
+      {1U, Opcode::SelectRowChunks, {1U, 2U}, outputs, {}}};
+  std::uint32_t operation = 2U;
+  auto total = outputs[0];
+  for (std::size_t chunk = 1U; chunk < chunks; ++chunk) {
+    c.program.tensors.push_back(
+        {next, DType::F32, TensorRole::Internal, chunk_shape});
+    c.program.operations.push_back(
+        {operation++, Opcode::Add, {total, outputs[chunk]}, {next}, {}});
+    total = next++;
+  }
+  const auto target = next++;
+  const auto loss = next++;
+  c.program.tensors.push_back(
+      {target, DType::F32, TensorRole::Input, chunk_shape});
+  c.program.tensors.push_back({loss, DType::F32, TensorRole::Output, {1U}});
+  c.program.operations.push_back(
+      {operation++, Opcode::MseLoss, {total, target}, {loss}, {}});
+  c.inputs.emplace(1U, f32_tensor(values, 337U, 1.0F));
+  c.inputs.emplace(2U, i32_tensor({rows}, indices));
+  c.inputs.emplace(target, f32_tensor(chunk_shape, 347U, 1.0F));
+  c.loss = loss;
+  c.targets = {1U};
+  return c;
+}
+
+// Mapped row update: a map of -1 keeps the base row, so the base gradient
+// passes through exactly there and is zero everywhere else, while update row
+// 1 is named twice and must sum.
+Case indexed_update_rows_case() {
+  Case c;
+  const std::uint64_t width = 4U;
+  const std::vector<std::int32_t> map{-1, 1, 0, 1, -1};
+  const auto rows = static_cast<std::uint64_t>(map.size());
+  const std::uint64_t update_rows = 3U;
+  const std::vector<std::uint64_t> base{rows, width};
+  const std::vector<std::uint64_t> updates{update_rows, width};
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, base},
+                       {2U, DType::F32, TensorRole::Input, updates},
+                       {3U, DType::I32, TensorRole::Input, {rows}},
+                       {4U, DType::F32, TensorRole::Internal, base},
+                       {5U, DType::F32, TensorRole::Input, base},
+                       {6U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::IndexedUpdateRows, {1U, 2U, 3U}, {4U}, {}},
+      {2U, Opcode::MseLoss, {4U, 5U}, {6U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(base, 349U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor(updates, 353U, 1.0F));
+  c.inputs.emplace(3U, i32_tensor({rows}, map));
+  c.inputs.emplace(5U, f32_tensor(base, 359U, 1.0F));
+  c.loss = 6U;
+  c.targets = {1U, 2U};
+  return c;
+}
+
+// Packed QKV weight split: a pure permutation, so the gradient is its
+// inverse. Nothing sums, and nothing may be dropped.
+//
+// The three components MUST reach the loss asymmetrically. Summing them and
+// taking one loss gives all three the same upstream gradient, and a backward
+// that sends K's gradient to V's slot then produces exactly the right answer
+// -- verified: that injected swap passed a symmetric version of this case.
+// Three separate losses against three different targets make the components
+// distinguishable, and the same injection then fails.
+Case deinterleave_qkv_case() {
+  Case c;
+  const std::uint64_t heads = 2U;
+  const std::uint64_t head_dim = 3U;
+  const std::uint64_t hidden = 4U;
+  const auto n = heads * head_dim;
+  const std::vector<std::uint64_t> packed{3U * n, hidden};
+  const std::vector<std::uint64_t> part{n, hidden};
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, packed},
+                       {2U, DType::F32, TensorRole::Internal, part},
+                       {3U, DType::F32, TensorRole::Internal, part},
+                       {4U, DType::F32, TensorRole::Internal, part},
+                       {5U, DType::F32, TensorRole::Input, part},
+                       {6U, DType::F32, TensorRole::Input, part},
+                       {7U, DType::F32, TensorRole::Input, part},
+                       {8U, DType::F32, TensorRole::Internal, {1U}},
+                       {9U, DType::F32, TensorRole::Internal, {1U}},
+                       {10U, DType::F32, TensorRole::Internal, {1U}},
+                       {11U, DType::F32, TensorRole::Internal, {1U}},
+                       {12U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::H3DeinterleaveQkvWeight, {1U}, {2U, 3U, 4U},
+       {Attribute::u64(AttrKey::Heads, heads),
+        Attribute::u64(AttrKey::HeadDim, head_dim)}},
+      {2U, Opcode::MseLoss, {2U, 5U}, {8U}, {}},
+      {3U, Opcode::MseLoss, {3U, 6U}, {9U}, {}},
+      {4U, Opcode::MseLoss, {4U, 7U}, {10U}, {}},
+      {5U, Opcode::Add, {8U, 9U}, {11U}, {}},
+      {6U, Opcode::Add, {11U, 10U}, {12U}, {}}};
+  c.inputs.emplace(1U, f32_tensor(packed, 367U, 1.0F));
+  c.inputs.emplace(5U, f32_tensor(part, 373U, 1.0F));
+  c.inputs.emplace(6U, f32_tensor(part, 379U, 1.5F));
+  c.inputs.emplace(7U, f32_tensor(part, 389U, 0.5F));
+  c.loss = 12U;
+  c.targets = {1U};
+  return c;
+}
+
+// adaLN modulation selection: six chunks per token, with two tokens naming
+// the same table row so that row's gradient is a sum.
+Case adaln_select_case() {
+  Case c;
+  const std::uint64_t table = 2U;
+  const std::uint64_t hidden = 3U;
+  const std::vector<std::int32_t> indices{0, 5, 0, 3};
+  const auto rows = static_cast<std::uint64_t>(indices.size());
+  const std::vector<std::uint64_t> projected{table, 18U * hidden};
+  const std::vector<std::uint64_t> chunk{rows, hidden};
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, projected},
+                       {2U, DType::I32, TensorRole::Input, {rows}}};
+  std::vector<std::uint32_t> outputs;
+  std::uint32_t next = 3U;
+  for (std::size_t index = 0U; index < 6U; ++index) {
+    c.program.tensors.push_back(
+        {next, DType::F32, TensorRole::Internal, chunk});
+    outputs.push_back(next++);
+  }
+  c.program.operations = {{1U, Opcode::H3AdaLNSelect, {1U, 2U}, outputs, {}}};
+  std::uint32_t operation = 2U;
+  auto total = outputs[0];
+  for (std::size_t index = 1U; index < 6U; ++index) {
+    c.program.tensors.push_back(
+        {next, DType::F32, TensorRole::Internal, chunk});
+    c.program.operations.push_back(
+        {operation++, Opcode::Add, {total, outputs[index]}, {next}, {}});
+    total = next++;
+  }
+  const auto target = next++;
+  const auto loss = next++;
+  c.program.tensors.push_back({target, DType::F32, TensorRole::Input, chunk});
+  c.program.tensors.push_back({loss, DType::F32, TensorRole::Output, {1U}});
+  c.program.operations.push_back(
+      {operation++, Opcode::MseLoss, {total, target}, {loss}, {}});
+  c.inputs.emplace(1U, f32_tensor(projected, 397U, 1.0F));
+  c.inputs.emplace(2U, i32_tensor({rows}, indices));
+  c.inputs.emplace(target, f32_tensor(chunk, 401U, 1.0F));
+  c.loss = loss;
+  c.targets = {1U};
   return c;
 }
 
@@ -558,15 +737,6 @@ Case layer_norm_modulate_case(std::uint64_t modulation_rows) {
   c.loss = 8U;
   c.targets = {1U, 2U, 3U, 4U, 5U};
   return c;
-}
-
-dif::runtime::Tensor i32_tensor(std::vector<std::uint64_t> dims,
-                                const std::vector<std::int32_t> &values) {
-  dif::runtime::Tensor tensor{DType::I32, std::move(dims), {}};
-  tensor.bytes.resize(values.size() * sizeof(std::int32_t));
-  std::memcpy(tensor.bytes.data(), values.data(), tensor.bytes.size());
-  tensor.validate();
-  return tensor;
 }
 
 // An embedding lookup. Index 2 is chosen three times and index 0 twice, so
@@ -885,6 +1055,11 @@ int main() {
   run("conv2d strided", conv2d_case(2U, 1U, 1U));
   run("conv2d unpadded", conv2d_case(1U, 0U, 1U));
   run("conv2d grouped", conv2d_case(1U, 1U, 2U));
+  run("select row chunks", select_row_chunks_case(2U));
+  run("select row chunks four", select_row_chunks_case(4U));
+  run("indexed update rows", indexed_update_rows_case());
+  run("deinterleave qkv weight", deinterleave_qkv_case());
+  run("adaln select", adaln_select_case());
   run("pad reflect", pad_reflect_case(false));
   run("pad reflect volumetric", pad_reflect_case(true));
   run("channel rms norm", channel_rms_norm_case(1U, true));

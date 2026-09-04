@@ -1093,6 +1093,116 @@ void conv2d_backward_bias(const ir::Operation &op, TensorMap &tensors) {
 
 // The 3-D gradients are the 2-D ones over the same walker: only the rank of
 // the tensors they are handed differs.
+void select_row_chunks_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &indices_tensor = tensors.at(op.inputs[0]);
+  auto &grad_values = tensors.at(op.outputs[0]);
+  const auto *indices =
+      reinterpret_cast<const std::int32_t *>(indices_tensor.data());
+  const auto rows = indices_tensor.element_count();
+  const auto source_rows = grad_values.dims[0];
+  const auto source_width = grad_values.dims[1];
+  const auto chunks = op.inputs.size() - 1U;
+  const auto width = source_width / chunks;
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_values.element_count()), 0.0F);
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    if (indices[row] < 0 ||
+        static_cast<std::uint64_t>(indices[row]) >= source_rows)
+      fail("select_row_chunks_backward index is out of range");
+    const auto source_row = static_cast<std::uint64_t>(indices[row]);
+    for (std::size_t chunk = 0U; chunk < chunks; ++chunk) {
+      const auto &gradient = tensors.at(op.inputs[chunk + 1U]);
+      for (std::uint64_t column = 0U; column < width; ++column)
+        accumulator[static_cast<std::size_t>(source_row * source_width +
+                                             chunk * width + column)] +=
+            load_float(gradient, row * width + column);
+    }
+  }
+  for (std::size_t index = 0U; index < accumulator.size(); ++index)
+    store_float(grad_values, index, accumulator[index]);
+}
+
+void indexed_update_rows_backward(const ir::Operation &op,
+                                  TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &map_tensor = tensors.at(op.inputs[1]);
+  auto &grad_base = tensors.at(op.outputs[0]);
+  auto *grad_updates =
+      op.outputs.size() == 2U ? &tensors.at(op.outputs[1]) : nullptr;
+  const auto *map = reinterpret_cast<const std::int32_t *>(map_tensor.data());
+  const auto rows = grad_output.dims[0];
+  const auto width = grad_output.element_count() / rows;
+  std::vector<float> update_gradient(
+      grad_updates
+          ? static_cast<std::size_t>(grad_updates->element_count())
+          : 0U,
+      0.0F);
+  const auto update_rows = grad_updates ? grad_updates->dims[0] : 0U;
+  for (std::uint64_t row = 0U; row < rows; ++row) {
+    // A destination row took its value from the base only where the map
+    // declined to substitute; everywhere else the base did not participate.
+    const bool from_base = map[row] < 0;
+    for (std::uint64_t column = 0U; column < width; ++column)
+      store_float(grad_base, row * width + column,
+                  from_base ? load_float(grad_output, row * width + column)
+                            : 0.0F);
+    if (!grad_updates || from_base)
+      continue;
+    if (static_cast<std::uint64_t>(map[row]) >= update_rows)
+      fail("indexed_update_rows_backward map is out of range");
+    const auto target = static_cast<std::uint64_t>(map[row]);
+    for (std::uint64_t column = 0U; column < width; ++column)
+      update_gradient[static_cast<std::size_t>(target * width + column)] +=
+          load_float(grad_output, row * width + column);
+  }
+  if (grad_updates)
+    for (std::size_t index = 0U; index < update_gradient.size(); ++index)
+      store_float(*grad_updates, index, update_gradient[index]);
+}
+
+void h3_interleave_qkv_weight(const ir::Operation &op, TensorMap &tensors) {
+  auto &packed = tensors.at(op.outputs[0]);
+  const auto heads = op.u64(ir::AttrKey::Heads, 0U);
+  const auto dim = op.u64(ir::AttrKey::HeadDim, 0U);
+  const auto hidden = tensors.at(op.inputs[0]).dims[1];
+  for (std::uint64_t component = 0U; component < 3U; ++component) {
+    const auto &source = tensors.at(op.inputs[component]);
+    for (std::uint64_t head = 0U; head < heads; ++head)
+      for (std::uint64_t d = 0U; d < dim; ++d)
+        for (std::uint64_t column = 0U; column < hidden; ++column)
+          store_float(packed,
+                      ((head * 3U + component) * dim + d) * hidden + column,
+                      load_float(source, (head * dim + d) * hidden + column));
+  }
+}
+
+void h3_adaln_select_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &indices_tensor = tensors.at(op.inputs[0]);
+  auto &grad_projected = tensors.at(op.outputs[0]);
+  const auto *indices =
+      reinterpret_cast<const std::int32_t *>(indices_tensor.data());
+  const auto rows = indices_tensor.element_count();
+  const auto hidden = tensors.at(op.inputs[1]).dims[1];
+  const auto table_rows = grad_projected.dims[0] * 3U;
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_projected.element_count()), 0.0F);
+  for (std::uint64_t chunk = 0U; chunk < 6U; ++chunk) {
+    const auto &gradient = tensors.at(op.inputs[chunk + 1U]);
+    for (std::uint64_t row = 0U; row < rows; ++row) {
+      if (indices[row] < 0 ||
+          static_cast<std::uint64_t>(indices[row]) >= table_rows)
+        fail("h3_adaln_select_backward index is out of range");
+      const auto target =
+          (static_cast<std::uint64_t>(indices[row]) * 6U + chunk) * hidden;
+      for (std::uint64_t column = 0U; column < hidden; ++column)
+        accumulator[static_cast<std::size_t>(target + column)] +=
+            load_float(gradient, row * hidden + column);
+    }
+  }
+  for (std::size_t index = 0U; index < accumulator.size(); ++index)
+    store_float(grad_projected, index, accumulator[index]);
+}
+
 void channel_rms_norm_backward(const ir::Operation &op, TensorMap &tensors) {
   const auto &grad_output = tensors.at(op.inputs[0]);
   const auto &input = tensors.at(op.inputs[1]);
@@ -3573,6 +3683,18 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::GroupNormBackwardAffine:
       group_norm_backward_affine(op, tensors);
+      break;
+    case ir::Opcode::SelectRowChunksBackward:
+      select_row_chunks_backward(op, tensors);
+      break;
+    case ir::Opcode::IndexedUpdateRowsBackward:
+      indexed_update_rows_backward(op, tensors);
+      break;
+    case ir::Opcode::H3InterleaveQkvWeight:
+      h3_interleave_qkv_weight(op, tensors);
+      break;
+    case ir::Opcode::H3AdaLNSelectBackward:
+      h3_adaln_select_backward(op, tensors);
       break;
     case ir::Opcode::PadReflectBackward:
       pad_reflect_backward(op, tensors);

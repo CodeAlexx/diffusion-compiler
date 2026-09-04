@@ -7950,6 +7950,10 @@ public:
         case ir::Opcode::AttentionLse:
         case ir::Opcode::AttentionBackward:
         case ir::Opcode::LayerNormModulateBackward:
+        case ir::Opcode::SelectRowChunksBackward:
+        case ir::Opcode::IndexedUpdateRowsBackward:
+        case ir::Opcode::H3InterleaveQkvWeight:
+        case ir::Opcode::H3AdaLNSelectBackward:
         case ir::Opcode::PadReflectBackward:
         case ir::Opcode::ChannelRmsNormBackward:
         case ir::Opcode::GatherRowsBackward:

@@ -614,6 +614,90 @@ AutodiffResult differentiate(const ir::Program &forward,
       }
       break;
     }
+    case ir::Opcode::SelectRowChunks: {
+      // The gradients arrive one per chunk, in the forward's output order.
+      // A chunk whose output never reached the loss contributes nothing, and
+      // the backward needs a tensor for it anyway, so an explicit zero is
+      // filled rather than the shapes being allowed to disagree.
+      const auto values = operation.inputs[0];
+      std::vector<std::uint32_t> inputs{operation.inputs[1]};
+      for (std::size_t index = 0U; index < operation.outputs.size(); ++index) {
+        auto gradient = grad_outputs[index];
+        if (gradient == 0U) {
+          gradient = add_tensor(*result.program.tensor(operation.outputs[index]));
+          add_operation(ir::Opcode::Fill, {}, {gradient},
+                        {ir::Attribute::f64(ir::AttrKey::Value, 0.0)});
+        }
+        inputs.push_back(gradient);
+      }
+      const auto grad_values = add_tensor(*result.program.tensor(values));
+      add_operation(ir::Opcode::SelectRowChunksBackward, std::move(inputs),
+                    {grad_values});
+      accumulate(values, grad_values);
+      break;
+    }
+    case ir::Opcode::IndexedUpdateRows: {
+      const auto base = operation.inputs[0];
+      const auto updates = operation.inputs[1];
+      const auto grad_base = add_tensor(*result.program.tensor(base));
+      std::vector<std::uint32_t> outputs{grad_base};
+      std::uint32_t grad_updates = 0U;
+      const bool needs_updates =
+          requested.contains(updates) || produced.contains(updates);
+      if (needs_updates) {
+        grad_updates = add_tensor(*result.program.tensor(updates));
+        outputs.push_back(grad_updates);
+      }
+      add_operation(ir::Opcode::IndexedUpdateRowsBackward,
+                    {grad_output, operation.inputs[2]}, std::move(outputs));
+      accumulate(base, grad_base);
+      if (needs_updates)
+        accumulate(updates, grad_updates);
+      break;
+    }
+    case ir::Opcode::H3DeinterleaveQkvWeight: {
+      // The forward is a permutation, so the gradient is its inverse. Any
+      // component whose output did not reach the loss contributes zeros.
+      const auto packed = operation.inputs[0];
+      std::vector<std::uint32_t> inputs;
+      for (std::size_t index = 0U; index < 3U; ++index) {
+        auto gradient = grad_outputs[index];
+        if (gradient == 0U) {
+          gradient = add_tensor(*result.program.tensor(operation.outputs[index]));
+          add_operation(ir::Opcode::Fill, {}, {gradient},
+                        {ir::Attribute::f64(ir::AttrKey::Value, 0.0)});
+        }
+        inputs.push_back(gradient);
+      }
+      const auto grad_packed = add_tensor(*result.program.tensor(packed));
+      add_operation(ir::Opcode::H3InterleaveQkvWeight, std::move(inputs),
+                    {grad_packed},
+                    {ir::Attribute::u64(ir::AttrKey::Heads,
+                                        operation.u64(ir::AttrKey::Heads, 0U)),
+                     ir::Attribute::u64(
+                         ir::AttrKey::HeadDim,
+                         operation.u64(ir::AttrKey::HeadDim, 0U))});
+      accumulate(packed, grad_packed);
+      break;
+    }
+    case ir::Opcode::H3AdaLNSelect: {
+      const auto projected = operation.inputs[0];
+      std::vector<std::uint32_t> inputs{operation.inputs[1]};
+      for (std::size_t index = 0U; index < 6U; ++index) {
+        auto gradient = grad_outputs[index];
+        if (gradient == 0U) {
+          gradient = add_tensor(*result.program.tensor(operation.outputs[index]));
+          add_operation(ir::Opcode::Fill, {}, {gradient},
+                        {ir::Attribute::f64(ir::AttrKey::Value, 0.0)});
+        }
+        inputs.push_back(gradient);
+      }
+      const auto grad_projected = add_tensor(*result.program.tensor(projected));
+      add_operation(ir::Opcode::H3AdaLNSelectBackward, std::move(inputs),
+                    {grad_projected});
+      accumulate(projected, grad_projected);
+      break;
+    }
     case ir::Opcode::PadReflect: {
       // Every pad extent is stamped from the forward, because the gradient
       // has to fold back exactly the reflections the forward made.
@@ -862,7 +946,9 @@ AutodiffResult differentiate(const ir::Program &forward,
   for (const auto primal : with_respect_to) {
     const auto gradient = resolve(primal);
     if (gradient == 0U)
-      fail("autodiff target is disconnected from the loss");
+      fail("autodiff target " + std::to_string(primal) +
+           " is disconnected from the loss: nothing it feeds reaches the "
+           "value being differentiated");
     auto tensor = std::find_if(result.program.tensors.begin(),
                                result.program.tensors.end(),
                                [&](const auto &v) { return v.id == gradient; });
