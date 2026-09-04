@@ -248,12 +248,23 @@ gradients are the rest and no scheduling can touch those. The full step at
 costs, and it is the reason LoRA exists rather than a shortcoming of the plan.
 
 Gradients are gated against central differences of the forward program they
-claim to differentiate, then for CPU-versus-CUDA agreement, over nineteen
-cases at worst 0.44 of the admission budget. The budget was measured first and
-then tightened threefold, and it has teeth: an omitted group-norm mean term
-fails at 54 times budget, a one-percent convolution weight-gradient error at
-3.1 times, and a dropped batch offset in batched attention at twice the value
-range. Recompute is held to byte equality rather than a tolerance, and four
+claim to differentiate, then for CPU-versus-CUDA agreement, over more than
+fifty cases at worst 0.50 of the admission budget. The budget was measured first and
+then tightened threefold, and every bar is proven by injecting the defect it
+exists to catch: an omitted group-norm mean term fails at 54 times budget, a
+dropped temporal padding in the 3-D convolution at 815 times, an adaLN
+scatter that overwrites instead of summing at 408 times, a one-percent
+convolution weight-gradient error at 12 times the backend-agreement bar, and
+a swapped K/V in the packed-weight permutation at 65000 times it.
+
+That last one is worth stating plainly, because the injection found a bad
+test rather than a bad kernel. Summing the three split components into one
+loss gives all three the same upstream gradient, so a backward sending K's
+gradient to V's slot produced exactly the right answer and the case passed.
+It now takes three separate losses against three different targets. A gate
+that has not been shown to fail is not yet a gate.
+
+Recompute is held to byte equality rather than a tolerance, and four
 micro-batches of three match one batch of twelve to 4.2e-06 relative.
 
 ## Reporting rules

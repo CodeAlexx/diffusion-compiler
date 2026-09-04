@@ -55,9 +55,13 @@ checkpoint + frontend  ->  verified DiffIR  ->  compiler / optimizer / memory pl
 | FLUX.2 [dev] | Prompt to 1024x1024 PNG | RTX 3090 Ti | SquareQ W4 with INT8 compute from a rank-32 slab, or BF16 streamed |
 | SDXL base 1.0 | Prompt to 1024x1024 PNG | RTX 3090 Ti | F16 denoiser, F16 text towers, BF16 decoder |
 
-The SDXL UNet and VAE decoder also differentiate end to end: 2417 forward
-operations become 6623, producing all 1680 weight gradients, and the composed
-training step trains every F16 parameter through an F32 master.
+**Every model graph above differentiates.** Each of the eight frontends --
+both SDXL graphs, the SDXL CLIP text tower, the FLUX.2 transformer and VAE,
+the Krea 2 Qwen-Image VAE, and the MiniMax-H3 denoiser and video encoder --
+composes a complete training step from its own weights. The SDXL UNet is the
+largest: 2417 forward operations become 13347 with backward and optimizer,
+producing all 1680 weight gradients, every one of them trained through an F32
+master because the checkpoint is F16 and AdamW does not accept that storage.
 
 Each frontend also carries its conditioners and VAEs natively: Qwen3-VL
 vision/text conditioning, the H3 video encoder, video VAE, and audio VAE, the
