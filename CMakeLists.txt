@@ -122,6 +122,7 @@ add_library(difcore
     src/training/report.cpp
   src/training/config.cpp
   src/training/architecture.cpp
+  src/training/flow_matching.cpp
     src/training/recompute.cpp
     src/training/accumulate.cpp
     src/training/checkpoint.cpp
@@ -473,6 +474,14 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_training_gradient_tests tests/training_gradient_tests.cpp)
   target_link_libraries(dif_training_gradient_tests PRIVATE difcore)
   add_test(NAME dif_training_gradient_tests COMMAND dif_training_gradient_tests)
+
+  add_executable(dif_krea2_training_tests tests/krea2_training_tests.cpp)
+  target_link_libraries(dif_krea2_training_tests PRIVATE difcore)
+  add_test(NAME dif_krea2_training_tests COMMAND dif_krea2_training_tests)
+
+  add_executable(dif_flow_matching_tests tests/flow_matching_tests.cpp)
+  target_link_libraries(dif_flow_matching_tests PRIVATE difcore)
+  add_test(NAME dif_flow_matching_tests COMMAND dif_flow_matching_tests)
 
   add_executable(dif_training_config_tests tests/training_config_tests.cpp)
   target_link_libraries(dif_training_config_tests PRIVATE difcore)

@@ -1,7 +1,10 @@
 #include "dif/frontend/krea2_training.hpp"
 
 #include "dif/support/error.hpp"
+#include "dif/weights/safetensors.hpp"
 
+#include <filesystem>
+#include <map>
 #include <string>
 
 namespace dif::frontend {
@@ -105,6 +108,95 @@ krea2_training_architecture(const training::TrainingConfig &config) {
                              ".prenorm.scale",
                          0U, 0U));
   return architecture;
+}
+
+} // namespace dif::frontend
+
+namespace dif::frontend {
+
+Krea2TrainingBuild
+build_krea2_training(const training::TrainingConfig &config) {
+  using ir::Opcode;
+
+  Krea2TrainingBuild build;
+  const auto architecture = krea2_training_architecture(config);
+  build.config = architecture.config;
+
+  const auto run = training::read_run(config);
+  // The checkpoint is the authority on the architecture. Check the config
+  // against it BEFORE building a graph, so a wrong dimension costs a message
+  // rather than a 12-billion-parameter graph nobody can use.
+  if (std::filesystem::exists(run.checkpoint))
+    training::verify_architecture(weights::read_safetensors(run.checkpoint),
+                                  architecture.claims, config.source());
+
+  auto denoiser = make_krea2_denoiser(build.config);
+  build.context = denoiser.context_input;
+  build.positions = denoiser.positions_input;
+  build.validity_mask = denoiser.validity_mask_input;
+
+  // Which Linears a LoRA adapts: the eight per block the checkpoint names,
+  // found through the frontend's own provenance rather than by matching
+  // shapes. A predicate over shapes adapts the wrong sites the first time an
+  // architecture changes.
+  std::map<std::string, std::uint32_t> weight_of;
+  for (std::size_t index = 0U; index < denoiser.checkpoint_tensors.size();
+       ++index)
+    weight_of.emplace(denoiser.checkpoint_names[index],
+                      denoiser.checkpoint_tensors[index]);
+  std::map<std::uint32_t, std::uint32_t> linear_for_weight;
+  for (const auto &operation : denoiser.program.operations)
+    if (operation.opcode == Opcode::Linear && operation.inputs.size() >= 2U)
+      linear_for_weight.emplace(operation.inputs[1], operation.id);
+
+  opt::LoraSpec spec;
+  spec.rank = run.lora_rank;
+  spec.alpha = static_cast<double>(run.lora_alpha);
+  if (spec.rank == 0U)
+    fail("'lora_rank' in " + config.source().string() + " adapts nothing");
+  std::vector<std::string> names;
+  for (std::uint64_t block = 0U; block < build.config.kLayers; ++block)
+    for (const auto &site : krea2_lora_sites()) {
+      const auto name = "blocks." + std::to_string(block) + "." + site;
+      const auto weight = weight_of.find(name);
+      if (weight == weight_of.end())
+        fail("the Krea 2 denoiser has no weight named '" + name +
+             "', so a LoRA cannot adapt it");
+      const auto linear = linear_for_weight.find(weight->second);
+      if (linear == linear_for_weight.end())
+        fail("'" + name + "' is not consumed by a linear operation");
+      spec.operations.push_back(linear->second);
+      names.push_back(name);
+    }
+
+  auto adapted = opt::insert_lora(denoiser.program, spec);
+  build.sites = std::move(adapted.sites);
+  build.site_names = std::move(names);
+
+  // The objective. The denoiser's own timestep is reused rather than
+  // duplicated, so the noise level it is told about is the one it was given.
+  auto objective = training::add_flow_matching_loss(
+      std::move(adapted.program), denoiser.image_tokens_input,
+      denoiser.velocity_output, denoiser.timestep_input);
+  build.clean_latents = objective.clean_input;
+  build.noise = objective.noise_input;
+  build.timestep = objective.timestep_input;
+  build.loss = objective.loss_output;
+  build.target = objective.target_output;
+  build.velocity = denoiser.velocity_output;
+
+  training::OptimizerHyperparameters hyperparameters = run.optimizer;
+  // Adapters are F32, so no master copy is needed; the frozen base never
+  // moves at all.
+  hyperparameters.master_weights = false;
+  build.plan = training::compile(objective.program, build.loss,
+                                 adapted.parameters, hyperparameters);
+
+  for (std::size_t index = 0U; index < denoiser.checkpoint_tensors.size();
+       ++index)
+    build.frozen.emplace_back(denoiser.checkpoint_tensors[index],
+                              denoiser.checkpoint_names[index]);
+  return build;
 }
 
 } // namespace dif::frontend
