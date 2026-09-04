@@ -173,17 +173,21 @@ AutodiffResult differentiate(const ir::Program &forward,
        iterator != forward.operations.rend(); ++iterator) {
     const auto &operation = *iterator;
     current_consumer = operation.id;
-    std::uint32_t grad_output = 0U;
+    // Every output's gradient, in output order, zero where that output is
+    // not on a path to the loss. A single-output rule reads the first entry
+    // and cannot see the difference; an operation that produces several
+    // values gets all of them, which is the only way to differentiate one.
+    std::vector<std::uint32_t> grad_outputs;
+    grad_outputs.reserve(operation.outputs.size());
+    bool active = false;
     for (const auto output : operation.outputs) {
       const auto resolved = resolve(output);
-      if (resolved == 0U)
-        continue;
-      if (grad_output != 0U)
-        fail("autodiff does not yet support active multi-output operations");
-      grad_output = resolved;
+      grad_outputs.push_back(resolved);
+      active = active || resolved != 0U;
     }
-    if (grad_output == 0U)
+    if (!active)
       continue;
+    const auto grad_output = grad_outputs.front();
 
     switch (operation.opcode) {
     case ir::Opcode::MseLoss: {
@@ -716,8 +720,12 @@ AutodiffResult differentiate(const ir::Program &forward,
       break;
     }
     case ir::Opcode::SinusoidalTimestep:
-      // The timestep is a schedule position, not a learnable value: reverse
-      // mode terminates here the way it does at a Fill.
+    case ir::Opcode::RotaryPosition:
+      // A timestep and a rotary position are schedule coordinates, not
+      // learnable values: reverse mode terminates here the way it does at a
+      // Fill. RotaryPosition produces two tables and both terminate, which is
+      // why this needs the multi-output sweep above rather than a special
+      // case.
       break;
     case ir::Opcode::LayerNormModulate: {
       // One backward operation produces all five gradients, because the three
