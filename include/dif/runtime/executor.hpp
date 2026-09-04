@@ -27,6 +27,23 @@ struct LinearAlgorithmChoice {
   std::uint32_t heuristic_rank{};
 };
 
+// A tensor whose device value must survive from one execution to the next.
+//
+// The runtime allocates it once, keeps it resident, and after each execution
+// makes the value written to `output` the value that `input` will be read from
+// next time. Nothing about optimizers, adapters or any model is expressed
+// here: this is a statement about a pair of tensors in a program, and any
+// caller with the same shape of dataflow can use it.
+//
+// Both ids are named explicitly rather than being inferred from roles or from
+// adjacency, because an implicit rule would silently bind the wrong pair the
+// first time a program's tensor numbering changed.
+struct PersistentStateBinding {
+  std::uint32_t input{};
+  std::uint32_t output{};
+  bool operator==(const PersistentStateBinding &) const = default;
+};
+
 struct RunOptions {
   std::uint32_t warmups{2};
   std::uint32_t iterations{5};
@@ -42,6 +59,10 @@ struct RunOptions {
   // workspaces; operation math and DiffIR values are unchanged.
   std::vector<std::vector<std::uint32_t>> parallel_linear_groups;
   std::vector<std::uint32_t> fuse_linear_swiglu_operations;
+  // Declared when the plan is prepared and fixed thereafter, like the other
+  // plan-shaping options. A prepared execution refuses a run whose persistent
+  // state differs from the one it was prepared with.
+  std::vector<PersistentStateBinding> persistent_state;
   // Absorb an unbiased Linear's exclusive, immediately-adjacent BiasAdd into
   // the cuBLASLt bias epilogue: one library launch, no materialized
   // intermediate. Ids name the Linear operations (explicit = candidate
@@ -643,6 +664,13 @@ struct RunResult {
   std::string backend_name;
   std::string generated_source_hash;
   std::uint64_t resident_bytes{};
+  // Bytes moved between host and device FOR PERSISTENT STATE during this
+  // execution. Both are zero on an ordinary step: that is the property the
+  // mechanism exists to provide, so it is reported rather than assumed.
+  std::uint64_t persistent_state_host_to_device_bytes{};
+  std::uint64_t persistent_state_device_to_host_bytes{};
+  // Total bytes held resident on the device for persistent state.
+  std::uint64_t persistent_state_bytes{};
   std::vector<OperationTiming> operation_timings;
   std::vector<LinearTuningResult> linear_tuning_results;
   std::vector<LinearAlgorithmChoice> selected_linear_algorithms;
@@ -693,7 +721,26 @@ public:
   virtual std::string name() const = 0;
   virtual double preparation_milliseconds() const { return 0.0; }
   virtual std::uint64_t resident_bytes() const { return 0U; }
+
+  // Persistent state crosses the host boundary only when asked to. `capture`
+  // reads the current device value of every declared state tensor, keyed by
+  // its INPUT id -- the identity the state keeps across steps. `restore` puts
+  // values back, and refuses anything whose shape or dtype disagrees.
+  //
+  // A backend that does not implement persistent state says so rather than
+  // silently returning nothing.
+  virtual TensorMap capture_persistent_state() const;
+  virtual void restore_persistent_state(const TensorMap &state);
 };
+
+// Checks a persistent-state declaration against the program it belongs to and
+// throws on anything it cannot honour: an unknown tensor, a pair that is not
+// an actual program input and output, a shape or dtype disagreement, an input
+// that some operation also writes, an output nothing produces, or a tensor
+// named twice. Shared by every backend so they cannot drift.
+void validate_persistent_state(
+    const ir::Program &program,
+    const std::vector<PersistentStateBinding> &state);
 
 class Executor {
 public:

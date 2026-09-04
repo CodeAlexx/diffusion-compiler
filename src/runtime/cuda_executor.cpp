@@ -7102,7 +7102,8 @@ std::string compile_module(const std::string &source, int major, int minor,
 }
 
 void validate_inputs(const ir::Program &program, const TensorMap &inputs,
-                     const TensorMap &constants) {
+                     const TensorMap &constants,
+                     const std::unordered_set<std::uint32_t> &resident) {
   const auto &bound = [&](std::uint32_t id) -> const Tensor & {
     if (const auto found = inputs.find(id); found != inputs.end())
       return found->second;
@@ -7111,6 +7112,10 @@ void validate_inputs(const ir::Program &program, const TensorMap &inputs,
   for (const auto &desc : program.tensors) {
     if (!desc.has_role(ir::TensorRole::Input) &&
         !desc.has_role(ir::TensorRole::Constant))
+      continue;
+    // Session-owned state was validated once when it was seeded and has no
+    // host tensor to check here.
+    if (resident.contains(desc.id))
       continue;
     const auto &tensor = bound(desc.id);
     tensor.validate();
@@ -7673,9 +7678,14 @@ void upload_resident_constants(const ir::Program &program,
 }
 
 void upload_dynamic_inputs(const ir::Program &program, const TensorMap &inputs,
-                           DeviceBuffers &buffers, CUstream stream) {
+                           DeviceBuffers &buffers, CUstream stream,
+                           const std::unordered_set<std::uint32_t> &resident) {
   for (const auto &desc : program.tensors) {
     if (!desc.has_role(ir::TensorRole::Input))
+      continue;
+    // Persistent state already holds the current value on the device; it is
+    // not re-sent, which is the whole point of the mechanism.
+    if (resident.contains(desc.id))
       continue;
     const auto &tensor = inputs.at(desc.id);
     check(counted_memcpy_htod(buffers.at(desc.id), tensor.data(),
@@ -10529,7 +10539,7 @@ public:
               .count();
     }
     if (!options.tune_linear_operations.empty()) {
-      upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
+      upload_dynamic_inputs(program_, bindings, buffers_, context_.stream(), {});
       check(counted_stream_synchronize(context_.stream()),
             "Linear tuning input upload synchronization");
       std::unordered_set<std::uint32_t> tuned;
@@ -10644,6 +10654,33 @@ public:
     for (auto &plan : h3_modulation_cache_plans_)
       release_resident_host_pages(plan.modulation,
                                   resident_evict_host_pages_);
+    // Persistent state: validated, then seeded ONCE from the prepare
+    // bindings. This is the only host-to-device transfer these tensors ever
+    // see unless the caller explicitly restores them.
+    state_ = options.persistent_state;
+    validate_persistent_state(program_, state_);
+    for (const auto &binding : state_) {
+      const auto *desc = program_.tensor(binding.input);
+      const auto found = bindings.find(binding.input);
+      if (found == bindings.end())
+        fail("missing initial persistent state for tensor " +
+             std::to_string(binding.input));
+      found->second.validate();
+      if (found->second.dtype != desc->dtype ||
+          found->second.dims != desc->dims)
+        fail("initial persistent state shape/dtype mismatch for id " +
+             std::to_string(binding.input));
+      check(counted_memcpy_htod(buffers_.at(binding.input),
+                                found->second.data(),
+                                found->second.byte_size(), context_.stream()),
+            "cuMemcpyHtoDAsync persistent state seed");
+      state_inputs_.insert(binding.input);
+      state_outputs_.insert(binding.output);
+      state_bytes_ += found->second.byte_size();
+    }
+    if (!state_.empty())
+      check(counted_stream_synchronize(context_.stream()),
+            "persistent state seed synchronization");
     const auto preparation_stop = std::chrono::steady_clock::now();
     preparation_milliseconds_ =
         std::chrono::duration<double, std::milli>(preparation_stop -
@@ -10662,6 +10699,8 @@ public:
       fail("streamed mapped pages cannot be kept between runs and released per copy");
     if (options.lazy_resident_upload != lazy_resident_upload_)
       fail("lazy resident upload is fixed when the plan is prepared");
+    if (options.persistent_state != state_)
+      fail("persistent state is fixed when the plan is prepared");
     auto requested_captures = options.capture_intermediate_tensors;
     std::sort(requested_captures.begin(), requested_captures.end());
     if (requested_captures != capture_intermediate_tensors_)
@@ -10693,6 +10732,10 @@ public:
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Input))
         continue;
+      // The session owns this value on the device; a caller neither has to
+      // supply it nor can override it.
+      if (state_inputs_.contains(desc.id))
+        continue;
       const auto found = inputs.find(desc.id);
       if (found == inputs.end())
         fail("missing CUDA dynamic input tensor " + std::to_string(desc.id));
@@ -10703,7 +10746,7 @@ public:
              std::to_string(desc.id));
       bindings.emplace(desc.id, found->second);
     }
-    validate_inputs(program_, bindings, constants_);
+    validate_inputs(program_, bindings, constants_, state_inputs_);
     auto repeated_cache_ready = repeated_invariant_valid_;
     if (repeated_cache_ready) {
       for (const auto input_id : repeated_invariant_input_tensors_) {
@@ -10751,6 +10794,8 @@ public:
       for (const auto &desc : program_.tensors) {
         if (!desc.has_role(ir::TensorRole::Input))
           continue;
+        if (state_inputs_.contains(desc.id))
+          continue;
         const auto &tensor = bindings.at(desc.id);
         std::memcpy(base + offset, tensor.data(), tensor.byte_size());
         check(counted_memcpy_htod(buffers_.at(desc.id), base + offset,
@@ -10759,7 +10804,8 @@ public:
         offset += tensor.byte_size();
       }
     } else {
-      upload_dynamic_inputs(program_, bindings, buffers_, context_.stream());
+      upload_dynamic_inputs(program_, bindings, buffers_, context_.stream(),
+                            state_inputs_);
     }
     check(counted_stream_synchronize(context_.stream()),
           "dynamic input upload synchronization");
@@ -11907,6 +11953,11 @@ public:
       for (const auto &desc : program_.tensors) {
         if (!desc.has_role(ir::TensorRole::Output))
           continue;
+        // A state destination stays on the device. Bringing it back would
+        // undo the entire point of the mechanism, so it is not offered as an
+        // output at all -- capture_persistent_state() is the way to read it.
+        if (state_outputs_.contains(desc.id))
+          continue;
         auto tensor = zeros(desc);
         check(counted_memcpy_dtoh(tensor.mutable_data(), buffers_.at(desc.id),
                                 tensor.byte_size(), context_.stream()),
@@ -11916,6 +11967,14 @@ public:
       check(counted_stream_synchronize(context_.stream()),
             "output copy synchronization");
     }
+    // The value this run wrote becomes the value the next run reads. Both
+    // tensors hold a dedicated, never-shared slot in the memory plan, so
+    // exchanging the two pointers is sound and costs no copy at all.
+    for (const auto &binding : state_)
+      std::swap(buffers_.at(binding.input), buffers_.at(binding.output));
+    result.persistent_state_bytes = state_bytes_;
+    result.persistent_state_host_to_device_bytes = 0U;
+    result.persistent_state_device_to_host_bytes = 0U;
 
     std::size_t free_after = 0;
     std::size_t total = 0;
@@ -11975,6 +12034,48 @@ public:
     }
     telemetry::append_runtime_trace(result, program_, options);
     return result;
+  }
+
+  // The two places -- and the only two places -- where persistent state
+  // crosses the host boundary. Both are explicit calls; neither happens on a
+  // step.
+  TensorMap capture_persistent_state() const override {
+    TensorMap captured;
+    for (const auto &binding : state_) {
+      const auto *desc = program_.tensor(binding.input);
+      auto tensor = zeros(*desc);
+      check(counted_memcpy_dtoh(tensor.mutable_data(),
+                                buffers_.at(binding.input), tensor.byte_size(),
+                                context_.stream()),
+            "cuMemcpyDtoHAsync persistent state capture");
+      captured.emplace(binding.input, std::move(tensor));
+    }
+    if (!state_.empty())
+      check(counted_stream_synchronize(context_.stream()),
+            "persistent state capture synchronization");
+    return captured;
+  }
+
+  void restore_persistent_state(const TensorMap &state) override {
+    for (const auto &binding : state_) {
+      const auto found = state.find(binding.input);
+      if (found == state.end())
+        fail("restore is missing persistent state for tensor " +
+             std::to_string(binding.input));
+      const auto *desc = program_.tensor(binding.input);
+      found->second.validate();
+      if (found->second.dtype != desc->dtype ||
+          found->second.dims != desc->dims)
+        fail("restored persistent state shape/dtype mismatch for id " +
+             std::to_string(binding.input));
+      check(counted_memcpy_htod(buffers_.at(binding.input),
+                                found->second.data(),
+                                found->second.byte_size(), context_.stream()),
+            "cuMemcpyHtoDAsync persistent state restore");
+    }
+    if (!state_.empty())
+      check(counted_stream_synchronize(context_.stream()),
+            "persistent state restore synchronization");
   }
 
   std::string name() const override {
@@ -12310,6 +12411,12 @@ private:
   std::unordered_set<std::uint32_t> reshape_alias_operations_;
   std::unordered_map<std::uint32_t, std::uint32_t> reshape_aliases_;
   bool lazy_resident_upload_{};
+  // Tensors whose device value survives between runs, and the pairing that
+  // decides where the next run reads from.
+  std::vector<PersistentStateBinding> state_;
+  std::unordered_set<std::uint32_t> state_inputs_;
+  std::unordered_set<std::uint32_t> state_outputs_;
+  std::uint64_t state_bytes_{};
   bool repeated_invariant_valid_{};
   std::unique_ptr<Workspace> promoted_constant_storage_;
   std::uint64_t promoted_constant_bytes_{};

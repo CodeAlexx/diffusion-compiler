@@ -3992,8 +3992,9 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
 
 class CpuPreparedExecution final : public PreparedExecution {
 public:
-  CpuPreparedExecution(ir::Program program, const TensorMap &bindings)
-      : program_(std::move(program)) {
+  CpuPreparedExecution(ir::Program program, const TensorMap &bindings,
+                       const RunOptions &options)
+      : program_(std::move(program)), state_(options.persistent_state) {
     for (const auto &desc : program_.tensors) {
       if (!desc.has_role(ir::TensorRole::Constant))
         continue;
@@ -4006,15 +4007,57 @@ public:
              std::to_string(desc.id));
       constants_.emplace(desc.id, found->second);
     }
+    // Persistent state is seeded once, here, from the same bindings that seed
+    // the constants. After this the value lives in `state_values_` and no
+    // caller has to hand it back on a later run.
+    validate_persistent_state(program_, state_);
+    for (const auto &binding : state_) {
+      const auto *desc = program_.tensor(binding.input);
+      const auto found = bindings.find(binding.input);
+      if (found == bindings.end())
+        fail("missing initial persistent state for tensor " +
+             std::to_string(binding.input));
+      found->second.validate();
+      if (found->second.dtype != desc->dtype ||
+          found->second.dims != desc->dims)
+        fail("initial persistent state shape/dtype mismatch for id " +
+             std::to_string(binding.input));
+      state_bytes_ += found->second.byte_size();
+      state_values_.insert_or_assign(binding.input, found->second);
+    }
+  }
+
+  TensorMap capture_persistent_state() const override { return state_values_; }
+
+  void restore_persistent_state(const TensorMap &state) override {
+    for (const auto &binding : state_) {
+      const auto found = state.find(binding.input);
+      if (found == state.end())
+        fail("restore is missing persistent state for tensor " +
+             std::to_string(binding.input));
+      const auto *desc = program_.tensor(binding.input);
+      found->second.validate();
+      if (found->second.dtype != desc->dtype ||
+          found->second.dims != desc->dims)
+        fail("restored persistent state shape/dtype mismatch for id " +
+             std::to_string(binding.input));
+      state_values_.insert_or_assign(binding.input, found->second);
+    }
   }
 
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
+    if (options.persistent_state != state_)
+      fail("persistent state is fixed when the plan is prepared");
     TensorMap bindings = constants_;
     for (const auto &[id, tensor] : inputs) {
       const auto *desc = program_.tensor(id);
       if (desc && desc->has_role(ir::TensorRole::Input))
         bindings.insert_or_assign(id, tensor);
     }
+    // The carried value wins over anything a caller happens to pass, so a
+    // stale host copy cannot quietly overwrite the state the session owns.
+    for (const auto &[id, tensor] : state_values_)
+      bindings.insert_or_assign(id, tensor);
     validate_bound_inputs(program_, bindings);
     for (std::uint32_t warmup = 0; warmup < options.warmups; ++warmup) {
       auto tensors = initialize(program_, bindings);
@@ -4086,6 +4129,19 @@ public:
       if (desc.has_role(ir::TensorRole::Output))
         result.outputs.emplace(desc.id, std::move(final_tensors.at(desc.id)));
     }
+    // The value this step wrote becomes the value the next step reads. The
+    // state never leaves the executor, so nothing is copied across the host
+    // boundary and both counters stay at zero.
+    for (const auto &binding : state_) {
+      const auto produced = result.outputs.find(binding.output);
+      if (produced == result.outputs.end())
+        fail("persistent state destination " + std::to_string(binding.output) +
+             " was not produced by the run");
+      state_values_.insert_or_assign(binding.input, produced->second);
+    }
+    result.persistent_state_bytes = state_bytes_;
+    result.persistent_state_host_to_device_bytes = 0U;
+    result.persistent_state_device_to_host_bytes = 0U;
     telemetry::append_runtime_trace(result, program_, options);
     return result;
   }
@@ -4095,15 +4151,18 @@ public:
 private:
   ir::Program program_;
   TensorMap constants_;
+  std::vector<PersistentStateBinding> state_;
+  TensorMap state_values_;
+  std::uint64_t state_bytes_{};
 };
 
 class CpuExecutor final : public Executor {
 public:
   std::unique_ptr<PreparedExecution>
   prepare(const ir::Program &program, const TensorMap &bindings,
-          const RunOptions &) override {
+          const RunOptions &options) override {
     ir::verify(program);
-    return std::make_unique<CpuPreparedExecution>(program, bindings);
+    return std::make_unique<CpuPreparedExecution>(program, bindings, options);
   }
 
   std::string name() const override { return "cpu"; }

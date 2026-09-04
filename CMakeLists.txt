@@ -467,6 +467,10 @@ if(DIF_BUILD_TESTS)
   target_link_libraries(dif_training_gradient_tests PRIVATE difcore)
   add_test(NAME dif_training_gradient_tests COMMAND dif_training_gradient_tests)
 
+  add_executable(dif_persistent_state_tests tests/persistent_state_tests.cpp)
+  target_link_libraries(dif_persistent_state_tests PRIVATE difcore)
+  add_test(NAME dif_persistent_state_tests COMMAND dif_persistent_state_tests)
+
   add_executable(dif_training_step_tests tests/training_step_tests.cpp)
   target_link_libraries(dif_training_step_tests PRIVATE difcore)
   add_test(NAME dif_training_step_tests COMMAND dif_training_step_tests)
