@@ -234,62 +234,51 @@ void emit_conv1d(std::ostringstream &out, const ir::Program &program,
   const auto in_per_group = in_channels / groups;
   const auto out_per_group = out_channels / groups;
   const auto padded = length + pad_left + pad_right;
-
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* x,const dif_scalar* w,"
-      << (biased ? "const dif_scalar* bias," : "") << "dif_scalar* y){"
-      << "unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<" << count << "ULL){"
-      << "unsigned long long o=i%" << out_length << "ULL;"
-      << "unsigned long long oc=(i/" << out_length << "ULL)%" << out_channels
-      << "ULL;"
-      << "unsigned long long b=i/" << out_channels * out_length << "ULL;"
-      << "unsigned long long group=oc/" << out_per_group << "ULL;"
-      << "float acc=0.0f;";
+  const auto text = [](std::uint64_t v) { return std::to_string(v); };
   // Padded-coordinate sampler: position maps to input index pos-PadLeft,
   // replicate-clamped or zero outside; emitted as a literal expression.
   const auto clamped_sample = [&](const std::string &position) {
-    const auto shifted = "(" + position + "-" +
-                         std::to_string(pad_left) + "LL)";
+    const auto shifted = "(" + position + " - " + text(pad_left) + "LL)";
     if (!replicate)
-      return "((" + shifted + ">=0LL&&" + shifted + "<" +
-             std::to_string(length) +
-             "LL)?dif_load(xrow,(unsigned long long)" + shifted + "):0.0f)";
-    const auto last = std::to_string(length - 1U) + "LL";
-    return "dif_load(xrow,(unsigned long long)(" + shifted + "<0LL?0LL:(" +
-           shifted + ">" + last + "?" + last + ":" + shifted + ")))";
+      return "((" + shifted + " >= 0LL && " + shifted + " < " + text(length) +
+             "LL) ? dif_load(xrow, (unsigned long long)" + shifted + ") : 0.0f)";
+    const auto last = text(length - 1U) + "LL";
+    return "dif_load(xrow, (unsigned long long)(" + shifted + " < 0LL ? 0LL : (" +
+           shifted + " > " + last + " ? " + last + " : " + shifted + ")))";
   };
-  const std::string forward_sample = clamped_sample("p");
-  const std::string gather_sample = clamped_sample("pi");
-  if (!transposed) {
-    out << "for(unsigned long long ic=0;ic<" << in_per_group << "ULL;++ic){"
-        << "const dif_scalar* xrow=x+((b*" << in_channels
-        << "ULL)+(group*" << in_per_group << "ULL+ic))*" << length << "ULL;"
-        << "const dif_scalar* wrow=w+((oc*" << in_per_group << "ULL)+ic)*"
-        << kernel << "ULL;"
-        << "long long start=(long long)(o*" << stride << "ULL);"
-        << "for(unsigned long long k=0;k<" << kernel << "ULL;++k){"
-        << "long long p=start+(long long)(k*" << dilation << "ULL);"
-        << "acc+=" << forward_sample << "*dif_load(wrow,k);}}";
-  } else {
-    out << "unsigned long long ocg=oc%" << out_per_group << "ULL;"
-        << "long long ofull=(long long)o+" << trim_left << "LL;"
-        << "for(unsigned long long ic=0;ic<" << in_per_group << "ULL;++ic){"
-        << "const dif_scalar* xrow=x+((b*" << in_channels
-        << "ULL)+(group*" << in_per_group << "ULL+ic))*" << length << "ULL;"
-        << "const dif_scalar* wrow=w+(((group*" << in_per_group
-        << "ULL+ic)*" << out_per_group << "ULL)+ocg)*" << kernel << "ULL;"
-        << "long long imin=(ofull-" << kernel - 1U << "LL+" << stride
-        << "LL-1LL)/" << stride << "LL;if(imin<0LL)imin=0LL;"
-        << "long long imax=ofull/" << stride << "LL;if(imax>"
-        << padded - 1U << "LL)imax=" << padded - 1U << "LL;"
-        << "for(long long pi=imin;pi<=imax;++pi){"
-        << "long long k=ofull-pi*" << stride << "LL;"
-        << "if(k<0LL||k>=" << kernel << "LL)continue;"
-        << "acc+=" << gather_sample << "*dif_load(wrow,(unsigned long long)k);}}";
-  }
-  out << (biased ? "acc+=dif_load(bias,oc);" : "")
-      << "dif_store(y,i,acc);}}\n";
+  const std::string accumulate =
+      transposed
+          ? render_kernel_template(
+                "conv1d_transposed",
+                {{"out_per_group", text(out_per_group)},
+                 {"trim_left", text(trim_left)},
+                 {"in_per_group", text(in_per_group)},
+                 {"in_channels", text(in_channels)},
+                 {"length", text(length)},
+                 {"kernel", text(kernel)},
+                 {"kernel_minus_one", text(kernel - 1U)},
+                 {"stride", text(stride)},
+                 {"padded_minus_one", text(padded - 1U)},
+                 {"sample", clamped_sample("pi")}})
+          : render_kernel_template(
+                "conv1d_forward",
+                {{"in_per_group", text(in_per_group)},
+                 {"in_channels", text(in_channels)},
+                 {"length", text(length)},
+                 {"kernel", text(kernel)},
+                 {"stride", text(stride)},
+                 {"dilation", text(dilation)},
+                 {"sample", clamped_sample("p")}});
+  out << render_kernel_template(
+      "conv1d", {{"function", function_name(op)},
+                 {"bias_parameter", biased ? "const dif_scalar* bias, " : ""},
+                 {"count", text(count)},
+                 {"out_length", text(out_length)},
+                 {"out_channels", text(out_channels)},
+                 {"out_stride", text(out_channels * out_length)},
+                 {"out_per_group", text(out_per_group)},
+                 {"accumulate", accumulate},
+                 {"bias", biased ? "acc += dif_load(bias, oc);" : ""}});
 }
 
 void emit_channel_rms_norm(std::ostringstream &out,
@@ -813,42 +802,12 @@ void emit_quantize_fp8_blocks32(std::ostringstream &out,
   const auto rows = input->element_count() / columns;
   const auto blocks = (columns + 31U) / 32U;
   const auto scale_inner_dimension = scales->dims.at(1);
-  out << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_bf16* x,unsigned char* q,unsigned char* scales){"
-         "unsigned long long row=blockIdx.x;unsigned tid=threadIdx.x;"
-         "if(row>="
-      << rows
-      << "ULL)return;unsigned lane=tid&31U;unsigned warp=tid>>5U;"
-         "for(unsigned long long block=warp;block<"
-      << blocks
-      << "ULL;block+=8ULL){unsigned long long column=block*32ULL+lane;"
-         "float value=column<"
-      << columns
-      << "ULL?dif_load_bf16(x,row*" << columns
-      << "ULL+column):0.0f;float maximum=fabsf(value);"
-         "for(unsigned offset=16U;offset>0U;offset>>=1U)"
-         "maximum=fmaxf(maximum,__shfl_down_sync(0xffffffffU,maximum,offset));"
-         "maximum=__shfl_sync(0xffffffffU,maximum,0U);float target=maximum/448.0f;"
-         "unsigned bits=__float_as_uint(target)&0x7fffffffU;"
-         "unsigned exponent=bits>>23U;unsigned mantissa=bits&0x7fffffU;"
-         "unsigned encoded=(bits==0U)?0U:((exponent==0U)?"
-         "(mantissa>0x400000U?1U:0U):exponent+(mantissa!=0U));"
-         "unsigned char encoded_scale=(unsigned char)(encoded>254U?254U:encoded);"
-         "float scale=ldexpf(1.0f,(int)encoded_scale-127);"
-         "if(lane==0U){unsigned long long tile_outer=row/128ULL;"
-         "unsigned long long tile_inner=(block/4ULL)*4ULL;"
-         "unsigned long long within=(row%32ULL)*16ULL+"
-         "((row%128ULL)/32ULL)*4ULL+block%4ULL;"
-         "unsigned long long scale_offset=(tile_inner+tile_outer*"
-      << scale_inner_dimension
-      << "ULL)*128ULL+within;scales[scale_offset]=encoded_scale;}"
-         "if(column<"
-      << columns
-      << "ULL){float divided=value/scale;unsigned short pair;"
-         "asm(\"{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}\\n\":"
-         "\"=h\"(pair):\"f\"(divided),\"f\"(0.0f));"
-         "q[row*"
-      << columns << "ULL+column]=(unsigned char)pair;}}}\n";
+  out << render_kernel_template(
+      "quantize_fp8_blocks32", {{"function", function_name(op)},
+                                {"rows", std::to_string(rows)},
+                                {"blocks", std::to_string(blocks)},
+                                {"columns", std::to_string(columns)},
+                                {"scale_inner", std::to_string(scale_inner_dimension)}});
 }
 
 void emit_elementwise(std::ostringstream &out, const ir::Program &program,
@@ -1057,48 +1016,24 @@ void emit_rotary_apply(std::ostringstream &out, const ir::Program &program,
       static_cast<std::uint64_t>(ir::RotaryLayout::HalfSplit);
   // Interleaved: element d belongs to pair d/2, partner (d^1); HalfSplit:
   // pair d % pairs, partner d +- pairs. `second` selects the imaginary half.
-  const std::string pair_expression =
-      half_split ? "d%" + std::to_string(pairs) + "ULL" : "d/2ULL";
-  const std::string even_index =
-      half_split ? "base+pair" : "base+2ULL*pair";
-  const std::string odd_index =
-      half_split ? "base+pair+" + std::to_string(pairs) + "ULL"
-                 : "base+2ULL*pair+1ULL";
-  const std::string is_second =
-      half_split ? "(d>=" + std::to_string(pairs) + "ULL)" : "(d&1ULL)";
-  out << "extern \"C\" __global__ void " << function_name(op) << "(const "
-      << typed_scalar(input->dtype)
-      << "* x,const dif_f32* cosine,const dif_f32* sine,"
-      << typed_scalar(input->dtype)
-      << "* y){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+"
-         "threadIdx.x;if(i<"
-      << input->element_count() << "ULL){unsigned long long d=i%" << dim
-      << "ULL,outer=i/" << dim << "ULL,token=(outer/" << heads << "ULL)%"
-      << sequence << "ULL,batch=outer/(" << heads << "ULL*" << sequence
-      << "ULL);if(d<" << 2U * pairs
-      << "ULL){unsigned long long pair=" << pair_expression
-      << ",base=i-d,table=(batch*"
-      << sequence << "ULL+token)*" << pairs << "ULL+pair;float even="
-      << typed_load(input->dtype) << "(x," << even_index << "),odd="
-      << typed_load(input->dtype)
-      << "(x," << odd_index << "),c=dif_load_f32(cosine,table),"
-         "s=dif_load_f32(sine,table),first,second,result;"
-         "if(" << is_second << "){asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(first):"
-         "\"f\"(even),\"f\"(s));"
-         "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(second):"
-         "\"f\"(odd),\"f\"(c));"
-         "asm volatile(\"add.rn.f32 %0,%1,%2;\":\"=f\"(result):"
-         "\"f\"(first),\"f\"(second));}else{"
-         "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(first):"
-         "\"f\"(even),\"f\"(c));"
-         "asm volatile(\"mul.rn.f32 %0,%1,%2;\":\"=f\"(second):"
-         "\"f\"(odd),\"f\"(s));"
-         "asm volatile(\"sub.rn.f32 %0,%1,%2;\":\"=f\"(result):"
-         "\"f\"(first),\"f\"(second));}"
-      << typed_store(input->dtype)
-      << "(y,i,result);}else "
-      << typed_store(input->dtype) << "(y,i," << typed_load(input->dtype)
-      << "(x,i));}}\n";
+  const auto pairs_text = std::to_string(pairs);
+  out << render_kernel_template(
+      "rotary_apply",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(input->dtype)},
+       {"count", std::to_string(input->element_count())},
+       {"dim", std::to_string(dim)},
+       {"heads", std::to_string(heads)},
+       {"sequence", std::to_string(sequence)},
+       {"rotated", std::to_string(2U * pairs)},
+       {"pair", half_split ? "d % " + pairs_text + "ULL" : "d / 2ULL"},
+       {"pairs", pairs_text},
+       {"load", typed_load(input->dtype)},
+       {"even_index", half_split ? "base + pair" : "base + 2ULL * pair"},
+       {"odd_index", half_split ? "base + pair + " + pairs_text + "ULL"
+                                : "base + 2ULL * pair + 1ULL"},
+       {"is_second", half_split ? "(d >= " + pairs_text + "ULL)" : "(d & 1ULL)"},
+       {"store", typed_store(input->dtype)}});
 }
 
 void emit_boolean_mask_to_bias(std::ostringstream &out,
@@ -2275,47 +2210,26 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
   const auto group = heads / kv_heads;
   const std::string kv_head_expr =
       group == 1U ? std::string("h")
-                  : "h/" + std::to_string(group) + "ULL";
+                  : "h / " + std::to_string(group) + "ULL";
   const auto scale = op.f64(ir::AttrKey::AttentionScale,
                             1.0 / std::sqrt(static_cast<double>(dim)));
   const auto causal = op.boolean(ir::AttrKey::Causal, false);
-  out << std::setprecision(17)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* q,const dif_scalar* k,const dif_scalar* v,dif_scalar* y){\n"
-      << " extern __shared__ float shared[]; float* reduction=shared;"
-         "float* probabilities=shared+blockDim.x;"
-         "unsigned long long item=blockIdx.x;if(item>="
-      << sequence * heads << "ULL)return;unsigned long long qs=item/" << heads
-      << "ULL,h=item%" << heads << "ULL;unsigned long long kend="
-      << (causal ? "qs+1ULL" : std::to_string(sequence) + "ULL") << ";\n"
-      << " for(unsigned long long ks=0;ks<kend;++ks){float partial=0.0f;"
-         "for(unsigned long long d=threadIdx.x;d<"
-      << dim << "ULL;d+=blockDim.x)partial=fmaf(dif_load(q,(qs*" << heads << "ULL+h)*"
-      << dim << "ULL+d),dif_load(k,(ks*" << kv_heads << "ULL+"
-      << kv_head_expr << ")*" << dim
-      << "ULL+d),partial);reduction[threadIdx.x]=partial;__syncthreads();"
-         "for(unsigned int stride=blockDim.x/2;stride>0;stride>>=1){"
-         "if(threadIdx.x<stride)reduction[threadIdx.x]+=reduction[threadIdx.x+stride];"
-         "__syncthreads();}if(threadIdx.x==0)probabilities[ks]=reduction[0]*"
-      << static_cast<float>(scale) << "f;__syncthreads();}\n"
-      << " if(threadIdx.x==0){float maximum=-3.402823466e+38f;"
-         "for(unsigned long long ks=0;ks<kend;++ks)maximum=fmaxf(maximum,probabilities[ks]);"
-         "float denominator=0.0f;for(unsigned long long ks=0;ks<kend;++ks){"
-         "probabilities[ks]=expf(probabilities[ks]-maximum);denominator+=probabilities[ks];}"
-         "for(unsigned long long ks=0;ks<kend;++ks)probabilities[ks]/=denominator;}"
-         "__syncthreads();\n"
-      << " for(unsigned long long d=threadIdx.x;d<" << dim
-      << "ULL;d+=blockDim.x){float acc=0.0f;for(unsigned long long ks=0;ks<kend;++ks)"
-         "acc=fmaf(probabilities[ks],dif_load(v,(ks*"
-      << kv_heads << "ULL+" << kv_head_expr << ")*" << dim
-      << "ULL+d),acc);dif_store(y,(qs*" << heads
-      << "ULL+h)*" << dim << "ULL+d,acc);} }\n";
+  std::ostringstream scale_literal;
+  scale_literal << std::setprecision(17) << static_cast<float>(scale);
+  out << render_kernel_template(
+      "attention_exact",
+      {{"function", function_name(op)},
+       {"items", std::to_string(sequence * heads)},
+       {"heads", std::to_string(heads)},
+       {"kend", causal ? "qs + 1ULL" : std::to_string(sequence) + "ULL"},
+       {"dim", std::to_string(dim)},
+       {"kv_heads", std::to_string(kv_heads)},
+       {"kv_head", kv_head_expr},
+       {"scale", scale_literal.str()}});
+  // The historical emitter left the stream at precision 17.
+  out << std::setprecision(17);
 }
 
-// DiT backward emitters.  Contract: generic launch (one thread per element
-// of output[0], no shared memory), F32 register math with serial F32
-// accumulators for every cross-element reduction, one typed rounding store
-// per output element (flame dtype contract).
 void emit_rms_norm_backward(std::ostringstream &out,
                             const ir::Program &program,
                             const ir::Operation &op) {
@@ -2419,65 +2333,51 @@ void emit_qk_norm_rope_backward(std::ostringstream &out,
   const auto table_width = program.tensor(op.inputs[3])->dims[1];
   const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
   const bool weight_grad = op.outputs.size() == 2U;
+  const auto text = [](std::uint64_t v) { return std::to_string(v); };
   // rot(k): the rotation-transpose of the upstream gradient at offset k of
   // one head row (rb = row base, tb = table base), F32 registers.
   const auto rotated = [&](const std::string &row_base,
                            const std::string &table_base,
                            const std::string &k) {
-    std::ostringstream expression;
-    expression << "(" << k << "<" << half << "ULL?"
-               << "dif_load(grad_output," << row_base << "+" << k
-               << ")*dif_load(cosv," << table_base << "+" << k
-               << ")+dif_load(grad_output," << row_base << "+" << k << "+"
-               << half << "ULL)*dif_load(sinv," << table_base << "+"
-               << (table_width == rotary ? k + "+" + std::to_string(half) +
-                                               "ULL"
-                                         : k)
-               << "):(" << k << "<" << rotary << "ULL?"
-               << "-dif_load(grad_output," << row_base << "+" << k << "-"
-               << half << "ULL)*dif_load(sinv," << table_base << "+" << k
-               << "-" << half << "ULL)+dif_load(grad_output," << row_base
-               << "+" << k << ")*dif_load(cosv," << table_base << "+"
-               << (table_width == rotary ? k
-                                         : k + "-" + std::to_string(half) +
-                                               "ULL")
-               << "):dif_load(grad_output," << row_base << "+" << k << ")))";
-    return expression.str();
+    const auto half_text = text(half);
+    return "(" + k + " < " + half_text + "ULL ? dif_load(grad_output, " + row_base +
+           " + " + k + ") * dif_load(cosv, " + table_base + " + " + k +
+           ") + dif_load(grad_output, " + row_base + " + " + k + " + " + half_text +
+           "ULL) * dif_load(sinv, " + table_base + " + " +
+           (table_width == rotary ? k + " + " + half_text + "ULL" : k) +
+           ") : (" + k + " < " + text(rotary) + "ULL ? -dif_load(grad_output, " +
+           row_base + " + " + k + " - " + half_text + "ULL) * dif_load(sinv, " +
+           table_base + " + " + k + " - " + half_text + "ULL) + dif_load(grad_output, " +
+           row_base + " + " + k + ") * dif_load(cosv, " + table_base + " + " +
+           (table_width == rotary ? k : k + " - " + half_text + "ULL") +
+           ") : dif_load(grad_output, " + row_base + " + " + k + ")))";
   };
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op)
-      << "(const dif_scalar* grad_output,const dif_scalar* x,const dif_scalar* weight,const dif_scalar* cosv,const dif_scalar* sinv,dif_scalar* grad_input"
-      << (weight_grad ? ",dif_scalar* grad_weight" : "")
-      << "){unsigned long long i=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long row=i/" << dim
-      << "ULL,d=i%" << dim << "ULL,rb=row*" << dim
-      << "ULL,tb=(row/" << heads << "ULL)*" << table_width
-      << "ULL;float ss=0.0f;for(unsigned long long k=0ULL;k<" << dim
-      << "ULL;++k){float value=dif_load(x,rb+k);ss=fmaf(value,value,ss);}"
-         "float inv=rsqrtf(ss/"
-      << dim << ".0f+" << epsilon
-      << "f);float dot=0.0f;for(unsigned long long k=0ULL;k<" << dim
-      << "ULL;++k){float rotated_gradient=" << rotated("rb", "tb", "k")
-      << ";dot=fmaf(rotated_gradient*dif_load(weight,k),dif_load(x,rb+k),"
-         "dot);}float own_rotated="
-      << rotated("rb", "tb", "d")
-      << ";float value=dif_load(x,i);"
-         "dif_store(grad_input,i,own_rotated*dif_load(weight,d)*inv-"
-         "value*inv*inv*inv*dot/"
-      << dim << ".0f);";
-  if (weight_grad)
-    out << "if(i<" << dim
-        << "ULL){float acc=0.0f;for(unsigned long long r=0ULL;r<"
-        << sequence * heads << "ULL;++r){unsigned long long rrb=r*" << dim
-        << "ULL,rtb=(r/" << heads << "ULL)*" << table_width
-        << "ULL;float rss=0.0f;for(unsigned long long k=0ULL;k<" << dim
-        << "ULL;++k){float rv=dif_load(x,rrb+k);rss=fmaf(rv,rv,rss);}"
-           "float rinv=rsqrtf(rss/"
-        << dim << ".0f+" << epsilon << "f);float rotated_gradient="
-        << rotated("rrb", "rtb", "i")
-        << ";acc=fmaf(rotated_gradient*dif_load(x,rrb+i),rinv,acc);}"
-           "dif_store(grad_weight,i,acc);}";
-  out << "}}\n" << std::defaultfloat;
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9) << epsilon;
+  const std::string weight_gradient =
+      weight_grad ? render_kernel_template(
+                        "qk_norm_rope_backward_weight",
+                        {{"dim", text(dim)},
+                         {"rows", text(sequence * heads)},
+                         {"heads", text(heads)},
+                         {"table_width", text(table_width)},
+                         {"epsilon", epsilon_literal.str()},
+                         {"rotated_i", rotated("rrb", "rtb", "i")}})
+                  : std::string{};
+  out << render_kernel_template(
+      "qk_norm_rope_backward",
+      {{"function", function_name(op)},
+       {"weight_parameter", weight_grad ? ", dif_scalar* grad_weight" : ""},
+       {"count", text(count)},
+       {"dim", text(dim)},
+       {"heads", text(heads)},
+       {"table_width", text(table_width)},
+       {"epsilon", epsilon_literal.str()},
+       {"rotated_k", rotated("rb", "tb", "k")},
+       {"rotated_d", rotated("rb", "tb", "d")},
+       {"weight_gradient", weight_gradient}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_layer_norm_backward(std::ostringstream &out,
@@ -2522,36 +2422,26 @@ void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
   // byte-identical to the pre-GQA kernel for every existing program.
   const std::string kv_head_expr =
       group == 1U ? std::string("h")
-                  : "h/" + std::to_string(group) + "ULL";
+                  : "h / " + std::to_string(group) + "ULL";
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
-  const auto *scalar = typed_scalar(q->dtype);
-  const auto *load = typed_load(q->dtype);
-  out << std::scientific << std::setprecision(9)
-      << "extern \"C\" __global__ void " << function_name(op) << "(const "
-      << scalar << "* q,const " << scalar
-      << "* k,dif_f32* lse){unsigned long long i=(unsigned long long)"
-         "blockIdx.x*blockDim.x+threadIdx.x;if(i<"
-      << count << "ULL){unsigned long long qs=i/" << heads << "ULL,h=i%"
-      << heads << "ULL,qb=(qs*" << heads << "ULL+h)*" << dim
-      << "ULL,kend=" << (causal ? "qs+1ULL" : std::to_string(sequence) + "ULL")
-      << ";float maximum=-3.402823466e+38f;"
-         "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
-         "unsigned long long kb=(ks*"
-      << kv_heads << "ULL+" << kv_head_expr << ")*" << dim
-      << "ULL;for(unsigned long long d=0ULL;d<" << dim
-      << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
-      << "(k,kb+d),score);score*=" << scale
-      << "f;maximum=fmaxf(maximum,score);}float denominator=0.0f;"
-         "for(unsigned long long ks=0ULL;ks<kend;++ks){float score=0.0f;"
-         "unsigned long long kb=(ks*"
-      << kv_heads << "ULL+" << kv_head_expr << ")*" << dim
-      << "ULL;for(unsigned long long d=0ULL;d<" << dim
-      << "ULL;++d)score=fmaf(" << load << "(q,qb+d)," << load
-      << "(k,kb+d),score);denominator+=expf(score*" << scale
-      << "f-maximum);}dif_store_f32(lse,i,maximum+logf(denominator));}}\n"
-      << std::defaultfloat;
+  std::ostringstream scale_literal;
+  scale_literal << std::scientific << std::setprecision(9) << scale;
+  out << render_kernel_template(
+      "attention_lse",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(q->dtype)},
+       {"count", std::to_string(count)},
+       {"heads", std::to_string(heads)},
+       {"dim", std::to_string(dim)},
+       {"kend", causal ? "qs + 1ULL" : std::to_string(sequence) + "ULL"},
+       {"kv_heads", std::to_string(kv_heads)},
+       {"kv_head", kv_head_expr},
+       {"load", typed_load(q->dtype)},
+       {"scale", scale_literal.str()}});
+  // The historical emitter left the stream at precision 9, defaultfloat.
+  out << std::setprecision(9) << std::defaultfloat;
 }
 
 void emit_attention_backward(std::ostringstream &out,

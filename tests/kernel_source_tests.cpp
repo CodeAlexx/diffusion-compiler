@@ -564,6 +564,100 @@ Program batch6_program(std::string_view which) {
   return program;
 }
 
+
+Program batch7_program(std::string_view which) {
+  Program program;
+  auto op = [&](Opcode opcode, std::vector<std::uint32_t> inputs,
+                std::vector<std::uint32_t> outputs,
+                std::vector<Attribute> attributes = {}) {
+    program.operations = {{1, opcode, std::move(inputs), std::move(outputs),
+                           std::move(attributes)}};
+  };
+  if (which == "conv1d" || which == "conv1d_bias" || which == "conv1d_replicate") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 8}},
+                       {2, DType::BF16, TensorRole::Constant, {4, 2, 3}},
+                       {3, DType::BF16, TensorRole::Output, {1, 4, 8}}};
+    std::vector<std::uint32_t> inputs{1, 2};
+    if (which == "conv1d_bias") {
+      program.tensors.push_back({4, DType::BF16, TensorRole::Constant, {4}});
+      inputs.push_back(4);
+    }
+    std::vector<Attribute> attributes{Attribute::u64(AttrKey::PadLeft, 1U),
+                                      Attribute::u64(AttrKey::PadRight, 1U)};
+    if (which == "conv1d_replicate")
+      attributes.push_back(Attribute::u64(AttrKey::PadMode, 1U));
+    op(Opcode::Conv1d, inputs, {3}, attributes);
+  } else if (which == "conv1d_transposed") {
+    // stride 2 transposed conv: L_out = (L-1)*stride + K - pad_left - pad_right
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 4}},
+                       {2, DType::BF16, TensorRole::Constant, {2, 4, 4}},
+                       {3, DType::BF16, TensorRole::Output, {1, 4, 10}}};
+    op(Opcode::Conv1d, {1, 2}, {3},
+       {Attribute::boolean(AttrKey::Transposed, true),
+        Attribute::u64(AttrKey::Stride, 2U)});
+  } else if (which == "quantize_fp8_blocks32") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 64}},
+                       {2, DType::FP8E4M3, TensorRole::Output, {4, 64}},
+                       {3, DType::FP8E8M0, TensorRole::Output, {128, 4}}};
+    op(Opcode::QuantizeFp8Blocks32, {1}, {2, 3});
+  } else if (which == "rotary_apply_interleaved" || which == "rotary_apply_half_split") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 4, 2, 8}},
+                       {2, DType::F32, TensorRole::Input, {1, 4, 4}},
+                       {3, DType::F32, TensorRole::Input, {1, 4, 4}},
+                       {4, DType::BF16, TensorRole::Output, {1, 4, 2, 8}}};
+    op(Opcode::RotaryApply, {1, 2, 3}, {4},
+       {Attribute::u64(AttrKey::RotaryLayout,
+                       static_cast<std::uint64_t>(
+                           which == "rotary_apply_half_split"
+                               ? RotaryLayout::HalfSplit
+                               : RotaryLayout::Interleaved))});
+  } else if (which == "attention_exact" || which == "attention_exact_causal" ||
+             which == "attention_exact_gqa") {
+    const std::uint64_t kv = which == "attention_exact_gqa" ? 1U : 2U;
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, kv, 8}},
+                       {3, DType::BF16, TensorRole::Input, {4, kv, 8}},
+                       {4, DType::BF16, TensorRole::Output, {4, 2, 8}}};
+    std::vector<Attribute> attributes;
+    if (which == "attention_exact_causal")
+      attributes.push_back(Attribute::boolean(AttrKey::Causal, true));
+    if (which == "attention_exact_gqa")
+      attributes.push_back(Attribute::u64(AttrKey::KvHeads, 1U));
+    op(Opcode::Attention, {1, 2, 3}, {4}, attributes);
+  } else if (which == "attention_lse" || which == "attention_lse_causal_gqa") {
+    const bool gqa = which == "attention_lse_causal_gqa";
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, gqa ? 1U : 2U, 8}},
+                       {3, DType::F32, TensorRole::Output, {4, 2}}};
+    std::vector<Attribute> attributes{accumulate_f32()};
+    if (gqa) {
+      attributes.push_back(Attribute::boolean(AttrKey::Causal, true));
+      attributes.push_back(Attribute::u64(AttrKey::KvHeads, 1U));
+    }
+    op(Opcode::AttentionLse, {1, 2}, {3}, attributes);
+  } else if (which == "qk_norm_rope_backward" || which == "qk_norm_rope_backward_half_table" ||
+             which == "qk_norm_rope_backward_weight") {
+    const std::uint64_t table = which == "qk_norm_rope_backward_half_table" ? 4U : 8U;
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 2, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 2, 8}},
+                       {3, DType::BF16, TensorRole::Constant, {8}},
+                       {4, DType::BF16, TensorRole::Input, {4, table}},
+                       {5, DType::BF16, TensorRole::Input, {4, table}},
+                       {6, DType::BF16, TensorRole::Output, {4, 2, 8}}};
+    std::vector<std::uint32_t> outputs{6};
+    if (which == "qk_norm_rope_backward_weight") {
+      program.tensors.push_back({7, DType::BF16, TensorRole::Output, {8}});
+      outputs.push_back(7);
+    }
+    op(Opcode::QkNormPartialRopeBackward, {1, 2, 3, 4, 5}, outputs,
+       {accumulate_f32(), Attribute::u64(AttrKey::RotaryDim, 8U),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-6)});
+  } else {
+    fail("unknown batch7 corpus program " + std::string(which));
+  }
+  return program;
+}
+
 std::vector<Case> corpus() {
   using Q = Int8RowQuantization;
   return {
@@ -705,6 +799,22 @@ std::vector<Case> corpus() {
       {"layer_norm_backward", [] { return batch6_program("layer_norm_backward"); }},
       {"rms_norm_modulate_backward", [] { return batch6_program("rms_norm_modulate_backward"); }},
       {"rms_norm_modulate_backward_weighted", [] { return batch6_program("rms_norm_modulate_backward_weighted"); }},
+      // batch 7: conv1d, MXFP8, rotary apply, exact attention, LSE, qk-norm-rope backward
+      {"conv1d", [] { return batch7_program("conv1d"); }},
+      {"conv1d_bias", [] { return batch7_program("conv1d_bias"); }},
+      {"conv1d_replicate", [] { return batch7_program("conv1d_replicate"); }},
+      {"conv1d_transposed", [] { return batch7_program("conv1d_transposed"); }},
+      {"quantize_fp8_blocks32", [] { return batch7_program("quantize_fp8_blocks32"); }},
+      {"rotary_apply_interleaved", [] { return batch7_program("rotary_apply_interleaved"); }},
+      {"rotary_apply_half_split", [] { return batch7_program("rotary_apply_half_split"); }},
+      {"attention_exact", [] { return batch7_program("attention_exact"); }},
+      {"attention_exact_causal", [] { return batch7_program("attention_exact_causal"); }},
+      {"attention_exact_gqa", [] { return batch7_program("attention_exact_gqa"); }},
+      {"attention_lse", [] { return batch7_program("attention_lse"); }},
+      {"attention_lse_causal_gqa", [] { return batch7_program("attention_lse_causal_gqa"); }},
+      {"qk_norm_rope_backward", [] { return batch7_program("qk_norm_rope_backward"); }},
+      {"qk_norm_rope_backward_half_table", [] { return batch7_program("qk_norm_rope_backward_half_table"); }},
+      {"qk_norm_rope_backward_weight", [] { return batch7_program("qk_norm_rope_backward_weight"); }},
   };
 }
 
