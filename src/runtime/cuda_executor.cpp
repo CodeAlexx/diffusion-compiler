@@ -7949,6 +7949,8 @@ public:
         case ir::Opcode::QkNormPartialRopeBackward:
         case ir::Opcode::AttentionLse:
         case ir::Opcode::AttentionBackward:
+        case ir::Opcode::SigmoidBackward:
+        case ir::Opcode::ClampBackward:
         case ir::Opcode::GeluBackward:
         case ir::Opcode::UpsampleNearest2dBackward:
         case ir::Opcode::SliceBackward:

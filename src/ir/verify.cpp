@@ -305,6 +305,22 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::ClampBackward) {
+    expect_counts(op, 2, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &input = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    const auto lower = op.f64(AttrKey::Lower,
+                              -std::numeric_limits<double>::infinity());
+    const auto upper = op.f64(AttrKey::Upper,
+                              std::numeric_limits<double>::infinity());
+    if (!supported_float(input.dtype) || !(lower <= upper))
+      fail("clamp_backward requires float tensors and lower <= upper");
+    return;
+  }
+
   if (op.opcode == Opcode::MseLoss) {
     expect_counts(op, 2, 1);
     const auto &prediction = tensor_or_fail(program, op.inputs[0], op);
@@ -553,6 +569,19 @@ void verify_operation(const Program &program, const Operation &op) {
     if (groups == 0U || input.dims[1] % groups != 0U ||
         !(op.f64(AttrKey::Epsilon, 1.0e-5) > 0.0))
       fail("group_norm_backward_affine has invalid normalization geometry");
+    return;
+  }
+
+  if (op.opcode == Opcode::SigmoidBackward) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype))
+      fail("sigmoid_backward admits f32, bf16, or f16 tensors");
     return;
   }
 

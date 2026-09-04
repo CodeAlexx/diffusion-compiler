@@ -261,6 +261,68 @@ Case group_norm_case() {
   return c;
 }
 
+// The elementwise and affine rules the VAE and text frontends need. Clamp is
+// checked with the sampled values straddling both bounds, so the saturated
+// region is actually exercised rather than assumed.
+Case clamp_case() {
+  Case c;
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, {4U, 5U}},
+                       {2U, DType::F32, TensorRole::Internal, {4U, 5U}},
+                       {3U, DType::F32, TensorRole::Input, {4U, 5U}},
+                       {4U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {
+      {1U, Opcode::Clamp, {1U}, {2U},
+       {Attribute::f64(AttrKey::Lower, -0.5), Attribute::f64(AttrKey::Upper, 0.5)}},
+      {2U, Opcode::MseLoss, {2U, 3U}, {4U}, {}}};
+  c.inputs.emplace(1U, f32_tensor({4U, 5U}, 101U, 1.5F));
+  c.inputs.emplace(3U, f32_tensor({4U, 5U}, 103U, 1.0F));
+  c.loss = 4U;
+  c.targets = {1U};
+  return c;
+}
+
+Case sigmoid_case() {
+  Case c;
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, {4U, 5U}},
+                       {2U, DType::F32, TensorRole::Internal, {4U, 5U}},
+                       {3U, DType::F32, TensorRole::Input, {4U, 5U}},
+                       {4U, DType::F32, TensorRole::Output, {1U}}};
+  c.program.operations = {{1U, Opcode::Sigmoid, {1U}, {2U}, {}},
+                          {2U, Opcode::MseLoss, {2U, 3U}, {4U}, {}}};
+  c.inputs.emplace(1U, f32_tensor({4U, 5U}, 107U, 2.0F));
+  c.inputs.emplace(3U, f32_tensor({4U, 5U}, 109U, 1.0F));
+  c.loss = 4U;
+  c.targets = {1U};
+  return c;
+}
+
+// The affine rule adds no opcode: it composes from AffineLastDim, Multiply
+// and BiasBackward. That makes it more worth checking, not less -- a
+// composition can be wrong in ways a fused kernel cannot.
+Case affine_case(bool with_bias) {
+  Case c;
+  c.program.tensors = {{1U, DType::F32, TensorRole::Input, {4U, 5U}},
+                       {2U, DType::F32, TensorRole::Input, {5U}},
+                       {3U, DType::F32, TensorRole::Input, {5U}},
+                       {4U, DType::F32, TensorRole::Internal, {4U, 5U}},
+                       {5U, DType::F32, TensorRole::Input, {4U, 5U}},
+                       {6U, DType::F32, TensorRole::Output, {1U}}};
+  std::vector<std::uint32_t> inputs{1U, 2U};
+  if (with_bias)
+    inputs.push_back(3U);
+  c.program.operations = {
+      {1U, Opcode::AffineLastDim, inputs, {4U}, {}},
+      {2U, Opcode::MseLoss, {4U, 5U}, {6U}, {}}};
+  c.inputs.emplace(1U, f32_tensor({4U, 5U}, 113U, 1.0F));
+  c.inputs.emplace(2U, f32_tensor({5U}, 127U, 1.0F));
+  c.inputs.emplace(3U, f32_tensor({5U}, 131U, 0.5F));
+  c.inputs.emplace(5U, f32_tensor({4U, 5U}, 137U, 1.0F));
+  c.loss = 6U;
+  c.targets = with_bias ? std::vector<std::uint32_t>{1U, 2U, 3U}
+                        : std::vector<std::uint32_t>{1U, 2U};
+  return c;
+}
+
 // Attention over every geometry a real model carries: unbatched [S,H,D] and
 // batched [B,S,H,D], square self attention and cross attention whose keys
 // carry their own row count, plain and grouped-query.  The backward kernel
@@ -408,6 +470,10 @@ int main() {
   run("conv2d strided", conv2d_case(2U, 1U, 1U));
   run("conv2d unpadded", conv2d_case(1U, 0U, 1U));
   run("conv2d grouped", conv2d_case(1U, 1U, 2U));
+  run("clamp", clamp_case());
+  run("sigmoid", sigmoid_case());
+  run("affine last dim", affine_case(true));
+  run("affine last dim no bias", affine_case(false));
   run("attention", attention_case(false, 4U, 2U, false));
   run("attention causal", attention_case(false, 4U, 2U, true));
   run("attention gqa", attention_case(false, 4U, 1U, false));

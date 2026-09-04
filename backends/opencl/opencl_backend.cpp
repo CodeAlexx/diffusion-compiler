@@ -966,6 +966,8 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::QkNormPartialRopeBackward:
     case Opcode::AttentionLse:
     case Opcode::AttentionBackward:
+    case Opcode::SigmoidBackward:
+    case Opcode::ClampBackward:
     case Opcode::GeluBackward:
     case Opcode::UpsampleNearest2dBackward:
     case Opcode::SliceBackward:

@@ -1153,6 +1153,47 @@ std::string group_reduction_fragment(std::uint64_t block) {
   return reduction;
 }
 
+void emit_sigmoid_backward(std::ostringstream &out, const ir::Program &program,
+                           const ir::Operation &op) {
+  out << render_kernel_template(
+      "sigmoid_backward",
+      {{"function", function_name(op)},
+       {"count", std::to_string(
+                     program.tensor(op.outputs[0])->element_count())}});
+}
+
+void emit_clamp_backward(std::ostringstream &out, const ir::Program &program,
+                         const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[1]);
+  const auto count = input->element_count();
+  // Infinite bounds are the defaults, and an infinity literal in generated
+  // CUDA is a portability hazard; the largest finite float compares the same
+  // way for every value the kernel can see.
+  const auto bound = [](double value) {
+    std::ostringstream text;
+    text << std::setprecision(9);
+    if (value <= -std::numeric_limits<float>::max())
+      text << "-3.402823466e+38";
+    else if (value >= std::numeric_limits<float>::max())
+      text << "3.402823466e+38";
+    else
+      text << static_cast<float>(value);
+    return text.str();
+  };
+  out << render_kernel_template(
+      "clamp_backward",
+      {{"function", function_name(op)},
+       {"scalar", typed_scalar(input->dtype)},
+       {"count", std::to_string(count)},
+       {"load", typed_load(input->dtype)},
+       {"store", typed_store(input->dtype)},
+       {"lower", bound(op.f64(ir::AttrKey::Lower,
+                              -std::numeric_limits<double>::infinity()))},
+       {"upper", bound(op.f64(ir::AttrKey::Upper,
+                              std::numeric_limits<double>::infinity()))}});
+  out << std::setprecision(9);
+}
+
 void emit_gelu_backward(std::ostringstream &out, const ir::Program &program,
                         const ir::Operation &op) {
   const auto count = program.tensor(op.outputs[0])->element_count();
@@ -3201,6 +3242,12 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       break;
     case ir::Opcode::QkNormPartialRopeBackward:
       emit_qk_norm_rope_backward(source, program, op);
+      break;
+    case ir::Opcode::SigmoidBackward:
+      emit_sigmoid_backward(source, program, op);
+      break;
+    case ir::Opcode::ClampBackward:
+      emit_clamp_backward(source, program, op);
       break;
     case ir::Opcode::AttentionLse:
       emit_attention_lse(source, program, op);

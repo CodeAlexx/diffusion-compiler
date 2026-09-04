@@ -4,8 +4,10 @@
 #include "dif/support/error.hpp"
 
 #include <algorithm>
+#include <set>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -68,6 +70,10 @@ AutodiffResult differentiate(const ir::Program &forward,
   for (const auto &operation : forward.operations)
     for (const auto output : operation.outputs)
       produced.insert(output);
+
+  // Every active opcode the reverse sweep has no rule for, collected so a
+  // port learns the whole list at once.
+  std::set<std::string> missing;
 
   AutodiffResult result;
   result.program = forward;
@@ -579,6 +585,65 @@ AutodiffResult differentiate(const ir::Program &forward,
       // The timestep is a schedule position, not a learnable value: reverse
       // mode terminates here the way it does at a Fill.
       break;
+    case ir::Opcode::Sigmoid: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::SigmoidBackward,
+                    {operation.inputs[0], grad_output}, {grad_input});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::AffineLastDim: {
+      // y = x * scale[c] + bias[c].  Every gradient here is something the IR
+      // can already say, so this rule adds no opcode:
+      //   dx    = g * scale[c]        -- an AffineLastDim with no bias
+      //   dbias = column sum of g     -- exactly BiasBackward
+      //   dscale = column sum of g*x  -- a Multiply, then BiasBackward
+      const auto x = operation.inputs[0];
+      const auto scale = operation.inputs[1];
+      if (requested.contains(x) || produced.contains(x)) {
+        const auto grad_input = add_tensor(*result.program.tensor(x));
+        add_operation(ir::Opcode::AffineLastDim, {grad_output, scale},
+                      {grad_input});
+        accumulate(x, grad_input);
+      }
+      if (requested.contains(scale) || produced.contains(scale)) {
+        const auto product = add_tensor(*result.program.tensor(x));
+        add_operation(ir::Opcode::Multiply, {grad_output, x}, {product});
+        const auto grad_scale = add_tensor(*result.program.tensor(scale));
+        add_operation(ir::Opcode::BiasBackward, {product}, {grad_scale});
+        accumulate(scale, grad_scale);
+      }
+      if (operation.inputs.size() == 3U) {
+        const auto bias = operation.inputs[2];
+        if (requested.contains(bias) || produced.contains(bias)) {
+          const auto grad_bias = add_tensor(*result.program.tensor(bias));
+          add_operation(ir::Opcode::BiasBackward, {grad_output}, {grad_bias});
+          accumulate(bias, grad_bias);
+        }
+      }
+      break;
+    }
+    case ir::Opcode::Clamp: {
+      // The bounds travel onto the backward op explicitly, stamped with the
+      // forward's own defaults, so the two can never resolve a different
+      // saturation range.
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(
+          ir::Opcode::ClampBackward, {grad_output, operation.inputs[0]},
+          {grad_input},
+          {ir::Attribute::f64(
+               ir::AttrKey::Lower,
+               operation.f64(ir::AttrKey::Lower,
+                             -std::numeric_limits<double>::infinity())),
+           ir::Attribute::f64(
+               ir::AttrKey::Upper,
+               operation.f64(ir::AttrKey::Upper,
+                             std::numeric_limits<double>::infinity()))});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
     case ir::Opcode::Cast: {
       // Cast is the mixed-precision boundary op.  The gradient of
       // Cast(x, dt) with upstream gradient g is Cast(g, dtype(x)):
@@ -595,9 +660,22 @@ AutodiffResult differentiate(const ir::Program &forward,
       // so reverse mode terminates at this leaf.
       break;
     default:
-      fail("autodiff encountered unsupported active opcode " +
-           std::string(ir::opcode_name(operation.opcode)));
+      // Do not stop at the first one.  Porting a model means finding out
+      // everything its graph needs, and one opcode per run is a slow way to
+      // learn it -- so record this and keep sweeping.  The gradients built
+      // after this point are incomplete, which is why the collected list is
+      // fatal below before anything can read them.
+      missing.insert(std::string(ir::opcode_name(operation.opcode)));
+      break;
     }
+  }
+
+  if (!missing.empty()) {
+    std::string names;
+    for (const auto &name : missing)
+      names += (names.empty() ? "" : ", ") + name;
+    fail("autodiff has no rule for " + std::to_string(missing.size()) +
+         " active opcode(s): " + names);
   }
 
   for (const auto primal : with_respect_to) {

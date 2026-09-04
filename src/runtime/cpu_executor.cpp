@@ -81,6 +81,39 @@ void clamp(const ir::Operation &op, TensorMap &tensors) {
                 std::clamp(load_float(input, index), lower, upper));
 }
 
+void sigmoid_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &grad_output = tensors.at(op.inputs[1]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  for (std::uint64_t index = 0; index < grad_input.element_count(); ++index) {
+    const auto sigmoid =
+        1.0F / (1.0F + std::exp(-load_float(input, index)));
+    store_float(grad_input, index,
+                load_float(grad_output, index) * sigmoid * (1.0F - sigmoid));
+  }
+}
+
+void clamp_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &input = tensors.at(op.inputs[1]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto lower = static_cast<float>(op.f64(
+      ir::AttrKey::Lower, -std::numeric_limits<double>::infinity()));
+  const auto upper = static_cast<float>(op.f64(
+      ir::AttrKey::Upper, std::numeric_limits<double>::infinity()));
+  // Inside the bounds the clamp is the identity, so the gradient passes
+  // through; outside, the output did not depend on the input at all.  A value
+  // exactly on a bound counts as inside, which is the convention the
+  // reference frameworks use.
+  for (std::uint64_t index = 0; index < grad_input.element_count(); ++index) {
+    const auto value = load_float(input, index);
+    store_float(grad_input, index,
+                value >= lower && value <= upper
+                    ? load_float(grad_output, index)
+                    : 0.0F);
+  }
+}
+
 void silu(const ir::Operation &op, TensorMap &tensors) {
   const auto &input = tensors.at(op.inputs[0]);
   auto &out = tensors.at(op.outputs[0]);
@@ -3283,6 +3316,12 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::QkNormPartialRopeBackward:
       qk_norm_rope_backward(op, tensors);
+      break;
+    case ir::Opcode::SigmoidBackward:
+      sigmoid_backward(op, tensors);
+      break;
+    case ir::Opcode::ClampBackward:
+      clamp_backward(op, tensors);
       break;
     case ir::Opcode::AttentionLse:
       attention_lse(op, tensors);

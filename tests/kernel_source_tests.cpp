@@ -948,6 +948,27 @@ Program batch10_program(std::string_view which) {
   return program;
 }
 
+
+Program batch11_program(std::string_view which) {
+  Program program;
+  program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                     {2, DType::BF16, TensorRole::Input, {4, 8}},
+                     {3, DType::BF16, TensorRole::Output, {4, 8}}};
+  if (which == "sigmoid_backward") {
+    program.operations = {{1, Opcode::SigmoidBackward, {1, 2}, {3}, {}}};
+    return program;
+  }
+  // clamp_backward_open leaves both bounds at their infinite defaults, which
+  // the emitter has to turn into finite literals.
+  std::vector<Attribute> attributes;
+  if (which == "clamp_backward") {
+    attributes.push_back(Attribute::f64(AttrKey::Lower, -1.5));
+    attributes.push_back(Attribute::f64(AttrKey::Upper, 2.25));
+  }
+  program.operations = {{1, Opcode::ClampBackward, {1, 2}, {3}, attributes}};
+  return program;
+}
+
 std::vector<Case> corpus() {
   using Q = Int8RowQuantization;
   return {
@@ -1126,6 +1147,10 @@ std::vector<Case> corpus() {
       {"layer_norm_modulate_welford128", [] { return batch8_program("layer_norm_modulate_welford128"); }},
       {"layer_norm_modulate_generic_bf16_odd", [] { return batch8_program("layer_norm_modulate_generic_bf16_odd"); }},
       {"layer_norm_modulate_generic_f32", [] { return batch8_program("layer_norm_modulate_generic_f32"); }},
+      // batch 11: the elementwise gradients the VAE frontends need
+      {"clamp_backward", [] { return batch11_program("clamp_backward"); }},
+      {"clamp_backward_open", [] { return batch11_program("clamp_backward_open"); }},
+      {"sigmoid_backward", [] { return batch11_program("sigmoid_backward"); }},
       // batch 10: batched and cross attention, all three kernels
       {"attention_exact_batched", [] { return batch10_program("attention_exact_batched"); }},
       {"attention_exact_batched_cross", [] { return batch10_program("attention_exact_batched_cross"); }},

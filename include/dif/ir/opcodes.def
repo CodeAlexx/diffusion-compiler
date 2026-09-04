@@ -179,3 +179,12 @@ DIF_OPCODE(Conv2dBackwardBias, 83, "conv2d_backward_bias", None)
 // batch. Keeping them apart lets both sum deterministically without atomics,
 // which a training run depends on.
 DIF_OPCODE(GroupNormBackwardAffine, 84, "group_norm_backward_affine", None)
+// Gradient of the saturating clamp: the upstream gradient passes through
+// wherever the forward left the value alone, and stops where the forward
+// pinned it to a bound. The bounds travel on the operation so the backward
+// differentiates the clamp that actually ran.
+DIF_OPCODE(ClampBackward, 85, "clamp_backward", None)
+// Gradient of the logistic sigmoid. Fused for the same reason the SiLU and
+// GELU gradients are: composing it would allocate three full-size
+// intermediates to express one elementwise derivative.
+DIF_OPCODE(SigmoidBackward, 86, "sigmoid_backward", None)
