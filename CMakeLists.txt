@@ -116,6 +116,7 @@ add_library(difcore
     src/training/autodiff.cpp
     src/training/step.cpp
     src/training/recompute.cpp
+    src/training/accumulate.cpp
     src/training/checkpoint.cpp
     src/weights/safetensors.cpp
     src/weights/bundle.cpp
@@ -473,6 +474,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_training_recompute_tests tests/training_recompute_tests.cpp)
   target_link_libraries(dif_training_recompute_tests PRIVATE difcore)
   add_test(NAME dif_training_recompute_tests COMMAND dif_training_recompute_tests)
+
+  add_executable(dif_training_accumulate_tests tests/training_accumulate_tests.cpp)
+  target_link_libraries(dif_training_accumulate_tests PRIVATE difcore)
+  add_test(NAME dif_training_accumulate_tests COMMAND dif_training_accumulate_tests)
 
   add_executable(dif_autodiff_tests tests/autodiff_tests.cpp)
   target_link_libraries(dif_autodiff_tests PRIVATE difcore)
