@@ -67,6 +67,7 @@ add_library(difcore
   src/frontend/qwen3vl_conditioner.cpp
   src/frontend/qwen3vl_vision.cpp
   src/frontend/krea2.cpp
+  src/frontend/krea2_training.cpp
   src/frontend/provenance.cpp
   src/frontend/krea2_vae.cpp
   src/frontend/flux2.cpp
@@ -119,6 +120,8 @@ add_library(difcore
     src/training/session.cpp
     src/training/memory.cpp
     src/training/report.cpp
+  src/training/config.cpp
+  src/training/architecture.cpp
     src/training/recompute.cpp
     src/training/accumulate.cpp
     src/training/checkpoint.cpp
@@ -470,6 +473,10 @@ if(DIF_BUILD_TESTS)
   add_executable(dif_training_gradient_tests tests/training_gradient_tests.cpp)
   target_link_libraries(dif_training_gradient_tests PRIVATE difcore)
   add_test(NAME dif_training_gradient_tests COMMAND dif_training_gradient_tests)
+
+  add_executable(dif_training_config_tests tests/training_config_tests.cpp)
+  target_link_libraries(dif_training_config_tests PRIVATE difcore)
+  add_test(NAME dif_training_config_tests COMMAND dif_training_config_tests)
 
   add_executable(dif_training_report_tests tests/training_report_tests.cpp)
   target_link_libraries(dif_training_report_tests PRIVATE difcore)
