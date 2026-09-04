@@ -219,6 +219,227 @@ void CudnnConv2dPlan::execute(std::uintptr_t input, std::uintptr_t weight,
           "cudnnAddTensor Conv2d bias");
 }
 
+struct CudnnConv2dBackwardPlan::Impl {
+  cudnnHandle_t handle{};
+  cudnnTensorDescriptor_t input{};
+  cudnnTensorDescriptor_t grad_output{};
+  cudnnTensorDescriptor_t bias{};
+  cudnnFilterDescriptor_t weight{};
+  cudnnConvolutionDescriptor_t convolution{};
+  CudnnConv2dBackwardPlan::Kind kind{};
+  cudnnConvolutionBwdDataAlgo_t data_algorithm{};
+  cudnnConvolutionBwdFilterAlgo_t filter_algorithm{};
+  std::size_t workspace{};
+  std::string description;
+
+  ~Impl() {
+    if (convolution)
+      (void)cudnnDestroyConvolutionDescriptor(convolution);
+    if (weight)
+      (void)cudnnDestroyFilterDescriptor(weight);
+    if (bias)
+      (void)cudnnDestroyTensorDescriptor(bias);
+    if (grad_output)
+      (void)cudnnDestroyTensorDescriptor(grad_output);
+    if (input)
+      (void)cudnnDestroyTensorDescriptor(input);
+    // The handle is shared and outlives the plan.
+  }
+};
+
+CudnnConv2dBackwardPlan::CudnnConv2dBackwardPlan(
+    Kind kind, const ir::TensorDesc &input, const ir::TensorDesc &weight,
+    const ir::TensorDesc &grad_output, std::uint64_t stride_h,
+    std::uint64_t stride_w, std::uint64_t pad_h, std::uint64_t pad_w,
+    std::uint64_t dilation_h, std::uint64_t dilation_w, std::uint64_t groups,
+    std::size_t workspace_limit_bytes, bool deterministic)
+    : impl_(std::make_unique<Impl>()) {
+  if (input.dims.size() != 4U || weight.dims.size() != 4U ||
+      grad_output.dims.size() != 4U || input.dtype != weight.dtype ||
+      input.dtype != grad_output.dtype)
+    fail("cuDNN Conv2d gradient requires matching NCHW/OIHW rank-4 tensors");
+  const auto dtype = data_type(input.dtype);
+  impl_->kind = kind;
+  impl_->handle = shared_cudnn_handle();
+  check(cudnnCreateTensorDescriptor(&impl_->input),
+        "cudnnCreateTensorDescriptor Conv2d gradient input");
+  check(cudnnCreateTensorDescriptor(&impl_->grad_output),
+        "cudnnCreateTensorDescriptor Conv2d gradient output");
+  check(cudnnCreateTensorDescriptor(&impl_->bias),
+        "cudnnCreateTensorDescriptor Conv2d gradient bias");
+  check(cudnnCreateFilterDescriptor(&impl_->weight),
+        "cudnnCreateFilterDescriptor Conv2d gradient");
+  check(cudnnCreateConvolutionDescriptor(&impl_->convolution),
+        "cudnnCreateConvolutionDescriptor Conv2d gradient");
+  check(cudnnSetTensor4dDescriptor(
+            impl_->input, CUDNN_TENSOR_NCHW, dtype,
+            dimension(input.dims[0], "batch"),
+            dimension(input.dims[1], "input channels"),
+            dimension(input.dims[2], "input height"),
+            dimension(input.dims[3], "input width")),
+        "cudnnSetTensor4dDescriptor Conv2d gradient input");
+  check(cudnnSetTensor4dDescriptor(
+            impl_->grad_output, CUDNN_TENSOR_NCHW, dtype,
+            dimension(grad_output.dims[0], "output batch"),
+            dimension(grad_output.dims[1], "output channels"),
+            dimension(grad_output.dims[2], "output height"),
+            dimension(grad_output.dims[3], "output width")),
+        "cudnnSetTensor4dDescriptor Conv2d gradient output");
+  check(cudnnSetTensor4dDescriptor(
+            impl_->bias, CUDNN_TENSOR_NCHW, dtype, 1,
+            dimension(grad_output.dims[1], "bias channels"), 1, 1),
+        "cudnnSetTensor4dDescriptor Conv2d gradient bias");
+  check(cudnnSetFilter4dDescriptor(
+            impl_->weight, dtype, CUDNN_TENSOR_NCHW,
+            dimension(weight.dims[0], "filter outputs"),
+            dimension(weight.dims[1], "filter inputs"),
+            dimension(weight.dims[2], "filter height"),
+            dimension(weight.dims[3], "filter width")),
+        "cudnnSetFilter4dDescriptor Conv2d gradient");
+  check(cudnnSetConvolution2dDescriptor(
+            impl_->convolution, parameter(pad_h, "padding height"),
+            parameter(pad_w, "padding width"),
+            dimension(stride_h, "stride height"),
+            dimension(stride_w, "stride width"),
+            dimension(dilation_h, "dilation height"),
+            dimension(dilation_w, "dilation width"),
+            CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT),
+        "cudnnSetConvolution2dDescriptor Conv2d gradient");
+  check(cudnnSetConvolutionGroupCount(impl_->convolution,
+                                      dimension(groups, "groups")),
+        "cudnnSetConvolutionGroupCount Conv2d gradient");
+  if (input.dtype != ir::DType::F32)
+    check(cudnnSetConvolutionMathType(impl_->convolution,
+                                      CUDNN_TENSOR_OP_MATH),
+          "cudnnSetConvolutionMathType Conv2d gradient");
+
+  const auto shape = [](const std::vector<std::uint64_t> &dims) {
+    std::string text = "[";
+    for (std::size_t index = 0; index < dims.size(); ++index)
+      text += (index ? "," : "") + std::to_string(dims[index]);
+    return text + "]";
+  };
+  impl_->description = " input=" + shape(input.dims) + " weight=" +
+                       shape(weight.dims) + " grad_output=" +
+                       shape(grad_output.dims);
+  if (kind == Kind::Bias) {
+    // The bias gradient is a plain channel reduction: no algorithm, no
+    // workspace.
+    impl_->workspace = 0U;
+    return;
+  }
+  if (kind == Kind::Input) {
+    std::array<cudnnConvolutionBwdDataAlgoPerf_t, 8> candidates{};
+    int returned = 0;
+    check(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+              impl_->handle, impl_->weight, impl_->grad_output,
+              impl_->convolution, impl_->input,
+              static_cast<int>(candidates.size()), &returned,
+              candidates.data()),
+          "cudnnGetConvolutionBackwardDataAlgorithm_v7");
+    const auto selected = std::find_if(
+        candidates.begin(), candidates.begin() + returned,
+        [&](const cudnnConvolutionBwdDataAlgoPerf_t &candidate) {
+          return candidate.status == CUDNN_STATUS_SUCCESS &&
+                 candidate.memory <= workspace_limit_bytes &&
+                 (!deterministic ||
+                  candidate.determinism == CUDNN_DETERMINISTIC);
+        });
+    if (selected == candidates.begin() + returned)
+      fail(deterministic
+               ? "cuDNN Conv2d input gradient has no deterministic algorithm "
+                 "within its workspace limit"
+               : "cuDNN Conv2d input gradient has no algorithm within its "
+                 "workspace limit");
+    impl_->data_algorithm = selected->algo;
+    impl_->workspace = selected->memory;
+    check(cudnnSetConvolutionMathType(impl_->convolution, selected->mathType),
+          "cudnnSetConvolutionMathType Conv2d input gradient");
+    return;
+  }
+  std::array<cudnnConvolutionBwdFilterAlgoPerf_t, 8> candidates{};
+  int returned = 0;
+  check(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
+            impl_->handle, impl_->input, impl_->grad_output,
+            impl_->convolution, impl_->weight,
+            static_cast<int>(candidates.size()), &returned, candidates.data()),
+        "cudnnGetConvolutionBackwardFilterAlgorithm_v7");
+  const auto selected = std::find_if(
+      candidates.begin(), candidates.begin() + returned,
+      [&](const cudnnConvolutionBwdFilterAlgoPerf_t &candidate) {
+        return candidate.status == CUDNN_STATUS_SUCCESS &&
+               candidate.memory <= workspace_limit_bytes &&
+               (!deterministic ||
+                candidate.determinism == CUDNN_DETERMINISTIC);
+      });
+  if (selected == candidates.begin() + returned)
+    fail(deterministic
+             ? "cuDNN Conv2d weight gradient has no deterministic algorithm "
+               "within its workspace limit"
+             : "cuDNN Conv2d weight gradient has no algorithm within its "
+               "workspace limit");
+  impl_->filter_algorithm = selected->algo;
+  impl_->workspace = selected->memory;
+  check(cudnnSetConvolutionMathType(impl_->convolution, selected->mathType),
+        "cudnnSetConvolutionMathType Conv2d weight gradient");
+}
+
+CudnnConv2dBackwardPlan::~CudnnConv2dBackwardPlan() = default;
+CudnnConv2dBackwardPlan::CudnnConv2dBackwardPlan(
+    CudnnConv2dBackwardPlan &&) noexcept = default;
+CudnnConv2dBackwardPlan &
+CudnnConv2dBackwardPlan::operator=(CudnnConv2dBackwardPlan &&) noexcept =
+    default;
+
+std::size_t CudnnConv2dBackwardPlan::workspace_bytes() const {
+  return impl_->workspace;
+}
+
+void CudnnConv2dBackwardPlan::execute(std::uintptr_t grad_output,
+                                      std::uintptr_t operand,
+                                      std::uintptr_t gradient,
+                                      std::uintptr_t workspace,
+                                      std::uintptr_t stream) {
+  check(cudnnSetStream(impl_->handle, reinterpret_cast<cudaStream_t>(stream)),
+        "cudnnSetStream Conv2d gradient");
+  constexpr float one = 1.0F;
+  constexpr float zero = 0.0F;
+  cudnnStatus_t status = CUDNN_STATUS_SUCCESS;
+  const char *action = "";
+  switch (impl_->kind) {
+  case Kind::Input:
+    action = "cudnnConvolutionBackwardData";
+    status = cudnnConvolutionBackwardData(
+        impl_->handle, &one, impl_->weight,
+        reinterpret_cast<const void *>(operand), impl_->grad_output,
+        reinterpret_cast<const void *>(grad_output), impl_->convolution,
+        impl_->data_algorithm, reinterpret_cast<void *>(workspace),
+        impl_->workspace, &zero, impl_->input,
+        reinterpret_cast<void *>(gradient));
+    break;
+  case Kind::Weight:
+    action = "cudnnConvolutionBackwardFilter";
+    status = cudnnConvolutionBackwardFilter(
+        impl_->handle, &one, impl_->input,
+        reinterpret_cast<const void *>(operand), impl_->grad_output,
+        reinterpret_cast<const void *>(grad_output), impl_->convolution,
+        impl_->filter_algorithm, reinterpret_cast<void *>(workspace),
+        impl_->workspace, &zero, impl_->weight,
+        reinterpret_cast<void *>(gradient));
+    break;
+  case Kind::Bias:
+    action = "cudnnConvolutionBackwardBias";
+    status = cudnnConvolutionBackwardBias(
+        impl_->handle, &one, impl_->grad_output,
+        reinterpret_cast<const void *>(grad_output), &zero, impl_->bias,
+        reinterpret_cast<void *>(gradient));
+    break;
+  }
+  if (status != CUDNN_STATUS_SUCCESS)
+    fail(std::string(action) + " Conv2d" + impl_->description + ": " +
+         cudnnGetErrorString(status));
+}
+
 struct CudnnConv3dPlan::Impl {
   cudnnHandle_t handle{};
   cudnnTensorDescriptor_t input{};

@@ -35,6 +35,42 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// The three convolution gradients. Each takes the same geometry the forward
+// plan took, so a training program describes its convolution once and the
+// gradients inherit it; the algorithm is chosen by the same v7 heuristic and
+// the math type it returns is applied, as on the forward.
+class CudnnConv2dBackwardPlan {
+public:
+  enum class Kind { Input, Weight, Bias };
+
+  CudnnConv2dBackwardPlan(Kind kind, const ir::TensorDesc &input,
+                          const ir::TensorDesc &weight,
+                          const ir::TensorDesc &grad_output,
+                          std::uint64_t stride_h, std::uint64_t stride_w,
+                          std::uint64_t pad_h, std::uint64_t pad_w,
+                          std::uint64_t dilation_h, std::uint64_t dilation_w,
+                          std::uint64_t groups,
+                          std::size_t workspace_limit_bytes,
+                          bool deterministic = false);
+  ~CudnnConv2dBackwardPlan();
+
+  CudnnConv2dBackwardPlan(const CudnnConv2dBackwardPlan &) = delete;
+  CudnnConv2dBackwardPlan &operator=(const CudnnConv2dBackwardPlan &) = delete;
+  CudnnConv2dBackwardPlan(CudnnConv2dBackwardPlan &&) noexcept;
+  CudnnConv2dBackwardPlan &operator=(CudnnConv2dBackwardPlan &&) noexcept;
+
+  std::size_t workspace_bytes() const;
+  // `operand` is the weight for an input gradient and the input for a weight
+  // gradient; a bias gradient reads only the output gradient.
+  void execute(std::uintptr_t grad_output, std::uintptr_t operand,
+               std::uintptr_t gradient, std::uintptr_t workspace,
+               std::uintptr_t stream);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 class CudnnConv3dPlan {
 public:
   CudnnConv3dPlan(const ir::TensorDesc &input,

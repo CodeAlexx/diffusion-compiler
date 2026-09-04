@@ -416,6 +416,146 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::GeluBackward) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    check_accumulator_f32(op);
+    if (!supported_float(input.dtype))
+      fail("gelu_backward admits f32, bf16, or f16 tensors");
+    // The derivative has to be the derivative of the closed form that ran,
+    // so the approximation is as explicit here as it is on the forward op.
+    const auto *approximation = op.find(AttrKey::Approximation);
+    if (approximation == nullptr || approximation->kind != AttrKind::U64 ||
+        (approximation->bits !=
+             static_cast<std::uint64_t>(GeluApproximation::Tanh) &&
+         approximation->bits !=
+             static_cast<std::uint64_t>(GeluApproximation::ExactErf) &&
+         approximation->bits !=
+             static_cast<std::uint64_t>(GeluApproximation::QuickSigmoid)))
+      fail("gelu_backward requires an explicit tanh, exact-erf, or "
+           "quick-sigmoid approximation");
+    return;
+  }
+
+  if (op.opcode == Opcode::UpsampleNearest2dBackward) {
+    expect_counts(op, 1, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    const auto scale_h = op.u64(AttrKey::ScaleH, 1U);
+    const auto scale_w = op.u64(AttrKey::ScaleW, 1U);
+    check_accumulator_f32(op);
+    if (!supported_float(grad_input.dtype) ||
+        grad_output.dtype != grad_input.dtype ||
+        grad_input.dims.size() != 4U || grad_output.dims.size() != 4U ||
+        scale_h == 0U || scale_w == 0U ||
+        grad_output.dims[0] != grad_input.dims[0] ||
+        grad_output.dims[1] != grad_input.dims[1] ||
+        grad_output.dims[2] != grad_input.dims[2] * scale_h ||
+        grad_output.dims[3] != grad_input.dims[3] * scale_w)
+      fail("upsample_nearest_2d_backward requires NCHW float tensors whose "
+           "gradient is the input scaled by ScaleH and ScaleW");
+    return;
+  }
+
+  if (op.opcode == Opcode::SliceBackward) {
+    expect_counts(op, 1, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    const auto *axis_attribute = op.find(AttrKey::Axis);
+    const auto *start_attribute = op.find(AttrKey::Start);
+    check_accumulator_f32(op);
+    if (!supported_float(grad_input.dtype) ||
+        grad_output.dtype != grad_input.dtype || axis_attribute == nullptr ||
+        start_attribute == nullptr ||
+        grad_output.dims.size() != grad_input.dims.size() ||
+        grad_input.dims.empty() ||
+        axis_attribute->as_u64() >= grad_input.dims.size())
+      fail("slice_backward requires same-rank float tensors and an in-range "
+           "axis");
+    const auto axis = static_cast<std::size_t>(axis_attribute->as_u64());
+    const auto start = start_attribute->as_u64();
+    for (std::size_t dimension = 0U; dimension < grad_input.dims.size();
+         ++dimension)
+      if (dimension != axis &&
+          grad_output.dims[dimension] != grad_input.dims[dimension])
+        fail("slice_backward may differ only on the sliced axis");
+    if (grad_output.dims[axis] > grad_input.dims[axis] ||
+        start > grad_input.dims[axis] - grad_output.dims[axis])
+      fail("slice_backward window is outside the input axis");
+    return;
+  }
+
+  if (op.opcode == Opcode::BroadcastToBackward) {
+    expect_counts(op, 1, 1);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    check_accumulator_f32(op);
+    if (!supported_float(grad_input.dtype) ||
+        grad_output.dtype != grad_input.dtype ||
+        grad_input.dims.size() > grad_output.dims.size())
+      fail("broadcast_to_backward requires same-dtype float tensors and a "
+           "source rank no greater than the gradient rank");
+    const auto pad = grad_output.dims.size() - grad_input.dims.size();
+    for (std::size_t axis = 0U; axis < grad_input.dims.size(); ++axis) {
+      const auto source = grad_input.dims[axis];
+      const auto destination = grad_output.dims[pad + axis];
+      if (source != 1U && source != destination)
+        fail("broadcast_to_backward source dimensions must be one or match "
+             "the gradient");
+    }
+    return;
+  }
+
+  if (op.opcode == Opcode::GroupNormBackward) {
+    if (op.inputs.size() != 3U || op.outputs.size() != 1U)
+      fail("group_norm_backward expects x, weight, grad_output and the input "
+           "gradient");
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &weight = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[2], op);
+    const auto &grad_input = tensor_or_fail(program, op.outputs[0], op);
+    check_accumulator_f32(op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(input, grad_input, op);
+    if (!supported_float(input.dtype) ||
+        (input.dims.size() != 4U && input.dims.size() != 5U) ||
+        weight.dtype != input.dtype ||
+        weight.dims != std::vector<std::uint64_t>{input.dims[1]})
+      fail("group_norm_backward requires rank 4 or 5 float x/out and a "
+           "[channels] weight");
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    if (groups == 0U || input.dims[1] % groups != 0U ||
+        !(op.f64(AttrKey::Epsilon, 1.0e-5) > 0.0))
+      fail("group_norm_backward has invalid normalization geometry");
+    return;
+  }
+
+  if (op.opcode == Opcode::GroupNormBackwardAffine) {
+    expect_counts(op, 2, 2);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[1], op);
+    const auto &grad_weight = tensor_or_fail(program, op.outputs[0], op);
+    const auto &grad_bias = tensor_or_fail(program, op.outputs[1], op);
+    check_accumulator_f32(op);
+    same_shape_dtype(input, grad_output, op);
+    same_shape_dtype(grad_weight, grad_bias, op);
+    if (!supported_float(input.dtype) ||
+        (input.dims.size() != 4U && input.dims.size() != 5U) ||
+        grad_weight.dtype != input.dtype ||
+        grad_weight.dims != std::vector<std::uint64_t>{input.dims[1]})
+      fail("group_norm_backward_affine requires rank 4 or 5 float x and "
+           "[channels] gradients");
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    if (groups == 0U || input.dims[1] % groups != 0U ||
+        !(op.f64(AttrKey::Epsilon, 1.0e-5) > 0.0))
+      fail("group_norm_backward_affine has invalid normalization geometry");
+    return;
+  }
+
   if (op.opcode == Opcode::SiLUBackward) {
     expect_counts(op, 2, 1);
     const auto &input = tensor_or_fail(program, op.inputs[0], op);
@@ -1315,9 +1455,9 @@ void verify_operation(const Program &program, const Operation &op) {
     if (implementation == 2U && q.dtype != DType::BF16 &&
         q.dtype != DType::F16)
       fail("cuDNN attention implementation requires bf16 or f16");
-    if (implementation == 1U &&
-        (q.dims.size() != 3U || op.inputs.size() != 3U))
-      fail("generated attention currently admits unbatched attention without additive bias; use cuDNN for batched/masked semantics");
+    if (implementation == 1U && op.inputs.size() != 3U)
+      fail("generated attention admits q/k/v without an additive bias; use "
+           "cuDNN for masked semantics");
     if (implementation == 1U && q.dims[sequence_axis] > 4096U)
       fail("naive exact attention is admitted only for S<=4096; use a backend implementation");
     if (implementation == 3U &&
@@ -1660,20 +1800,38 @@ void verify_operation(const Program &program, const Operation &op) {
     const auto &k = tensor_or_fail(program, op.inputs[1], op);
     const auto &lse = tensor_or_fail(program, op.outputs[0], op);
     check_accumulator_f32(op);
-    if (!supported_float(q.dtype) || q.dims.size() != 3U)
-      fail("attention_lse requires f32, bf16, or f16 [S,H,D] inputs");
-    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[1]);
-    if (kv_heads == 0U || q.dims[1] % kv_heads != 0U)
+    // Real models carry a batch, so the batched [B,S,H,D] form is accepted
+    // alongside the historical [S,H,D] one; every axis is named relative to
+    // the end so both ranks share one rule.
+    if (!supported_float(q.dtype) ||
+        (q.dims.size() != 3U && q.dims.size() != 4U))
+      fail("attention_lse requires f32, bf16, or f16 [S,H,D] or [B,S,H,D] "
+           "inputs");
+    const auto head_axis = q.dims.size() - 2U;
+    const auto sequence_axis = q.dims.size() - 3U;
+    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[head_axis]);
+    if (kv_heads == 0U || q.dims[head_axis] % kv_heads != 0U)
       fail("attention_lse KvHeads must be nonzero and divide the query head "
            "count");
-    if (k.dtype != q.dtype || k.dims.size() != 3U ||
-        k.dims[0] != q.dims[0] || k.dims[1] != kv_heads ||
-        k.dims[2] != q.dims[2])
+    // Cross attention: the keys may carry their own row count, so only the
+    // batch, head grouping, and head dim have to match the query.  A causal
+    // mask keeps the historical square contract.
+    auto expected_kv = q.dims;
+    expected_kv[head_axis] = kv_heads;
+    expected_kv[sequence_axis] = k.dims.size() == q.dims.size()
+                                     ? k.dims[sequence_axis]
+                                     : q.dims[sequence_axis];
+    if (k.dtype != q.dtype || k.dims != expected_kv ||
+        k.dims[sequence_axis] == 0U)
       fail("attention_lse k must be [S,KvHeads,D] with the query dtype");
-    if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
-        lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
+    auto expected_lse = q.dims;
+    expected_lse.pop_back();
+    if (lse.dtype != DType::F32 || lse.dims != expected_lse)
       fail("attention_lse output must be F32 [S,H]");
-    if (q.dims[0] > 4096U)
+    if (op.boolean(AttrKey::Causal, false) &&
+        k.dims[sequence_axis] != q.dims[sequence_axis])
+      fail("a causal mask requires the key and query row counts to match");
+    if (q.dims[sequence_axis] > 4096U || k.dims[sequence_axis] > 4096U)
       fail("decomposed attention backward is admitted only for S<=4096");
     return;
   }
@@ -1700,21 +1858,36 @@ void verify_operation(const Program &program, const Operation &op) {
     same_shape_dtype(k, grad_k, op);
     same_shape_dtype(k, grad_v, op);
     check_accumulator_f32(op);
-    if (!supported_float(q.dtype) || q.dims.size() != 3U)
-      fail("attention_backward requires f32, bf16, or f16 [S,H,D] tensors");
-    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[1]);
-    if (kv_heads == 0U || q.dims[1] % kv_heads != 0U)
+    if (!supported_float(q.dtype) ||
+        (q.dims.size() != 3U && q.dims.size() != 4U))
+      fail("attention_backward requires f32, bf16, or f16 [S,H,D] or "
+           "[B,S,H,D] tensors");
+    const auto head_axis = q.dims.size() - 2U;
+    const auto sequence_axis = q.dims.size() - 3U;
+    const auto kv_heads = op.u64(AttrKey::KvHeads, q.dims[head_axis]);
+    if (kv_heads == 0U || q.dims[head_axis] % kv_heads != 0U)
       fail("attention_backward KvHeads must be nonzero and divide the query "
            "head count");
-    if (k.dtype != q.dtype || k.dims.size() != 3U ||
-        k.dims[0] != q.dims[0] || k.dims[1] != kv_heads ||
-        k.dims[2] != q.dims[2])
+    // Cross attention: the keys may carry their own row count, so only the
+    // batch, head grouping, and head dim have to match the query.  A causal
+    // mask keeps the historical square contract.
+    auto expected_kv = q.dims;
+    expected_kv[head_axis] = kv_heads;
+    expected_kv[sequence_axis] = k.dims.size() == q.dims.size()
+                                     ? k.dims[sequence_axis]
+                                     : q.dims[sequence_axis];
+    if (k.dtype != q.dtype || k.dims != expected_kv ||
+        k.dims[sequence_axis] == 0U)
       fail("attention_backward k/v must be [S,KvHeads,D] with the query "
            "dtype");
-    if (lse.dtype != DType::F32 || lse.dims.size() != 2U ||
-        lse.dims[0] != q.dims[0] || lse.dims[1] != q.dims[1])
+    auto expected_lse = q.dims;
+    expected_lse.pop_back();
+    if (lse.dtype != DType::F32 || lse.dims != expected_lse)
       fail("attention_backward saved logsumexp must be F32 [S,H]");
-    if (q.dims[0] > 4096U)
+    if (op.boolean(AttrKey::Causal, false) &&
+        k.dims[sequence_axis] != q.dims[sequence_axis])
+      fail("a causal mask requires the key and query row counts to match");
+    if (q.dims[sequence_axis] > 4096U || k.dims[sequence_axis] > 4096U)
       fail("decomposed attention backward is admitted only for S<=4096");
     return;
   }
@@ -1854,6 +2027,74 @@ void verify_operation(const Program &program, const Operation &op) {
           bias.dims != std::vector<std::uint64_t>{out_channels})
         fail("conv2d bias must be a [C_out] vector of the input dtype");
     }
+    return;
+  }
+
+  if (op.opcode == Opcode::Conv2dBackwardInput ||
+      op.opcode == Opcode::Conv2dBackwardWeight ||
+      op.opcode == Opcode::Conv2dBackwardBias) {
+    const bool bias_gradient = op.opcode == Opcode::Conv2dBackwardBias;
+    expect_counts(op, bias_gradient ? 1U : 2U, 1U);
+    check_accumulator_f32(op);
+    const auto &grad_output = tensor_or_fail(program, op.inputs[0], op);
+    if (!supported_float(grad_output.dtype) || grad_output.dims.size() != 4U)
+      fail("conv2d gradients require an NCHW float output gradient");
+    if (bias_gradient) {
+      const auto &grad_bias = tensor_or_fail(program, op.outputs[0], op);
+      if (grad_bias.dtype != grad_output.dtype ||
+          grad_bias.dims !=
+              std::vector<std::uint64_t>{grad_output.dims[1]})
+        fail("conv2d_backward_bias produces a [C_out] vector of the gradient "
+             "dtype");
+      return;
+    }
+    // The other two see one of (weight, input) and produce the other's
+    // gradient, so between the operand and the result the whole forward
+    // geometry is present and can be checked the way the forward is.
+    const auto &operand = tensor_or_fail(program, op.inputs[1], op);
+    const auto &gradient = tensor_or_fail(program, op.outputs[0], op);
+    const auto &input =
+        op.opcode == ir::Opcode::Conv2dBackwardInput ? gradient : operand;
+    const auto &weight =
+        op.opcode == ir::Opcode::Conv2dBackwardInput ? operand : gradient;
+    if (operand.dtype != grad_output.dtype ||
+        gradient.dtype != grad_output.dtype || input.dims.size() != 4U ||
+        weight.dims.size() != 4U)
+      fail("conv2d gradients require NCHW activations and OIHW weights of "
+           "one float dtype");
+    const auto stride_h = op.u64(AttrKey::StrideH, 1U);
+    const auto stride_w = op.u64(AttrKey::StrideW, 1U);
+    const auto dilation_h = op.u64(AttrKey::DilationH, 1U);
+    const auto dilation_w = op.u64(AttrKey::DilationW, 1U);
+    const auto pad_top = op.u64(AttrKey::PadTop, 0U);
+    const auto pad_bottom = op.u64(AttrKey::PadBottom, 0U);
+    const auto pad_west = op.u64(AttrKey::PadWest, 0U);
+    const auto pad_east = op.u64(AttrKey::PadEast, 0U);
+    const auto groups = op.u64(AttrKey::Groups, 1U);
+    constexpr auto kLimit = std::uint64_t{1} << 20U;
+    if (stride_h == 0U || stride_w == 0U || dilation_h == 0U ||
+        dilation_w == 0U || groups == 0U || stride_h > kLimit ||
+        stride_w > kLimit || dilation_h > kLimit || dilation_w > kLimit ||
+        pad_top > kLimit || pad_bottom > kLimit || pad_west > kLimit ||
+        pad_east > kLimit)
+      fail("conv2d gradient attributes are invalid or out of range");
+    const auto in_channels = input.dims[1];
+    const auto out_channels = weight.dims[0];
+    if (in_channels % groups != 0U || out_channels % groups != 0U ||
+        weight.dims[1] != in_channels / groups || weight.dims[2] == 0U ||
+        weight.dims[3] == 0U)
+      fail("conv2d gradient weight/groups geometry is invalid");
+    const auto effective_h = dilation_h * (weight.dims[2] - 1U) + 1U;
+    const auto effective_w = dilation_w * (weight.dims[3] - 1U) + 1U;
+    const auto padded_h = input.dims[2] + pad_top + pad_bottom;
+    const auto padded_w = input.dims[3] + pad_west + pad_east;
+    if (padded_h < effective_h || padded_w < effective_w)
+      fail("conv2d gradient kernel does not fit its padded input");
+    if (grad_output.dims !=
+        std::vector<std::uint64_t>{input.dims[0], out_channels,
+                                   (padded_h - effective_h) / stride_h + 1U,
+                                   (padded_w - effective_w) / stride_w + 1U})
+      fail("conv2d gradient output geometry does not match its attributes");
     return;
   }
 

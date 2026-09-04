@@ -7766,6 +7766,27 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     grid = static_cast<unsigned>(input->dims[0] *
                                  op.u64(ir::AttrKey::Groups, 1U));
     shared = 2U * block * sizeof(float);
+  } else if (op.opcode == ir::Opcode::GroupNormBackward) {
+    const auto *input = program.tensor(op.inputs[0]);
+    block = static_cast<unsigned>(ir::group_norm_block_size(op, *input));
+    grid = static_cast<unsigned>(input->dims[0] *
+                                 op.u64(ir::AttrKey::Groups, 1U));
+    shared = 2U * block * sizeof(float);
+  } else if (op.opcode == ir::Opcode::GroupNormBackwardAffine) {
+    // One block per channel: the weight and bias gradients reduce across the
+    // batch, so the channel is the axis that makes each output exclusive.
+    const auto *input = program.tensor(op.inputs[0]);
+    block = static_cast<unsigned>(ir::group_norm_block_size(op, *input));
+    grid = static_cast<unsigned>(input->dims[1]);
+    shared = 2U * block * sizeof(float);
+  } else if (op.opcode == ir::Opcode::AttentionBackward) {
+    // The kernel guards the query and key geometries independently, so the
+    // grid has to cover whichever is larger (cross-attention keys may
+    // outnumber the query rows, or the other way round).
+    const auto queries = program.tensor(op.outputs[0])->element_count();
+    const auto keys = program.tensor(op.outputs[1])->element_count();
+    const auto count = std::max(queries, keys);
+    grid = static_cast<unsigned>((count + block - 1U) / block);
   } else if (op.opcode == ir::Opcode::Attention) {
     const auto &dims = program.tensor(op.inputs[0])->dims;
     const auto batched = dims.size() == 4U;
@@ -7928,6 +7949,15 @@ public:
         case ir::Opcode::QkNormPartialRopeBackward:
         case ir::Opcode::AttentionLse:
         case ir::Opcode::AttentionBackward:
+        case ir::Opcode::GeluBackward:
+        case ir::Opcode::UpsampleNearest2dBackward:
+        case ir::Opcode::SliceBackward:
+        case ir::Opcode::BroadcastToBackward:
+        case ir::Opcode::GroupNormBackward:
+        case ir::Opcode::GroupNormBackwardAffine:
+        case ir::Opcode::Conv2dBackwardInput:
+        case ir::Opcode::Conv2dBackwardWeight:
+        case ir::Opcode::Conv2dBackwardBias:
           training_opcode = ir::opcode_name(operation.opcode).data();
           break;
         default:
@@ -8858,6 +8888,52 @@ public:
       cudnn_conv_plans_.emplace(op.id, found->second);
       cudnn_workspace_bytes_ =
           std::max(cudnn_workspace_bytes_, found->second->workspace_bytes());
+    }
+    for (const auto &op : program_.operations) {
+      const bool input_gradient =
+          op.opcode == ir::Opcode::Conv2dBackwardInput;
+      const bool weight_gradient =
+          op.opcode == ir::Opcode::Conv2dBackwardWeight;
+      const bool bias_gradient = op.opcode == ir::Opcode::Conv2dBackwardBias;
+      if (!input_gradient && !weight_gradient && !bias_gradient)
+        continue;
+      const auto *grad_output = program_.tensor(op.inputs.at(0));
+      if (!grad_output)
+        fail("cuDNN Conv2d gradient references a missing output gradient");
+      // The verifier has already established that the operand and the result
+      // carry the whole forward geometry between them.
+      const auto *input = grad_output;
+      const auto *weight = grad_output;
+      if (!bias_gradient) {
+        const auto *operand = program_.tensor(op.inputs.at(1));
+        const auto *gradient = program_.tensor(op.outputs.at(0));
+        if (!operand || !gradient)
+          fail("cuDNN Conv2d gradient references a missing tensor");
+        input = input_gradient ? gradient : operand;
+        weight = input_gradient ? operand : gradient;
+      }
+      const auto pad_top = op.u64(ir::AttrKey::PadTop, 0U);
+      const auto pad_west = op.u64(ir::AttrKey::PadWest, 0U);
+      if (pad_top != op.u64(ir::AttrKey::PadBottom, 0U) ||
+          pad_west != op.u64(ir::AttrKey::PadEast, 0U))
+        fail("cuDNN Conv2d gradient currently requires symmetric spatial "
+             "padding");
+      constexpr std::uint64_t default_workspace = 64ULL * 1024ULL * 1024ULL;
+      const auto limit =
+          op.u64(ir::AttrKey::WorkspaceLimitBytes, default_workspace);
+      auto plan = std::make_shared<CudnnConv2dBackwardPlan>(
+          input_gradient ? CudnnConv2dBackwardPlan::Kind::Input
+          : weight_gradient ? CudnnConv2dBackwardPlan::Kind::Weight
+                            : CudnnConv2dBackwardPlan::Kind::Bias,
+          *input, *weight, *grad_output, op.u64(ir::AttrKey::StrideH, 1U),
+          op.u64(ir::AttrKey::StrideW, 1U), pad_top, pad_west,
+          op.u64(ir::AttrKey::DilationH, 1U),
+          op.u64(ir::AttrKey::DilationW, 1U),
+          op.u64(ir::AttrKey::Groups, 1U), static_cast<std::size_t>(limit),
+          options.deterministic_convolution_algorithms);
+      cudnn_workspace_bytes_ =
+          std::max(cudnn_workspace_bytes_, plan->workspace_bytes());
+      cudnn_conv_backward_plans_.emplace(op.id, std::move(plan));
     }
     for (const auto &op : program_.operations) {
       if (op.opcode != ir::Opcode::Conv3d)
@@ -11098,6 +11174,19 @@ public:
             reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
             reinterpret_cast<std::uintptr_t>(context_.stream()));
       }
+      else if (op.opcode == ir::Opcode::Conv2dBackwardInput ||
+               op.opcode == ir::Opcode::Conv2dBackwardWeight ||
+               op.opcode == ir::Opcode::Conv2dBackwardBias) {
+        count_cudnn_convolution_dispatch();
+        cudnn_conv_backward_plans_.at(op.id)->execute(
+            static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+            op.inputs.size() == 2U
+                ? static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1)))
+                : 0U,
+            static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+            reinterpret_cast<std::uintptr_t>(cudnn_workspace_->data()),
+            reinterpret_cast<std::uintptr_t>(context_.stream()));
+      }
       else if (op.opcode == ir::Opcode::Conv3d) {
         count_cudnn_convolution_dispatch();
         cudnn_conv3d_plans_.at(op.id)->execute(
@@ -12112,6 +12201,8 @@ private:
   std::uint64_t cudnn_backward_stats_bytes_{};
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv2dPlan>>
       cudnn_conv_plans_;
+  std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv2dBackwardPlan>>
+      cudnn_conv_backward_plans_;
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv3dPlan>>
       cudnn_conv3d_plans_;
 #endif

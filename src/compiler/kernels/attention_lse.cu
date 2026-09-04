@@ -8,7 +8,7 @@ extern "C" __global__ void ${function}(const ${scalar}* q, const ${scalar}* k, d
     float maximum = -3.402823466e+38f;
     for (unsigned long long ks = 0ULL; ks < kend; ++ks) {
       float score = 0.0f;
-      unsigned long long kb = (ks * ${kv_heads}ULL + ${kv_head}) * ${dim}ULL;
+      unsigned long long kb = ${key_base};
       for (unsigned long long d = 0ULL; d < ${dim}ULL; ++d) score = fmaf(${load}(q, qb + d), ${load}(k, kb + d), score);
       score *= ${scale}f;
       maximum = fmaxf(maximum, score);
@@ -16,7 +16,7 @@ extern "C" __global__ void ${function}(const ${scalar}* q, const ${scalar}* k, d
     float denominator = 0.0f;
     for (unsigned long long ks = 0ULL; ks < kend; ++ks) {
       float score = 0.0f;
-      unsigned long long kb = (ks * ${kv_heads}ULL + ${kv_head}) * ${dim}ULL;
+      unsigned long long kb = ${key_base};
       for (unsigned long long d = 0ULL; d < ${dim}ULL; ++d) score = fmaf(${load}(q, qb + d), ${load}(k, kb + d), score);
       denominator += expf(score * ${scale}f - maximum);
     }

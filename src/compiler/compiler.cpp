@@ -1140,6 +1140,188 @@ void emit_silu_backward(std::ostringstream &out, const ir::Program &program,
                         {"count", std::to_string(count)}});
 }
 
+// Shared by the group-normalization backward emitters: the unrolled
+// two-array shared-memory tree the forward emitter also uses.
+std::string group_reduction_fragment(std::uint64_t block) {
+  std::string reduction;
+  for (auto stride = block / 2U; stride != 0U; stride /= 2U) {
+    const auto text = std::to_string(stride);
+    reduction += "  if (lane < " + text + "ULL) {\n    reduction[lane] += reduction[lane + " +
+                 text + "ULL];\n    reduction[blockDim.x + lane] += reduction[blockDim.x + lane + " +
+                 text + "ULL];\n  }\n  __syncthreads();\n";
+  }
+  return reduction;
+}
+
+void emit_gelu_backward(std::ostringstream &out, const ir::Program &program,
+                        const ir::Operation &op) {
+  const auto count = program.tensor(op.outputs[0])->element_count();
+  const auto approximation = static_cast<ir::GeluApproximation>(
+      op.u64(ir::AttrKey::Approximation, 0U));
+  const std::string derivative =
+      approximation == ir::GeluApproximation::ExactErf
+          ? "float c = 5.0e-1f * (1.0f + erff(v * 7.071067812e-1f));\n"
+            "    float p = 3.989422804e-1f * expf(-5.0e-1f * v * v);\n"
+            "    d = c + v * p;"
+      : approximation == ir::GeluApproximation::QuickSigmoid
+          ? "float s = 1.0f / (1.0f + expf(-1.702f * v));\n"
+            "    d = s + v * 1.702f * s * (1.0f - s);"
+          : "float c = v * v * v;\n"
+            "    float z = 7.978845608e-1f * (v + 4.471500218e-2f * c);\n"
+            "    float t = tanhf(z);\n"
+            "    float q = 7.978845608e-1f * (1.0f + 1.341450065e-1f * v * v);\n"
+            "    d = 5.0e-1f * (1.0f + t) + 5.0e-1f * v * (1.0f - t * t) * q;";
+  out << render_kernel_template(
+      "gelu_backward", {{"function", function_name(op)},
+                        {"count", std::to_string(count)},
+                        {"derivative", derivative}});
+}
+
+void emit_upsample_nearest_2d_backward(std::ostringstream &out,
+                                       const ir::Program &program,
+                                       const ir::Operation &op) {
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto *grad_input = program.tensor(op.outputs[0]);
+  const auto text = [](std::uint64_t value) { return std::to_string(value); };
+  out << render_kernel_template(
+      "upsample_nearest_2d_backward",
+      {{"function", function_name(op)},
+       {"count", text(grad_input->element_count())},
+       {"width", text(grad_input->dims[3])},
+       {"height", text(grad_input->dims[2])},
+       {"out_width", text(grad_output->dims[3])},
+       {"out_height", text(grad_output->dims[2])},
+       {"scale_h", text(op.u64(ir::AttrKey::ScaleH, 1U))},
+       {"scale_w", text(op.u64(ir::AttrKey::ScaleW, 1U))}});
+}
+
+void emit_slice_backward(std::ostringstream &out, const ir::Program &program,
+                         const ir::Operation &op) {
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto *grad_input = program.tensor(op.outputs[0]);
+  const auto axis = static_cast<std::size_t>(op.u64(ir::AttrKey::Axis, 0U));
+  std::uint64_t inner = 1U;
+  for (std::size_t index = axis + 1U; index < grad_input->dims.size(); ++index)
+    inner *= grad_input->dims[index];
+  const auto text = [](std::uint64_t value) { return std::to_string(value); };
+  out << render_kernel_template(
+      "slice_backward",
+      {{"function", function_name(op)},
+       {"count", text(grad_input->element_count())},
+       {"inner", text(inner)},
+       {"extent", text(grad_input->dims[axis])},
+       {"window", text(grad_output->dims[axis])},
+       {"start", text(op.u64(ir::AttrKey::Start, 0U))}});
+}
+
+void emit_broadcast_to_backward(std::ostringstream &out,
+                                const ir::Program &program,
+                                const ir::Operation &op) {
+  const auto *grad_output = program.tensor(op.inputs[0]);
+  const auto *grad_input = program.tensor(op.outputs[0]);
+  const auto rank = grad_output->dims.size();
+  const auto pad = rank - grad_input->dims.size();
+  std::vector<std::uint64_t> stride(rank, 1U);
+  for (std::size_t axis = rank - 1U; axis-- > 0U;)
+    stride[axis] = stride[axis + 1U] * grad_output->dims[axis + 1U];
+  // Source coordinates give the base offset; axes the broadcast expanded are
+  // walked by the generated inner loop instead.
+  std::string decompose;
+  for (std::size_t axis = grad_input->dims.size(); axis-- > 0U;) {
+    const auto extent = grad_input->dims[axis];
+    decompose += "    {\n      unsigned long long c = source % " +
+                 std::to_string(extent) + "ULL;\n      source /= " +
+                 std::to_string(extent) + "ULL;\n";
+    if (extent != 1U)
+      decompose += "      base += c * " + std::to_string(stride[pad + axis]) +
+                   "ULL;\n";
+    else
+      decompose += "      (void)c;\n";
+    decompose += "    }\n";
+  }
+  std::string expand;
+  std::uint64_t repeats = 1U;
+  for (std::size_t axis = 0U; axis < rank; ++axis) {
+    const auto source =
+        axis < pad ? 1U : grad_input->dims[axis - pad];
+    if (source != 1U || grad_output->dims[axis] == 1U)
+      continue;
+    repeats *= grad_output->dims[axis];
+    expand += "      {\n        unsigned long long c = remainder % " +
+              std::to_string(grad_output->dims[axis]) +
+              "ULL;\n        remainder /= " +
+              std::to_string(grad_output->dims[axis]) +
+              "ULL;\n        offset += c * " + std::to_string(stride[axis]) +
+              "ULL;\n      }\n";
+  }
+  if (expand.empty())
+    expand = "      (void)remainder;\n";
+  out << render_kernel_template(
+      "broadcast_to_backward",
+      {{"function", function_name(op)},
+       {"count", std::to_string(grad_input->element_count())},
+       {"decompose", decompose},
+       {"repeats", std::to_string(repeats)},
+       {"expand", expand}});
+}
+
+void emit_group_norm_backward(std::ostringstream &out,
+                              const ir::Program &program,
+                              const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto channels = input->dims[1];
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto channels_per_group = channels / groups;
+  std::uint64_t inner = 1U;
+  for (std::size_t axis = 2U; axis < input->dims.size(); ++axis)
+    inner *= input->dims[axis];
+  const auto block = ir::group_norm_block_size(op, *input);
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9)
+                  << static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto text = [](std::uint64_t value) { return std::to_string(value); };
+  out << render_kernel_template(
+      "group_norm_backward",
+      {{"function", function_name(op)},
+       {"vectors", text(input->dims[0] * groups)},
+       {"groups", text(groups)},
+       {"channels", text(channels)},
+       {"channels_per_group", text(channels_per_group)},
+       {"inner", text(inner)},
+       {"elements", text(channels_per_group * inner)},
+       {"epsilon", epsilon_literal.str()},
+       {"reduction", group_reduction_fragment(block)}});
+  out << std::setprecision(9) << std::defaultfloat;
+}
+
+void emit_group_norm_backward_affine(std::ostringstream &out,
+                                     const ir::Program &program,
+                                     const ir::Operation &op) {
+  const auto *input = program.tensor(op.inputs[0]);
+  const auto channels = input->dims[1];
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto channels_per_group = channels / groups;
+  std::uint64_t inner = 1U;
+  for (std::size_t axis = 2U; axis < input->dims.size(); ++axis)
+    inner *= input->dims[axis];
+  const auto block = ir::group_norm_block_size(op, *input);
+  std::ostringstream epsilon_literal;
+  epsilon_literal << std::scientific << std::setprecision(9)
+                  << static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto text = [](std::uint64_t value) { return std::to_string(value); };
+  out << render_kernel_template(
+      "group_norm_backward_affine",
+      {{"function", function_name(op)},
+       {"batch", text(input->dims[0])},
+       {"channels", text(channels)},
+       {"channels_per_group", text(channels_per_group)},
+       {"inner", text(inner)},
+       {"elements", text(channels_per_group * inner)},
+       {"epsilon", epsilon_literal.str()},
+       {"reduction", group_reduction_fragment(block)}});
+  out << std::setprecision(9) << std::defaultfloat;
+}
+
 void emit_adamw_update(std::ostringstream &out, const ir::Program &program,
                        const ir::Operation &op) {
   const auto *parameter = program.tensor(op.inputs[0]);
@@ -1908,12 +2090,16 @@ void emit_qk_norm_rope(std::ostringstream &out, const ir::Program &program,
 void emit_attention(std::ostringstream &out, const ir::Program &program,
                     const ir::Operation &op) {
   const auto &shape = program.tensor(op.inputs[0])->dims;
-  const auto sequence = shape[0];
-  const auto heads = shape[1];
-  const auto dim = shape[2];
+  // Batched attention carries [B,S,H,D]; the historical form is [S,H,D].
+  const bool batched = shape.size() == 4U;
+  const auto batch = batched ? shape[0] : 1U;
+  const auto sequence = shape[batched ? 1U : 0U];
+  const auto heads = shape[batched ? 2U : 1U];
+  const auto dim = shape[batched ? 3U : 2U];
   // Cross-attention keys carry their own row count; a square program keeps
   // its historical generated source (kend is the query row count).
-  const auto kv_sequence = program.tensor(op.inputs[1])->dims[0];
+  const auto kv_sequence =
+      program.tensor(op.inputs[1])->dims[batched ? 1U : 0U];
   // GQA (KvHeads attr): query head h reads kv head h/(H/KvHeads).  When
   // KvHeads == H the emitted source is BYTE-IDENTICAL to the pre-GQA kernel
   // (kv_head_expr collapses to "h"), so recorded programs keep their
@@ -1928,15 +2114,25 @@ void emit_attention(std::ostringstream &out, const ir::Program &program,
   const auto causal = op.boolean(ir::AttrKey::Causal, false);
   std::ostringstream scale_literal;
   scale_literal << std::setprecision(17) << static_cast<float>(scale);
+  // The block's query row is (b*S + s), so the key row it reads is
+  // (b*Skv + ks); an unbatched program keeps the bare "ks" it always had.
+  const std::string key_row =
+      batched ? "(qs / " + std::to_string(sequence) + "ULL * " +
+                    std::to_string(kv_sequence) + "ULL + ks)"
+              : std::string("ks");
   out << render_kernel_template(
       "attention_exact",
       {{"function", function_name(op)},
-       {"items", std::to_string(sequence * heads)},
+       {"items", std::to_string(batch * sequence * heads)},
        {"heads", std::to_string(heads)},
-       {"kend", causal ? "qs + 1ULL" : std::to_string(kv_sequence) + "ULL"},
+       {"kend",
+        causal ? (batched ? "qs % " + std::to_string(sequence) + "ULL + 1ULL"
+                          : std::string("qs + 1ULL"))
+               : std::to_string(kv_sequence) + "ULL"},
        {"dim", std::to_string(dim)},
-       {"kv_heads", std::to_string(kv_heads)},
-       {"kv_head", kv_head_expr},
+       {"key_base", "(" + key_row + " * " + std::to_string(kv_heads) +
+                        "ULL + " + kv_head_expr + ") * " +
+                        std::to_string(dim) + "ULL"},
        {"scale", scale_literal.str()}});
   // The historical emitter left the stream at precision 17.
   out << std::setprecision(17);
@@ -2124,10 +2320,16 @@ void emit_residual_gate_backward(std::ostringstream &out,
 void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
                         const ir::Operation &op) {
   const auto *q = program.tensor(op.inputs[0]);
-  const auto sequence = q->dims[0];
-  const auto heads = q->dims[1];
-  const auto dim = q->dims[2];
-  const auto count = sequence * heads;
+  // Batched attention carries [B,S,H,D]; the historical form is [S,H,D].
+  const bool batched = q->dims.size() == 4U;
+  const auto batch = batched ? q->dims[0] : 1U;
+  const auto sequence = q->dims[batched ? 1U : 0U];
+  const auto heads = q->dims[batched ? 2U : 1U];
+  const auto dim = q->dims[batched ? 3U : 2U];
+  const auto count = batch * sequence * heads;
+  // Cross attention: the keys carry their own row count.
+  const auto *k_tensor = program.tensor(op.inputs[1]);
+  const auto kv_sequence = k_tensor->dims[batched ? 1U : 0U];
   const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
   const auto group = heads / kv_heads;
   // Collapses to "h" when KvHeads == H, keeping the emitted source
@@ -2135,6 +2337,16 @@ void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
   const std::string kv_head_expr =
       group == 1U ? std::string("h")
                   : "h / " + std::to_string(group) + "ULL";
+  // The key base gains the batch offset only when there is a batch, so an
+  // unbatched program emits exactly the text it always did.
+  const std::string key_row =
+      batched ? "(qs / " + std::to_string(sequence) + "ULL * " +
+                    std::to_string(kv_sequence) + "ULL + ks)"
+              : std::string("ks");
+  const std::string key_base = "(" + key_row + " * " +
+                               std::to_string(kv_heads) + "ULL + " +
+                               kv_head_expr + ") * " + std::to_string(dim) +
+                               "ULL";
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
@@ -2147,9 +2359,11 @@ void emit_attention_lse(std::ostringstream &out, const ir::Program &program,
        {"count", std::to_string(count)},
        {"heads", std::to_string(heads)},
        {"dim", std::to_string(dim)},
-       {"kend", causal ? "qs + 1ULL" : std::to_string(sequence) + "ULL"},
-       {"kv_heads", std::to_string(kv_heads)},
-       {"kv_head", kv_head_expr},
+       {"kend", causal ? (batched ? "qs % " + std::to_string(sequence) +
+                                        "ULL + 1ULL"
+                                  : std::string("qs + 1ULL"))
+                       : std::to_string(kv_sequence) + "ULL"},
+       {"key_base", key_base},
        {"load", typed_load(q->dtype)},
        {"scale", scale_literal.str()}});
   // The historical emitter left the stream at precision 9, defaultfloat.
@@ -2161,32 +2375,68 @@ void emit_attention_backward(std::ostringstream &out,
                              const ir::Operation &op) {
   const auto *q = program.tensor(op.inputs[1]);
   const auto *k_tensor = program.tensor(op.inputs[2]);
-  const auto sequence = q->dims[0];
-  const auto heads = q->dims[1];
-  const auto dim = q->dims[2];
-  const auto kv_heads = k_tensor->dims[1];
+  const bool batched = q->dims.size() == 4U;
+  const auto batch = batched ? q->dims[0] : 1U;
+  const auto sequence = q->dims[batched ? 1U : 0U];
+  const auto heads = q->dims[batched ? 2U : 1U];
+  const auto dim = q->dims[batched ? 3U : 2U];
+  const auto kv_sequence = k_tensor->dims[batched ? 1U : 0U];
+  const auto kv_heads = k_tensor->dims[batched ? 2U : 1U];
   const auto group = heads / kv_heads;
-  const auto count = sequence * heads * dim;
+  const auto count = batch * sequence * heads * dim;
+  const auto kv_count = batch * kv_sequence * kv_heads * dim;
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
   const auto text = [](std::uint64_t v) { return std::to_string(v); };
   std::ostringstream scale_literal;
   scale_literal << std::scientific << std::setprecision(9) << scale;
+  // Every index is an expression so one template serves the unbatched
+  // [S,H,D] form, the batched [B,S,H,D] form, and cross attention where the
+  // keys carry their own row count.  The batch offset appears only when
+  // there is a batch, so an unbatched program emits the simple form.
+  // Query rows are numbered ((b*S + s)*H + h); key rows ((b*Skv + ks)*KV + kh).
+  const std::string query_batch =
+      "row / " + text(sequence * heads) + "ULL";
+  const std::string key_batch =
+      "krow / " + text(kv_sequence * kv_heads) + "ULL";
+  const std::string s_expr =
+      batched ? "row / " + text(heads) + "ULL % " + text(sequence) + "ULL"
+              : "row / " + text(heads) + "ULL";
+  const std::string ks_expr =
+      batched
+          ? "krow / " + text(kv_heads) + "ULL % " + text(kv_sequence) + "ULL"
+          : "krow / " + text(kv_heads) + "ULL";
+  // The dq branch reads keys, so it offsets by the QUERY thread's batch into
+  // the key geometry; the dk/dv branch reads queries and does the reverse.
+  const std::string key_row =
+      batched ? "(" + query_batch + " * " + text(kv_sequence) + "ULL + ks)"
+              : std::string("ks");
+  const std::string query_row =
+      batched ? "(" + key_batch + " * " + text(sequence) + "ULL + qs)"
+              : std::string("qs");
   out << render_kernel_template(
       "attention_backward",
       {{"function", function_name(op)},
        {"scalar", typed_scalar(q->dtype)},
        {"count", text(count)},
+       {"kv_count", text(kv_count)},
        {"dim", text(dim)},
        {"heads", text(heads)},
        {"group", text(group)},
-       {"kend", causal ? "s + 1ULL" : text(sequence) + "ULL"},
+       {"kend", causal ? "s + 1ULL" : text(kv_sequence) + "ULL"},
        {"load", typed_load(q->dtype)},
+       {"s_expr", s_expr},
+       {"ks_expr", ks_expr},
        {"kv_heads", text(kv_heads)},
+       {"dq_key_base", "(" + key_row + " * " + text(kv_heads) + "ULL + kh) * " +
+                           text(dim) + "ULL"},
+       {"peer_query_base", "(" + query_row + " * " + text(heads) +
+                               "ULL + qh) * " + text(dim) + "ULL"},
+       {"peer_lse_index", query_row + " * " + text(heads) + "ULL + qh"},
        {"scale", scale_literal.str()},
        {"store", typed_store(q->dtype)},
-       {"qs_start", causal ? "s" : "0ULL"},
+       {"qs_start", causal ? "ks" : "0ULL"},
        {"sequence", text(sequence)}});
   // The historical emitter left the stream at precision 9, defaultfloat.
   out << std::setprecision(9) << std::defaultfloat;
@@ -2708,6 +2958,11 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
         op.opcode == ir::Opcode::LinearFp8BlockScaled ||
         op.opcode == ir::Opcode::Conv2d ||
         op.opcode == ir::Opcode::Conv3d ||
+        // The convolution gradients are library plans for the same reason
+        // the forward is: cuDNN owns the algorithm choice.
+        op.opcode == ir::Opcode::Conv2dBackwardInput ||
+        op.opcode == ir::Opcode::Conv2dBackwardWeight ||
+        op.opcode == ir::Opcode::Conv2dBackwardBias ||
         (op.opcode == ir::Opcode::Attention &&
          op.u64(ir::AttrKey::Implementation, 1U) != 1U))
       continue;
@@ -2831,6 +3086,24 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
     case ir::Opcode::SiLUBackward:
       emit_silu_backward(source, program, op);
       break;
+    case ir::Opcode::GeluBackward:
+      emit_gelu_backward(source, program, op);
+      break;
+    case ir::Opcode::UpsampleNearest2dBackward:
+      emit_upsample_nearest_2d_backward(source, program, op);
+      break;
+    case ir::Opcode::SliceBackward:
+      emit_slice_backward(source, program, op);
+      break;
+    case ir::Opcode::BroadcastToBackward:
+      emit_broadcast_to_backward(source, program, op);
+      break;
+    case ir::Opcode::GroupNormBackward:
+      emit_group_norm_backward(source, program, op);
+      break;
+    case ir::Opcode::GroupNormBackwardAffine:
+      emit_group_norm_backward_affine(source, program, op);
+      break;
     case ir::Opcode::AdamWUpdate:
       emit_adamw_update(source, program, op);
       break;
@@ -2939,6 +3212,11 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
       emit_conv1d(source, program, op);
       break;
     case ir::Opcode::Conv2d:
+    // The convolution and its three gradients are cuDNN plans, so codegen
+    // emits nothing for them.
+    case ir::Opcode::Conv2dBackwardInput:
+    case ir::Opcode::Conv2dBackwardWeight:
+    case ir::Opcode::Conv2dBackwardBias:
       break;
     case ir::Opcode::ChannelRmsNorm:
       emit_channel_rms_norm(source, program, op);

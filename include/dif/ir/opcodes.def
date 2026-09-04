@@ -151,3 +151,31 @@ DIF_OPCODE(LinearInt8WeightScaled, 74, "linear_int8_weight_scaled", PinnedNumeri
 // multiplication, and shift addition. Scale/shift carry one or more rows
 // which broadcast over contiguous groups of input rows.
 DIF_OPCODE(LayerNormModulate, 75, "layer_norm_modulate", DtypeUniform)
+// Gradient of the gated linear unit activation. The approximation attribute
+// selects the same closed form the forward operation used, so the derivative
+// is the derivative of what actually ran.
+DIF_OPCODE(GeluBackward, 76, "gelu_backward", None)
+// Gradient of nearest-neighbour 2-D upsampling: each input position sums the
+// gradient of the ScaleH x ScaleW output block it was copied into.
+DIF_OPCODE(UpsampleNearest2dBackward, 77, "upsample_nearest_2d_backward", None)
+// Gradient of an axis slice: the upstream gradient lands in the window the
+// slice read and every other position is zero.
+DIF_OPCODE(SliceBackward, 78, "slice_backward", None)
+// Gradient of a broadcast: sum the upstream gradient over the axes the
+// broadcast expanded, back to the source shape.
+DIF_OPCODE(BroadcastToBackward, 79, "broadcast_to_backward", None)
+// Gradient of group normalization with respect to its input, from the saved
+// input and the group statistics recomputed exactly as the forward did.
+DIF_OPCODE(GroupNormBackward, 80, "group_norm_backward", None)
+// Gradient of a 2-D convolution with respect to its input, its weight, and
+// its bias. Three operations rather than one multi-output operation, so a
+// frozen weight or an absent bias simply is not emitted.
+DIF_OPCODE(Conv2dBackwardInput, 81, "conv2d_backward_input", None)
+DIF_OPCODE(Conv2dBackwardWeight, 82, "conv2d_backward_weight", None)
+DIF_OPCODE(Conv2dBackwardBias, 83, "conv2d_backward_bias", None)
+// Weight and bias gradients of group normalization. Separate from the input
+// gradient because the two have different natural parallelism: the input
+// gradient reduces per (batch, group), these reduce per channel across the
+// batch. Keeping them apart lets both sum deterministically without atomics,
+// which a training run depends on.
+DIF_OPCODE(GroupNormBackwardAffine, 84, "group_norm_backward_affine", None)

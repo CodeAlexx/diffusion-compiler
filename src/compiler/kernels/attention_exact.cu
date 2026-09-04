@@ -1,6 +1,7 @@
-// Exact attention reference: one block per (query, head); scores reduced
-// through shared memory, a serial softmax on thread 0, then the value
-// accumulation. Grouped-query heads read kv head h / group.
+// Exact attention reference: one block per (query, head) of the whole
+// batch; scores reduced through shared memory, a serial softmax on thread 0,
+// then the value accumulation. Grouped-query heads read kv head h / group,
+// and the key base carries the batch offset when there is a batch.
 extern "C" __global__ void ${function}(const dif_scalar* q, const dif_scalar* k, const dif_scalar* v, dif_scalar* y) {
   extern __shared__ float shared[];
   float* reduction = shared;
@@ -12,7 +13,7 @@ extern "C" __global__ void ${function}(const dif_scalar* q, const dif_scalar* k,
   for (unsigned long long ks = 0; ks < kend; ++ks) {
     float partial = 0.0f;
     for (unsigned long long d = threadIdx.x; d < ${dim}ULL; d += blockDim.x)
-      partial = fmaf(dif_load(q, (qs * ${heads}ULL + h) * ${dim}ULL + d), dif_load(k, (ks * ${kv_heads}ULL + ${kv_head}) * ${dim}ULL + d), partial);
+      partial = fmaf(dif_load(q, (qs * ${heads}ULL + h) * ${dim}ULL + d), dif_load(k, ${key_base} + d), partial);
     reduction[threadIdx.x] = partial;
     __syncthreads();
     for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -36,7 +37,7 @@ extern "C" __global__ void ${function}(const dif_scalar* q, const dif_scalar* k,
   for (unsigned long long d = threadIdx.x; d < ${dim}ULL; d += blockDim.x) {
     float acc = 0.0f;
     for (unsigned long long ks = 0; ks < kend; ++ks)
-      acc = fmaf(probabilities[ks], dif_load(v, (ks * ${kv_heads}ULL + ${kv_head}) * ${dim}ULL + d), acc);
+      acc = fmaf(probabilities[ks], dif_load(v, ${key_base} + d), acc);
     dif_store(y, (qs * ${heads}ULL + h) * ${dim}ULL + d, acc);
   }
 }

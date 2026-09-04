@@ -46,9 +46,10 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-// Exact attention reference: one block per (query, head); scores reduced
-// through shared memory, a serial softmax on thread 0, then the value
-// accumulation. Grouped-query heads read kv head h / group.
+// Exact attention reference: one block per (query, head) of the whole
+// batch; scores reduced through shared memory, a serial softmax on thread 0,
+// then the value accumulation. Grouped-query heads read kv head h / group,
+// and the key base carries the batch offset when there is a batch.
 extern "C" __global__ void dif_op_1(const dif_scalar* q, const dif_scalar* k, const dif_scalar* v, dif_scalar* y) {
   extern __shared__ float shared[];
   float* reduction = shared;

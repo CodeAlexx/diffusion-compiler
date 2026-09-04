@@ -814,6 +814,140 @@ Program batch8_program(std::string_view which) {
   return program;
 }
 
+
+// The training backward kernels. Correctness lives in the finite-difference
+// and backend-parity gates; these pins say the generated source stops moving.
+Program batch9_program(std::string_view which) {
+  Program program;
+  auto op = [&](Opcode opcode, std::vector<std::uint32_t> inputs,
+                std::vector<std::uint32_t> outputs,
+                std::vector<Attribute> attributes = {}) {
+    program.operations = {{1, opcode, std::move(inputs), std::move(outputs),
+                           std::move(attributes)}};
+  };
+  if (which == "gelu_backward_tanh" || which == "gelu_backward_exacterf" ||
+      which == "gelu_backward_quick") {
+    const auto approximation =
+        which == "gelu_backward_tanh"
+            ? GeluApproximation::Tanh
+            : which == "gelu_backward_exacterf" ? GeluApproximation::ExactErf
+                                                : GeluApproximation::QuickSigmoid;
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {4, 8}},
+                       {2, DType::BF16, TensorRole::Input, {4, 8}},
+                       {3, DType::BF16, TensorRole::Output, {4, 8}}};
+    op(Opcode::GeluBackward, {1, 2}, {3},
+       {Attribute::u64(AttrKey::Approximation,
+                       static_cast<std::uint64_t>(approximation))});
+  } else if (which == "upsample_nearest_2d_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {1, 2, 6, 8}},
+                       {2, DType::BF16, TensorRole::Output, {1, 2, 3, 2}}};
+    op(Opcode::UpsampleNearest2dBackward, {1}, {2},
+       {Attribute::u64(AttrKey::ScaleH, 2U),
+        Attribute::u64(AttrKey::ScaleW, 4U)});
+  } else if (which == "slice_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {3, 2, 4}},
+                       {2, DType::BF16, TensorRole::Output, {3, 5, 4}}};
+    op(Opcode::SliceBackward, {1}, {2},
+       {Attribute::u64(AttrKey::Axis, 1U), Attribute::u64(AttrKey::Start, 2U)});
+  } else if (which == "broadcast_to_backward" ||
+             which == "broadcast_to_backward_rank") {
+    // One expands a size-one axis, the other also gains leading axes.
+    const bool ranked = which == "broadcast_to_backward_rank";
+    program.tensors = {
+        {1, DType::BF16, TensorRole::Input, {2, 3, 4}},
+        {2, DType::BF16, TensorRole::Output,
+         ranked ? std::vector<std::uint64_t>{4}
+                : std::vector<std::uint64_t>{1, 3, 4}}};
+    op(Opcode::BroadcastToBackward, {1}, {2});
+  } else if (which == "group_norm_backward") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {2, 4, 3, 3}},
+                       {2, DType::BF16, TensorRole::Constant, {4}},
+                       {3, DType::BF16, TensorRole::Input, {2, 4, 3, 3}},
+                       {4, DType::BF16, TensorRole::Output, {2, 4, 3, 3}}};
+    op(Opcode::GroupNormBackward, {1, 2, 3}, {4},
+       {Attribute::u64(AttrKey::Groups, 2U),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-5)});
+  } else if (which == "group_norm_backward_affine") {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, {2, 4, 3, 3}},
+                       {2, DType::BF16, TensorRole::Input, {2, 4, 3, 3}},
+                       {3, DType::BF16, TensorRole::Output, {4}},
+                       {4, DType::BF16, TensorRole::Output, {4}}};
+    op(Opcode::GroupNormBackwardAffine, {1, 2}, {3, 4},
+       {Attribute::u64(AttrKey::Groups, 2U),
+        Attribute::f64(AttrKey::Epsilon, 1.0e-5)});
+  } else {
+    fail("unknown batch9 corpus program " + std::string(which));
+  }
+  return program;
+}
+
+
+// Batched [B,S,H,D] attention and cross attention (keys with their own row
+// count) — the two geometries every real model carries.
+Program batch10_program(std::string_view which) {
+  Program program;
+  const bool batched = which.find("batched") != std::string_view::npos;
+  const bool cross = which.find("cross") != std::string_view::npos;
+  const bool gqa = which.find("gqa") != std::string_view::npos;
+  const std::uint64_t kv_heads = gqa ? 1U : 2U;
+  const std::uint64_t kv_rows = cross ? 6U : 4U;
+  auto shape = [&](std::uint64_t rows, std::uint64_t heads) {
+    std::vector<std::uint64_t> dims;
+    if (batched)
+      dims.push_back(2U);
+    dims.push_back(rows);
+    dims.push_back(heads);
+    dims.push_back(8U);
+    return dims;
+  };
+  auto rows_shape = [&](std::uint64_t rows, std::uint64_t heads) {
+    auto dims = shape(rows, heads);
+    dims.pop_back();
+    return dims;
+  };
+  std::vector<Attribute> attributes{accumulate_f32()};
+  if (gqa)
+    attributes.push_back(Attribute::u64(AttrKey::KvHeads, kv_heads));
+  if (which.find("exact") != std::string_view::npos) {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, shape(4U, 2U)},
+                       {2, DType::BF16, TensorRole::Input,
+                        shape(kv_rows, kv_heads)},
+                       {3, DType::BF16, TensorRole::Input,
+                        shape(kv_rows, kv_heads)},
+                       {4, DType::BF16, TensorRole::Output, shape(4U, 2U)}};
+    std::vector<Attribute> forward;
+    if (gqa)
+      forward.push_back(Attribute::u64(AttrKey::KvHeads, kv_heads));
+    program.operations = {
+        {1, Opcode::Attention, {1, 2, 3}, {4}, std::move(forward)}};
+    return program;
+  }
+  if (which.find("lse") != std::string_view::npos) {
+    program.tensors = {{1, DType::BF16, TensorRole::Input, shape(4U, 2U)},
+                       {2, DType::BF16, TensorRole::Input,
+                        shape(kv_rows, kv_heads)},
+                       {3, DType::F32, TensorRole::Output, rows_shape(4U, 2U)}};
+    program.operations = {{1, Opcode::AttentionLse, {1, 2}, {3}, attributes}};
+    return program;
+  }
+  program.tensors = {{1, DType::BF16, TensorRole::Input, shape(4U, 2U)},
+                     {2, DType::BF16, TensorRole::Input, shape(4U, 2U)},
+                     {3, DType::BF16, TensorRole::Input,
+                      shape(kv_rows, kv_heads)},
+                     {4, DType::BF16, TensorRole::Input,
+                      shape(kv_rows, kv_heads)},
+                     {5, DType::BF16, TensorRole::Input, shape(4U, 2U)},
+                     {6, DType::F32, TensorRole::Input, rows_shape(4U, 2U)},
+                     {7, DType::BF16, TensorRole::Output, shape(4U, 2U)},
+                     {8, DType::BF16, TensorRole::Output,
+                      shape(kv_rows, kv_heads)},
+                     {9, DType::BF16, TensorRole::Output,
+                      shape(kv_rows, kv_heads)}};
+  program.operations = {
+      {1, Opcode::AttentionBackward, {1, 2, 3, 4, 5, 6}, {7, 8, 9}, attributes}};
+  return program;
+}
+
 std::vector<Case> corpus() {
   using Q = Int8RowQuantization;
   return {
@@ -992,6 +1126,27 @@ std::vector<Case> corpus() {
       {"layer_norm_modulate_welford128", [] { return batch8_program("layer_norm_modulate_welford128"); }},
       {"layer_norm_modulate_generic_bf16_odd", [] { return batch8_program("layer_norm_modulate_generic_bf16_odd"); }},
       {"layer_norm_modulate_generic_f32", [] { return batch8_program("layer_norm_modulate_generic_f32"); }},
+      // batch 10: batched and cross attention, all three kernels
+      {"attention_exact_batched", [] { return batch10_program("attention_exact_batched"); }},
+      {"attention_exact_batched_cross", [] { return batch10_program("attention_exact_batched_cross"); }},
+      {"attention_exact_batched_cross_gqa", [] { return batch10_program("attention_exact_batched_cross_gqa"); }},
+      {"attention_lse_batched", [] { return batch10_program("attention_lse_batched"); }},
+      {"attention_lse_cross", [] { return batch10_program("attention_lse_cross"); }},
+      {"attention_lse_batched_cross_gqa", [] { return batch10_program("attention_lse_batched_cross_gqa"); }},
+      {"attention_backward_batched", [] { return batch10_program("attention_backward_batched"); }},
+      {"attention_backward_cross", [] { return batch10_program("attention_backward_cross"); }},
+      {"attention_backward_batched_cross", [] { return batch10_program("attention_backward_batched_cross"); }},
+      {"attention_backward_batched_cross_gqa", [] { return batch10_program("attention_backward_batched_cross_gqa"); }},
+      // batch 9: the training backward kernels
+      {"gelu_backward_tanh", [] { return batch9_program("gelu_backward_tanh"); }},
+      {"gelu_backward_exacterf", [] { return batch9_program("gelu_backward_exacterf"); }},
+      {"gelu_backward_quick", [] { return batch9_program("gelu_backward_quick"); }},
+      {"upsample_nearest_2d_backward", [] { return batch9_program("upsample_nearest_2d_backward"); }},
+      {"slice_backward", [] { return batch9_program("slice_backward"); }},
+      {"broadcast_to_backward", [] { return batch9_program("broadcast_to_backward"); }},
+      {"broadcast_to_backward_rank", [] { return batch9_program("broadcast_to_backward_rank"); }},
+      {"group_norm_backward", [] { return batch9_program("group_norm_backward"); }},
+      {"group_norm_backward_affine", [] { return batch9_program("group_norm_backward_affine"); }},
   };
 }
 

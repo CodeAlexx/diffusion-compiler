@@ -62,7 +62,7 @@ extern "C" __global__ void dif_op_1(const dif_bf16* grad_output, const dif_bf16*
     unsigned long long row = i / 8ULL, d = i % 8ULL, s = row / 2ULL, h = row % 2ULL, qb = row * 8ULL;
     float dq = 0.0f;
     {
-      unsigned long long kh = h / 1ULL, kend = 4ULL;
+      unsigned long long kh = h / 1ULL, kend = 6ULL;
       float row_lse = dif_load_f32(lse, row);
       float delta = 0.0f;
       for (unsigned long long e = 0ULL; e < 8ULL; ++e) delta = fmaf(dif_load_bf16(grad_output, qb + e), dif_load_bf16(forward_output, qb + e), delta);
@@ -79,7 +79,7 @@ extern "C" __global__ void dif_op_1(const dif_bf16* grad_output, const dif_bf16*
     }
     dif_store_bf16(grad_q, i, dq);
   }
-  if (i < 64ULL) {
+  if (i < 96ULL) {
     unsigned long long krow = i / 8ULL, d = i % 8ULL, ks = krow / 2ULL, h = krow % 2ULL, kvb = krow * 8ULL;
     float dk = 0.0f, dv = 0.0f;
     for (unsigned long long g = 0ULL; g < 1ULL; ++g) {

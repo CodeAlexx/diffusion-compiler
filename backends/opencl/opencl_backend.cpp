@@ -966,7 +966,16 @@ std::string generate_source(const dif::ir::Program &program) {
     case Opcode::QkNormPartialRopeBackward:
     case Opcode::AttentionLse:
     case Opcode::AttentionBackward:
-      dif::fail("OpenCL reference backend does not implement the DiT "
+    case Opcode::GeluBackward:
+    case Opcode::UpsampleNearest2dBackward:
+    case Opcode::SliceBackward:
+    case Opcode::BroadcastToBackward:
+    case Opcode::GroupNormBackward:
+    case Opcode::GroupNormBackwardAffine:
+    case Opcode::Conv2dBackwardInput:
+    case Opcode::Conv2dBackwardWeight:
+    case Opcode::Conv2dBackwardBias:
+      dif::fail("OpenCL reference backend does not implement the training "
                 "backward opcodes");
       break;
     case Opcode::Barrier:

@@ -4,11 +4,41 @@
 #include "dif/support/error.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace dif::training {
+
+namespace {
+
+// Attribute sets a gradient operation has to carry to reproduce the
+// forward's geometry exactly.
+std::vector<ir::Attribute>
+group_norm_attributes(const ir::Operation &operation) {
+  return {ir::Attribute::u64(ir::AttrKey::Groups,
+                             operation.u64(ir::AttrKey::Groups, 1U)),
+          ir::Attribute::f64(ir::AttrKey::Epsilon,
+                             operation.f64(ir::AttrKey::Epsilon, 1.0e-5))};
+}
+
+std::vector<ir::Attribute> conv2d_attributes(const ir::Operation &operation) {
+  const std::array<ir::AttrKey, 9> keys{
+      ir::AttrKey::StrideH,   ir::AttrKey::StrideW, ir::AttrKey::DilationH,
+      ir::AttrKey::DilationW, ir::AttrKey::PadTop,  ir::AttrKey::PadBottom,
+      ir::AttrKey::PadWest,   ir::AttrKey::PadEast, ir::AttrKey::Groups};
+  const std::array<std::uint64_t, 9> defaults{1U, 1U, 1U, 1U, 0U,
+                                              0U, 0U, 0U, 1U};
+  std::vector<ir::Attribute> attributes;
+  for (std::size_t index = 0U; index < keys.size(); ++index)
+    attributes.push_back(ir::Attribute::u64(
+        keys[index], operation.u64(keys[index], defaults[index])));
+  return attributes;
+}
+
+} // namespace
+
 
 AutodiffResult differentiate(const ir::Program &forward,
                              std::uint32_t loss_tensor,
@@ -272,7 +302,10 @@ AutodiffResult differentiate(const ir::Program &forward,
       const auto k = operation.inputs[1];
       const auto v = operation.inputs[2];
       const auto *q_description = result.program.tensor(q);
-      const auto head_dim = q_description->dims[2];
+      // [S,H,D] and [B,S,H,D] differ only in a leading axis, so every axis is
+      // named from the end and one rule serves both.
+      const auto head_axis = q_description->dims.size() - 2U;
+      const auto head_dim = q_description->dims.back();
       const auto scale = operation.f64(
           ir::AttrKey::AttentionScale,
           1.0 / std::sqrt(static_cast<double>(head_dim)));
@@ -284,7 +317,7 @@ AutodiffResult differentiate(const ir::Program &forward,
       // (fingerprint stability for every pre-GQA program).
       const bool grouped = operation.find(ir::AttrKey::KvHeads) != nullptr;
       const auto kv_heads = operation.u64(ir::AttrKey::KvHeads,
-                                          q_description->dims[1]);
+                                          q_description->dims[head_axis]);
       // Saved-stats recompute path: one AttentionLse op recomputes the
       // per-(query,head) F32 logsumexp, then AttentionBackward recomputes P
       // from Q,K,lse and consumes the forward output BY DIRECT TENSOR ID
@@ -292,9 +325,10 @@ AutodiffResult differentiate(const ir::Program &forward,
       // identity lesson.  AttentionScale and Causal are stamped explicitly
       // so forward and backward can never resolve different defaults.
       const auto lse = next_tensor++;
+      auto lse_dims = q_description->dims;
+      lse_dims.pop_back();
       result.program.tensors.push_back(
-          {lse, ir::DType::F32, ir::TensorRole::Internal,
-           {q_description->dims[0], q_description->dims[1]}});
+          {lse, ir::DType::F32, ir::TensorRole::Internal, std::move(lse_dims)});
       std::vector<ir::Attribute> lse_attributes{
           ir::Attribute::f64(ir::AttrKey::AttentionScale, scale),
           ir::Attribute::boolean(ir::AttrKey::Causal, causal)};
@@ -398,6 +432,153 @@ AutodiffResult differentiate(const ir::Program &forward,
       accumulate(operation.inputs[2], grad_gate);
       break;
     }
+    case ir::Opcode::Gelu: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      // The backward carries the same approximation attribute, so it
+      // differentiates the closed form the forward actually evaluated.
+      add_operation(ir::Opcode::GeluBackward,
+                    {operation.inputs[0], grad_output}, {grad_input},
+                    {ir::Attribute::u64(
+                        ir::AttrKey::Approximation,
+                        operation.u64(ir::AttrKey::Approximation, 0U))});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::UpsampleNearest2d: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::UpsampleNearest2dBackward, {grad_output},
+                    {grad_input},
+                    {ir::Attribute::u64(ir::AttrKey::ScaleH,
+                                        operation.u64(ir::AttrKey::ScaleH, 1U)),
+                     ir::Attribute::u64(ir::AttrKey::ScaleW,
+                                        operation.u64(ir::AttrKey::ScaleW, 1U))});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::Slice: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::SliceBackward, {grad_output}, {grad_input},
+                    {ir::Attribute::u64(ir::AttrKey::Axis,
+                                        operation.u64(ir::AttrKey::Axis, 0U)),
+                     ir::Attribute::u64(ir::AttrKey::Start,
+                                        operation.u64(ir::AttrKey::Start, 0U))});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::BroadcastTo: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::BroadcastToBackward, {grad_output},
+                    {grad_input});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::Reshape: {
+      // A reshape moves no values, so its gradient is the same gradient in
+      // the source shape.
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::Reshape, {grad_output}, {grad_input});
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::Permute: {
+      const auto &source = *result.program.tensor(operation.inputs[0]);
+      const auto grad_input = add_tensor(source);
+      // The gradient permutes back: position i of the inverse is where the
+      // forward sent axis i.
+      constexpr std::array<ir::AttrKey, 8> keys{
+          ir::AttrKey::Permutation0, ir::AttrKey::Permutation1,
+          ir::AttrKey::Permutation2, ir::AttrKey::Permutation3,
+          ir::AttrKey::Permutation4, ir::AttrKey::Permutation5,
+          ir::AttrKey::Permutation6, ir::AttrKey::Permutation7};
+      const auto rank = source.dims.size();
+      std::vector<std::uint64_t> inverse(rank, 0U);
+      for (std::size_t axis = 0U; axis < rank; ++axis)
+        inverse[operation.u64(keys[axis], axis)] = axis;
+      std::vector<ir::Attribute> attributes;
+      for (std::size_t axis = 0U; axis < rank; ++axis)
+        attributes.push_back(ir::Attribute::u64(keys[axis], inverse[axis]));
+      add_operation(ir::Opcode::Permute, {grad_output}, {grad_input},
+                    std::move(attributes));
+      accumulate(operation.inputs[0], grad_input);
+      break;
+    }
+    case ir::Opcode::Concat: {
+      // Each input takes the slice of the gradient it contributed.
+      const auto axis =
+          static_cast<std::size_t>(operation.u64(ir::AttrKey::Axis, 0U));
+      std::uint64_t offset = 0U;
+      for (const auto input : operation.inputs) {
+        const auto &description = *result.program.tensor(input);
+        const auto grad_input = add_tensor(description);
+        add_operation(ir::Opcode::Slice, {grad_output}, {grad_input},
+                      {ir::Attribute::u64(ir::AttrKey::Axis, axis),
+                       ir::Attribute::u64(ir::AttrKey::Start, offset)});
+        accumulate(input, grad_input);
+        offset += description.dims[axis];
+      }
+      break;
+    }
+    case ir::Opcode::GroupNorm: {
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::GroupNormBackward,
+                    {operation.inputs[0], operation.inputs[1], grad_output},
+                    {grad_input}, group_norm_attributes(operation));
+      accumulate(operation.inputs[0], grad_input);
+      // The affine gradients reduce per channel across the batch, so they
+      // are their own operation, and like every leaf weight they are only
+      // emitted when something asks for them.
+      const auto weight = operation.inputs[1];
+      const auto bias = operation.inputs[2];
+      const bool wanted = requested.contains(weight) ||
+                          produced.contains(weight) ||
+                          requested.contains(bias) || produced.contains(bias);
+      if (wanted) {
+        const auto grad_weight = add_tensor(*result.program.tensor(weight));
+        const auto grad_bias = add_tensor(*result.program.tensor(bias));
+        add_operation(ir::Opcode::GroupNormBackwardAffine,
+                      {operation.inputs[0], grad_output},
+                      {grad_weight, grad_bias},
+                      group_norm_attributes(operation));
+        accumulate(weight, grad_weight);
+        accumulate(bias, grad_bias);
+      }
+      break;
+    }
+    case ir::Opcode::Conv2d: {
+      auto attributes = conv2d_attributes(operation);
+      const auto grad_input =
+          add_tensor(*result.program.tensor(operation.inputs[0]));
+      add_operation(ir::Opcode::Conv2dBackwardInput,
+                    {grad_output, operation.inputs[1]}, {grad_input},
+                    attributes);
+      accumulate(operation.inputs[0], grad_input);
+      const auto weight = operation.inputs[1];
+      if (requested.contains(weight) || produced.contains(weight)) {
+        const auto grad_weight = add_tensor(*result.program.tensor(weight));
+        add_operation(ir::Opcode::Conv2dBackwardWeight,
+                      {grad_output, operation.inputs[0]}, {grad_weight},
+                      attributes);
+        accumulate(weight, grad_weight);
+      }
+      if (operation.inputs.size() == 3U) {
+        const auto grad_bias =
+            add_tensor(*result.program.tensor(operation.inputs[2]));
+        add_operation(ir::Opcode::Conv2dBackwardBias, {grad_output},
+                      {grad_bias});
+        accumulate(operation.inputs[2], grad_bias);
+      }
+      break;
+    }
+    case ir::Opcode::SinusoidalTimestep:
+      // The timestep is a schedule position, not a learnable value: reverse
+      // mode terminates here the way it does at a Fill.
+      break;
     case ir::Opcode::Cast: {
       // Cast is the mixed-precision boundary op.  The gradient of
       // Cast(x, dt) with upstream gradient g is Cast(g, dtype(x)):

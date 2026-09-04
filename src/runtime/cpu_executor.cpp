@@ -766,6 +766,351 @@ void silu_backward(const ir::Operation &op, TensorMap &tensors) {
   }
 }
 
+// The three convolution gradients share the forward's loop nest and its
+// index arithmetic; only the tensor each iteration accumulates into differs.
+struct Conv2dGeometry {
+  std::uint64_t stride_h, stride_w, dilation_h, dilation_w;
+  std::uint64_t pad_top, pad_west, groups;
+  std::uint64_t batch, in_channels, input_h, input_w;
+  std::uint64_t out_channels, kernel_h, kernel_w, output_h, output_w;
+  std::uint64_t in_per_group, out_per_group;
+};
+
+Conv2dGeometry conv2d_geometry(const ir::Operation &op,
+                               const ir::TensorDesc &input,
+                               const ir::TensorDesc &weight,
+                               const ir::TensorDesc &grad_output) {
+  Conv2dGeometry geometry{};
+  geometry.stride_h = op.u64(ir::AttrKey::StrideH, 1U);
+  geometry.stride_w = op.u64(ir::AttrKey::StrideW, 1U);
+  geometry.dilation_h = op.u64(ir::AttrKey::DilationH, 1U);
+  geometry.dilation_w = op.u64(ir::AttrKey::DilationW, 1U);
+  geometry.pad_top = op.u64(ir::AttrKey::PadTop, 0U);
+  geometry.pad_west = op.u64(ir::AttrKey::PadWest, 0U);
+  geometry.groups = op.u64(ir::AttrKey::Groups, 1U);
+  geometry.batch = input.dims[0];
+  geometry.in_channels = input.dims[1];
+  geometry.input_h = input.dims[2];
+  geometry.input_w = input.dims[3];
+  geometry.out_channels = weight.dims[0];
+  geometry.kernel_h = weight.dims[2];
+  geometry.kernel_w = weight.dims[3];
+  geometry.output_h = grad_output.dims[2];
+  geometry.output_w = grad_output.dims[3];
+  geometry.in_per_group = geometry.in_channels / geometry.groups;
+  geometry.out_per_group = geometry.out_channels / geometry.groups;
+  return geometry;
+}
+
+// Walks every (batch, out channel, out position, in channel, kernel tap) the
+// forward touched, handing the visitor the two flat indices involved.
+template <typename Visit>
+void conv2d_taps(const Conv2dGeometry &g, Visit &&visit) {
+  for (std::uint64_t b = 0U; b < g.batch; ++b)
+    for (std::uint64_t oc = 0U; oc < g.out_channels; ++oc) {
+      const auto group = oc / g.out_per_group;
+      for (std::uint64_t oh = 0U; oh < g.output_h; ++oh)
+        for (std::uint64_t ow = 0U; ow < g.output_w; ++ow) {
+          const auto output_index =
+              ((b * g.out_channels + oc) * g.output_h + oh) * g.output_w + ow;
+          for (std::uint64_t ic = 0U; ic < g.in_per_group; ++ic) {
+            const auto source_channel = group * g.in_per_group + ic;
+            for (std::uint64_t kh = 0U; kh < g.kernel_h; ++kh) {
+              const auto ih =
+                  static_cast<std::int64_t>(oh * g.stride_h + kh * g.dilation_h) -
+                  static_cast<std::int64_t>(g.pad_top);
+              if (ih < 0 || ih >= static_cast<std::int64_t>(g.input_h))
+                continue;
+              for (std::uint64_t kw = 0U; kw < g.kernel_w; ++kw) {
+                const auto iw =
+                    static_cast<std::int64_t>(ow * g.stride_w + kw * g.dilation_w) -
+                    static_cast<std::int64_t>(g.pad_west);
+                if (iw < 0 || iw >= static_cast<std::int64_t>(g.input_w))
+                  continue;
+                const auto input_index =
+                    ((b * g.in_channels + source_channel) * g.input_h +
+                     static_cast<std::uint64_t>(ih)) *
+                        g.input_w +
+                    static_cast<std::uint64_t>(iw);
+                const auto weight_index =
+                    ((oc * g.in_per_group + ic) * g.kernel_h + kh) * g.kernel_w +
+                    kw;
+                visit(output_index, input_index, weight_index);
+              }
+            }
+          }
+        }
+    }
+}
+
+void conv2d_backward_input(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto geometry = conv2d_geometry(
+      op, {0U, grad_input.dtype, 0U, grad_input.dims},
+      {0U, weight.dtype, 0U, weight.dims},
+      {0U, grad_output.dtype, 0U, grad_output.dims});
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_input.element_count()), 0.0F);
+  conv2d_taps(geometry, [&](std::uint64_t output_index,
+                            std::uint64_t input_index,
+                            std::uint64_t weight_index) {
+    accumulator[static_cast<std::size_t>(input_index)] +=
+        load_float(grad_output, output_index) * load_float(weight, weight_index);
+  });
+  for (std::size_t index = 0U; index < accumulator.size(); ++index)
+    store_float(grad_input, index, accumulator[index]);
+}
+
+void conv2d_backward_weight(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  const auto &input = tensors.at(op.inputs[1]);
+  auto &grad_weight = tensors.at(op.outputs[0]);
+  const auto geometry = conv2d_geometry(
+      op, {0U, input.dtype, 0U, input.dims},
+      {0U, grad_weight.dtype, 0U, grad_weight.dims},
+      {0U, grad_output.dtype, 0U, grad_output.dims});
+  std::vector<float> accumulator(
+      static_cast<std::size_t>(grad_weight.element_count()), 0.0F);
+  conv2d_taps(geometry, [&](std::uint64_t output_index,
+                            std::uint64_t input_index,
+                            std::uint64_t weight_index) {
+    accumulator[static_cast<std::size_t>(weight_index)] +=
+        load_float(grad_output, output_index) * load_float(input, input_index);
+  });
+  for (std::size_t index = 0U; index < accumulator.size(); ++index)
+    store_float(grad_weight, index, accumulator[index]);
+}
+
+void conv2d_backward_bias(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  auto &grad_bias = tensors.at(op.outputs[0]);
+  const auto batch = grad_output.dims[0];
+  const auto channels = grad_output.dims[1];
+  const auto plane = grad_output.dims[2] * grad_output.dims[3];
+  for (std::uint64_t channel = 0U; channel < channels; ++channel) {
+    float total = 0.0F;
+    for (std::uint64_t b = 0U; b < batch; ++b)
+      for (std::uint64_t index = 0U; index < plane; ++index)
+        total += load_float(grad_output,
+                            (b * channels + channel) * plane + index);
+    store_float(grad_bias, channel, total);
+  }
+}
+
+void gelu_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &grad_output = tensors.at(op.inputs[1]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto approximation = static_cast<ir::GeluApproximation>(
+      op.u64(ir::AttrKey::Approximation, 0U));
+  constexpr float kSqrtTwoOverPi = 0.7978845608028654F;
+  constexpr float kCubicCoefficient = 0.044715F;
+  constexpr float kInverseSqrtTwo = 0.7071067811865475F;
+  constexpr float kInverseSqrtTwoPi = 0.3989422804014327F;
+  for (std::uint64_t index = 0U; index < input.element_count(); ++index) {
+    const auto value = load_float(input, index);
+    float derivative = 0.0F;
+    if (approximation == ir::GeluApproximation::ExactErf) {
+      const auto cumulative =
+          0.5F * (1.0F + std::erf(value * kInverseSqrtTwo));
+      const auto density =
+          kInverseSqrtTwoPi * std::exp(-0.5F * value * value);
+      derivative = cumulative + value * density;
+    } else if (approximation == ir::GeluApproximation::QuickSigmoid) {
+      const auto sigmoid = 1.0F / (1.0F + std::exp(-1.702F * value));
+      derivative = sigmoid + value * 1.702F * sigmoid * (1.0F - sigmoid);
+    } else {
+      const auto cubic = value * value * value;
+      const auto inner =
+          kSqrtTwoOverPi * (value + kCubicCoefficient * cubic);
+      const auto tanh_inner = std::tanh(inner);
+      const auto squared = 1.0F - tanh_inner * tanh_inner;
+      const auto inner_derivative =
+          kSqrtTwoOverPi * (1.0F + 3.0F * kCubicCoefficient * value * value);
+      derivative =
+          0.5F * (1.0F + tanh_inner) + 0.5F * value * squared * inner_derivative;
+    }
+    store_float(grad_input, index,
+                load_float(grad_output, index) * derivative);
+  }
+}
+
+void upsample_nearest_2d_backward(const ir::Operation &op,
+                                  TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto scale_h = op.u64(ir::AttrKey::ScaleH, 1U);
+  const auto scale_w = op.u64(ir::AttrKey::ScaleW, 1U);
+  const auto height = grad_input.dims[2];
+  const auto width = grad_input.dims[3];
+  const auto out_width = grad_output.dims[3];
+  const auto planes = grad_input.dims[0] * grad_input.dims[1];
+  for (std::uint64_t plane = 0U; plane < planes; ++plane)
+    for (std::uint64_t y = 0U; y < height; ++y)
+      for (std::uint64_t x = 0U; x < width; ++x) {
+        // Every output position in the block read this input, so the
+        // gradient of the input is their sum.
+        float total = 0.0F;
+        for (std::uint64_t dy = 0U; dy < scale_h; ++dy)
+          for (std::uint64_t dx = 0U; dx < scale_w; ++dx)
+            total += load_float(
+                grad_output,
+                (plane * grad_output.dims[2] + y * scale_h + dy) * out_width +
+                    x * scale_w + dx);
+        store_float(grad_input, (plane * height + y) * width + x, total);
+      }
+}
+
+void slice_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto axis = static_cast<std::size_t>(op.u64(ir::AttrKey::Axis, 0U));
+  const auto start = op.u64(ir::AttrKey::Start, 0U);
+  std::uint64_t inner = 1U;
+  for (std::size_t index = axis + 1U; index < grad_input.dims.size(); ++index)
+    inner *= grad_input.dims[index];
+  const auto window = grad_output.dims[axis];
+  const auto extent = grad_input.dims[axis];
+  const auto outer = grad_input.element_count() / (extent * inner);
+  for (std::uint64_t index = 0U; index < grad_input.element_count(); ++index)
+    store_float(grad_input, index, 0.0F);
+  for (std::uint64_t o = 0U; o < outer; ++o)
+    for (std::uint64_t w = 0U; w < window; ++w)
+      for (std::uint64_t i = 0U; i < inner; ++i)
+        store_float(grad_input, (o * extent + start + w) * inner + i,
+                    load_float(grad_output, (o * window + w) * inner + i));
+}
+
+void broadcast_to_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &grad_output = tensors.at(op.inputs[0]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto rank = grad_output.dims.size();
+  const auto pad = rank - grad_input.dims.size();
+  for (std::uint64_t index = 0U; index < grad_input.element_count(); ++index)
+    store_float(grad_input, index, 0.0F);
+  // Walk the gradient and fold each position onto the source position it was
+  // broadcast from; an expanded axis contributes every one of its entries.
+  std::vector<std::uint64_t> coordinate(rank, 0U);
+  for (std::uint64_t index = 0U; index < grad_output.element_count();
+       ++index) {
+    std::uint64_t remainder = index;
+    for (std::size_t axis = rank; axis-- > 0U;) {
+      coordinate[axis] = remainder % grad_output.dims[axis];
+      remainder /= grad_output.dims[axis];
+    }
+    std::uint64_t source = 0U;
+    for (std::size_t axis = 0U; axis < grad_input.dims.size(); ++axis) {
+      const auto extent = grad_input.dims[axis];
+      source = source * extent +
+               (extent == 1U ? 0U : coordinate[pad + axis]);
+    }
+    store_float(grad_input, source,
+                load_float(grad_input, source) + load_float(grad_output, index));
+  }
+}
+
+void group_norm_backward(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &weight = tensors.at(op.inputs[1]);
+  const auto &grad_output = tensors.at(op.inputs[2]);
+  auto &grad_input = tensors.at(op.outputs[0]);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto batch = input.dims[0];
+  const auto channels = input.dims[1];
+  const auto channels_per_group = channels / groups;
+  std::uint64_t inner = 1U;
+  for (std::size_t axis = 2U; axis < input.dims.size(); ++axis)
+    inner *= input.dims[axis];
+  const auto elements = channels_per_group * inner;
+  for (std::uint64_t b = 0U; b < batch; ++b)
+    for (std::uint64_t group = 0U; group < groups; ++group) {
+      const auto base = (b * channels + group * channels_per_group) * inner;
+      // Statistics exactly as the forward computed them.
+      float sum = 0.0F;
+      float squares = 0.0F;
+      for (std::uint64_t k = 0U; k < elements; ++k) {
+        const auto value = load_float(input, base + k);
+        sum += value;
+        squares += value * value;
+      }
+      const auto mean = sum / static_cast<float>(elements);
+      const auto variance =
+          std::max(squares / static_cast<float>(elements) - mean * mean, 0.0F);
+      const auto inverse = 1.0F / std::sqrt(variance + epsilon);
+      // Two group reductions carry the mean and the projection of the
+      // normalized value, the standard normalization backward.
+      float grad_sum = 0.0F;
+      float grad_dot = 0.0F;
+      for (std::uint64_t k = 0U; k < elements; ++k) {
+        const auto channel = group * channels_per_group + k / inner;
+        const auto scaled =
+            load_float(grad_output, base + k) * load_float(weight, channel);
+        grad_sum += scaled;
+        grad_dot += scaled * (load_float(input, base + k) - mean) * inverse;
+      }
+      const auto count = static_cast<float>(elements);
+      for (std::uint64_t k = 0U; k < elements; ++k) {
+        const auto channel = group * channels_per_group + k / inner;
+        const auto normalized =
+            (load_float(input, base + k) - mean) * inverse;
+        const auto scaled =
+            load_float(grad_output, base + k) * load_float(weight, channel);
+        store_float(grad_input, base + k,
+                    inverse * (scaled - grad_sum / count -
+                               normalized * grad_dot / count));
+      }
+    }
+}
+
+void group_norm_backward_affine(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &grad_output = tensors.at(op.inputs[1]);
+  auto &grad_weight = tensors.at(op.outputs[0]);
+  auto &grad_bias = tensors.at(op.outputs[1]);
+  const auto groups = op.u64(ir::AttrKey::Groups, 1U);
+  const auto epsilon = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-5));
+  const auto batch = input.dims[0];
+  const auto channels = input.dims[1];
+  const auto channels_per_group = channels / groups;
+  std::uint64_t inner = 1U;
+  for (std::size_t axis = 2U; axis < input.dims.size(); ++axis)
+    inner *= input.dims[axis];
+  const auto elements = channels_per_group * inner;
+  for (std::uint64_t channel = 0U; channel < channels; ++channel) {
+    const auto group = channel / channels_per_group;
+    float weight_total = 0.0F;
+    float bias_total = 0.0F;
+    for (std::uint64_t b = 0U; b < batch; ++b) {
+      // The group statistics this channel was normalized with, recomputed
+      // exactly as the forward did.
+      const auto group_base =
+          (b * channels + group * channels_per_group) * inner;
+      float sum = 0.0F;
+      float squares = 0.0F;
+      for (std::uint64_t k = 0U; k < elements; ++k) {
+        const auto value = load_float(input, group_base + k);
+        sum += value;
+        squares += value * value;
+      }
+      const auto mean = sum / static_cast<float>(elements);
+      const auto variance =
+          std::max(squares / static_cast<float>(elements) - mean * mean, 0.0F);
+      const auto inverse = 1.0F / std::sqrt(variance + epsilon);
+      const auto base = (b * channels + channel) * inner;
+      for (std::uint64_t i = 0U; i < inner; ++i) {
+        const auto gradient = load_float(grad_output, base + i);
+        weight_total += gradient * (load_float(input, base + i) - mean) * inverse;
+        bias_total += gradient;
+      }
+    }
+    store_float(grad_weight, channel, weight_total);
+    store_float(grad_bias, channel, bias_total);
+  }
+}
+
 void adamw_update(const ir::Operation &op, TensorMap &tensors) {
   const auto &parameter = tensors.at(op.inputs[0]);
   const auto &gradient = tensors.at(op.inputs[1]);
@@ -1945,34 +2290,48 @@ void attention_lse(const ir::Operation &op, TensorMap &tensors) {
   const auto &q_tensor = tensors.at(op.inputs[0]);
   const auto &k = tensors.at(op.inputs[1]);
   auto &lse = tensors.at(op.outputs[0]);
-  const auto sequence = q_tensor.dims[0];
-  const auto heads = q_tensor.dims[1];
-  const auto dim = q_tensor.dims[2];
+  // [S,H,D] and the batched [B,S,H,D] share one loop: an unbatched tensor is
+  // a batch of one, so its offsets are all zero and the arithmetic is the
+  // arithmetic it always was.
+  const bool batched = q_tensor.dims.size() == 4U;
+  const auto batch = batched ? q_tensor.dims[0] : 1U;
+  const auto sequence = q_tensor.dims[batched ? 1U : 0U];
+  const auto heads = q_tensor.dims[batched ? 2U : 1U];
+  const auto dim = q_tensor.dims[batched ? 3U : 2U];
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
   const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
   const auto group = heads / kv_heads;
-  for (std::uint64_t query = 0U; query < sequence; ++query) {
-    const auto key_end = causal ? query + 1U : sequence;
-    for (std::uint64_t head = 0U; head < heads; ++head) {
-      const auto kv_head = head / group;
-      float maximum = -std::numeric_limits<float>::infinity();
-      std::vector<float> scores(key_end);
-      for (std::uint64_t key = 0U; key < key_end; ++key) {
-        float score = 0.0F;
-        for (std::uint64_t d = 0U; d < dim; ++d)
-          score = std::fma(
-              load_float(q_tensor, (query * heads + head) * dim + d),
-              load_float(k, (key * kv_heads + kv_head) * dim + d), score);
-        scores[key] = score * scale;
-        maximum = std::max(maximum, scores[key]);
+  // Cross attention: the keys carry their own row count.
+  const auto kv_sequence = k.dims[batched ? 1U : 0U];
+  for (std::uint64_t b = 0U; b < batch; ++b) {
+    const auto query_offset = b * sequence * heads * dim;
+    const auto key_offset = b * kv_sequence * kv_heads * dim;
+    const auto row_offset = b * sequence * heads;
+    for (std::uint64_t query = 0U; query < sequence; ++query) {
+      const auto key_end = causal ? query + 1U : kv_sequence;
+      for (std::uint64_t head = 0U; head < heads; ++head) {
+        const auto kv_head = head / group;
+        float maximum = -std::numeric_limits<float>::infinity();
+        std::vector<float> scores(key_end);
+        for (std::uint64_t key = 0U; key < key_end; ++key) {
+          float score = 0.0F;
+          for (std::uint64_t d = 0U; d < dim; ++d)
+            score = std::fma(
+                load_float(q_tensor,
+                           query_offset + (query * heads + head) * dim + d),
+                load_float(k, key_offset + (key * kv_heads + kv_head) * dim + d),
+                score);
+          scores[key] = score * scale;
+          maximum = std::max(maximum, scores[key]);
+        }
+        float denominator = 0.0F;
+        for (std::uint64_t key = 0U; key < key_end; ++key)
+          denominator += std::exp(scores[key] - maximum);
+        store_float(lse, row_offset + query * heads + head,
+                    maximum + std::log(denominator));
       }
-      float denominator = 0.0F;
-      for (std::uint64_t key = 0U; key < key_end; ++key)
-        denominator += std::exp(scores[key] - maximum);
-      store_float(lse, query * heads + head,
-                  maximum + std::log(denominator));
     }
   }
 }
@@ -1987,14 +2346,17 @@ void attention_backward(const ir::Operation &op, TensorMap &tensors) {
   auto &grad_q = tensors.at(op.outputs[0]);
   auto &grad_k = tensors.at(op.outputs[1]);
   auto &grad_v = tensors.at(op.outputs[2]);
-  const auto sequence = q_tensor.dims[0];
-  const auto heads = q_tensor.dims[1];
-  const auto dim = q_tensor.dims[2];
+  const bool batched = q_tensor.dims.size() == 4U;
+  const auto batch = batched ? q_tensor.dims[0] : 1U;
+  const auto sequence = q_tensor.dims[batched ? 1U : 0U];
+  const auto heads = q_tensor.dims[batched ? 2U : 1U];
+  const auto dim = q_tensor.dims[batched ? 3U : 2U];
   const auto scale = static_cast<float>(op.f64(
       ir::AttrKey::AttentionScale, 1.0 / std::sqrt(static_cast<double>(dim))));
   const bool causal = op.boolean(ir::AttrKey::Causal, false);
   const auto kv_heads = op.u64(ir::AttrKey::KvHeads, heads);
   const auto group = heads / kv_heads;
+  const auto kv_sequence = k.dims[batched ? 1U : 0U];
   // dK/dV accumulate across every query AND every query head sharing the kv
   // head, in F32 accumulators (flame dtype contract: cross-element
   // accumulation never round-trips through storage precision); one rounding
@@ -2002,48 +2364,56 @@ void attention_backward(const ir::Operation &op, TensorMap &tensors) {
   // zeros for keys beyond every query.
   std::vector<float> key_gradient(grad_k.element_count(), 0.0F);
   std::vector<float> value_gradient(grad_v.element_count(), 0.0F);
-  std::vector<float> row_gradient(sequence);
-  for (std::uint64_t head = 0U; head < heads; ++head) {
-    const auto kv_head = head / group;
-    for (std::uint64_t query = 0U; query < sequence; ++query) {
-      const auto key_end = causal ? query + 1U : sequence;
-      const auto query_base = (query * heads + head) * dim;
-      const auto row_lse = load_float(lse, query * heads + head);
-      float delta = 0.0F;
-      for (std::uint64_t d = 0U; d < dim; ++d)
-        delta = std::fma(load_float(grad_output, query_base + d),
-                         load_float(forward_output, query_base + d), delta);
-      for (std::uint64_t key = 0U; key < key_end; ++key) {
-        const auto key_base = (key * kv_heads + kv_head) * dim;
-        float score = 0.0F;
-        float projected = 0.0F;
-        for (std::uint64_t d = 0U; d < dim; ++d) {
-          score = std::fma(load_float(q_tensor, query_base + d),
-                           load_float(k, key_base + d), score);
-          projected = std::fma(load_float(grad_output, query_base + d),
-                               load_float(v, key_base + d), projected);
+  std::vector<float> row_gradient(kv_sequence);
+  // Batch rows never mix: each one carries its own query/key/lse offset, and
+  // an unbatched tensor is a batch of one whose offsets are zero.
+  for (std::uint64_t b = 0U; b < batch; ++b) {
+    const auto query_offset = b * sequence * heads * dim;
+    const auto key_offset = b * kv_sequence * kv_heads * dim;
+    const auto row_offset = b * sequence * heads;
+    for (std::uint64_t head = 0U; head < heads; ++head) {
+      const auto kv_head = head / group;
+      for (std::uint64_t query = 0U; query < sequence; ++query) {
+        const auto key_end = causal ? query + 1U : kv_sequence;
+        const auto query_base = query_offset + (query * heads + head) * dim;
+        const auto row_lse = load_float(lse, row_offset + query * heads + head);
+        float delta = 0.0F;
+        for (std::uint64_t d = 0U; d < dim; ++d)
+          delta = std::fma(load_float(grad_output, query_base + d),
+                           load_float(forward_output, query_base + d), delta);
+        for (std::uint64_t key = 0U; key < key_end; ++key) {
+          const auto key_base = key_offset + (key * kv_heads + kv_head) * dim;
+          float score = 0.0F;
+          float projected = 0.0F;
+          for (std::uint64_t d = 0U; d < dim; ++d) {
+            score = std::fma(load_float(q_tensor, query_base + d),
+                             load_float(k, key_base + d), score);
+            projected = std::fma(load_float(grad_output, query_base + d),
+                                 load_float(v, key_base + d), projected);
+          }
+          const auto probability = std::exp(score * scale - row_lse);
+          const auto score_gradient =
+              probability * (projected - delta) * scale;
+          row_gradient[key] = score_gradient;
+          for (std::uint64_t d = 0U; d < dim; ++d) {
+            key_gradient[key_base + d] =
+                std::fma(score_gradient, load_float(q_tensor, query_base + d),
+                         key_gradient[key_base + d]);
+            value_gradient[key_base + d] =
+                std::fma(probability, load_float(grad_output, query_base + d),
+                         value_gradient[key_base + d]);
+          }
         }
-        const auto probability = std::exp(score * scale - row_lse);
-        const auto score_gradient =
-            probability * (projected - delta) * scale;
-        row_gradient[key] = score_gradient;
         for (std::uint64_t d = 0U; d < dim; ++d) {
-          key_gradient[key_base + d] =
-              std::fma(score_gradient, load_float(q_tensor, query_base + d),
-                       key_gradient[key_base + d]);
-          value_gradient[key_base + d] =
-              std::fma(probability, load_float(grad_output, query_base + d),
-                       value_gradient[key_base + d]);
+          float accumulator = 0.0F;
+          for (std::uint64_t key = 0U; key < key_end; ++key)
+            accumulator = std::fma(
+                row_gradient[key],
+                load_float(k,
+                           key_offset + (key * kv_heads + kv_head) * dim + d),
+                accumulator);
+          store_float(grad_q, query_base + d, accumulator);
         }
-      }
-      for (std::uint64_t d = 0U; d < dim; ++d) {
-        float accumulator = 0.0F;
-        for (std::uint64_t key = 0U; key < key_end; ++key)
-          accumulator =
-              std::fma(row_gradient[key],
-                       load_float(k, (key * kv_heads + kv_head) * dim + d),
-                       accumulator);
-        store_float(grad_q, query_base + d, accumulator);
       }
     }
   }
@@ -2785,6 +3155,33 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
       break;
     case ir::Opcode::SiLUBackward:
       silu_backward(op, tensors);
+      break;
+    case ir::Opcode::GeluBackward:
+      gelu_backward(op, tensors);
+      break;
+    case ir::Opcode::UpsampleNearest2dBackward:
+      upsample_nearest_2d_backward(op, tensors);
+      break;
+    case ir::Opcode::SliceBackward:
+      slice_backward(op, tensors);
+      break;
+    case ir::Opcode::BroadcastToBackward:
+      broadcast_to_backward(op, tensors);
+      break;
+    case ir::Opcode::GroupNormBackward:
+      group_norm_backward(op, tensors);
+      break;
+    case ir::Opcode::GroupNormBackwardAffine:
+      group_norm_backward_affine(op, tensors);
+      break;
+    case ir::Opcode::Conv2dBackwardInput:
+      conv2d_backward_input(op, tensors);
+      break;
+    case ir::Opcode::Conv2dBackwardWeight:
+      conv2d_backward_weight(op, tensors);
+      break;
+    case ir::Opcode::Conv2dBackwardBias:
+      conv2d_backward_bias(op, tensors);
       break;
     case ir::Opcode::AdamWUpdate:
       adamw_update(op, tensors);

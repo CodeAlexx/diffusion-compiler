@@ -55,13 +55,13 @@ extern "C" __global__ void dif_op_1(const dif_scalar* q, const dif_scalar* k, co
   float* reduction = shared;
   float* probabilities = shared + blockDim.x;
   unsigned long long item = blockIdx.x;
-  if (item >= 8ULL) return;
+  if (item >= 16ULL) return;
   unsigned long long qs = item / 2ULL, h = item % 2ULL;
   unsigned long long kend = 6ULL;
   for (unsigned long long ks = 0; ks < kend; ++ks) {
     float partial = 0.0f;
     for (unsigned long long d = threadIdx.x; d < 8ULL; d += blockDim.x)
-      partial = fmaf(dif_load(q, (qs * 2ULL + h) * 8ULL + d), dif_load(k, (ks * 2ULL + h) * 8ULL + d), partial);
+      partial = fmaf(dif_load(q, (qs * 2ULL + h) * 8ULL + d), dif_load(k, ((qs / 4ULL * 6ULL + ks) * 2ULL + h) * 8ULL + d), partial);
     reduction[threadIdx.x] = partial;
     __syncthreads();
     for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -85,7 +85,7 @@ extern "C" __global__ void dif_op_1(const dif_scalar* q, const dif_scalar* k, co
   for (unsigned long long d = threadIdx.x; d < 8ULL; d += blockDim.x) {
     float acc = 0.0f;
     for (unsigned long long ks = 0; ks < kend; ++ks)
-      acc = fmaf(probabilities[ks], dif_load(v, (ks * 2ULL + h) * 8ULL + d), acc);
+      acc = fmaf(probabilities[ks], dif_load(v, ((qs / 4ULL * 6ULL + ks) * 2ULL + h) * 8ULL + d), acc);
     dif_store(y, (qs * 2ULL + h) * 8ULL + d, acc);
   }
 }

@@ -46,20 +46,23 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-// Decomposed attention backward (reference form). Thread i = (s,h,d) over
-// the QUERY geometry computes dq[s,h,d]; threads with h < KvHeads also own
-// dk/dv[s,h,d], accumulating in F32 across every query and every query head
-// of their group (grouped-KV gradient accumulation). P is recomputed from
-// Q,K and the saved F32 logsumexp; delta = rowsum(dO*O) uses the forward
-// output. O(S) score recomputations per thread: acceptable at gate scale,
-// cuDNN SDPA backward stays future work.
+// Decomposed attention backward (reference form). One thread index covers
+// both geometries independently: threads under the query element count
+// compute dq at their own flat index, and threads under the key/value
+// element count own dk/dv at theirs, accumulating in F32 across every query
+// and every query head of their group (grouped-KV gradient accumulation).
+// The two guards are separate because cross-attention keys carry their own
+// row count, so the key geometry is not the query geometry.  P is recomputed
+// from Q,K and the saved F32 logsumexp; delta = rowsum(dO*O) uses the
+// forward output. O(S) score recomputations per thread: acceptable at gate
+// scale, cuDNN SDPA backward stays future work.
 extern "C" __global__ void dif_op_1(const dif_bf16* grad_output, const dif_bf16* q, const dif_bf16* k, const dif_bf16* v, const dif_bf16* forward_output, const dif_f32* lse, dif_bf16* grad_q, dif_bf16* grad_k, dif_bf16* grad_v) {
   unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < 64ULL) {
-    unsigned long long row = i / 8ULL, d = i % 8ULL, s = row / 2ULL, h = row % 2ULL, base = row * 8ULL;
+    unsigned long long row = i / 8ULL, d = i % 8ULL, s = row / 2ULL, h = row % 2ULL, qb = row * 8ULL;
     float dq = 0.0f;
     {
-      unsigned long long qb = base, kh = h / 2ULL, kend = 4ULL;
+      unsigned long long kh = h / 2ULL, kend = 4ULL;
       float row_lse = dif_load_f32(lse, row);
       float delta = 0.0f;
       for (unsigned long long e = 0ULL; e < 8ULL; ++e) delta = fmaf(dif_load_bf16(grad_output, qb + e), dif_load_bf16(forward_output, qb + e), delta);
@@ -75,29 +78,28 @@ extern "C" __global__ void dif_op_1(const dif_bf16* grad_output, const dif_bf16*
       }
     }
     dif_store_bf16(grad_q, i, dq);
-    if (h < 1ULL) {
-      unsigned long long kb = (s * 1ULL + h) * 8ULL + d;
-      float dk = 0.0f, dv = 0.0f;
-      unsigned long long kvb = (s * 1ULL + h) * 8ULL;
-      for (unsigned long long g = 0ULL; g < 2ULL; ++g) {
-        unsigned long long qh = h * 2ULL + g;
-        for (unsigned long long qs = 0ULL; qs < 4ULL; ++qs) {
-          unsigned long long qb = (qs * 2ULL + qh) * 8ULL;
-          float row_lse = dif_load_f32(lse, qs * 2ULL + qh);
-          float score = 0.0f, projected = 0.0f, delta = 0.0f;
-          for (unsigned long long e = 0ULL; e < 8ULL; ++e) {
-            score = fmaf(dif_load_bf16(q, qb + e), dif_load_bf16(k, kvb + e), score);
-            projected = fmaf(dif_load_bf16(grad_output, qb + e), dif_load_bf16(v, kvb + e), projected);
-            delta = fmaf(dif_load_bf16(grad_output, qb + e), dif_load_bf16(forward_output, qb + e), delta);
-          }
-          float probability = expf(score * 3.535533845e-01f - row_lse);
-          dk = fmaf(probability * (projected - delta) * 3.535533845e-01f, dif_load_bf16(q, qb + d), dk);
-          dv = fmaf(probability, dif_load_bf16(grad_output, qb + d), dv);
+  }
+  if (i < 32ULL) {
+    unsigned long long krow = i / 8ULL, d = i % 8ULL, ks = krow / 1ULL, h = krow % 1ULL, kvb = krow * 8ULL;
+    float dk = 0.0f, dv = 0.0f;
+    for (unsigned long long g = 0ULL; g < 2ULL; ++g) {
+      unsigned long long qh = h * 2ULL + g;
+      for (unsigned long long qs = 0ULL; qs < 4ULL; ++qs) {
+        unsigned long long qb = (qs * 2ULL + qh) * 8ULL;
+        float row_lse = dif_load_f32(lse, qs * 2ULL + qh);
+        float score = 0.0f, projected = 0.0f, delta = 0.0f;
+        for (unsigned long long e = 0ULL; e < 8ULL; ++e) {
+          score = fmaf(dif_load_bf16(q, qb + e), dif_load_bf16(k, kvb + e), score);
+          projected = fmaf(dif_load_bf16(grad_output, qb + e), dif_load_bf16(v, kvb + e), projected);
+          delta = fmaf(dif_load_bf16(grad_output, qb + e), dif_load_bf16(forward_output, qb + e), delta);
         }
+        float probability = expf(score * 3.535533845e-01f - row_lse);
+        dk = fmaf(probability * (projected - delta) * 3.535533845e-01f, dif_load_bf16(q, qb + d), dk);
+        dv = fmaf(probability, dif_load_bf16(grad_output, qb + d), dv);
       }
-      dif_store_bf16(grad_k, kb, dk);
-      dif_store_bf16(grad_v, kb, dv);
     }
+    dif_store_bf16(grad_k, i, dk);
+    dif_store_bf16(grad_v, i, dv);
   }
 }
 #undef dif_scalar
