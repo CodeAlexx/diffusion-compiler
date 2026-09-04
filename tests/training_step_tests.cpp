@@ -138,6 +138,91 @@ void bf16_parameters_stay_bf16() {
   }
 }
 
+// A half-precision checkpoint has to be trainable. F16 has ten mantissa
+// bits, so a small AdamW update rounds away entirely and the parameter stops
+// moving -- and AdamW does not accept F16 storage at all, so without a master
+// copy an F16 checkpoint cannot train even badly.
+void half_precision_parameters_train_through_a_master() {
+  const auto forward = two_layer_forward(DType::F16);
+  const std::vector<std::uint32_t> parameters{2U, 3U, 4U};
+  const auto step = dif::training::build_training_step(forward, 9U, parameters,
+                                                       {});
+  for (const auto &binding : step.bindings) {
+    expect(binding.master_input != 0U && binding.master_output != 0U,
+           "an F16 parameter gets a master without being asked");
+    const auto *master = step.program.tensor(binding.master_input);
+    expect(master != nullptr && master->dtype == DType::F32,
+           "the master copy is F32");
+    const auto *update = update_for(step.program, binding.master_input);
+    expect(update != nullptr,
+           "the optimizer reads the master, not the half-precision parameter");
+    if (!update)
+      continue;
+    expect(update->outputs[0] == binding.master_output,
+           "the optimizer writes the master");
+    // The gradient arrives in F16 and must cross an explicit cast.
+    const auto *gradient = step.program.tensor(update->inputs[1]);
+    expect(gradient != nullptr && gradient->dtype == DType::F32,
+           "an F16 gradient is cast before the optimizer sees it");
+    expect(update_for(step.program, binding.parameter_input) == nullptr,
+           "the F16 parameter is never handed to the optimizer directly");
+    // And the updated master is rounded back down for the next forward pass.
+    bool rounded_down = false;
+    for (const auto &operation : step.program.operations)
+      if (operation.opcode == Opcode::Cast &&
+          operation.inputs[0] == binding.master_output &&
+          operation.outputs[0] == binding.parameter_output)
+        rounded_down = true;
+    expect(rounded_down, "the updated master is rounded down for the forward pass");
+    const auto *parameter = step.program.tensor(binding.parameter_output);
+    expect(parameter != nullptr && parameter->dtype == DType::F16,
+           "the forward pass still sees an F16 parameter");
+  }
+}
+
+void f32_parameters_are_their_own_master() {
+  const auto forward = two_layer_forward(DType::F32);
+  const std::vector<std::uint32_t> parameters{2U, 4U};
+  // Asking for masters on F32 parameters buys nothing, so it must not add
+  // a redundant copy of every weight.
+  dif::training::OptimizerHyperparameters hyperparameters;
+  hyperparameters.master_weights = true;
+  const auto step = dif::training::build_training_step(forward, 9U, parameters,
+                                                       hyperparameters);
+  for (const auto &binding : step.bindings) {
+    expect(binding.master_input == 0U && binding.master_output == 0U,
+           "an F32 parameter is already its own master");
+    expect(update_for(step.program, binding.parameter_input) != nullptr,
+           "the optimizer reads the F32 parameter directly");
+  }
+}
+
+void bf16_masters_are_opt_in() {
+  const auto forward = two_layer_forward(DType::BF16);
+  const std::vector<std::uint32_t> parameters{2U, 4U};
+  // BF16 has the range but not the precision. AdamW accepts BF16 storage, so
+  // training without a master is a real choice, and it stays the default.
+  const auto direct = dif::training::build_training_step(forward, 9U,
+                                                         parameters, {});
+  for (const auto &binding : direct.bindings)
+    expect(binding.master_input == 0U,
+           "BF16 trains without a master unless asked");
+
+  dif::training::OptimizerHyperparameters hyperparameters;
+  hyperparameters.master_weights = true;
+  const auto mastered = dif::training::build_training_step(
+      forward, 9U, parameters, hyperparameters);
+  for (const auto &binding : mastered.bindings) {
+    expect(binding.master_input != 0U, "asking for a master gets one");
+    const auto *update = update_for(mastered.program, binding.master_input);
+    expect(update != nullptr, "the optimizer reads the master");
+    // A BF16 gradient needs no cast: AdamW takes BF16 gradients as they are.
+    if (update)
+      expect(update->inputs[1] == binding.gradient_output,
+             "a BF16 gradient reaches the optimizer without a cast");
+  }
+}
+
 void the_decay_hook_reaches_its_parameter() {
   const auto forward = two_layer_forward(DType::F32);
   const std::vector<std::uint32_t> parameters{2U, 3U, 4U};
@@ -210,6 +295,9 @@ void bad_requests_are_refused() {
 int main() {
   composes_one_program();
   bf16_parameters_stay_bf16();
+  half_precision_parameters_train_through_a_master();
+  f32_parameters_are_their_own_master();
+  bf16_masters_are_opt_in();
   the_decay_hook_reaches_its_parameter();
   the_composition_is_deterministic();
   bad_requests_are_refused();

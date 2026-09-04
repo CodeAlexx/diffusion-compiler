@@ -31,6 +31,16 @@ struct OptimizerHyperparameters {
   double beta2{0.999};
   double epsilon{1.0e-8};
   double weight_decay{0.0};
+  // Train through an F32 master copy of each parameter.  A half-precision
+  // parameter has too few mantissa bits to accumulate a small update: the
+  // update rounds away and the parameter stops moving.  The standard answer
+  // is to keep the optimizer's copy in F32 and round it down for the forward
+  // pass, which is what this does.
+  //
+  // F16 parameters get a master whatever this says, because AdamW does not
+  // accept F16 storage at all -- a checkpoint saved in F16 would otherwise be
+  // untrainable rather than merely imprecise.
+  bool master_weights{false};
 };
 
 // The tensors that tie one parameter to its gradient and its optimizer state
@@ -44,6 +54,12 @@ struct ParameterBinding {
   std::uint32_t parameter_output{};
   std::uint32_t first_moment_output{};
   std::uint32_t second_moment_output{};
+  // Set only when this parameter trains through a master copy: the optimizer
+  // reads and writes these, and the parameter above is the rounded-down
+  // version the forward pass uses.  Zero means the parameter is its own
+  // master, which is the ordinary case.
+  std::uint32_t master_input{};
+  std::uint32_t master_output{};
 };
 
 struct TrainingStep {

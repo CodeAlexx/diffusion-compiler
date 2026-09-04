@@ -45,6 +45,14 @@ TrainingStep build_training_step(
       fail("a training step parameter has no gradient");
     const auto dims = description->dims;
 
+    // A parameter trains through an F32 master when it is asked for, and
+    // always when its storage is F16: AdamW accepts F32 and BF16 storage, so
+    // an F16 checkpoint has no other way to train at all.
+    const auto storage = description->dtype;
+    const bool needs_master =
+        storage == ir::DType::F16 ||
+        (hyperparameters.master_weights && storage != ir::DType::F32);
+
     ParameterBinding binding;
     binding.parameter_input = parameter_id;
     binding.gradient_output = gradient->second;
@@ -62,7 +70,7 @@ TrainingStep build_training_step(
     // The updated parameter keeps the parameter's storage dtype: a BF16
     // parameter stays BF16 across the step, an F32 one stays F32.
     step.program.tensors.push_back(
-        {binding.parameter_output, description->dtype,
+        {binding.parameter_output, storage,
          ir::TensorRole::Output | ir::TensorRole::Parameter, dims});
     step.program.tensors.push_back(
         {binding.first_moment_output, ir::DType::F32,
@@ -71,15 +79,52 @@ TrainingStep build_training_step(
         {binding.second_moment_output, ir::DType::F32,
          ir::TensorRole::Output | ir::TensorRole::OptimizerState, dims});
 
+    // What the optimizer actually reads and writes.  Without a master that is
+    // the parameter itself; with one it is the F32 copy, and the forward
+    // pass's parameter is the rounded-down result.
+    auto optimizer_parameter = binding.parameter_input;
+    auto optimizer_output = binding.parameter_output;
+    auto optimizer_gradient = binding.gradient_output;
+    if (needs_master) {
+      binding.master_input = next_tensor++;
+      binding.master_output = next_tensor++;
+      step.program.tensors.push_back(
+          {binding.master_input, ir::DType::F32,
+           ir::TensorRole::Input | ir::TensorRole::Parameter |
+               ir::TensorRole::OptimizerState,
+           dims});
+      step.program.tensors.push_back(
+          {binding.master_output, ir::DType::F32,
+           ir::TensorRole::Output | ir::TensorRole::Parameter |
+               ir::TensorRole::OptimizerState,
+           dims});
+      optimizer_parameter = binding.master_input;
+      optimizer_output = binding.master_output;
+      // The gradient arrives in the parameter's storage dtype. AdamW takes
+      // F32 or BF16 gradients, so an F16 gradient crosses an explicit cast
+      // rather than being reinterpreted.
+      const auto *gradient_description =
+          step.program.tensor(binding.gradient_output);
+      if (gradient_description->dtype == ir::DType::F16) {
+        const auto cast_gradient = next_tensor++;
+        step.program.tensors.push_back(
+            {cast_gradient, ir::DType::F32, ir::TensorRole::Internal, dims});
+        step.program.operations.push_back({next_operation++, ir::Opcode::Cast,
+                                           {binding.gradient_output},
+                                           {cast_gradient},
+                                           {}});
+        optimizer_gradient = cast_gradient;
+      }
+    }
+
     const auto weight_decay = decay_for ? decay_for(index, parameter_id)
                                         : hyperparameters.weight_decay;
     step.program.operations.push_back(
         {next_operation++,
          ir::Opcode::AdamWUpdate,
-         {binding.parameter_input, binding.gradient_output,
-          binding.first_moment_input, binding.second_moment_input,
-          step.step_input},
-         {binding.parameter_output, binding.first_moment_output,
+         {optimizer_parameter, optimizer_gradient, binding.first_moment_input,
+          binding.second_moment_input, step.step_input},
+         {optimizer_output, binding.first_moment_output,
           binding.second_moment_output},
          {ir::Attribute::f64(ir::AttrKey::LearningRate,
                              hyperparameters.learning_rate),
@@ -87,6 +132,12 @@ TrainingStep build_training_step(
           ir::Attribute::f64(ir::AttrKey::Beta2, hyperparameters.beta2),
           ir::Attribute::f64(ir::AttrKey::Epsilon, hyperparameters.epsilon),
           ir::Attribute::f64(ir::AttrKey::WeightDecay, weight_decay)}});
+    // Round the updated master back down for the next forward pass.
+    if (needs_master)
+      step.program.operations.push_back({next_operation++, ir::Opcode::Cast,
+                                         {binding.master_output},
+                                         {binding.parameter_output},
+                                         {}});
     step.bindings.push_back(binding);
   }
 
