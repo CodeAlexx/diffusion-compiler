@@ -8837,14 +8837,17 @@ public:
           op.u64(ir::AttrKey::Implementation, 1U) != 2U)
         continue;
       const auto *query = program_.tensor(op.inputs.at(1));
-      if (!query || query->dims.size() != 3U)
-        fail("cuDNN attention backward requires an [S,H,D] query");
-      const auto sequence = query->dims.at(0);
-      const auto heads = query->dims.at(1);
-      const auto head_dim = query->dims.at(2);
+      const bool batched = query != nullptr && query->dims.size() == 4U;
+      if (!query || (query->dims.size() != 3U && !batched))
+        fail("cuDNN attention backward requires an [S,H,D] or [1,S,H,D] "
+             "query");
+      const auto axis = static_cast<std::size_t>(batched ? 1U : 0U);
+      const auto sequence = query->dims.at(axis);
+      const auto heads = query->dims.at(axis + 1U);
+      const auto head_dim = query->dims.at(axis + 2U);
       const CudnnAttentionKey key{
           query->dtype,
-          1U,
+          batched ? query->dims.at(0) : 1U,
           sequence,
           sequence,
           heads,

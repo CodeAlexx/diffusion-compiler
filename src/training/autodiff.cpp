@@ -410,7 +410,17 @@ AutodiffResult differentiate(const ir::Program &forward,
       const auto grad_q = add_tensor(*result.program.tensor(q));
       const auto grad_k = add_tensor(*result.program.tensor(k));
       const auto grad_v = add_tensor(*result.program.tensor(v));
+      // Carry the forward's chosen implementation onto the backward, the way
+      // the rope backward below already does. Without this the backward
+      // resolves the default and runs the generated kernel while the forward
+      // runs cuDNN -- the same mathematics through two backends, one of them
+      // recomputing every score once per head-dimension element. The
+      // attribute is attached ONLY when the forward carries it, so a program
+      // that never chose an implementation still differentiates to
+      // byte-identical IR.
       auto backward_attributes = lse_attributes;
+      if (const auto *carried = operation.find(ir::AttrKey::Implementation))
+        backward_attributes.push_back(*carried);
       add_operation(ir::Opcode::AttentionBackward,
                     {grad_output, q, k, v, operation.outputs[0], lse},
                     {grad_q, grad_k, grad_v},

@@ -284,12 +284,23 @@ CudnnAttentionBackwardPlan::CudnnAttentionBackwardPlan(
     const ir::TensorDesc &query, std::uint64_t kv_heads, double scale,
     bool causal, std::uint32_t heuristic)
     : impl_(std::make_unique<Impl>()) {
+  // [1,S,H,D] is byte-identical to [S,H,D], so a single-batch four-axis
+  // query is the same tensor viewed with a leading one and needs no
+  // different strides. A real batch does need them, and is refused rather
+  // than mis-strided: reading the second sample's memory as the first is the
+  // kind of wrong that still produces plausible gradients.
+  const bool batched = query.dims.size() == 4U;
   if ((query.dtype != ir::DType::BF16 && query.dtype != ir::DType::F16) ||
-      query.dims.size() != 3U)
-    fail("cuDNN attention backward requires BF16 or F16 [S,H,D]");
-  const auto sequence = dimension(query.dims[0], "sequence");
-  const auto heads = dimension(query.dims[1], "heads");
-  const auto head_dim = dimension(query.dims[2], "head dimension");
+      (query.dims.size() != 3U && !batched))
+    fail("cuDNN attention backward requires BF16 or F16 [S,H,D] or "
+         "[1,S,H,D]");
+  if (batched && query.dims[0] != 1U)
+    fail("cuDNN attention backward does not yet carry a batch axis; the "
+         "plan's strides describe one sample");
+  const auto axis = static_cast<std::size_t>(batched ? 1U : 0U);
+  const auto sequence = dimension(query.dims[axis], "sequence");
+  const auto heads = dimension(query.dims[axis + 1U], "heads");
+  const auto head_dim = dimension(query.dims[axis + 2U], "head dimension");
   const auto key_value_heads = dimension(kv_heads, "kv heads");
   if (key_value_heads > heads || heads % key_value_heads != 0)
     fail("cuDNN attention backward kv heads must divide the query head count");

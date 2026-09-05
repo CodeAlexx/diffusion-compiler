@@ -136,6 +136,8 @@ TrainingStepResult TrainingSession::step(const runtime::TensorMap &batch) {
     device_name_ = result.device_name;
   if (options_.trace_events)
     step_result.trace_events = result.trace_events;
+  step_result.profile = result.pipeline_profile;
+  step_result.operation_timings = std::move(result.operation_timings);
   step_result.phases = attribute_phases(result.trace_events, plan_.program,
                                        plan_.forward_operations,
                                        plan_.optimizer_operations);

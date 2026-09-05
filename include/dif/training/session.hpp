@@ -103,6 +103,14 @@ struct TrainingStepResult {
   // the normal case: collecting these costs something, so a step that was
   // not asked to profile does not carry them.
   std::vector<runtime::TraceEvent> trace_events;
+  // Device-side timing, when the run asked for it. Trace events record when
+  // the HOST submitted work, which for an asynchronous launch is not when the
+  // GPU did it; this is measured on the device timeline.
+  runtime::PipelineProfile profile;
+  // Per-operation DEVICE time, when the run asked to be profiled. This is
+  // what a kernel actually cost, as opposed to when the host got round to
+  // submitting it.
+  std::vector<runtime::OperationTiming> operation_timings;
 };
 
 class TrainingSession {

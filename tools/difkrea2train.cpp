@@ -29,6 +29,7 @@
 #include "dif/weights/safetensors.hpp"
 
 #include <algorithm>
+#include <iomanip>
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -407,6 +408,7 @@ int main(int argc, char **argv) {
     options.warmups = 0U;
     options.iterations = 1U;
     options.trace_events = trace;
+    options.profile_pipeline = trace;
     // One map, not a copy of one. The weights are eleven gigabytes.
     for (const auto &[id, tensor] : batch)
       bindings.insert_or_assign(id, tensor);
@@ -438,6 +440,36 @@ int main(int argc, char **argv) {
       if (step == 0U)
         first_loss = result.loss;
       last_loss = result.loss;
+      if (!result.operation_timings.empty()) {
+        // Device time per opcode. This is the measurement that counts: the
+        // trace records when the HOST submitted work, which for an
+        // asynchronous launch says nothing about what the GPU spent.
+        std::map<std::string, std::pair<double, std::uint64_t>> by_opcode;
+        double total = 0.0;
+        for (const auto &timing : result.operation_timings) {
+          auto &entry =
+              by_opcode[std::string(dif::ir::opcode_name(timing.opcode))];
+          entry.first += timing.mean_milliseconds;
+          ++entry.second;
+          total += timing.mean_milliseconds;
+        }
+        std::vector<std::pair<std::string, std::pair<double, std::uint64_t>>>
+            ranked(by_opcode.begin(), by_opcode.end());
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto &left, const auto &right) {
+                    return left.second.first > right.second.first;
+                  });
+        std::cout << "KREA2_DEVICE_BY_OPCODE total_ms=" << total << "\n";
+        for (std::size_t index = 0U;
+             index < ranked.size() && index < 12U; ++index)
+          std::cout << "  " << std::left << std::setw(42)
+                    << ranked[index].first << " ms=" << std::setw(10)
+                    << ranked[index].second.first
+                    << " count=" << std::setw(6) << ranked[index].second.second
+                    << " share=" << 100.0 * ranked[index].second.first / total
+                    << "%\n";
+        std::cout << std::flush;
+      }
       if (!result.trace_events.empty()) {
         // Where the time actually went, by opcode. Guessing twice was
         // expensive; this is the measurement.
@@ -469,6 +501,22 @@ int main(int argc, char **argv) {
                     << 100.0 * ranked[index].second.first / traced << "%\n";
         std::cout << std::flush;
       }
+      if (result.profile.enabled)
+        std::cout << "KREA2_DEVICE operation_kernels_ms="
+                  << result.profile.operation_kernel_milliseconds
+                  << " attention_kernels_ms="
+                  << result.profile.attention_kernel_milliseconds
+                  << " non_kernel_timeline_ms="
+                  << result.profile.non_kernel_device_timeline_milliseconds
+                  << " resident_weight_bytes="
+                  << result.profile.resident_weight_bytes
+                  << " streamed_weight_bytes="
+                  << result.profile.streamed_weight_bytes
+                  << " streamed_h2d_ms="
+                  << result.profile.streamed_h2d_milliseconds
+                  << " streamed_host_stage_ms="
+                  << result.profile.streamed_host_stage_milliseconds
+                  << std::endl;
       if (result.phases)
         std::cout << "KREA2_PHASES forward_ms="
                   << result.phases->forward_milliseconds

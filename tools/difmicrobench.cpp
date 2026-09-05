@@ -8,6 +8,7 @@
 //
 //   difmicrobench --rows 768 --columns 6144 [--iterations 50]
 
+#include "dif/compiler/int8.hpp"
 #include "dif/ir/ir.hpp"
 #include "dif/ir/verify.hpp"
 #include "dif/runtime/executor.hpp"
@@ -105,6 +106,58 @@ std::vector<Case> cases(std::uint64_t rows, std::uint64_t columns) {
          {dif::ir::Attribute::f64(dif::ir::AttrKey::Value, 1.0)}}};
     built.push_back({"fill bf16", std::move(program), elements * 2U});
   }
+  // The matmul-class kernels, at the shapes a Krea block actually uses:
+  // a [rows, 6144] activation against a [6144, 6144] projection.
+  {
+    const std::uint64_t inner = columns, outputs = columns;
+    Program program;
+    program.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {rows, outputs}},
+        {2U, DType::I8, TensorRole::Constant, {outputs, inner}},
+        {3U, DType::F32, TensorRole::Constant, {outputs}},
+        {4U, DType::BF16, TensorRole::Output, {rows, inner}}};
+    program.operations = {
+        {1U, Opcode::LinearInt8WeightScaledBackwardInput, {1U, 2U, 3U}, {4U},
+         {}}};
+    built.push_back({"int8 backward-input", std::move(program),
+                     2U * rows * inner * outputs});
+  }
+  {
+    const std::uint64_t inner = columns, outputs = columns;
+    Program program;
+    program.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {rows, outputs}},
+        {2U, DType::BF16, TensorRole::Constant, {outputs, inner}},
+        {3U, DType::BF16, TensorRole::Output, {rows, inner}}};
+    program.operations = {
+        {1U, Opcode::LinearBackwardInput, {1U, 2U}, {3U}, {}}};
+    built.push_back({"bf16 backward-input", std::move(program),
+                     2U * rows * inner * outputs});
+  }
+  {
+    const std::uint64_t inner = columns, outputs = columns;
+    Program program;
+    program.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {rows, inner}},
+        {2U, DType::I8, TensorRole::Constant, {outputs, inner}},
+        {3U, DType::F32, TensorRole::Constant, {outputs}},
+        {4U, DType::BF16, TensorRole::Output, {rows, outputs}}};
+    program.operations = {
+        {1U, Opcode::LinearInt8WeightScaled, {1U, 2U, 3U}, {4U}, {}}};
+    built.push_back({"int8 forward (cutlass)", std::move(program),
+                     2U * rows * inner * outputs});
+  }
+  {
+    const std::uint64_t inner = columns, outputs = columns;
+    Program program;
+    program.tensors = {
+        {1U, DType::BF16, TensorRole::Input, {rows, inner}},
+        {2U, DType::BF16, TensorRole::Constant, {outputs, inner}},
+        {3U, DType::BF16, TensorRole::Output, {rows, outputs}}};
+    program.operations = {{1U, Opcode::Linear, {1U, 2U}, {3U}, {}}};
+    built.push_back({"bf16 forward (cublasLt)", std::move(program),
+                     2U * rows * inner * outputs});
+  }
   for (auto &value : built)
     dif::ir::verify(value.program);
   return built;
@@ -156,7 +209,8 @@ int main(int argc, char **argv) {
     for (auto &value : built) {
       dif::runtime::TensorMap inputs;
       for (const auto &tensor : value.program.tensors)
-        if (tensor.has_role(TensorRole::Input))
+        if (tensor.has_role(TensorRole::Input) ||
+            tensor.has_role(TensorRole::Constant))
           inputs.emplace(tensor.id, filled(tensor.dtype, tensor.dims));
       std::cout << "  " << value.name << " ..." << std::flush;
       dif::runtime::RunOptions options;
@@ -165,13 +219,14 @@ int main(int argc, char **argv) {
       const auto prepared = executor->prepare(value.program, inputs, options);
       const auto result = prepared->run(inputs, options);
       const double milliseconds = result.mean_milliseconds;
-      const double bandwidth =
+      const double rate =
           static_cast<double>(value.traffic) / (milliseconds * 1.0e-3) / 1.0e9;
-      std::cout << "\r  " << std::left << std::setw(18) << value.name
-                << " mean_ms=" << std::setw(10) << milliseconds
-                << " traffic_mb="
-                << static_cast<double>(value.traffic) / 1.0e6
-                << " effective_gb_s=" << bandwidth << "\n";
+      const bool matmul = value.name.find("ward") != std::string::npos;
+      std::cout << "\r  " << std::left << std::setw(24) << value.name
+                << " mean_ms=" << std::setw(11) << milliseconds
+                << (matmul ? " GFLOP=" : " traffic_mb=")
+                << std::setw(10) << static_cast<double>(value.traffic) / 1.0e9
+                << (matmul ? " TFLOP_s=" : " GB_s=") << rate << "\n";
     }
   } catch (const std::exception &error) {
     std::cerr << "difmicrobench: " << error.what() << "\n";
