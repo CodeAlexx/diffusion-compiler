@@ -400,26 +400,40 @@ void the_gpu_kernel_agrees_with_the_reference() {
     const auto actual =
         cuda->prepare(program, inputs, options)->run(inputs, options)
             .outputs.at(4U);
-    // Both accumulate over n in increasing order with the same fused
-    // multiply-adds, so this is an equality, not a tolerance.
     const auto *left =
         reinterpret_cast<const std::uint16_t *>(reference.data());
     const auto *right =
         reinterpret_cast<const std::uint16_t *>(actual.data());
     std::uint64_t mismatches = 0U;
-    double worst = 0.0;
+    double worst = 0.0, magnitude = 0.0;
     for (std::uint64_t index = 0U; index < rows * inner; ++index) {
       if (left[index] != right[index])
         ++mismatches;
-      worst = std::max(worst, std::abs(static_cast<double>(from_bf16(
-                                           left[index])) -
-                                       from_bf16(right[index])));
+      const double expected = from_bf16(left[index]);
+      magnitude = std::max(magnitude, std::abs(expected));
+      worst = std::max(worst, std::abs(expected - from_bf16(right[index])));
     }
-    expect(mismatches == 0U,
-           "CUDA matches the CPU reference bit for bit at " +
-               std::to_string(rows) + "x" + std::to_string(inner) + "x" +
-               std::to_string(outputs) + " (worst " + std::to_string(worst) +
-               ", " + std::to_string(mismatches) + " differing)");
+    const auto label = std::to_string(rows) + "x" + std::to_string(inner) +
+                       "x" + std::to_string(outputs) + " (worst " +
+                       std::to_string(worst) + " of " +
+                       std::to_string(magnitude) + ", " +
+                       std::to_string(mismatches) + " differing)";
+    // Two paths run on the device. A shape CUTLASS can align goes to the
+    // tensor cores, which round the scale-folded gradient to BF16 before the
+    // matmul -- one extra rounding, so it agrees to a couple of BF16 ulps of
+    // the largest value and no better. A shape it cannot align keeps the
+    // generated kernel, which accumulates in the CPU's order with the CPU's
+    // fused multiply-adds and has to match to the bit.
+    const bool tensor_core_eligible =
+        inner % 16U == 0U && outputs % 16U == 0U && rows % 8U == 0U;
+    if (tensor_core_eligible)
+      expect(worst <= magnitude * (2.0 / 128.0),
+             "the tensor-core path agrees with the CPU reference to two "
+             "BF16 ulps at " + label);
+    else
+      expect(mismatches == 0U,
+             "the generated kernel matches the CPU reference bit for bit "
+             "at " + label);
   }
 }
 

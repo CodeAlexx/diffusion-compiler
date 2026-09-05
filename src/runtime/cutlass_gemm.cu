@@ -939,4 +939,93 @@ void destroy_cutlass_int8_weight_gemm(
   delete handle;
 }
 
+// ---- The two small kernels that turn a per-row-scaled INT8 weight's input
+// gradient into a problem the mixed-input tensor-core GEMM above can run.
+//
+//   grad_input[m,k] = sum_n grad[m,n] * scale[n] * q[n,k]
+//
+// The GEMM's epilogue scale is per OUTPUT column, and here the scale sits on
+// the contraction index, so it is folded into the gradient first (one cheap
+// pass over [M,N]). The GEMM wants its narrow operand as [columns, inner]
+// with the contraction contiguous, which for this orientation is q
+// transposed; the transpose goes into a scratch buffer shared by every such
+// operation, so it costs one tile pass per launch and no resident copy.
+namespace {
+
+__global__ void scale_columns_bf16_kernel(const cutlass::bfloat16_t *gradient,
+                                          const float *scale,
+                                          cutlass::bfloat16_t *scaled,
+                                          unsigned long long count,
+                                          unsigned long long columns) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count)
+    scaled[i] = cutlass::bfloat16_t(static_cast<float>(gradient[i]) *
+                                    scale[i % columns]);
+}
+
+__global__ void transpose_int8_kernel(const std::int8_t *source,
+                                      std::int8_t *destination, unsigned rows,
+                                      unsigned columns) {
+  __shared__ std::int8_t tile[32][33];
+  const unsigned tile_column = blockIdx.x * 32u;
+  const unsigned tile_row = blockIdx.y * 32u;
+  const unsigned x = threadIdx.x % 32u;
+  const unsigned y_base = threadIdx.x / 32u;  // 0..7
+  for (unsigned y = y_base; y < 32u; y += 8u) {
+    const unsigned row = tile_row + y, column = tile_column + x;
+    if (row < rows && column < columns)
+      tile[y][x] = source[static_cast<unsigned long long>(row) * columns + column];
+  }
+  __syncthreads();
+  for (unsigned y = y_base; y < 32u; y += 8u) {
+    const unsigned row = tile_column + y, column = tile_row + x;  // transposed
+    if (row < columns && column < rows)
+      destination[static_cast<unsigned long long>(row) * rows + column] =
+          tile[x][y];
+  }
+}
+
+} // namespace
+
+bool launch_scale_columns_bf16(std::uintptr_t gradient, std::uintptr_t scale,
+                               std::uintptr_t scaled, std::uint64_t rows,
+                               std::uint64_t columns, std::uintptr_t stream,
+                               char *error, std::size_t error_capacity) {
+  const auto count = rows * columns;
+  const auto blocks = static_cast<unsigned>((count + 255U) / 256U);
+  scale_columns_bf16_kernel<<<blocks, 256, 0,
+                              reinterpret_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<const cutlass::bfloat16_t *>(gradient),
+      reinterpret_cast<const float *>(scale),
+      reinterpret_cast<cutlass::bfloat16_t *>(scaled), count, columns);
+  const auto status = cudaGetLastError();
+  if (status == cudaSuccess)
+    return true;
+  set_error(error, error_capacity,
+            std::string("scale_columns_bf16 launch failed: ") +
+                cudaGetErrorString(status));
+  return false;
+}
+
+bool launch_transpose_int8(std::uintptr_t source, std::uintptr_t destination,
+                           std::uint64_t rows, std::uint64_t columns,
+                           std::uintptr_t stream, char *error,
+                           std::size_t error_capacity) {
+  const dim3 grid(static_cast<unsigned>((columns + 31U) / 32U),
+                  static_cast<unsigned>((rows + 31U) / 32U));
+  transpose_int8_kernel<<<grid, 256, 0,
+                          reinterpret_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<const std::int8_t *>(source),
+      reinterpret_cast<std::int8_t *>(destination),
+      static_cast<unsigned>(rows), static_cast<unsigned>(columns));
+  const auto status = cudaGetLastError();
+  if (status == cudaSuccess)
+    return true;
+  set_error(error, error_capacity,
+            std::string("transpose_int8 launch failed: ") +
+                cudaGetErrorString(status));
+  return false;
+}
+
 } // namespace dif::runtime

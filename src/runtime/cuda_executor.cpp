@@ -2423,6 +2423,86 @@ private:
       handle_;
 };
 
+// The input gradient of a weight-only-quantized linear, on tensor cores.
+//
+//   grad_input[m,k] = sum_n grad[m,n] * scale[n] * q[n,k]
+//
+// Three launches: fold scale[n] into the gradient, transpose q into a
+// scratch the operations share, and run the same CUTLASS mixed-input GEMM
+// the forward uses with a unit column scale. The generated kernel this
+// replaces peaked at 8 TFLOP/s on CUDA-core FMA; the forward GEMM measures
+// 68 TFLOP/s on the same shapes. The transpose is the price of not holding a
+// second resident copy of a 12 GB base -- the reference implementation makes
+// the same trade in its non-cached arm.
+class Int8WeightBackwardPlan {
+public:
+  Int8WeightBackwardPlan(const ir::Program &program, const ir::Operation &op,
+                         const DeviceBuffers &buffers, CUdeviceptr scaled,
+                         CUdeviceptr transposed, CUdeviceptr ones,
+                         CUstream stream)
+      : scaled_(scaled), transposed_(transposed), ones_(ones) {
+    const auto *grad_output = program.tensor(op.inputs.at(0));
+    const auto *weight = program.tensor(op.inputs.at(1));
+    outputs_ = weight->dims.at(0);   // N: the contraction here
+    inner_ = weight->dims.at(1);     // K: the gradient's columns
+    rows_ = grad_output->element_count() / outputs_;
+    std::array<char, 512> error{};
+    handle_.reset(create_cutlass_int8_weight_gemm(
+        static_cast<std::uint32_t>(rows_), static_cast<std::uint32_t>(inner_),
+        static_cast<std::uint32_t>(outputs_),
+        static_cast<std::uintptr_t>(scaled_),
+        static_cast<std::uintptr_t>(transposed_),
+        static_cast<std::uintptr_t>(ones_),
+        static_cast<std::uintptr_t>(buffers.at(op.outputs.at(0))),
+        reinterpret_cast<std::uintptr_t>(stream), error.data(), error.size()));
+    if (!handle_)
+      fail(std::string("CUTLASS INT8 backward plan creation failed: ") +
+           error.data());
+  }
+
+  void launch(const ir::Operation &op, const DeviceBuffers &buffers,
+              CUstream stream) const {
+    std::array<char, 512> error{};
+    const auto s = reinterpret_cast<std::uintptr_t>(stream);
+    if (!launch_scale_columns_bf16(
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(0))),
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(2))),
+            static_cast<std::uintptr_t>(scaled_), rows_, outputs_, s,
+            error.data(), error.size()))
+      fail(error.data());
+    if (!launch_transpose_int8(
+            static_cast<std::uintptr_t>(buffers.at(op.inputs.at(1))),
+            static_cast<std::uintptr_t>(transposed_), outputs_, inner_, s,
+            error.data(), error.size()))
+      fail(error.data());
+    count_cutlass_launch();
+    if (!launch_cutlass_int8_weight_gemm(
+            handle_.get(), static_cast<std::uintptr_t>(scaled_),
+            static_cast<std::uintptr_t>(transposed_),
+            static_cast<std::uintptr_t>(ones_),
+            static_cast<std::uintptr_t>(buffers.at(op.outputs.at(0))), s,
+            error.data(), error.size()))
+      fail(std::string("CUTLASS INT8 backward launch failed: ") + error.data());
+  }
+
+  // Scratch this operation needs, so the executor can size the shared ones.
+  static void scratch_bytes(const ir::Program &program, const ir::Operation &op,
+                            std::uint64_t &scaled, std::uint64_t &transposed,
+                            std::uint64_t &ones) {
+    const auto *grad_output = program.tensor(op.inputs.at(0));
+    const auto *weight = program.tensor(op.inputs.at(1));
+    scaled = std::max(scaled, grad_output->byte_count());
+    transposed = std::max(transposed, weight->byte_count());
+    ones = std::max(ones, weight->dims.at(1) * sizeof(float));
+  }
+
+private:
+  CUdeviceptr scaled_{}, transposed_{}, ones_{};
+  std::uint64_t rows_{}, outputs_{}, inner_{};
+  std::unique_ptr<CutlassInt8WeightGemmHandle, CutlassInt8WeightGemmDeleter>
+      handle_;
+};
+
 class CutlassLinearPlan {
 public:
   CutlassLinearPlan(const ir::Program &program, const ir::Operation &op,
@@ -7727,6 +7807,11 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     const auto flattened_rows =
         input->element_count() / weight->dims[1];
     shared = static_cast<unsigned>(8U * flattened_rows * sizeof(float));
+  } else if (op.opcode == ir::Opcode::AttentionLse) {
+    // One warp per (query, head); eight of them to a block.
+    const auto count = program.tensor(op.outputs[0])->element_count();
+    block = 256U;
+    grid = static_cast<unsigned>((count + 7U) / 8U);
   } else if (op.opcode == ir::Opcode::RmsNormBackward &&
              op.outputs.size() == 1U) {
     // One block per row, with room for both of the row's reductions.
@@ -9257,7 +9342,24 @@ public:
         fail("H3 modulation prepared storage overflow");
       h3_modulation_bytes += plan.storage_bytes;
     }
-    const auto base_required = tensor_bytes + workspace_bytes_ +
+#if DIF_HAS_CUTLASS
+    int8_backward_scratch_bytes_ = 0U;
+    {
+      std::uint64_t scaled = 0U, transposed = 0U, ones = 0U;
+      for (const auto &op : program_.operations)
+        if (op.opcode == ir::Opcode::LinearInt8WeightScaledBackwardInput)
+          Int8WeightBackwardPlan::scratch_bytes(program_, op, scaled,
+                                                transposed, ones);
+      int8_backward_scaled_bytes_ = align_256(scaled);
+      int8_backward_transposed_bytes_ = align_256(transposed);
+      int8_backward_ones_bytes_ = align_256(ones);
+      int8_backward_scratch_bytes_ = int8_backward_scaled_bytes_ +
+                                     int8_backward_transposed_bytes_ +
+                                     int8_backward_ones_bytes_;
+    }
+#endif
+    const auto base_required = tensor_bytes + int8_backward_scratch_bytes_ +
+                               workspace_bytes_ +
                                parallel_workspace_bytes_ +
                                cudnn_workspace_bytes_ +
                                materialized_f32_attention_score_bytes_;
@@ -9791,6 +9893,38 @@ public:
               static_cast<std::size_t>(query->dims.at(0) * query->dims.at(1) *
                                        sizeof(float)),
               arena_.get()));
+    }
+#endif
+#if DIF_HAS_CUTLASS
+    if (int8_backward_scratch_bytes_ != 0U) {
+      int8_backward_scaled_ = std::make_unique<Workspace>(
+          static_cast<std::size_t>(int8_backward_scaled_bytes_), arena_.get());
+      int8_backward_transposed_ = std::make_unique<Workspace>(
+          static_cast<std::size_t>(int8_backward_transposed_bytes_),
+          arena_.get());
+      int8_backward_ones_ = std::make_unique<Workspace>(
+          static_cast<std::size_t>(int8_backward_ones_bytes_), arena_.get());
+      // A unit column scale: the real scale was folded into the gradient.
+      check(cuMemsetD32(int8_backward_ones_->pointer(), 0x3F800000U,
+                        int8_backward_ones_bytes_ / sizeof(float)),
+            "cuMemsetD32 INT8 backward unit scales");
+      for (const auto &op : program_.operations) {
+        if (op.opcode != ir::Opcode::LinearInt8WeightScaledBackwardInput)
+          continue;
+        // CUTLASS needs its operands aligned (8 BF16 / 16 INT8 elements on
+        // the contiguous axis). A shape it cannot implement keeps the
+        // generated kernel, which is slower and correct; production shapes
+        // are all multiples of 64.
+        try {
+          int8_backward_plans_.emplace(
+              op.id, std::make_unique<Int8WeightBackwardPlan>(
+                         program_, op, buffers_,
+                         int8_backward_scaled_->pointer(),
+                         int8_backward_transposed_->pointer(),
+                         int8_backward_ones_->pointer(), context_.stream()));
+        } catch (const Error &) {
+        }
+      }
     }
 #endif
     for (auto &plan : h3_w8a8_mlp_plans_) {
@@ -11210,6 +11344,9 @@ public:
       else if (const auto weight_only = int8_weight_linear_plans_.find(op.id);
                weight_only != int8_weight_linear_plans_.end())
         weight_only->second->launch(op, buffers_, context_.stream());
+      else if (const auto backward = int8_backward_plans_.find(op.id);
+               backward != int8_backward_plans_.end())
+        backward->second->launch(op, buffers_, context_.stream());
       else if (const auto cutlass = cutlass_linear_plans_.find(op.id);
                cutlass != cutlass_linear_plans_.end()) {
         count_cutlass_launch();
@@ -12275,6 +12412,14 @@ private:
       int8_scaled_linear_plans_;
   std::unordered_map<std::uint32_t, std::unique_ptr<Int8WeightLinearPlan>>
       int8_weight_linear_plans_;
+  std::unordered_map<std::uint32_t, std::unique_ptr<Int8WeightBackwardPlan>>
+      int8_backward_plans_;
+  std::unique_ptr<Workspace> int8_backward_scaled_;
+  std::unique_ptr<Workspace> int8_backward_transposed_;
+  std::unique_ptr<Workspace> int8_backward_ones_;
+  std::uint64_t int8_backward_scaled_bytes_{};
+  std::uint64_t int8_backward_transposed_bytes_{};
+  std::uint64_t int8_backward_ones_bytes_{};
 #endif
   std::vector<LinearTuningResult> linear_tuning_results_;
   std::vector<LinearAlgorithmChoice> selected_linear_algorithms_;
@@ -12412,6 +12557,7 @@ private:
       cudnn_attention_backward_plans_;
   std::unordered_map<std::uint32_t, std::unique_ptr<Workspace>>
       cudnn_backward_stats_;
+  std::uint64_t int8_backward_scratch_bytes_{};
   std::uint64_t cudnn_backward_stats_bytes_{};
   std::unordered_map<std::uint32_t, std::shared_ptr<CudnnConv2dPlan>>
       cudnn_conv_plans_;

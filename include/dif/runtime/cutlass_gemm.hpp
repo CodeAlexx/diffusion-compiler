@@ -98,4 +98,16 @@ bool launch_cutlass_int8_weight_gemm(
 
 void destroy_cutlass_int8_weight_gemm(CutlassInt8WeightGemmHandle *handle);
 
+// Helpers for running the INT8 weight-only GEMM in its backward orientation:
+// fold a per-contraction-index scale into a BF16 gradient, and transpose an
+// INT8 [rows, columns] matrix into [columns, rows].
+bool launch_scale_columns_bf16(std::uintptr_t gradient, std::uintptr_t scale,
+                               std::uintptr_t scaled, std::uint64_t rows,
+                               std::uint64_t columns, std::uintptr_t stream,
+                               char *error, std::size_t error_capacity);
+bool launch_transpose_int8(std::uintptr_t source, std::uintptr_t destination,
+                           std::uint64_t rows, std::uint64_t columns,
+                           std::uintptr_t stream, char *error,
+                           std::size_t error_capacity);
+
 } // namespace dif::runtime
