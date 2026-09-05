@@ -434,6 +434,119 @@ void count_exact_stream_attention_dispatch() {
   trace_submit(telemetry::category::attention, "exact-stream");
 }
 
+// Research instrumentation: DIF_ATTENTION_CAPTURE_DIR=<dir> dumps the raw
+// BF16 Q/K/V operands of selected long-sequence Attention operations to
+// <dir>/attn_s<step>_l<layer>_op<id>_{q,k,v}.bin.  The layer index counts
+// Attention operations with sequence >= DIF_ATTENTION_CAPTURE_MIN_SEQUENCE
+// (default 4096) inside one evaluation; a new evaluation starts whenever the
+// first such operation id recurs.  DIF_ATTENTION_CAPTURE_LAYERS and
+// DIF_ATTENTION_CAPTURE_STEPS take comma lists or "all".  Never enabled
+// without the directory variable; copies synchronously through pageable host
+// memory and adds no device allocation.
+struct AttentionCaptureState {
+  bool checked{};
+  bool enabled{};
+  std::string directory;
+  std::uint64_t minimum_sequence{4096};
+  bool all_layers{};
+  bool all_steps{};
+  std::unordered_set<std::uint64_t> layers;
+  std::unordered_set<std::uint64_t> steps;
+  std::optional<std::uint64_t> first_operation;
+  std::uint64_t step{};
+  std::uint64_t layer{};
+};
+
+AttentionCaptureState attention_capture_state;
+
+void parse_capture_list(const char *text, bool &all,
+                        std::unordered_set<std::uint64_t> &values) {
+  if (text == nullptr || std::string_view(text) == "all") {
+    all = true;
+    return;
+  }
+  std::stringstream stream(text);
+  std::string item;
+  while (std::getline(stream, item, ','))
+    if (!item.empty())
+      values.insert(std::stoull(item));
+}
+
+void maybe_capture_attention_operands(
+    const ir::Program &program, const ir::Operation &op,
+    const std::function<CUdeviceptr(std::uint32_t)> &buffer_of,
+    cudaStream_t stream) {
+  auto &state = attention_capture_state;
+  if (!state.checked) {
+    state.checked = true;
+    const auto *directory = std::getenv("DIF_ATTENTION_CAPTURE_DIR");
+    if (directory == nullptr || *directory == '\0')
+      return;
+    state.enabled = true;
+    state.directory = directory;
+    if (const auto *minimum = std::getenv("DIF_ATTENTION_CAPTURE_MIN_SEQUENCE"))
+      state.minimum_sequence = std::stoull(minimum);
+    parse_capture_list(std::getenv("DIF_ATTENTION_CAPTURE_LAYERS"),
+                       state.all_layers, state.layers);
+    parse_capture_list(std::getenv("DIF_ATTENTION_CAPTURE_STEPS"),
+                       state.all_steps, state.steps);
+    std::filesystem::create_directories(state.directory);
+  }
+  if (!state.enabled)
+    return;
+  const auto *query = program.tensor(op.inputs.at(0));
+  const auto batched = query->dims.size() == 4U;
+  const auto sequence = query->dims.at(batched ? 1U : 0U);
+  if (sequence < state.minimum_sequence)
+    return;
+  if (!state.first_operation) {
+    state.first_operation = op.id;
+  } else if (*state.first_operation == op.id) {
+    ++state.step;
+    state.layer = 0;
+  }
+  const auto layer = state.layer++;
+  if (!(state.all_layers || state.layers.contains(layer)))
+    return;
+  if (!(state.all_steps || state.steps.contains(state.step)))
+    return;
+  if (cudaStreamSynchronize(stream) != cudaSuccess)
+    throw std::runtime_error("attention capture: stream synchronize failed");
+  static const char *const names[3] = {"q", "k", "v"};
+  for (std::size_t index = 0; index < 3U; ++index) {
+    const auto *tensor = program.tensor(op.inputs.at(index));
+    std::uint64_t bytes = 2;
+    for (const auto dim : tensor->dims)
+      bytes *= dim;
+    std::vector<char> host(bytes);
+    if (cudaMemcpy(host.data(),
+                   reinterpret_cast<const void *>(buffer_of(op.inputs.at(index))),
+                   bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+      throw std::runtime_error("attention capture: device-to-host copy failed");
+    const auto path = std::filesystem::path(state.directory) /
+                      ("attn_s" + std::to_string(state.step) + "_l" +
+                       std::to_string(layer) + "_op" + std::to_string(op.id) +
+                       "_" + names[index] + ".bin");
+    std::ofstream file(path, std::ios::binary);
+    file.write(host.data(), static_cast<std::streamsize>(bytes));
+    if (!file)
+      throw std::runtime_error("attention capture: write failed: " +
+                               path.string());
+  }
+  std::ofstream meta(std::filesystem::path(state.directory) /
+                     ("attn_s" + std::to_string(state.step) + "_l" +
+                      std::to_string(layer) + "_op" + std::to_string(op.id) +
+                      ".txt"));
+  meta << "dims";
+  for (const auto dim : query->dims)
+    meta << ' ' << dim;
+  meta << "\nscale "
+       << op.f64(ir::AttrKey::AttentionScale,
+                 1.0 / std::sqrt(static_cast<double>(query->dims.back())))
+       << "\nimplementation " << op.u64(ir::AttrKey::Implementation, 1U)
+       << '\n';
+}
+
 template <typename... Arguments>
 cublasStatus_t counted_cublas_gemm_ex(Arguments &&...arguments) {
   if (active_telemetry)
@@ -10704,6 +10817,11 @@ public:
       if (skipped_operations_.contains(op.id))
         return;
       TraceOperationScope operation_scope(op);
+      if (op.opcode == ir::Opcode::Attention)
+        maybe_capture_attention_operands(
+            program_, op,
+            [&](std::uint32_t id) { return buffers_.at(id); },
+            context_.stream());
       const auto h3_groupwise_qkv = std::find_if(
           h3_groupwise_plans_.begin(), h3_groupwise_plans_.end(),
           [&](const H3GroupwiseBlockPlan &plan) {
