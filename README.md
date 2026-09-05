@@ -135,7 +135,17 @@ SNR 1.7 dB; the mix measures 32.3 dB, 0.958, 12.9 dB, passes the video bars,
 and passed the owner's listening review. It costs 10.9 seconds over the
 retired INT8-only recipe (78.88 s, 1.028x faster than the comparator) and is
 8.7 seconds (10.7%) slower than that comparator, which has not been measured
-at matched exactness. No H3 speed claim is made.
+at matched exactness. This comparison does not show an H3 speed win over ComfyUI.
+
+Separately, the shared host-cache repair speeds up fixed RTX 5080 native H3
+generations without changing their video/audio bytes. First-frame, last-frame,
+both-keyframe and image-reference cases measured **1.28–1.50x** end-to-end
+speedups over the previous native runtime (one all-model-shards-cold pair per
+mode). The earlier T2VA median was **1.4985x**, with only the declared
+pack/text/VAE files controlled cold. These are not new framework comparisons;
+2x and 3090 verification remain open. See the
+[cache results](PERFORMANCE.md#h3-shared-host-cache-fix--rtx-5080-2026-09-04)
+and [exact replay fixtures](USAGE.md#minimax-h3-fl2va).
 
 ## Build and test
 

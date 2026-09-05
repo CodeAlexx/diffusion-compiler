@@ -152,13 +152,15 @@ AutodiffResult differentiate(const ir::Program &forward,
       auto running = gradients.find(primal);
       std::uint32_t total =
           running == gradients.end() ? 0U : running->second;
-      const auto *description = result.program.tensor(primal);
+      // add_tensor can reallocate the program's tensor vector during the
+      // fold. Keep the descriptor independent of that storage.
+      const auto description = *result.program.tensor(primal);
       for (const auto &contribution : contributions) {
         if (total == 0U) {
           total = contribution.tensor;
           continue;
         }
-        const auto sum = add_tensor(*description);
+        const auto sum = add_tensor(description);
         add_operation(ir::Opcode::Add, {total, contribution.tensor}, {sum});
         total = sum;
       }

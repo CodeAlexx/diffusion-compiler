@@ -80,6 +80,32 @@ dif::target::RuntimeBudget synthetic_budget() {
   return budget;
 }
 
+void test_host_cache_admission() {
+  using dif::runtime::host_cache_working_set_fits;
+  constexpr auto gib = 1ULL << 30U;
+  expect(!host_cache_working_set_fits(50 * gib, 40 * gib,
+                                     {22 * gib, 2 * gib}, 4 * gib),
+         "a non-fitting conditioner must not reread weights to warm cache");
+  expect(host_cache_working_set_fits(8 * gib, 40 * gib,
+                                    {22 * gib, 2 * gib}, 4 * gib),
+         "a fitting iterative denoiser retains cache warming");
+  expect(!host_cache_working_set_fits(8 * gib, 10 * gib, {}, 4 * gib),
+         "uncapped processes still respect available host RAM");
+  expect(host_cache_working_set_fits(16 * gib, 40 * gib,
+                                    {22 * gib, 2 * gib}, 4 * gib),
+         "exact-fit cache admission preserves the reserve");
+  expect(!host_cache_working_set_fits(1, 40 * gib,
+                                     {22 * gib, 23 * gib}, 0),
+         "an over-limit cgroup does not underflow available memory");
+  expect(!host_cache_working_set_fits(1, 0, {}, 0),
+         "unknown available host memory fails closed");
+  expect(!host_cache_working_set_fits(0, 40 * gib, {}, 0),
+         "empty working sets do not need cache warming");
+  expect(!host_cache_working_set_fits(UINT64_MAX, UINT64_MAX,
+                                     {UINT64_MAX, 1}, 4 * gib),
+         "cache admission does not overflow working set plus reserve");
+}
+
 void test_architecture_classification() {
   using dif::target::ArchitectureFamily;
   expect(dif::target::classify_nvidia_architecture(8, 6) ==
@@ -224,6 +250,7 @@ void test_live_host_probe() {
 
 int main() {
   try {
+    test_host_cache_admission();
     test_architecture_classification();
     test_target_identity();
     test_probe_schema();

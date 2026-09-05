@@ -18,6 +18,9 @@
 #if DIF_HAS_FLASH_ATTENTION
 #include "dif/runtime/flash_attention.hpp"
 #endif
+#if DIF_HAS_EXACT_STREAM_ATTENTION
+#include "dif/runtime/exact_stream_attention.hpp"
+#endif
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/telemetry/trace_sink.hpp"
@@ -425,6 +428,123 @@ void count_ck_attention_dispatch() {
   if (active_telemetry)
     ++active_telemetry->ck_attention_dispatches;
   trace_submit(telemetry::category::attention, "ck-int8-dso");
+}
+
+void count_exact_stream_attention_dispatch() {
+  trace_submit(telemetry::category::attention, "exact-stream");
+}
+
+// Research instrumentation: DIF_ATTENTION_CAPTURE_DIR=<dir> dumps the raw
+// BF16 Q/K/V operands of selected long-sequence Attention operations to
+// <dir>/attn_s<step>_l<layer>_op<id>_{q,k,v}.bin.  The layer index counts
+// Attention operations with sequence >= DIF_ATTENTION_CAPTURE_MIN_SEQUENCE
+// (default 4096) inside one evaluation; a new evaluation starts whenever the
+// first such operation id recurs.  DIF_ATTENTION_CAPTURE_LAYERS and
+// DIF_ATTENTION_CAPTURE_STEPS take comma lists or "all".  Never enabled
+// without the directory variable; copies synchronously through pageable host
+// memory and adds no device allocation.
+struct AttentionCaptureState {
+  bool checked{};
+  bool enabled{};
+  std::string directory;
+  std::uint64_t minimum_sequence{4096};
+  bool all_layers{};
+  bool all_steps{};
+  std::unordered_set<std::uint64_t> layers;
+  std::unordered_set<std::uint64_t> steps;
+  std::optional<std::uint64_t> first_operation;
+  std::uint64_t step{};
+  std::uint64_t layer{};
+};
+
+AttentionCaptureState attention_capture_state;
+
+void parse_capture_list(const char *text, bool &all,
+                        std::unordered_set<std::uint64_t> &values) {
+  if (text == nullptr || std::string_view(text) == "all") {
+    all = true;
+    return;
+  }
+  std::stringstream stream(text);
+  std::string item;
+  while (std::getline(stream, item, ','))
+    if (!item.empty())
+      values.insert(std::stoull(item));
+}
+
+void maybe_capture_attention_operands(
+    const ir::Program &program, const ir::Operation &op,
+    const std::function<CUdeviceptr(std::uint32_t)> &buffer_of,
+    cudaStream_t stream) {
+  auto &state = attention_capture_state;
+  if (!state.checked) {
+    state.checked = true;
+    const auto *directory = std::getenv("DIF_ATTENTION_CAPTURE_DIR");
+    if (directory == nullptr || *directory == '\0')
+      return;
+    state.enabled = true;
+    state.directory = directory;
+    if (const auto *minimum = std::getenv("DIF_ATTENTION_CAPTURE_MIN_SEQUENCE"))
+      state.minimum_sequence = std::stoull(minimum);
+    parse_capture_list(std::getenv("DIF_ATTENTION_CAPTURE_LAYERS"),
+                       state.all_layers, state.layers);
+    parse_capture_list(std::getenv("DIF_ATTENTION_CAPTURE_STEPS"),
+                       state.all_steps, state.steps);
+    std::filesystem::create_directories(state.directory);
+  }
+  if (!state.enabled)
+    return;
+  const auto *query = program.tensor(op.inputs.at(0));
+  const auto batched = query->dims.size() == 4U;
+  const auto sequence = query->dims.at(batched ? 1U : 0U);
+  if (sequence < state.minimum_sequence)
+    return;
+  if (!state.first_operation) {
+    state.first_operation = op.id;
+  } else if (*state.first_operation == op.id) {
+    ++state.step;
+    state.layer = 0;
+  }
+  const auto layer = state.layer++;
+  if (!(state.all_layers || state.layers.contains(layer)))
+    return;
+  if (!(state.all_steps || state.steps.contains(state.step)))
+    return;
+  if (cudaStreamSynchronize(stream) != cudaSuccess)
+    throw std::runtime_error("attention capture: stream synchronize failed");
+  static const char *const names[3] = {"q", "k", "v"};
+  for (std::size_t index = 0; index < 3U; ++index) {
+    const auto *tensor = program.tensor(op.inputs.at(index));
+    std::uint64_t bytes = 2;
+    for (const auto dim : tensor->dims)
+      bytes *= dim;
+    std::vector<char> host(bytes);
+    if (cudaMemcpy(host.data(),
+                   reinterpret_cast<const void *>(buffer_of(op.inputs.at(index))),
+                   bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+      throw std::runtime_error("attention capture: device-to-host copy failed");
+    const auto path = std::filesystem::path(state.directory) /
+                      ("attn_s" + std::to_string(state.step) + "_l" +
+                       std::to_string(layer) + "_op" + std::to_string(op.id) +
+                       "_" + names[index] + ".bin");
+    std::ofstream file(path, std::ios::binary);
+    file.write(host.data(), static_cast<std::streamsize>(bytes));
+    if (!file)
+      throw std::runtime_error("attention capture: write failed: " +
+                               path.string());
+  }
+  std::ofstream meta(std::filesystem::path(state.directory) /
+                     ("attn_s" + std::to_string(state.step) + "_l" +
+                      std::to_string(layer) + "_op" + std::to_string(op.id) +
+                      ".txt"));
+  meta << "dims";
+  for (const auto dim : query->dims)
+    meta << ' ' << dim;
+  meta << "\nscale "
+       << op.f64(ir::AttrKey::AttentionScale,
+                 1.0 / std::sqrt(static_cast<double>(query->dims.back())))
+       << "\nimplementation " << op.u64(ir::AttrKey::Implementation, 1U)
+       << '\n';
 }
 
 template <typename... Arguments>
@@ -7364,12 +7484,6 @@ public:
         resident_overrides_(std::move(resident_overrides)),
         lazy_resident_overrides_(std::move(lazy_resident_overrides)),
         direct_io_(direct_io), warm_page_cache_(warm_page_cache) {
-    if (warm_page_cache_) {
-      const auto cgroup = probe_host_cgroup_memory();
-      warm_page_cache_ = cgroup.limit_bytes == 0U ||
-                         cgroup.limit_bytes >
-                             cgroup.current_bytes + (4ULL << 30U);
-    }
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
@@ -7444,14 +7558,30 @@ public:
       }
       overwrite_wait_operation_.emplace(id, wait);
     }
+    auto total = std::uint64_t{0U};
+    for (const auto &[id, first] : first_consumer_) {
+      (void)first;
+      const auto bytes = constants_.at(id).byte_size();
+      if (bytes > std::numeric_limits<std::uint64_t>::max() - total)
+        fail("streamed working-set size overflow");
+      total += bytes;
+    }
+    if (warm_page_cache_) {
+      // Warming rereads O_DIRECT input through the page cache. When the
+      // working set cannot survive until its next use, that doubles storage
+      // traffic without creating a reusable cache (e.g. a 50 GB conditioner
+      // inside a 22 GiB service). Check after allocating the staging ring so
+      // its pinned charge is included, and retain warming for fitting loops.
+      const auto budget = probe_runtime_budget(probe_target(ProbeBackend::Host));
+      warm_page_cache_ = host_cache_working_set_fits(
+          total, budget.available_host_memory_bytes,
+          probe_host_cgroup_memory(), 4ULL << 30U);
+    }
     if (describe_plan) {
-      auto total = std::uint64_t{0U};
-      for (const auto &[id, first] : first_consumer_) {
-        (void)first;
-        total += constants_.at(id).byte_size();
-      }
       std::cerr << "STREAMED_PREFETCH_PLAN tensors=" << first_consumer_.size()
-                << " bytes_per_iteration=" << total << '\n';
+                << " bytes_per_iteration=" << total
+                << " direct_io=" << direct_io_
+                << " warm_page_cache=" << warm_page_cache_ << '\n';
       for (const auto &[id, first] : first_consumer_) {
         const auto bytes = constants_.at(id).byte_size();
         if (bytes >= 64ULL * 1024ULL * 1024ULL)
@@ -8246,6 +8376,20 @@ public:
           batch * heads * sequence * sizeof(float));
 #else
       fail("DiffIR requests native FlashAttention but this CUDA backend was "
+           "built without it");
+#endif
+    }
+    // Exact stream attention (Implementation 5) keeps softmax state and the
+    // output accumulator in registers and streams K/V tiles through shared
+    // memory, so it requires no workspace and no additional global VRAM.
+    for (const auto &operation : program_.operations) {
+      if (operation.opcode != ir::Opcode::Attention ||
+          operation.u64(ir::AttrKey::Implementation, 1U) != 5U)
+        continue;
+#if DIF_HAS_EXACT_STREAM_ATTENTION
+      uses_exact_stream_attention_ = true;
+#else
+      fail("DiffIR requests exact stream attention but this CUDA backend was "
            "built without it");
 #endif
     }
@@ -10478,7 +10622,7 @@ public:
               tensor.read_direct_into(destination)) {
             h3_resident_direct_read_bytes_ += tensor.byte_size();
             if (direct_io_warm_page_cache_)
-              h3_resident_warm_list_.push_back(&tensor);
+              h3_resident_warm_list_.push_back({&tensor, true});
             return;
           }
           h3_w8a8_staging_pool_->copy(destination, tensor.data(),
@@ -10594,7 +10738,7 @@ public:
         }
         h3_resident_direct_read_bytes_ += tensor.byte_size();
         if (direct_io_warm_page_cache_)
-          h3_resident_warm_list_.push_back(&tensor);
+          h3_resident_warm_list_.push_back({&tensor, true});
         check(counted_memcpy_htod(device, staging, tensor.byte_size(),
                                   context_.stream()),
               label);
@@ -10611,8 +10755,6 @@ public:
       if (convrot_stage_armed)
         check(counted_event_synchronize(convrot_stage_done->get()),
               "cuEventSynchronize generic ConvRot staging drain");
-      // Prepare-time uploads: warm the cache now, the plan is ready.
-      warm_h3_resident_pages();
     }
     if (options.lazy_resident_upload) {
       // Dedicated storage is populated at first semantic use by the prepared
@@ -10808,6 +10950,9 @@ public:
     for (auto &plan : h3_modulation_cache_plans_)
       release_resident_host_pages(plan.modulation,
                                   resident_evict_host_pages_);
+    // The keep/evict policy must be resolved before admitting prepare-time
+    // cache warming, including explicit keep requests on non-lazy uploads.
+    warm_h3_resident_pages();
     // Persistent state: validated, then seeded ONCE from the prepare
     // bindings. This is the only host-to-device transfer these tensors ever
     // see unless the caller explicitly restores them.
@@ -10986,21 +11131,6 @@ public:
     h3_resident_counters_reported_ = true;
     auto convrot_streamed_bytes = std::uint64_t{0U};
     auto convrot_host_stage_milliseconds = 0.0;
-    const H3HostCopy h3_tail_host_copy =
-        [&](std::uint8_t *destination, const Tensor &tensor) {
-          // Direct IO only when the pages are cold: a warm mapping copies at
-          // 2-4 s per checkpoint, a fresh disk read costs 8-9 s.
-          if (h3_resident_direct_io_ &&
-              tensor.mapped_resident_fraction() < 0.9 &&
-              tensor.read_direct_into(destination)) {
-            h3_resident_direct_read_bytes_ += tensor.byte_size();
-            if (direct_io_warm_page_cache_)
-              h3_resident_warm_list_.push_back(&tensor);
-            return;
-          }
-          h3_w8a8_staging_pool_->copy(destination, tensor.data(),
-                                      tensor.byte_size());
-        };
     auto stage_h3_w8a8_tail = [&](auto &plan, bool profile) {
       const auto populate_resident = plan.resident && !plan.uploaded;
       if (plan.resident && !populate_resident)
@@ -11036,6 +11166,19 @@ public:
       auto *staging = static_cast<std::uint8_t *>(
           h3_w8a8_tail_stage_->data()) +
           half * h3_w8a8_tail_stage_half_bytes_;
+      const H3HostCopy h3_tail_host_copy =
+          [&](std::uint8_t *destination, const Tensor &tensor) {
+            if (h3_resident_direct_io_ &&
+                tensor.mapped_resident_fraction() < 0.9 &&
+                tensor.read_direct_into(destination)) {
+              h3_resident_direct_read_bytes_ += tensor.byte_size();
+              if (direct_io_warm_page_cache_)
+                h3_resident_warm_list_.push_back({&tensor, plan.resident});
+              return;
+            }
+            h3_w8a8_staging_pool_->copy(destination, tensor.data(),
+                                        tensor.byte_size());
+          };
       const auto bytes = stage_h3_w8a8_weights(
           plan, staging, h3_w8a8_tail_stage_half_bytes_, tail_stream,
           h3_tail_host_copy);
@@ -11214,6 +11357,11 @@ public:
       if (skipped_operations_.contains(op.id))
         return;
       TraceOperationScope operation_scope(op);
+      if (op.opcode == ir::Opcode::Attention)
+        maybe_capture_attention_operands(
+            program_, op,
+            [&](std::uint32_t id) { return buffers_.at(id); },
+            context_.stream());
       const auto h3_groupwise_qkv = std::find_if(
           h3_groupwise_plans_.begin(), h3_groupwise_plans_.end(),
           [&](const H3GroupwiseBlockPlan &plan) {
@@ -11436,6 +11584,36 @@ public:
                 sequence, heads, key_value_heads, head_dimension, scale,
                 reinterpret_cast<std::uintptr_t>(context_.stream())))
           fail(std::string("native FlashAttention execution failed: ") + error);
+      }
+#endif
+#if DIF_HAS_EXACT_STREAM_ATTENTION
+      else if (op.opcode == ir::Opcode::Attention &&
+               op.u64(ir::AttrKey::Implementation, 1U) == 5U) {
+        const auto *query = program_.tensor(op.inputs.at(0));
+        const auto batched = query->dims.size() == 4U;
+        const auto batch = static_cast<std::uint32_t>(
+            batched ? query->dims.at(0) : 1U);
+        const auto sequence = static_cast<std::uint32_t>(
+            query->dims.at(batched ? 1U : 0U));
+        const auto heads = static_cast<std::uint32_t>(
+            query->dims.at(batched ? 2U : 1U));
+        const auto head_dimension =
+            static_cast<std::uint32_t>(query->dims.back());
+        const auto key_value_heads = static_cast<std::uint32_t>(
+            op.u64(ir::AttrKey::KvHeads, heads));
+        const auto scale = static_cast<float>(op.f64(
+            ir::AttrKey::AttentionScale,
+            1.0 / std::sqrt(static_cast<double>(head_dimension))));
+        count_exact_stream_attention_dispatch();
+        if (const auto *error = exact_stream_attention_bf16_forward(
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(0))),
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(1))),
+                static_cast<std::uintptr_t>(buffers_.at(op.inputs.at(2))),
+                static_cast<std::uintptr_t>(buffers_.at(op.outputs.at(0))),
+                batch, sequence, heads, key_value_heads, head_dimension,
+                scale, reinterpret_cast<std::uintptr_t>(context_.stream())))
+          fail(std::string("exact stream attention execution failed: ") +
+               error);
       }
 #endif
 #if DIF_HAS_CUDNN
@@ -12339,6 +12517,8 @@ public:
       result += "-materialized-f32-attention";
     if (flash_attention_workspace_bytes_ != 0U)
       result += "-native-flash-attention";
+    if (uses_exact_stream_attention_)
+      result += "-exact-stream-attention";
     return result;
   }
   double preparation_milliseconds() const override {
@@ -12467,26 +12647,41 @@ private:
   std::uint64_t h3_resident_direct_read_bytes_{};
   bool h3_resident_counters_reported_{false};
   bool direct_io_warm_page_cache_{true};
-  std::vector<const Tensor *> h3_resident_warm_list_;
+  struct HostCacheWarmRequest {
+    const Tensor *tensor{};
+    bool device_resident{};
+  };
+  std::vector<HostCacheWarmRequest> h3_resident_warm_list_;
 
   // Background page-cache read of everything staged with direct IO since the
   // last call, so the next process (or evaluation) takes the mapping copy.
   void warm_h3_resident_pages() {
     if (h3_resident_warm_list_.empty())
       return;
-    // Same admission as the keep policy: page cache is charged to the
-    // process' cgroup, so warm only when its limit can hold the bytes.
+    // Respect the resolved host-page policy: repopulating just-evicted
+    // GPU-resident weights consumes the budget needed by the recurrent tail
+    // and rereads data that this execution will never use from the host again.
+    const auto reusable = [&](const HostCacheWarmRequest &request) {
+      return !request.device_resident || !resident_evict_host_pages_;
+    };
     std::uint64_t bytes = 0U;
-    for (const auto *tensor : h3_resident_warm_list_)
-      bytes += tensor->byte_size();
+    for (const auto &request : h3_resident_warm_list_) {
+      if (!reusable(request))
+        continue;
+      const auto size = request.tensor->byte_size();
+      if (size > std::numeric_limits<std::uint64_t>::max() - bytes)
+        fail("host cache warm request size overflow");
+      bytes += size;
+    }
     const auto cgroup = probe_host_cgroup_memory();
+    const auto budget = probe_runtime_budget(probe_target(ProbeBackend::Host));
     constexpr std::uint64_t margin = 512ULL * 1024ULL * 1024ULL;
-    const bool admitted =
-        cgroup.limit_bytes == 0U ||
-        cgroup.limit_bytes >= cgroup.current_bytes + bytes + margin;
+    const bool admitted = host_cache_working_set_fits(
+        bytes, budget.available_host_memory_bytes, cgroup, margin);
     if (admitted)
-      for (const auto *tensor : h3_resident_warm_list_)
-        tensor->prefetch_mapped_pages();
+      for (const auto &request : h3_resident_warm_list_)
+        if (reusable(request))
+          request.tensor->prefetch_mapped_pages();
     h3_resident_warm_list_.clear();
   }
 
@@ -12620,6 +12815,7 @@ private:
   std::uint64_t resident_major_page_faults_{};
   std::uint64_t resident_prefault_checksum_{};
   bool uses_cudnn_attention_{};
+  bool uses_exact_stream_attention_{};
   std::uint32_t cudnn_attention_heuristic_{};
 };
 

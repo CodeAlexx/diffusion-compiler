@@ -37,6 +37,14 @@ struct HostCgroupMemory {
 };
 HostCgroupMemory probe_host_cgroup_memory();
 
+// Admission guard for optional file-cache warming. The whole reusable working
+// set, not just the next tensor, must fit after preserving host headroom.
+// Zero available memory fails closed; a zero cgroup limit means unlimited.
+bool host_cache_working_set_fits(std::uint64_t working_set_bytes,
+                                std::uint64_t available_host_bytes,
+                                const HostCgroupMemory &cgroup,
+                                std::uint64_t reserve_bytes);
+
 target::TargetProfile probe_target(ProbeBackend backend, int device_ordinal = 0);
 target::RuntimeBudget probe_runtime_budget(
     const target::TargetProfile &profile,

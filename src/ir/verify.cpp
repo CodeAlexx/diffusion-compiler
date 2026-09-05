@@ -1550,9 +1550,10 @@ void verify_operation(const Program &program, const Operation &op) {
     }
     const auto implementation = op.u64(AttrKey::Implementation, 1U);
     if (implementation != 1U && implementation != 2U &&
-        implementation != 3U && implementation != 4U)
-      fail("attention implementation must be 1 (generated), 2 (cuDNN), or "
-           "3 (materialized f32), or 4 (native FlashAttention)");
+        implementation != 3U && implementation != 4U && implementation != 5U)
+      fail("attention implementation must be 1 (generated), 2 (cuDNN), "
+           "3 (materialized f32), 4 (native FlashAttention), or 5 (exact "
+           "stream)");
     if (implementation == 2U && q.dtype != DType::BF16 &&
         q.dtype != DType::F16)
       fail("cuDNN attention implementation requires bf16 or f16");
@@ -1574,6 +1575,13 @@ void verify_operation(const Program &program, const Operation &op) {
          op.boolean(AttrKey::Causal, false)))
       fail("native FlashAttention requires noncausal bf16 [S,H,128] or "
            "[B,S,H,128] q/k/v without additive bias");
+    if (implementation == 5U &&
+        (q.dtype != DType::BF16 ||
+         (q.dims.size() != 3U && q.dims.size() != 4U) ||
+         q.dims.back() != 128U || kv_heads != q.dims[head_axis] ||
+         op.inputs.size() != 3U || op.boolean(AttrKey::Causal, false)))
+      fail("exact stream attention requires noncausal bf16 [S,H,128] or "
+           "[B,S,H,128] q/k/v with full heads and no additive bias");
     const auto block = op.u64(AttrKey::BlockSize, 64U);
     if (block < 32U || block > 256U || (block & (block - 1U)) != 0U)
       fail("initial fused attention requires a power-of-two block in [32,256]");

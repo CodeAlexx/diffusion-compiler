@@ -187,6 +187,10 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   if(DIF_CUTLASS_INCLUDE_DIR)
     enable_language(CUDA)
     target_sources(difcore PRIVATE src/runtime/cutlass_gemm.cu)
+    # Project-owned exact streaming attention (Attention Implementation 5).
+    # Needs only the CUDA toolchain, which this branch enables.
+    target_sources(difcore PRIVATE src/runtime/exact_stream_attention.cu)
+    target_compile_definitions(difcore PUBLIC DIF_HAS_EXACT_STREAM_ATTENTION=1)
     # CUTLASS 2.x epilogue visitors use CUTE constexpr tuple/move helpers from
     # device callbacks and require relaxed constexpr under CUDA 12.x.
     set_source_files_properties(src/runtime/cutlass_gemm.cu PROPERTIES
@@ -238,7 +242,8 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
     endif()
   else()
     target_compile_definitions(difcore PUBLIC DIF_HAS_CUTLASS=0
-                                              DIF_HAS_FLASH_ATTENTION=0)
+                                              DIF_HAS_FLASH_ATTENTION=0
+                                              DIF_HAS_EXACT_STREAM_ATTENTION=0)
     message(STATUS "Diffusion compiler CUTLASS GEMM: disabled")
   endif()
   if(DIF_ENABLE_CUDNN)
@@ -269,7 +274,8 @@ else()
   target_sources(difcore PRIVATE src/runtime/cuda_executor_stub.cpp)
   target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=0 DIF_HAS_CUDNN=0
                                             DIF_HAS_CUTLASS=0
-                                            DIF_HAS_FLASH_ATTENTION=0)
+                                            DIF_HAS_FLASH_ATTENTION=0
+                                            DIF_HAS_EXACT_STREAM_ATTENTION=0)
 endif()
 
 add_executable(difc tools/difc.cpp)
@@ -460,6 +466,10 @@ if(DIF_BUILD_TESTS)
   target_link_libraries(dif_tests PRIVATE difcore)
   add_test(NAME dif_tests COMMAND dif_tests)
 
+  add_executable(dif_tensor_io_tests tests/tensor_io_tests.cpp)
+  target_link_libraries(dif_tensor_io_tests PRIVATE difcore)
+  add_test(NAME dif_tensor_io_tests COMMAND dif_tensor_io_tests)
+
   add_executable(dif_flux2_frontend_tests tests/flux2_frontend_tests.cpp)
   target_link_libraries(dif_flux2_frontend_tests PRIVATE difcore)
   add_test(NAME dif_flux2_frontend_tests COMMAND dif_flux2_frontend_tests)
@@ -549,6 +559,9 @@ if(DIF_BUILD_TESTS)
   target_link_libraries(dif_h3_route_refinement_tests PRIVATE difcore)
   add_test(NAME dif_h3_route_refinement_tests
            COMMAND dif_h3_route_refinement_tests)
+  add_executable(dif_exact_stream_attention_tests tests/exact_stream_attention_tests.cpp)
+  target_link_libraries(dif_exact_stream_attention_tests PRIVATE difcore)
+  add_test(NAME dif_exact_stream_attention_tests COMMAND dif_exact_stream_attention_tests)
   add_executable(dif_epilogue_tests tests/epilogue_tests.cpp)
   target_link_libraries(dif_epilogue_tests PRIVATE difcore)
   add_test(NAME dif_epilogue_tests COMMAND dif_epilogue_tests)

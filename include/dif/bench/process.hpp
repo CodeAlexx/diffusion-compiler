@@ -41,7 +41,8 @@ struct StageResult {
 };
 
 // Content-addressed stage cache. A stage's key is the SHA-256 of its name,
-// its argv, and the identity of every declared key file: path, size, mtime,
+// its argv, its effective child environment, and the identity of every
+// declared key file: path, size, mtime,
 // and the file's SHA-256 when it is at most `digest_limit_bytes` (larger
 // files, typically multi-GB model caches, contribute path+size+mtime only).
 struct StageCachePolicy {
@@ -49,11 +50,14 @@ struct StageCachePolicy {
   std::uint64_t digest_limit_bytes{64ULL * 1024ULL * 1024ULL};
   bool enabled() const { return !directory.empty(); }
 };
-// `work_directory` is replaced by a placeholder in argv and key-file paths
-// so runs in different work directories share keys.
+// `work_directory` is replaced by a placeholder in argv, environment values,
+// and key-file paths so runs in different work directories share keys.
+// Environment precedence matches execution: inherited, stage, then extra.
 std::string stage_cache_key(const ResolvedStage &stage,
                             const StageCachePolicy &policy,
-                            const std::filesystem::path &work_directory);
+                            const std::filesystem::path &work_directory,
+                            const std::vector<std::pair<std::string,
+                                                        std::string>> &extra = {});
 
 struct ChainResult {
   bool success{};
@@ -65,6 +69,7 @@ struct ChainResult {
 // Runs the resolved stages under the given log directory. `before_stage`
 // may add stage-specific environment (diftrace uses it for per-stage trace
 // sinks); it receives the stage index and returns extra environment pairs.
+// It runs before cache lookup, including hits, so its values enter the key.
 ChainResult run_chain(
     const ResolvedRecipe &resolved, const std::filesystem::path &log_directory,
     const std::function<std::vector<std::pair<std::string, std::string>>(

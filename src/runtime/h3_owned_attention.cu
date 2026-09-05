@@ -348,6 +348,8 @@ __device__ __forceinline__ int permute_key32(int virtual_key) {
 
 constexpr int kVQuantThreads = 128;
 constexpr int kVQuantRowStride = kScaleTile + 4;  // int8 bytes, bank-staggered
+constexpr int kVQuantSharedBytes =
+    kScaleTile * kHeadDim * sizeof(__nv_bfloat16) + kHeadDim * kVQuantRowStride;
 
 // Stage one [128 keys][128 features] BF16 tile into shared memory (zero
 // padding beyond the sequence).
@@ -404,8 +406,12 @@ __global__ void __launch_bounds__(kVQuantThreads) quantize_v_tiles_bf16(
     const float* __restrict__ v_scale, int heads, int sequence,
     int padded_sequence, int64_t v_stride_b, int64_t v_stride_h,
     int64_t v_stride_s) {
-  __shared__ __align__(16) __nv_bfloat16 tile[kScaleTile * kHeadDim];
-  __shared__ __align__(16) int8_t transposed[kHeadDim * kVQuantRowStride];
+  // The two buffers total 49,664 bytes, above CUDA's 48 KiB static limit.
+  // Preserve their layout in opt-in dynamic shared memory.
+  extern __shared__ __align__(16) unsigned char v_shared[];
+  auto* tile = reinterpret_cast<__nv_bfloat16*>(v_shared);
+  auto* transposed = reinterpret_cast<int8_t*>(
+      v_shared + kScaleTile * kHeadDim * sizeof(__nv_bfloat16));
 
   const int key_start = blockIdx.x * kScaleTile;
   const int head = blockIdx.y;
@@ -997,7 +1003,11 @@ int quantize_kv_impl(
       static_cast<float*>(v_scale));
   status = cudaGetLastError();
   if (status != cudaSuccess) return static_cast<int>(status);
-  quantize_v_tiles_bf16<<<tile_grid, kVQuantThreads, 0, cuda_stream>>>(
+  status = cudaFuncSetAttribute(quantize_v_tiles_bf16,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                kVQuantSharedBytes);
+  if (status != cudaSuccess) return static_cast<int>(status);
+  quantize_v_tiles_bf16<<<tile_grid, kVQuantThreads, kVQuantSharedBytes, cuda_stream>>>(
       static_cast<const __nv_bfloat16*>(v), static_cast<int8_t*>(v8),
       static_cast<const float*>(v_scale), heads, sequence, padded_sequence,
       v_stride_b, v_stride_h, v_stride_s);

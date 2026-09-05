@@ -172,7 +172,9 @@ private:
                           spatial_padding, spatial_padding);
     if (temporal_padding != 0U)
       value = constant_pad(value, temporal_padding);
-    const auto &desc = description(value);
+    // Checkpoint tensors append to the same vector; retain a value across
+    // those appends so shape construction cannot read an invalid descriptor.
+    const auto desc = description(value);
     const auto weight = checkpoint(
         prefix + ".weight",
         {out_channels, desc.dims[1], kernel, kernel, kernel});
@@ -199,7 +201,7 @@ private:
   std::uint32_t group_norm_per_frame(std::uint32_t input,
                                      const std::string &prefix) {
     using namespace ir;
-    const auto &desc = description(input);
+    const auto desc = description(input);
     const auto channels = desc.dims[1];
     const auto weight = checkpoint(prefix + ".weight", {channels});
     const auto bias = checkpoint(prefix + ".bias", {channels});

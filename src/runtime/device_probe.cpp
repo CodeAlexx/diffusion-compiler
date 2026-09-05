@@ -149,6 +149,21 @@ HostCgroupMemory probe_host_cgroup_memory() {
   return result;
 }
 
+bool host_cache_working_set_fits(std::uint64_t working_set_bytes,
+                                std::uint64_t available_host_bytes,
+                                const HostCgroupMemory &cgroup,
+                                std::uint64_t reserve_bytes) {
+  auto available = available_host_bytes;
+  if (cgroup.limit_bytes != 0U) {
+    const auto remaining = cgroup.limit_bytes > cgroup.current_bytes
+                               ? cgroup.limit_bytes - cgroup.current_bytes
+                               : 0U;
+    available = std::min(available, remaining);
+  }
+  return working_set_bytes != 0U && available > reserve_bytes &&
+         working_set_bytes <= available - reserve_bytes;
+}
+
 target::TargetProfile probe_target(ProbeBackend backend, int device_ordinal) {
   target::TargetProfile profile;
   if (backend == ProbeBackend::Host) {
