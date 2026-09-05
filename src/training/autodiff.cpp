@@ -420,9 +420,23 @@ AutodiffResult differentiate(const ir::Program &forward,
       // attribute is attached ONLY when the forward carries it, so a program
       // that never chose an implementation still differentiates to
       // byte-identical IR.
+      //
+      // Native FlashAttention (4) and exact stream (5) are forward-only
+      // backends: neither has a backward kernel, and both are gated against
+      // cuDNN as their exact reference. Their backward is therefore cuDNN's
+      // (2), not the decomposed kernel the bare attribute would select --
+      // that kernel is admitted only up to S=4096, so carrying 4 or 5
+      // verbatim would make every production-length forward that chose them
+      // impossible to differentiate.
       auto backward_attributes = lse_attributes;
-      if (const auto *carried = operation.find(ir::AttrKey::Implementation))
-        backward_attributes.push_back(*carried);
+      if (const auto *carried = operation.find(ir::AttrKey::Implementation)) {
+        const auto forward_implementation = carried->as_u64();
+        const bool forward_only =
+            forward_implementation == 4U || forward_implementation == 5U;
+        backward_attributes.push_back(
+            forward_only ? ir::Attribute::u64(ir::AttrKey::Implementation, 2U)
+                         : *carried);
+      }
       add_operation(ir::Opcode::AttentionBackward,
                     {grad_output, q, k, v, operation.outputs[0], lse},
                     {grad_q, grad_k, grad_v},

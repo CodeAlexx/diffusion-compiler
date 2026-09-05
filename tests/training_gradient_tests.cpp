@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -991,6 +992,60 @@ Case conv2d_case(std::uint64_t stride, std::uint64_t pad,
 // The same differentiated program on both executors. The CPU reference is
 // the oracle the finite differences validated; this says the CUDA kernels
 // compute the same thing, which is the second half of trusting a gradient.
+// The backward's implementation follows the forward's -- except for the
+// backends that exist only as forward kernels. Native FlashAttention (4)
+// and exact stream (5) have no backward of their own and are gated against
+// cuDNN as their exact reference, so their backward is cuDNN's (2). Carrying
+// 4 or 5 verbatim would select the decomposed backward, which the verifier
+// admits only up to S=4096: a production-length forward that chose either
+// backend would then fail to differentiate at all. A forward that never
+// chose an implementation leaves the backward without one too.
+void check_attention_backward_implementation() {
+  auto differentiated_backward = [](std::optional<std::uint64_t> forward) {
+    // Head dimension 128: the only one the forward-only backends admit.
+    const std::uint64_t rows = 4U, heads = 2U, dim = 128U;
+    const std::vector<std::uint64_t> shape{rows, heads, dim};
+    Program program;
+    program.tensors = {{1U, DType::BF16, TensorRole::Input, shape},
+                       {2U, DType::BF16, TensorRole::Input, shape},
+                       {3U, DType::BF16, TensorRole::Input, shape},
+                       {4U, DType::BF16, TensorRole::Internal, shape},
+                       {5U, DType::BF16, TensorRole::Input, shape},
+                       {6U, DType::F32, TensorRole::Output, {1U}}};
+    std::vector<Attribute> attributes;
+    if (forward)
+      attributes.push_back(Attribute::u64(AttrKey::Implementation, *forward));
+    program.operations = {
+        {1U, Opcode::Attention, {1U, 2U, 3U}, {4U}, std::move(attributes)},
+        {2U, Opcode::MseLoss, {4U, 5U}, {6U}, {}}};
+    const std::vector<std::uint32_t> targets{1U, 2U, 3U};
+    const auto differentiated =
+        dif::training::differentiate(program, 6U, targets);
+    dif::ir::verify(differentiated.program);
+    std::optional<std::uint64_t> backward;
+    std::size_t backward_count = 0U;
+    for (const auto &op : differentiated.program.operations) {
+      if (op.opcode != Opcode::AttentionBackward)
+        continue;
+      ++backward_count;
+      if (const auto *carried = op.find(AttrKey::Implementation))
+        backward = carried->as_u64();
+    }
+    expect(backward_count == 1U,
+           "differentiating one attention yields one attention backward");
+    return backward;
+  };
+  expect(!differentiated_backward(std::nullopt).has_value(),
+         "an attention without an implementation differentiates to a "
+         "backward without one");
+  expect(differentiated_backward(2U) == std::optional<std::uint64_t>{2U},
+         "a cuDNN attention differentiates to a cuDNN backward");
+  expect(differentiated_backward(4U) == std::optional<std::uint64_t>{2U},
+         "a native FlashAttention forward differentiates to a cuDNN backward");
+  expect(differentiated_backward(5U) == std::optional<std::uint64_t>{2U},
+         "an exact stream forward differentiates to a cuDNN backward");
+}
+
 void check_backends(const std::string &label, const Case &c) {
   if (!dif::runtime::cuda_available())
     return;
@@ -1267,6 +1322,7 @@ int main() {
   run("sigmoid", sigmoid_case());
   run("affine last dim", affine_case(true));
   run("affine last dim no bias", affine_case(false));
+  check_attention_backward_implementation();
   run("attention", attention_case(false, 4U, 2U, false));
   run("attention causal", attention_case(false, 4U, 2U, true));
   run("attention gqa", attention_case(false, 4U, 1U, false));
