@@ -12,6 +12,7 @@
 #include "dif/training/autodiff.hpp"
 
 #include <cstdint>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -127,9 +128,66 @@ Run run(const std::vector<std::uint32_t> &order) {
   return {result.outputs.at(gradient).bytes, adds};
 }
 
+// Shared input, weight, and bias keep the forward graph small while backward
+// descriptors grow. Folding five input contributions crosses vector capacity.
+void test_large_fan_in() {
+  using namespace dif::ir;
+  for (const auto branches : {5U, 8U, 17U, 32U}) {
+    Program program;
+    program.tensors = {
+        {1U, DType::F32, TensorRole::Input, {1U, 1U}},
+        {2U, DType::F32, TensorRole::Constant, {1U, 1U}},
+        {3U, DType::F32, TensorRole::Input, {1U, 1U}},
+        {4U, DType::F32, TensorRole::Constant, {1U}},
+    };
+    std::uint32_t next_tensor = 5U, next_operation = 1U;
+    std::vector<std::uint32_t> outputs;
+    for (std::uint32_t branch = 0U; branch < branches; ++branch) {
+      outputs.push_back(next_tensor);
+      program.tensors.push_back(
+          {next_tensor, DType::F32, TensorRole::Internal, {1U, 1U}});
+      program.operations.push_back(
+          {next_operation++, Opcode::Linear, {1U, 2U, 4U}, {next_tensor++}, {}});
+    }
+    auto total = outputs.front();
+    for (std::uint32_t branch = 1U; branch < branches; ++branch) {
+      program.tensors.push_back(
+          {next_tensor, DType::F32, TensorRole::Internal, {1U, 1U}});
+      program.operations.push_back(
+          {next_operation++, Opcode::Add, {total, outputs[branch]},
+           {next_tensor}, {}});
+      total = next_tensor++;
+    }
+    program.tensors.push_back(
+        {next_tensor, DType::F32, TensorRole::Output, {1U}});
+    program.operations.push_back(
+        {next_operation++, Opcode::MseLoss, {total, 3U}, {next_tensor}, {}});
+    const std::array<std::uint32_t, 1> targets{1U};
+    const auto differentiated =
+        dif::training::differentiate(program, next_tensor, targets);
+    dif::runtime::TensorMap bindings;
+    const std::array<float, 4> values{2.0F, 3.0F, 5.0F, 1.0F};
+    for (std::uint32_t id = 1U; id <= values.size(); ++id) {
+      auto tensor = dif::runtime::zeros(*program.tensor(id));
+      tensor.f32()[0] = values[id - 1U];
+      bindings.emplace(id, std::move(tensor));
+    }
+    dif::runtime::RunOptions options;
+    options.warmups = 0U;
+    options.iterations = 1U;
+    options.minimum_free_bytes = 0U;
+    const auto result = dif::runtime::make_cpu_executor()->run(
+        differentiated.program, bindings, options);
+    const auto expected = 2.0F * (7.0F * branches - 5.0F) * 3.0F * branches;
+    expect(result.outputs.at(differentiated.gradients.at(1U)).f32()[0] == expected,
+           "shared input gradient for " + std::to_string(branches) + " consumers");
+  }
+}
+
 } // namespace
 
 int main() {
+  test_large_fan_in();
   const auto a = run({0U, 1U, 2U});
   const auto b = run({2U, 0U, 1U});
   const auto c = run({1U, 2U, 0U});

@@ -24,7 +24,8 @@ std::pair<std::uint32_t, std::filesystem::path> binding(const std::string &text)
   if (split == std::string::npos || split == 0 || split + 1 >= text.size())
     dif::fail("tensor binding must be ID=PATH");
   char *end = nullptr;
-  const auto id = std::strtoul(text.substr(0, split).c_str(), &end, 10);
+  const auto id_text = text.substr(0, split);
+  const auto id = std::strtoul(id_text.c_str(), &end, 10);
   if (!end || *end != '\0' || id == 0)
     dif::fail("tensor binding has invalid id");
   return {static_cast<std::uint32_t>(id), text.substr(split + 1)};

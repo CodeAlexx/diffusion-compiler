@@ -76,7 +76,9 @@ environment_for(const ResolvedStage &stage,
 
 std::string stage_cache_key(const ResolvedStage &stage,
                             const StageCachePolicy &policy,
-                            const std::filesystem::path &work_directory) {
+                            const std::filesystem::path &work_directory,
+                            const std::vector<std::pair<std::string,
+                                                        std::string>> &extra) {
   const auto workdir = work_directory.string();
   const auto normalize = [&](std::string text) {
     if (workdir.empty())
@@ -86,10 +88,18 @@ std::string stage_cache_key(const ResolvedStage &stage,
       text.replace(at, workdir.size(), "${workdir}");
     return text;
   };
-  std::string material = "diffusion-compiler-stage-cache-v1\n";
+  std::string material = "diffusion-compiler-stage-cache-v2\n";
   material += "stage=" + stage.name + "\n";
   for (const auto &argument : stage.argv)
     material += "argv=" + normalize(argument) + "\n";
+  // Hash the same sorted, last-override-wins environment the child gets.
+  // Length prefixes keep values containing newlines unambiguous. Only the
+  // digest is persisted; environment values never enter the manifest.
+  for (const auto &entry : environment_for(stage, extra)) {
+    const auto normalized = normalize(entry);
+    material += "env=" + std::to_string(normalized.size()) + ":" + normalized;
+  }
+  material += '\n';
   for (const auto &file : stage.cache_key_files) {
     std::error_code error;
     const auto size = std::filesystem::file_size(file, error);
@@ -220,13 +230,16 @@ ChainResult run_chain(
           ready = ready && succeeded[dependency];
         if (!ready)
           continue;
+        const auto extra = before_stage ? before_stage(index)
+                                        : std::vector<std::pair<std::string,
+                                                                std::string>>{};
         if (cache.enabled() && resolved.stages[index].cacheable) {
           // Key files must exist by now (they are inputs or earlier
           // outputs); a hit restores the outputs and never starts the
           // process, and the stage wall is the restore time.
           const auto start = std::chrono::steady_clock::now();
           record.cache_key = stage_cache_key(resolved.stages[index], cache,
-                                             resolved.work_directory);
+                                             resolved.work_directory, extra);
           if (restore_from_cache(resolved.stages[index], cache,
                                  record.cache_key)) {
             record.started = true;
@@ -241,9 +254,6 @@ ChainResult run_chain(
             continue;
           }
         }
-        const auto extra = before_stage ? before_stage(index)
-                                        : std::vector<std::pair<std::string,
-                                                                std::string>>{};
         const auto environment =
             environment_for(resolved.stages[index], extra);
         const auto start = std::chrono::steady_clock::now();

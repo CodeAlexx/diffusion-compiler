@@ -87,6 +87,7 @@ MlpTrainingBuild make_mlp_training(const MlpTrainingConfig &config) {
   for (const auto parameter_id : parameters) {
     const auto *description = build.program.tensor(parameter_id);
     const auto parameter_dims = description->dims;
+    const auto parameter_dtype = description->dtype;
     OptimizerBinding binding;
     binding.parameter_input = parameter_id;
     binding.gradient_output = differentiated.gradients.at(parameter_id);
@@ -104,7 +105,7 @@ MlpTrainingBuild make_mlp_training(const MlpTrainingConfig &config) {
          ir::TensorRole::Input | ir::TensorRole::OptimizerState,
          parameter_dims});
     build.program.tensors.push_back(
-        {binding.parameter_output, description->dtype,
+        {binding.parameter_output, parameter_dtype,
          ir::TensorRole::Output | ir::TensorRole::Parameter,
          parameter_dims});
     build.program.tensors.push_back(

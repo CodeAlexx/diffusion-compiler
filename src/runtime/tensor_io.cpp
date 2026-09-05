@@ -238,9 +238,9 @@ double MappedStorage::resident_fraction(std::size_t offset,
   const auto end_unaligned = offset + bytes;
   const auto end = std::min(
       size_, end_unaligned + (page - end_unaligned % page) % page);
-  const auto pages = (end - begin) / page;
-  if (pages == 0U)
-    return 0.0;
+  // mincore writes one byte even for a partial page at the end of a file.
+  const auto length = end - begin;
+  const auto pages = length / page + (length % page != 0U);
   std::vector<unsigned char> flags(pages);
   if (mincore(static_cast<std::uint8_t *>(address_) + begin, end - begin,
               flags.data()) != 0)

@@ -2,16 +2,13 @@
 // Implementation 5).  Design: flash-style online softmax with K/V tiles
 // streamed through shared memory via cp.async double buffering; Q fragments,
 // softmax state, and the output accumulator are register resident, so the
-// kernel allocates no global workspace.  Q K^T runs on the BF16/FP32-
-// accumulate tensor-core path so scores feeding the softmax are FP32 exact.
-// The P*V product for one 32-column tile runs on the full-rate f16-accumulate
-// tensor-core path (GeForce parts halve FP32-accumulate throughput) and each
-// bounded 32-term partial is folded into the FP32 master accumulator before
-// the next tile, keeping cross-tile accumulation FP32.
+// kernel allocates no global workspace. Both Q K^T and P V use BF16 operands
+// and FP32 tensor-core accumulation. Keeping V in its original BF16 dtype
+// preserves its exponent range; FP32 accumulation avoids overflowing an
+// unnormalized tile sum before the final softmax division.
 #include "dif/runtime/exact_stream_attention.hpp"
 
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdint>
@@ -84,25 +81,6 @@ __device__ __forceinline__ void mma_bf16(float *d, const std::uint32_t *a,
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-// P V partial accumulation runs at the full-rate f16 tensor-core path; the
-// 32-term tile partial is folded into the FP32 master accumulator each tile.
-__device__ __forceinline__ void mma_f16(std::uint32_t &d0, std::uint32_t &d1,
-                                        const std::uint32_t *a,
-                                        std::uint32_t b0, std::uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-      "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-      : "+r"(d0), "+r"(d1)
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ std::uint32_t bf16x2_to_f16x2(std::uint32_t packed) {
-  const __nv_bfloat162 pair = *reinterpret_cast<const __nv_bfloat162 *>(&packed);
-  const __half2 converted =
-      __floats2half2_rn(__bfloat162float(pair.x), __bfloat162float(pair.y));
-  return *reinterpret_cast<const std::uint32_t *>(&converted);
 }
 
 __device__ __forceinline__ float exp2_approx(float value) {
@@ -375,13 +353,13 @@ __global__ void __launch_bounds__(Warps * 32, 1)
       }
 #pragma unroll
       for (int step = 0; step < kValueSteps; ++step) {
-        const __half2 low_rows = __floats2half2_rn(
+        const __nv_bfloat162 low_rows = __floats2bfloat162_rn(
             score[m_tile][step * 2][0], score[m_tile][step * 2][1]);
-        const __half2 high_rows = __floats2half2_rn(
+        const __nv_bfloat162 high_rows = __floats2bfloat162_rn(
             score[m_tile][step * 2][2], score[m_tile][step * 2][3]);
-        const __half2 low_rows_high_k = __floats2half2_rn(
+        const __nv_bfloat162 low_rows_high_k = __floats2bfloat162_rn(
             score[m_tile][step * 2 + 1][0], score[m_tile][step * 2 + 1][1]);
-        const __half2 high_rows_high_k = __floats2half2_rn(
+        const __nv_bfloat162 high_rows_high_k = __floats2bfloat162_rn(
             score[m_tile][step * 2 + 1][2], score[m_tile][step * 2 + 1][3]);
         probability[m_tile][step][0] =
             *reinterpret_cast<const std::uint32_t *>(&low_rows);
@@ -394,9 +372,8 @@ __global__ void __launch_bounds__(Warps * 32, 1)
       }
     }
 
-    // P V on the full-rate f16 tensor-core path.  The f16 partial covers only
-    // this tile's BlockColumns terms and is folded into the FP32 master
-    // accumulator below, so cross-tile accumulation stays FP32.
+    // P V consumes the original BF16 values and accumulates directly in
+    // FP32. Even a 32-term tile can overflow FP16 with finite BF16 inputs.
     {
       const int matrix = lane >> 3;
       const int value_row_base = ((matrix == 0 || matrix == 2) ? 0 : 8) +
@@ -414,18 +391,8 @@ __global__ void __launch_bounds__(Warps * 32, 1)
                                 static_cast<std::uint32_t>(
                                     row * (kRowChunks * 16) +
                                     swizzle_chunk(row, piece) * 16));
-#pragma unroll
-          for (int piece_index = 0; piece_index < 4; ++piece_index)
-            destination[step][piece_index] =
-                bf16x2_to_f16x2(destination[step][piece_index]);
         }
       };
-      std::uint32_t partial[kMTiles][kOutputFragments][2];
-#pragma unroll
-      for (int m_tile = 0; m_tile < kMTiles; ++m_tile)
-#pragma unroll
-        for (int fragment = 0; fragment < kOutputFragments; ++fragment)
-          partial[m_tile][fragment][0] = partial[m_tile][fragment][1] = 0U;
       fetch_pair(0, value_fragment[0]);
 #pragma unroll
       for (int pair = 0; pair < kOutputFragments / 2; ++pair) {
@@ -435,30 +402,16 @@ __global__ void __launch_bounds__(Warps * 32, 1)
         for (int step = 0; step < kValueSteps; ++step)
 #pragma unroll
           for (int m_tile = 0; m_tile < kMTiles; ++m_tile) {
-            mma_f16(partial[m_tile][pair * 2][0], partial[m_tile][pair * 2][1],
+            mma_bf16(output_accumulator[m_tile][pair * 2],
                     probability[m_tile][step],
                     value_fragment[pair & 1][step][0],
                     value_fragment[pair & 1][step][1]);
-            mma_f16(partial[m_tile][pair * 2 + 1][0],
-                    partial[m_tile][pair * 2 + 1][1],
+            mma_bf16(output_accumulator[m_tile][pair * 2 + 1],
                     probability[m_tile][step],
                     value_fragment[pair & 1][step][2],
                     value_fragment[pair & 1][step][3]);
           }
       }
-#pragma unroll
-      for (int m_tile = 0; m_tile < kMTiles; ++m_tile)
-#pragma unroll
-        for (int fragment = 0; fragment < kOutputFragments; ++fragment) {
-          const __half2 low = *reinterpret_cast<const __half2 *>(
-              &partial[m_tile][fragment][0]);
-          const __half2 high = *reinterpret_cast<const __half2 *>(
-              &partial[m_tile][fragment][1]);
-          output_accumulator[m_tile][fragment][0] += __half2float(low.x);
-          output_accumulator[m_tile][fragment][1] += __half2float(low.y);
-          output_accumulator[m_tile][fragment][2] += __half2float(high.x);
-          output_accumulator[m_tile][fragment][3] += __half2float(high.y);
-        }
     }
 
     __syncthreads();

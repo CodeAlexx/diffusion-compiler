@@ -1,9 +1,11 @@
 // Stage cache tests: a cached stage is restored from the cache directory on
-// an identical key and never started; any key-file or argv change misses.
+// an identical key and never started; key files, argv, and environment enter
+// the key, including inherited values and before-stage overrides.
 #include "dif/bench/process.hpp"
 #include "dif/bench/recipe.hpp"
 
 #include <filesystem>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -37,11 +39,81 @@ std::string read(const std::filesystem::path &path) {
                      std::istreambuf_iterator<char>());
 }
 
+void test_environment_cache(const std::filesystem::path &base) {
+  const auto work = base / "environment";
+  std::filesystem::create_directories(work);
+  write(work / "input.txt", "unchanged");
+  dif::bench::ResolvedRecipe recipe;
+  recipe.work_directory = work;
+  dif::bench::ResolvedStage stage;
+  stage.name = "environment";
+  stage.cwd = work;
+  stage.argv = {"sh", "-c", "printf '%s' \"$DIF_TEST_CACHE_VALUE\" > output.txt"};
+  stage.cacheable = true;
+  stage.cache_key_files = {work / "input.txt"};
+  stage.cache_outputs = {work / "output.txt"};
+  recipe.stages.push_back(stage);
+  dif::bench::StageCachePolicy policy;
+  policy.directory = base / "environment-cache";
+  const auto run = [&](const std::string &expected, const std::string &status,
+                       const std::string &override = "") {
+    const auto result = dif::bench::run_chain(
+        recipe, work / "logs",
+        [&](std::size_t) {
+          std::vector<std::pair<std::string, std::string>> extra;
+          if (!override.empty())
+            extra.emplace_back("DIF_TEST_CACHE_VALUE", override);
+          return extra;
+        }, policy);
+    expect(result.success && result.stages[0].cache_status == status &&
+               read(work / "output.txt") == expected,
+           "environment cache " + status + " returns " + expected);
+  };
+  // Restore this test's single inherited variable on exit.
+  struct EnvironmentGuard {
+    bool existed;
+    std::string original;
+    EnvironmentGuard() {
+      const auto *value = std::getenv("DIF_TEST_CACHE_VALUE");
+      existed = value != nullptr;
+      if (value)
+        original = value;
+    }
+    ~EnvironmentGuard() {
+      if (existed)
+        setenv("DIF_TEST_CACHE_VALUE", original.c_str(), 1);
+      else
+        unsetenv("DIF_TEST_CACHE_VALUE");
+    }
+  } guard;
+  setenv("DIF_TEST_CACHE_VALUE", "inherited-one", 1);
+  run("inherited-one", "miss");
+  run("inherited-one", "hit");
+  setenv("DIF_TEST_CACHE_VALUE", "inherited-two", 1);
+  run("inherited-two", "miss");
+  recipe.stages[0].environment = {{"DIF_TEST_CACHE_VALUE", "stage-one"}};
+  run("stage-one", "miss");
+  recipe.stages[0].environment = {{"DIF_TEST_CACHE_VALUE", "stage-two"}};
+  run("stage-two", "miss");
+  run("stage-two", "hit");
+  // Changes shadowed by a stage override leave the effective environment intact.
+  setenv("DIF_TEST_CACHE_VALUE", "shadowed", 1);
+  run("stage-two", "hit");
+  run("callback-one", "miss", "callback-one");
+  run("callback-two", "miss", "callback-two");
+  run("callback-two", "hit", "callback-two");
+  // Duplicate overrides canonicalize to their final value, matching exec.
+  recipe.stages[0].environment = {{"DIF_TEST_CACHE_VALUE", "ignored"},
+                                  {"DIF_TEST_CACHE_VALUE", "stage-two"}};
+  run("stage-two", "hit");
+}
+
 } // namespace
 
 int main() {
   try {
     const auto base = workspace();
+    test_environment_cache(base);
     write(base / "prompt.txt", "a lamb\n");
     write(base / "key.txt", "v1\n");
     const std::string recipe_text = R"({

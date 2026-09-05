@@ -187,11 +187,14 @@ attention backend for `Opcode::Attention` (noncausal BF16 `[S,H,128]` /
 `[B,S,H,128]`, full heads, no bias): flash-style FP32 online softmax, K/V
 tiles streamed through 48 KiB of shared memory with cp.async double
 buffering, Q fragments and the FP32 output accumulator register resident,
-zero global workspace.  Q·Kt runs on the BF16/FP32-accumulate tensor path;
-each 32-column P·V partial runs on the full-rate f16-accumulate path and is
-folded into the FP32 accumulator per tile (GeForce parts halve
-FP32-accumulate tensor throughput: measured 124.9 vs 248.3 TFLOPS on the
-RTX 5080 at 300 W).
+zero global workspace. Both Q·Kt and P·V use BF16 operands with FP32
+accumulation. This preserves V's BF16 exponent range and prevents the FP16
+tile-sum overflow found with Q=K=0, S=32, V=4096 (the previous kernel
+returned infinity instead of 4096).
+
+The measurements below are historical results from the earlier FP16 P·V
+kernel. They do not establish performance or end-to-end parity for the
+corrected BF16/FP32 kernel; those full-model gates must be remeasured.
 
 Isolated H3 DiT geometry `[16880,56,128]` BF16, warm, 20 iterations, three
 interleaved sessions, real-data inputs (constant-fill inputs understate time

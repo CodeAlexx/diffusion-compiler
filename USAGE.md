@@ -390,9 +390,13 @@ tool.
 A stage may declare `"cache": {"key": [files...], "outputs": [files...]}`.
 With `--stage-cache DIR` (on `difbench run` and `diftrace recipe`) a stage
 whose key is already in `DIR` has its outputs restored and its process never
-started. The key is the stage's argv with the work directory normalized, plus
+started. The key includes the stage's argv and effective child environment
+(inherited values, overridden by recipe/stage values and then callback values),
+with the work directory normalized, plus
 every key file's path, size, and mtime outside the work directory and its
-SHA-256 up to 64 MiB. Every stage record carries `cache_status` (`disabled`,
+SHA-256 up to 64 MiB. Environment values enter the digest only; they are not
+written to the cache manifest. Version 2 keys invalidate older entries that
+did not include the environment. Every stage record carries `cache_status` (`disabled`,
 `none`, `miss`, `hit`, `store-failed`) and `cache_key`, and the run
 conditions list the hits, so a cached wall is never mistaken for a cold one.
 Without `--stage-cache` the declarations are inert. The H3 recipe caches its
