@@ -531,6 +531,34 @@ The complete chain, in order, is transcribed in
 `difh3state`, `difh3infer`, `difvaedecode`, `difaudiodecode`, and ffmpeg
 muxing (or `difh3media`).
 
+For the quality-preserving shared-cache comparison, use
+`h3-t2va-convrot-exact.json`, `h3-fl2va-keyframe-convrot-exact.json`, or
+`h3-fl2va-first-last-convrot-exact.json` in `perf/recipes/`. These frozen
+832x480/124-frame workloads use BF16 conditioning, ConvRot INT8 projections,
+exact cuDNN attention, and 19 Euler evaluations. They regenerate conditioning
+and noise inside the complete prompt-to-MP4 timer; the historical seven-step
+CK recipe is a different precision/workload contract.
+
+The image recipes require prepared vision/encoder programs and bundles,
+`conditioner-1` / `denoiser-1` (837 text tokens, one image) or
+`conditioner-2` / `denoiser-2` (1,235 text tokens, two images), and a three-table
+20-point modulation cache with condition-video floor `0.999`. Input PNGs are
+already canvas-sized at 832x480. Override `PIPE_FIXTURE`, `FIXTURE`, `CKPT`,
+`CONVROT`, and `RESIDENT_LAYERS` for the measured machine. For last-only input,
+use the single-keyframe recipe and override **both** `KEYFRAMES=last` and
+`IMAGE=/path/to/last.png`. A changed prompt needs matching conditioner and
+denoiser programs; these recipes are regression fixtures, not arbitrary-prompt
+entrypoints. Check `difbench show` before running, use the memory-safe wrapper,
+and retain separate baseline/candidate output directories. Never infer 3090
+speed or quality from a 5080 run.
+
+`h3-ref2va-image-convrot-exact.json` covers one image reference using the same
+native executor. Prepare its own Ref2VA ConvRot pack, modulation cache and
+`denoiser-ref-1.difbind`; reuse text/VAE bundles only after verifying the actual
+shared checkpoint files. FL2VA and Ref2VA can have identical index JSON while
+their weight shards differ. This fixture does not cover reference-video or
+reference-audio input encoding, nor establish creator-BF16 versus INT8 parity.
+
 `revert-check` suspects the harness before convicting a commit: it runs the
 gate on a detached worktree of HEAD (expected to fail), reverts the commit
 onto it, rebuilds with the given build directory's `DIF_*` configuration

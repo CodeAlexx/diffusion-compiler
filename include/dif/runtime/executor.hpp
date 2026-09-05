@@ -329,6 +329,9 @@ struct RunOptions {
   // cache, so without this every later run or evaluation reads the drive
   // again (measured 11.4 s versus 7.5 s first evaluations on the H3 chain);
   // with it the next use finds warm pages and takes the mapping copy.
+  // Streamed warming is admitted only when the complete working set fits
+  // available host RAM and cgroup headroom; non-fitting single-pass encoders
+  // must not double their storage traffic to populate an unusable cache.
   bool direct_io_warm_page_cache{true};
   // Host file-cache policy for weights that became GPU resident. Default
   // (true) preserves the historical behavior: after a resident upload the

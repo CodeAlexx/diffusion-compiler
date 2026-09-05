@@ -3,7 +3,8 @@
 This file owns the measured speed results that used to make the main README
 hard to scan. Times are complete product walls unless a row explicitly says it
 is denoiser-only. Lower is better. Ratios compare the native compiler with the
-matched framework baseline on the same GPU and workload.
+matched framework baseline on the same GPU and workload unless explicitly
+labeled native-versus-native.
 
 ## Speed gains at a glance
 
@@ -216,6 +217,86 @@ is smaller than exchanging cuDNN for FlashAttention-2 (0.907); decoded MP4s
 from both backends passed visual inspection.  The frozen RTX 3090 Ti FL2VA
 row above is unchanged; its fixtures and GPU gate cannot run on this
 machine.
+
+## H3 shared host-cache fix — RTX 5080, 2026-09-04
+
+This is a **native-versus-native partial-cold comparison**, not a new ComfyUI
+comparison or a warm-generation claim. The frozen T2VA workload is 832x480x124
+at 24 fps, 439 text tokens, 19 Euler evaluations, BF16 conditioning, all 50
+ConvRot INT8 projection blocks (28 GPU-resident), and exact cuDNN attention.
+Both arms regenerate conditioning and noise and include both decoders and mux.
+The declared ConvRot/text/VAE cache files start cold; prepared programs/kernel
+caches are retained. These original measurements did not explicitly evict the
+original transformer shards used for the remaining non-quantized weights, so
+they are not an all-model-files-cold result. The current exact recipes include
+those shards for subsequent measurements.
+The complete process group has a 22 GiB RAM cap, no swap, and a 300 W GPU limit.
+
+| Complete prompt-to-MP4 measurement | Before (`4de52a1`) | Cache fix |
+|---|---:|---:|
+| Raw samples, seconds | 255.929, 267.175 | 170.087, 180.291, 174.542 |
+| Median, seconds | 261.552 | 174.542 |
+| Peak process-group RAM, including file cache | 22.000 GiB | 13.121 GiB |
+
+The measured ratio is **1.4985x**, a 33.27% latency reduction. This does not
+meet a strict 1.5x threshold and does not meet the requested 2x target. The
+third candidate run uses the final prepare-time keep/evict policy ordering;
+the first two use the same lazy-upload path before that ordering fix.
+
+The conditioner had been rereading approximately 50 GB of weights to warm a
+cache that could never fit. That also prevented the denoiser's reusable
+streamed tail from remaining cached, causing about 172 GB of denoiser disk
+reads. Warming now requires whole-working-set headroom and respects eviction
+of host copies of GPU-resident weights. Final-run denoiser disk reads fell to
+28.3 GB. No attention, GEMM, precision, schedule, or checkpoint changed.
+
+The final candidate is byte-identical to the control at token IDs,
+conditioning, both initial noises, video/audio latents, raw/decoded video,
+WAV audio, and final MP4. The MP4 SHA-256 is
+`249383056146ab47f3152ac85c979a2a7c351e2432e44f748c87e2b578c0a59d`;
+decoded frames were inspected. Release core, tensor-I/O, target, and benchmark
+tests pass. Replay uses
+[`h3-t2va-convrot-exact.json`](perf/recipes/h3-t2va-convrot-exact.json) with
+`difbench run --drop-file-cache`; its checkpoint/program prerequisites and
+machine-specific resident-layer count must be supplied.
+
+The cache mechanism is shared and adds no SM120-only kernel requirement.
+RTX 3090/Ti execution is **not yet revalidated**; its speedup must not be
+inferred from this T2VA result. Local image-mode checks follow below. Sol-Attn
+was screened separately on real captured H3 Q/K/V: useful speeds had significant numerical
+departures, and no sparse attention replacement was admitted.
+
+## H3 image-conditioned cache validation — RTX 5080
+
+Native-versus-native, one full-cold sample per arm, using the same 832x480,
+124-frame, 19-evaluation, BF16-conditioner/ConvRot-INT8/exact-attention contract.
+These recipes explicitly reset the original transformer shards as well as
+the derived packs, text encoder and VAEs. All prompt/image processing, noise,
+denoising, both decoders and MP4 saving are timed.
+
+| Pipeline | Before | Cache fix | Measured speedup |
+|---|---:|---:|---:|
+| FL2VA, first frame | 272.082 s | 181.095 s | 1.502x |
+| FL2VA, last frame | 271.287 s | 185.133 s | 1.465x |
+| FL2VA, first + last | 288.026 s | 195.028 s | 1.477x |
+| Ref2VA, one image reference | 236.898 s | 184.401 s | 1.285x |
+
+All four pairs are byte-identical through raw/decoded video, WAV and final MP4:
+79 byte comparisons and 12 zero-error numerical checks passed, with no
+nonfinite latent values. Contact sheets were inspected. Candidate process-group
+RAM stayed below 15.84 GiB under the unchanged 22 GiB cap; no OOM occurred.
+The four selected release suites also pass.
+
+Replay fixtures are `h3-fl2va-keyframe-convrot-exact.json` (first or last),
+`h3-fl2va-first-last-convrot-exact.json`, and
+`h3-ref2va-image-convrot-exact.json` under `perf/recipes/`; see
+[preparation and scope](USAGE.md#minimax-h3-fl2va).
+Ref2VA uses its own denoiser pack and bundle, not FL2VA weights. This is
+same-precision native regression evidence, not creator-BF16 versus INT8 parity.
+
+**2x is not reached.** These individual 480p pairs do not establish a speed
+guarantee at other resolutions or for larger reference sets. Reference-video/
+audio input encoding and actual RTX 3090/Ti execution remain unverified.
 
 ## Reporting rules
 

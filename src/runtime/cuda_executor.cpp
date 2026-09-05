@@ -7374,12 +7374,6 @@ public:
         resident_overrides_(std::move(resident_overrides)),
         lazy_resident_overrides_(std::move(lazy_resident_overrides)),
         direct_io_(direct_io), warm_page_cache_(warm_page_cache) {
-    if (warm_page_cache_) {
-      const auto cgroup = probe_host_cgroup_memory();
-      warm_page_cache_ = cgroup.limit_bytes == 0U ||
-                         cgroup.limit_bytes >
-                             cgroup.current_bytes + (4ULL << 30U);
-    }
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
@@ -7454,14 +7448,30 @@ public:
       }
       overwrite_wait_operation_.emplace(id, wait);
     }
+    auto total = std::uint64_t{0U};
+    for (const auto &[id, first] : first_consumer_) {
+      (void)first;
+      const auto bytes = constants_.at(id).byte_size();
+      if (bytes > std::numeric_limits<std::uint64_t>::max() - total)
+        fail("streamed working-set size overflow");
+      total += bytes;
+    }
+    if (warm_page_cache_) {
+      // Warming rereads O_DIRECT input through the page cache. When the
+      // working set cannot survive until its next use, that doubles storage
+      // traffic without creating a reusable cache (e.g. a 50 GB conditioner
+      // inside a 22 GiB service). Check after allocating the staging ring so
+      // its pinned charge is included, and retain warming for fitting loops.
+      const auto budget = probe_runtime_budget(probe_target(ProbeBackend::Host));
+      warm_page_cache_ = host_cache_working_set_fits(
+          total, budget.available_host_memory_bytes,
+          probe_host_cgroup_memory(), 4ULL << 30U);
+    }
     if (describe_plan) {
-      auto total = std::uint64_t{0U};
-      for (const auto &[id, first] : first_consumer_) {
-        (void)first;
-        total += constants_.at(id).byte_size();
-      }
       std::cerr << "STREAMED_PREFETCH_PLAN tensors=" << first_consumer_.size()
-                << " bytes_per_iteration=" << total << '\n';
+                << " bytes_per_iteration=" << total
+                << " direct_io=" << direct_io_
+                << " warm_page_cache=" << warm_page_cache_ << '\n';
       for (const auto &[id, first] : first_consumer_) {
         const auto bytes = constants_.at(id).byte_size();
         if (bytes >= 64ULL * 1024ULL * 1024ULL)
@@ -10141,7 +10151,7 @@ public:
               tensor.read_direct_into(destination)) {
             h3_resident_direct_read_bytes_ += tensor.byte_size();
             if (direct_io_warm_page_cache_)
-              h3_resident_warm_list_.push_back(&tensor);
+              h3_resident_warm_list_.push_back({&tensor, true});
             return;
           }
           h3_w8a8_staging_pool_->copy(destination, tensor.data(),
@@ -10257,7 +10267,7 @@ public:
         }
         h3_resident_direct_read_bytes_ += tensor.byte_size();
         if (direct_io_warm_page_cache_)
-          h3_resident_warm_list_.push_back(&tensor);
+          h3_resident_warm_list_.push_back({&tensor, true});
         check(counted_memcpy_htod(device, staging, tensor.byte_size(),
                                   context_.stream()),
               label);
@@ -10274,8 +10284,6 @@ public:
       if (convrot_stage_armed)
         check(counted_event_synchronize(convrot_stage_done->get()),
               "cuEventSynchronize generic ConvRot staging drain");
-      // Prepare-time uploads: warm the cache now, the plan is ready.
-      warm_h3_resident_pages();
     }
     if (options.lazy_resident_upload) {
       // Dedicated storage is populated at first semantic use by the prepared
@@ -10459,6 +10467,9 @@ public:
     for (auto &plan : h3_modulation_cache_plans_)
       release_resident_host_pages(plan.modulation,
                                   resident_evict_host_pages_);
+    // The keep/evict policy must be resolved before admitting prepare-time
+    // cache warming, including explicit keep requests on non-lazy uploads.
+    warm_h3_resident_pages();
     const auto preparation_stop = std::chrono::steady_clock::now();
     preparation_milliseconds_ =
         std::chrono::duration<double, std::milli>(preparation_stop -
@@ -10589,21 +10600,6 @@ public:
     h3_resident_counters_reported_ = true;
     auto convrot_streamed_bytes = std::uint64_t{0U};
     auto convrot_host_stage_milliseconds = 0.0;
-    const H3HostCopy h3_tail_host_copy =
-        [&](std::uint8_t *destination, const Tensor &tensor) {
-          // Direct IO only when the pages are cold: a warm mapping copies at
-          // 2-4 s per checkpoint, a fresh disk read costs 8-9 s.
-          if (h3_resident_direct_io_ &&
-              tensor.mapped_resident_fraction() < 0.9 &&
-              tensor.read_direct_into(destination)) {
-            h3_resident_direct_read_bytes_ += tensor.byte_size();
-            if (direct_io_warm_page_cache_)
-              h3_resident_warm_list_.push_back(&tensor);
-            return;
-          }
-          h3_w8a8_staging_pool_->copy(destination, tensor.data(),
-                                      tensor.byte_size());
-        };
     auto stage_h3_w8a8_tail = [&](auto &plan, bool profile) {
       const auto populate_resident = plan.resident && !plan.uploaded;
       if (plan.resident && !populate_resident)
@@ -10639,6 +10635,19 @@ public:
       auto *staging = static_cast<std::uint8_t *>(
           h3_w8a8_tail_stage_->data()) +
           half * h3_w8a8_tail_stage_half_bytes_;
+      const H3HostCopy h3_tail_host_copy =
+          [&](std::uint8_t *destination, const Tensor &tensor) {
+            if (h3_resident_direct_io_ &&
+                tensor.mapped_resident_fraction() < 0.9 &&
+                tensor.read_direct_into(destination)) {
+              h3_resident_direct_read_bytes_ += tensor.byte_size();
+              if (direct_io_warm_page_cache_)
+                h3_resident_warm_list_.push_back({&tensor, plan.resident});
+              return;
+            }
+            h3_w8a8_staging_pool_->copy(destination, tensor.data(),
+                                        tensor.byte_size());
+          };
       const auto bytes = stage_h3_w8a8_weights(
           plan, staging, h3_w8a8_tail_stage_half_bytes_, tail_stream,
           h3_tail_host_copy);
@@ -11995,26 +12004,41 @@ private:
   std::uint64_t h3_resident_direct_read_bytes_{};
   bool h3_resident_counters_reported_{false};
   bool direct_io_warm_page_cache_{true};
-  std::vector<const Tensor *> h3_resident_warm_list_;
+  struct HostCacheWarmRequest {
+    const Tensor *tensor{};
+    bool device_resident{};
+  };
+  std::vector<HostCacheWarmRequest> h3_resident_warm_list_;
 
   // Background page-cache read of everything staged with direct IO since the
   // last call, so the next process (or evaluation) takes the mapping copy.
   void warm_h3_resident_pages() {
     if (h3_resident_warm_list_.empty())
       return;
-    // Same admission as the keep policy: page cache is charged to the
-    // process' cgroup, so warm only when its limit can hold the bytes.
+    // Respect the resolved host-page policy: repopulating just-evicted
+    // GPU-resident weights consumes the budget needed by the recurrent tail
+    // and rereads data that this execution will never use from the host again.
+    const auto reusable = [&](const HostCacheWarmRequest &request) {
+      return !request.device_resident || !resident_evict_host_pages_;
+    };
     std::uint64_t bytes = 0U;
-    for (const auto *tensor : h3_resident_warm_list_)
-      bytes += tensor->byte_size();
+    for (const auto &request : h3_resident_warm_list_) {
+      if (!reusable(request))
+        continue;
+      const auto size = request.tensor->byte_size();
+      if (size > std::numeric_limits<std::uint64_t>::max() - bytes)
+        fail("host cache warm request size overflow");
+      bytes += size;
+    }
     const auto cgroup = probe_host_cgroup_memory();
+    const auto budget = probe_runtime_budget(probe_target(ProbeBackend::Host));
     constexpr std::uint64_t margin = 512ULL * 1024ULL * 1024ULL;
-    const bool admitted =
-        cgroup.limit_bytes == 0U ||
-        cgroup.limit_bytes >= cgroup.current_bytes + bytes + margin;
+    const bool admitted = host_cache_working_set_fits(
+        bytes, budget.available_host_memory_bytes, cgroup, margin);
     if (admitted)
-      for (const auto *tensor : h3_resident_warm_list_)
-        tensor->prefetch_mapped_pages();
+      for (const auto &request : h3_resident_warm_list_)
+        if (reusable(request))
+          request.tensor->prefetch_mapped_pages();
     h3_resident_warm_list_.clear();
   }
 
