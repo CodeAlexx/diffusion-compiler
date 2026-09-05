@@ -2506,6 +2506,16 @@ void emit_rms_norm_backward(std::ostringstream &out,
                          {"rows", std::to_string(rows)},
                          {"epsilon", epsilon_literal.str()}})
                   : std::string{};
+  if (!weight_grad) {
+    // A frozen gain needs only the input gradient, which is one block per
+    // row rather than one thread per element.
+    out << render_kernel_template(
+        "rms_norm_backward_rows",
+        {{"function", function_name(op)},
+         {"columns", std::to_string(columns)},
+         {"epsilon", epsilon_literal.str()}});
+    return;
+  }
   out << render_kernel_template(
       "rms_norm_backward",
       {{"function", function_name(op)},

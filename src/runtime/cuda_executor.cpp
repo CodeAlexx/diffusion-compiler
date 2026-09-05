@@ -7727,15 +7727,22 @@ void launch(const ir::Program &program, const ir::Operation &op, CUfunction func
     const auto flattened_rows =
         input->element_count() / weight->dims[1];
     shared = static_cast<unsigned>(8U * flattened_rows * sizeof(float));
+  } else if (op.opcode == ir::Opcode::RmsNormBackward &&
+             op.outputs.size() == 1U) {
+    // One block per row, with room for both of the row's reductions.
+    const auto *input = program.tensor(op.inputs[1]);
+    block = 256U;
+    grid = static_cast<unsigned>(input->element_count() / input->dims.back());
+    shared = 2U * block * static_cast<unsigned>(sizeof(float));
   } else if (op.opcode == ir::Opcode::LinearInt8WeightScaledBackwardInput) {
     // One block per 32x32 tile of the gradient, 1024 threads laid out as that
     // tile. The kernel decodes its tile from a linear block index.
     const auto *weight = program.tensor(op.inputs[1]);
     const auto inner = weight->dims[1];
     const auto rows = program.tensor(op.outputs[0])->element_count() / inner;
-    const auto tiles_per_row = (inner + 31U) / 32U;
-    const auto tile_rows = (rows + 31U) / 32U;
-    block = 1024U;
+    const auto tiles_per_row = (inner + 63U) / 64U;
+    const auto tile_rows = (rows + 63U) / 64U;
+    block = 256U;
     grid = static_cast<unsigned>(tiles_per_row * tile_rows);
   } else if (op.opcode == ir::Opcode::RmsNormModulate ||
              op.opcode == ir::Opcode::RmsNorm ||

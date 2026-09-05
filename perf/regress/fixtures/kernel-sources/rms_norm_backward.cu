@@ -46,26 +46,47 @@ extern "C" __device__ float dif_silu(float x) {
 #define dif_load dif_load_bf16
 #define dif_store dif_store_bf16
 #define dif_round dif_round_bf16
-// Reference rms_norm backward: one thread per element recomputes the row
-// statistics; the optional weight gradient is reduced over rows by the
-// first `columns` threads.
+// rms_norm backward for a FROZEN gain: one block per row.
+//
+// The row needs two reductions -- the sum of squares and the dot product of
+// the weighted gradient with the input -- and they are the same two numbers
+// for every element in the row. The reference form has each of the row's
+// threads recompute both, which at 6144 columns is 6144 redundant passes.
+// The row's values fit in cache, which is the only reason that was
+// survivable rather than catastrophic; it was still the single most
+// expensive operation in a Krea training step.
+//
+// The forward has always done it this way. This is the backward catching up.
+//
+// A trainable gain needs a per-column reduction across rows as well, which
+// is a different shape of problem; that case keeps the reference kernel.
 extern "C" __global__ void dif_op_1(const dif_scalar* grad_output, const dif_scalar* x, const dif_scalar* weight, dif_scalar* grad_input) {
-  unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < 32ULL) {
-    unsigned long long row = i / 8ULL, base = row * 8ULL;
-    float ss = 0.0f;
-    for (unsigned long long k = 0ULL; k < 8ULL; ++k) {
-      float value = dif_load(x, base + k);
-      ss = fmaf(value, value, ss);
+  extern __shared__ float reduction[];
+  const unsigned long long row = blockIdx.x;
+  const unsigned long long base = row * 8ULL;
+  float sum_squares = 0.0f, dot = 0.0f;
+  for (unsigned long long k = threadIdx.x; k < 8ULL; k += blockDim.x) {
+    const float value = dif_load(x, base + k);
+    sum_squares = fmaf(value, value, sum_squares);
+    dot = fmaf(dif_load(grad_output, base + k) * dif_load(weight, k), value, dot);
+  }
+  reduction[threadIdx.x] = sum_squares;
+  reduction[blockDim.x + threadIdx.x] = dot;
+  __syncthreads();
+  for (unsigned stride = blockDim.x / 2u; stride > 0u; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+      reduction[blockDim.x + threadIdx.x] += reduction[blockDim.x + threadIdx.x + stride];
     }
-    float inv = rsqrtf(ss / 8.0f + 9.999999975e-07f);
-    float dot = 0.0f;
-    for (unsigned long long k = 0ULL; k < 8ULL; ++k)
-      dot = fmaf(dif_load(grad_output, base + k) * dif_load(weight, k), dif_load(x, base + k), dot);
-    float value = dif_load(x, i);
-    float gradient = dif_load(grad_output, i) * dif_load(weight, i - base) * inv - value * inv * inv * inv * dot / 8.0f;
-    dif_store(grad_input, i, gradient);
-    
+    __syncthreads();
+  }
+  const float inverse = rsqrtf(reduction[0] / 8.0f + 9.999999975e-07f);
+  const float row_dot = reduction[blockDim.x];
+  for (unsigned long long k = threadIdx.x; k < 8ULL; k += blockDim.x) {
+    const float value = dif_load(x, base + k);
+    dif_store(grad_input, base + k,
+              dif_load(grad_output, base + k) * dif_load(weight, k) * inverse -
+                  value * inverse * inverse * inverse * row_dot / 8.0f);
   }
 }
 #undef dif_scalar
