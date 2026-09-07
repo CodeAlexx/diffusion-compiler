@@ -309,6 +309,9 @@ target_link_libraries(difrun PRIVATE difcore)
 add_executable(difinspect tools/difinspect.cpp)
 target_link_libraries(difinspect PRIVATE difcore)
 
+add_executable(difpagecache tools/difpagecache.cpp)
+target_link_libraries(difpagecache PRIVATE difcore)
+
 add_executable(difprobe tools/difprobe.cpp)
 target_link_libraries(difprobe PRIVATE difcore)
 
