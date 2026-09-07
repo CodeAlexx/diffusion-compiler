@@ -4,6 +4,7 @@ extern "C" __global__ void ${function}(const signed char* x, const float* scales
   if (i < ${count}ULL) {
     unsigned long long row = i / ${columns}ULL;
     unsigned long long column = i % ${columns}ULL;
-    dif_store_bf16(y, i, (float)x[i] * scales[row * ${scale_columns}ULL + column / ${block}ULL]);
+    unsigned long long scale_index = row * ${scale_columns}ULL + column / ${block}ULL;
+    dif_store_bf16(y, i, (float)x[i] * scales[scale_index]);
   }
 }

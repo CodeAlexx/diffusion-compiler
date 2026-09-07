@@ -9,6 +9,7 @@
 #include "dif/ir/verify.hpp"
 #include "dif/runtime/executor.hpp"
 #include "dif/support/error.hpp"
+#include "dif/support/image_resize.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/text/qwen_bpe_tokenizer.hpp"
 #include "dif/weights/bundle.hpp"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -41,8 +43,12 @@ struct Options {
   fs::path prompt;
   fs::path program;
   fs::path bundle;
+  fs::path sealed_bundle;
   fs::path inputs;
   std::vector<fs::path> vision_inputs;
+  // Ordered text-only token parts and visual presentations. Reference audio
+  // contributes its existing <Audio N>: label, never waveform embeddings.
+  std::vector<std::pair<bool, fs::path>> presentation_inputs;
   fs::path output;
   fs::path ids_output;
   fs::path tags_output;
@@ -53,6 +59,8 @@ struct Options {
   std::uint64_t grid_t{1U};
   std::uint64_t grid_h{};
   std::uint64_t grid_w{};
+  std::uint64_t label_offset{};
+  std::uint64_t short_edge{};
   std::uint64_t minimum_free_mib{4096U};
   std::uint64_t streamed_stage_threads{1U};
   std::uint64_t warmups{};
@@ -74,13 +82,13 @@ void usage() {
          " [--grid-t N] [--trace]\n"
          "       difh3vision bundle --checkpoint TEXT_ENCODER_DIR --program"
          " V.difir --grid-h N --grid-w N --output V.difbind [--grid-t N]"
-         " [--trace]\n"
+         " [--trace] [--sealed-bundle EXISTING.difbind]\n"
          "       difh3vision inputs --checkpoint TEXT_ENCODER_DIR --processor"
          " PROCESSOR_DIR --image FIRST.png [--image LAST.png]"
          " --prompt-file PROMPT --grid-h N --grid-w N"
          " --output INPUTS.safetensors [--grid-t N]\n"
          "         [--strip-trailing-newline] [--ids-out IDS.diftensor]"
-         " [--tags-out TAGS.diftensor]\n"
+         " [--tags-out TAGS.diftensor] [--label-offset N]\n"
          "       difh3vision run --program V.difir --bundle V.difbind --inputs"
          " INPUTS.safetensors --grid-h N --grid-w N --output"
          " VISION.safetensors [--grid-t N] [--backend cuda|cpu] [--trace]"
@@ -94,7 +102,11 @@ void usage() {
          " [--capture-tensor ID --capture-dir DIR]"
          " [--report FILE.json]\n"
          "       difh3vision combine --vision-input FIRST.safetensors"
-         " --vision-input LAST.safetensors --output BOTH.safetensors\n";
+         " --vision-input LAST.safetensors --output BOTH.safetensors\n"
+         "       difh3vision combine-inputs [--text-input IDS.diftensor] --vision-input PRESENTATION.safetensors"
+         " [--vision-input PRESENTATION.safetensors] --output INPUTS.safetensors"
+         " --ids-out IDS.diftensor --tags-out TAGS.diftensor\n"
+         "       difh3vision prepare-image --image SOURCE.png --short-edge N --output PREPARED.png\n";
 }
 
 std::uint64_t number(const std::string &text, const char *label) {
@@ -130,12 +142,21 @@ Options parse(int argc, char **argv) {
       options.prompt = value("--prompt-file");
     else if (option == "--program")
       options.program = value("--program");
+    else if (option == "--sealed-bundle")
+      options.sealed_bundle = value("--sealed-bundle");
+    else if (option == "--label-offset")
+      options.label_offset = number(value("--label-offset"), "label offset");
+    else if (option == "--short-edge")
+      options.short_edge = number(value("--short-edge"), "short edge");
     else if (option == "--bundle")
       options.bundle = value("--bundle");
     else if (option == "--inputs")
       options.inputs = value("--inputs");
-    else if (option == "--vision-input")
+    else if (option == "--vision-input") {
       options.vision_inputs.emplace_back(value("--vision-input"));
+      options.presentation_inputs.emplace_back(false, options.vision_inputs.back());
+    } else if (option == "--text-input")
+      options.presentation_inputs.emplace_back(true, value("--text-input"));
     else if (option == "--output")
       options.output = value("--output");
     else if (option == "--ids-out")
@@ -212,11 +233,16 @@ Options parse(int argc, char **argv) {
       dif::fail("unknown option: " + option);
     }
   }
-  if (options.command != "combine" &&
+  if (options.command != "combine" && options.command != "combine-inputs" &&
+      options.command != "prepare-image" &&
       (options.grid_t == 0U || options.grid_h == 0U || options.grid_w == 0U))
     dif::fail("difh3vision requires positive --grid-t/--grid-h/--grid-w");
   if (options.backend != "cuda" && options.backend != "cpu")
     dif::fail("difh3vision backend must be cuda or cpu");
+  if (options.command != "combine-inputs" && std::any_of(
+          options.presentation_inputs.begin(), options.presentation_inputs.end(),
+          [](const auto &part) { return part.first; }))
+    dif::fail("--text-input is only valid for combine-inputs");
   if (options.warmups > std::numeric_limits<std::uint32_t>::max())
     dif::fail("vision warmups exceed U32 range");
   if (options.capture_tensors.empty() != options.capture_directory.empty())
@@ -317,6 +343,14 @@ void command_bundle(const Options &options) {
   dif::weights::WeightBundle bundle;
   bundle.program_fingerprint = dif::ir::fingerprint(program);
   bundle.index_fingerprint = dif::sha256_file(index_path);
+  std::map<fs::path, dif::weights::BundleShard> receipts;
+  if (!options.sealed_bundle.empty()) {
+    const auto sealed = dif::weights::read_weight_bundle(options.sealed_bundle);
+    if (sealed.index_fingerprint != bundle.index_fingerprint)
+      dif::fail("vision sealed bundle has another source index");
+    for (const auto &shard : sealed.shards)
+      receipts.emplace(fs::absolute(shard.path).lexically_normal(), shard);
+  }
   std::map<fs::path, std::uint32_t> shard_indices;
   std::map<fs::path, dif::weights::SafeTensorFile> shard_files;
   for (const auto &binding : build.bindings) {
@@ -328,8 +362,15 @@ void command_bundle(const Options &options) {
     auto known = shard_indices.find(shard_path);
     if (known == shard_indices.end()) {
       const auto shard_index = static_cast<std::uint32_t>(bundle.shards.size());
-      bundle.shards.push_back({shard_path, fs::file_size(shard_path),
-                               dif::sha256_file(shard_path)});
+      if (!options.sealed_bundle.empty()) {
+        const auto receipt = receipts.find(shard_path);
+        if (receipt == receipts.end() || receipt->second.file_size != fs::file_size(shard_path))
+          dif::fail("vision sealed receipt missing or changed shard: " + shard_path.string());
+        bundle.shards.push_back(receipt->second);
+      } else {
+        bundle.shards.push_back({shard_path, fs::file_size(shard_path),
+                                 dif::sha256_file(shard_path)});
+      }
       shard_files.emplace(shard_path, dif::weights::read_safetensors(shard_path));
       known = shard_indices.emplace(shard_path, shard_index).first;
     }
@@ -401,7 +442,7 @@ void command_inputs(const Options &options) {
       vision_tokens * static_cast<std::uint64_t>(options.images.size())));
   for (std::size_t image = 0U; image < options.images.size(); ++image) {
     append_ids(ids, tags,
-               tokenizer.encode("<Picture " + std::to_string(image + 1U) +
+               tokenizer.encode("<Picture " + std::to_string(image + options.label_offset + 1U) +
                                 ">: "),
                1);
     ids.push_back(vision_start);
@@ -520,6 +561,90 @@ void command_combine(const Options &options) {
             << " images=" << options.vision_inputs.size() << " shape=["
             << embeds.dims.at(0) << ',' << embeds.dims.at(1)
             << "] payload_sha256=" << hash << '\n';
+}
+
+void command_combine_inputs(const Options &options) {
+  if (options.vision_inputs.empty() || options.output.empty() ||
+      options.ids_output.empty() || options.tags_output.empty())
+    dif::fail("combine-inputs needs presentations, output, ids-out and tags-out");
+  for (const auto &path : {options.output, options.ids_output, options.tags_output})
+    if (fs::exists(path)) dif::fail("refusing to overwrite " + path.string());
+  std::vector<std::int32_t> ids, tags, positions, destinations;
+  std::int64_t visual_offset = 0;
+  for (const auto &[text_only, path] : options.presentation_inputs) {
+    if (text_only) {
+      const auto part = dif::runtime::read_tensor(path);
+      if (part.dtype != dif::ir::DType::I32 || part.dims.size() != 1U ||
+          ids.size() + part.element_count() > std::size_t(INT32_MAX))
+        dif::fail("text presentation input must be I32 [tokens] within I32 indexing");
+      std::vector<std::int32_t> values(part.element_count());
+      std::memcpy(values.data(), part.data(), part.byte_size());
+      if (std::any_of(values.begin(), values.end(), [](auto id) { return id < 0; }))
+        dif::fail("text presentation token IDs must be nonnegative");
+      ids.insert(ids.end(), values.begin(), values.end());
+      tags.insert(tags.end(), values.size(), 1);
+      destinations.insert(destinations.end(), values.size(), -1);
+      continue;
+    }
+    const auto file = dif::weights::read_safetensors(path);
+    const auto read = [&](const char *name) {
+      auto tensor = dif::weights::map_safetensor(file, name);
+      if (tensor.dtype != dif::ir::DType::I32 || tensor.dims.size() != 1U)
+        dif::fail(std::string("invalid presentation ") + name);
+      std::vector<std::int32_t> values(tensor.element_count());
+      std::memcpy(values.data(), tensor.data(), tensor.byte_size());
+      return values;
+    };
+    const auto part_ids = read("input_ids");
+    const auto part_tags = read("token_tags");
+    const auto part_map = read("vision_destination_map");
+    const auto part_positions = read("visual_positions");
+    if (part_ids.size() != part_tags.size() || part_ids.size() != part_map.size() ||
+        ids.size() + part_ids.size() > std::size_t(INT32_MAX) ||
+        visual_offset + std::int64_t(part_positions.size()) > INT32_MAX)
+      dif::fail("inconsistent or oversized multimodal presentation");
+    for (std::size_t i = 0; i < part_positions.size(); ++i) {
+      const auto position = part_positions[i];
+      if (position < 0 || std::size_t(position) >= part_ids.size() || part_map[position] != std::int32_t(i))
+        dif::fail("invalid presentation visual mapping");
+      positions.push_back(static_cast<std::int32_t>(ids.size() + position));
+    }
+    for (std::size_t i = 0; i < part_map.size(); ++i) {
+      const auto value = part_map[i];
+      if (value < -1 || (value >= 0 && (std::size_t(value) >= part_positions.size() || part_positions[value] != std::int32_t(i))))
+        dif::fail("invalid presentation destination mapping");
+      destinations.push_back(value < 0 ? -1 : static_cast<std::int32_t>(visual_offset + value));
+    }
+    ids.insert(ids.end(), part_ids.begin(), part_ids.end());
+    tags.insert(tags.end(), part_tags.begin(), part_tags.end());
+    visual_offset += static_cast<std::int64_t>(part_positions.size());
+  }
+  auto id_tensor = i32_tensor({ids.size()}, ids);
+  auto tag_tensor = i32_tensor({tags.size()}, tags);
+  auto position_tensor = i32_tensor({positions.size()}, positions);
+  auto destination_tensor = i32_tensor({destinations.size()}, destinations);
+  write_named_tensors(options.output, {{"input_ids", &id_tensor}, {"token_tags", &tag_tensor},
+      {"visual_positions", &position_tensor}, {"vision_destination_map", &destination_tensor}});
+  dif::runtime::write_tensor(id_tensor, options.ids_output);
+  dif::runtime::write_tensor(tag_tensor, options.tags_output);
+  std::cout << "H3_PRESENTATION_COMBINE sequence=" << ids.size() << " vision_tokens=" << positions.size() << '\n';
+}
+
+void command_prepare_image(const Options &options) {
+  if (options.images.size() != 1U || options.output.empty() ||
+      options.short_edge < 32U || options.short_edge > 2048U || options.short_edge % 32U)
+    dif::fail("prepare-image needs one PNG, output and 32-aligned short-edge in [32,2048]");
+  if (fs::exists(options.output)) dif::fail("refusing to overwrite " + options.output.string());
+  const auto source = dif::read_png_rgb8(options.images[0]);
+  if (!source.width || !source.height || source.width > 4ULL * source.height || source.height > 4ULL * source.width)
+    dif::fail("H3 reference image aspect ratio must be between 1:4 and 4:1");
+  const auto scale = double(options.short_edge) / std::min(source.width, source.height);
+  const auto width = static_cast<std::uint32_t>(std::nearbyint(source.width * scale / 32.0)) * 32U;
+  const auto height = static_cast<std::uint32_t>(std::nearbyint(source.height * scale / 32.0)) * 32U;
+  const auto prepared = dif::resize_rgb8_lanczos(source, width, height);
+  dif::write_png_rgb8(options.output, width, height, prepared.pixels);
+  std::cout << "{\"width\":" << width << ",\"height\":" << height
+            << ",\"source_width\":" << source.width << ",\"source_height\":" << source.height << "}\n";
 }
 
 void command_run(const Options &options) {
@@ -714,6 +839,10 @@ int main(int argc, char **argv) {
       command_run(options);
     else if (options.command == "combine")
       command_combine(options);
+    else if (options.command == "combine-inputs")
+      command_combine_inputs(options);
+    else if (options.command == "prepare-image")
+      command_prepare_image(options);
     else {
       usage();
       dif::fail("unknown command: " + options.command);

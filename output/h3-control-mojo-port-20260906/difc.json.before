@@ -1,0 +1,163 @@
+{
+  "compiler_build": "${home}/diffusion-compiler/build",
+  "gpu_lock": "/tmp/dc-gpu.lock",
+  "gpu_lock_wait_seconds": 3600,
+  "memory_max": "24G",
+  "memory_swap_max": "2G",
+  "desktop_reserve": "16G",
+  "sdxl": {
+    "checkpoint": "${home}/.serenity/models/checkpoints/sd_xl_base_1.0.safetensors",
+    "tokenizer_dir": "${home}/.cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer",
+    "cache_dir": "${repo}/output/cache/sdxl-base-1.0",
+    "extra_args": [
+      "--unet-dtype",
+      "f16",
+      "--clip-dtype",
+      "f16",
+      "--vae-dtype",
+      "bf16"
+    ]
+  },
+  "flux2_klein_base_9b": {
+    "model_dir": "${home}/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-9B/snapshots/32773329fbe7e81a90ef971740e8ba4b0364ecf3",
+    "transformer_checkpoint": "${home}/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-9B/snapshots/32773329fbe7e81a90ef971740e8ba4b0364ecf3/flux-2-klein-base-9b.safetensors",
+    "vae_checkpoint": "${home}/.serenity/models/vaes/flux2-vae.safetensors",
+    "cache_dir": "${repo}/output/cache/flux2-klein-base-9b",
+    "extra_args": [
+      "--vae-format",
+      "diffusers",
+      "--transformer-attention",
+      "cudnn",
+      "--cudnn-attention-heuristic",
+      "a",
+      "--resident-plan-mib",
+      "20000",
+      "--resident-order",
+      "first"
+    ]
+  },
+  "minimax_h3": {
+    "ck_attention_libraries": {
+      "86": "${home}/Ck-INT8/native/lib/owned/sm86/libcodealexx_h3_dense.so"
+    },
+    "task_configs": { "ref2va": "${repo}/config/h3-ref2va.json" },
+    "lora": { "enabled": true, "max_count": 4, "max_abs_scale": 10.0 },
+    "motion": {
+      "save_context": true, "filename": "motion_context.safetensors", "windows": [5, 22, 39], "default_frames": 22,
+      "stage_script": "${repo}/scripts/h3-motion.sh",
+      "modulation_cache": "${minimax_h3.keyframes.modulation_cache}",
+      "timestep_tables": 3,
+      "noise_seed_offset": 102,
+      "audio_decoder_stages": 8,
+      "audio_decoder_batch": 2
+    },
+    "control": {
+      "enabled": true,
+      "ui_artifacts": [
+        {"type":"controlnet","name":"MiniMax-H3-Fun-Controlnet-Union.safetensors","path":"${minimax_h3.control.checkpoint}"},
+        {"type":"clip","name":"MiniMax-H3/FL2VA/text_encoder/serenity_int8_rowscale_v1","path":"${minimax_h3.checkpoint}/text_encoder/serenity_int8_rowscale_v1"},
+        {"type":"vae","name":"MiniMax-H3/FL2VA/video_vae/source/model.safetensors","path":"${minimax_h3.checkpoint}/video_vae/source/model.safetensors"},
+        {"type":"vae","name":"MiniMax-H3/FL2VA/audio_vae/model.safetensors","path":"${minimax_h3.checkpoint}/audio_vae/model.safetensors"}
+      ],
+      "stage_script": "${repo}/scripts/h3-controls.sh",
+      "checkpoint": "${home}/.serenity/models/controlnets/MiniMax-H3-Fun-Controlnet-Union.safetensors",
+      "max_count": 4,
+      "max_abs_strength": 10.0,
+      "input_policy": "mojo_resize_trim_hold_last",
+      "media_program": "${repo}/serenity-server/target/release/h3-control-media",
+      "preprocessors": ["prepared", "canny"],
+      "resize_modes": ["crop", "pad", "stretch"],
+      "defaults": {
+        "preprocessor": "prepared", "resize_mode": "crop",
+        "canny_low": 100, "canny_high": 200,
+        "strength": 1.0, "start": 0.0, "end": 1.0,
+        "invert_mask": false
+      },
+      "ffmpeg": "/usr/bin/ffmpeg",
+      "ffprobe": "/usr/bin/ffprobe",
+      "encoder_program": "${minimax_h3.fixture_dir}/control-encoder/tile-f17-h256-w256.difir",
+      "encoder_bundle": "${minimax_h3.fixture_dir}/control-encoder/tile-f17-h256-w256.difbind",
+      "encoder_source_bundle": "${minimax_h3.keyframes.encoder_bundle}",
+      "encoder_residency": "resident",
+      "encoder_pixels_id": 1,
+      "encoder_moments_id": 375,
+      "clip_length": 17,
+      "token_drop": 3,
+      "tile_size": 256,
+      "tile_overlap": 64,
+      "patch_height": 2,
+      "patch_width": 2,
+      "patch_features": 196
+    },
+    "checkpoint": "${home}/.serenity/models/checkpoints/MiniMax-H3/FL2VA",
+    "fixture_dir": "${repo}/output/cache/h3-832x480x124",
+    "convrot_int8": "${minimax_h3.checkpoint}/serenity_runtime_cache_v1/native_convrot_h256_official_blocks_50.safetensors",
+    "cache_dir": "${repo}/output/cache/h3-runtime",
+    "resident_layers": 28,
+    "prepared_source_root": "${home}/diffusion-compiler/artifacts/h3-flref-product-2026-09-01",
+    "conditioner_bundle": "${minimax_h3.prepared_source_root}/fl2va/conditioner-s460.difbind",
+    "denoiser_bundle": "${minimax_h3.prepared_source_root}/fl2va/denoiser-s14078-t3.difbind",
+    "video_program": "${minimax_h3.prepared_source_root}/shared/video-vae/tile-t7-h16-w16-l36.difir",
+    "video_bundle": "${minimax_h3.prepared_source_root}/shared/video-vae/tile-t7-h16-w16-l36.difbind",
+    "audio_program": "${minimax_h3.prepared_source_root}/shared/audio-vae-t207/t207.difir",
+    "audio_bundle": "${minimax_h3.prepared_source_root}/shared/audio-vae-t207/t207.difbind",
+    "modulation_cache": "${minimax_h3.fixture_dir}/native-modcache-t2va-steps20-blocks50.safetensors",
+    "preparation": {
+      "runner": "${repo}/scripts/prepare-h3.sh",
+      "cublas": "${home}/mojodiffusion/.pixi/envs/default/lib/libcublas.so.13"
+    },
+    "profile": {
+      "tasks": ["t2va", "i2va", "l2va", "fl2va", "continue", "controlnet"]
+    },
+    "keyframes": {
+      "required_tools": ["${compiler_build}/difh3vision", "${compiler_build}/difh3encode", "${compiler_build}/difh3state"],
+      "input_policy": "exact_canvas_rgb_no_resize",
+      "stage_script": "${repo}/scripts/h3-keyframes.sh",
+      "vision_program": "${minimax_h3.prepared_source_root}/fl2va-t37-native/vision/qwen3vl-vision-t1h30w52.difir",
+      "vision_bundle": "${minimax_h3.prepared_source_root}/fl2va-t37-native/vision/qwen3vl-vision-t1h30w52.difbind",
+      "encoder_program": "${minimax_h3.prepared_source_root}/shared/video-encoder/tile-f1-h256-w256.difir",
+      "encoder_bundle": "${minimax_h3.prepared_source_root}/shared/video-encoder/tile-f1-h256-w256.difbind",
+      "modulation_cache": "${minimax_h3.checkpoint}/serenity_runtime_cache_v1/native_modcache_local_keyframe_steps_20_blocks_50.safetensors",
+      "condition_timestep": "0.999",
+      "posterior_seed": 42,
+      "timestep_tables": 3,
+      "encoder_pixels_id": 1,
+      "encoder_moments_id": 375,
+      "vision_patch_size": 16,
+      "vision_merge_size": 2
+    }
+  },
+  "krea2": {
+    "turbo_checkpoint": "${home}/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots/1161245028ef398cd0a951101b2bbf486464f841/turbo.safetensors",
+    "raw_checkpoint": "${home}/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494/raw.safetensors",
+    "qwen_processor": "${home}/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17",
+    "conditioner_program": "/mnt/disk1/diffusion-compiler-cache/krea2-dcui/krea2-qwen3vl-4b-s546.difir",
+    "conditioner_bundle": "/mnt/disk1/diffusion-compiler-cache/krea2-dcui/krea2-qwen3vl-4b-s546.difbind",
+    "vae_checkpoint": "${home}/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/75e0b4be04f60ec59a75f475837eced720f823b6/vae/diffusion_pytorch_model.safetensors",
+    "vae_config": "${home}/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/75e0b4be04f60ec59a75f475837eced720f823b6/vae/config.json",
+    "cache_dir": "/mnt/disk1/diffusion-compiler-cache/krea2-dcui/runtime-cache",
+    "resident_plan_mib": 11000,
+    "mu": 1.15
+  },
+  "flux2_klein_base_4b": {
+    "model_dir": "${home}/.serenity/models/checkpoints",
+    "text_encoder_dir": "${home}/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c",
+    "tokenizer_dir": "${home}/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c",
+    "transformer_checkpoint": "${home}/.serenity/models/checkpoints/flux-2-klein-base-4b.safetensors",
+    "vae_checkpoint": "${home}/.serenity/models/vaes/flux2-vae.safetensors",
+    "cache_dir": "${repo}/output/cache/flux2-klein-base-4b",
+    "extra_args": [
+      "--vae-format",
+      "diffusers",
+      "--transformer-attention",
+      "cudnn",
+      "--cudnn-attention-heuristic",
+      "a",
+      "--resident-plan-mib",
+      "20000",
+      "--resident-order",
+      "first"
+    ]
+  },
+  "extends": "runtime.json"
+}

@@ -425,7 +425,10 @@ int run_full(const Arguments &arguments) {
   std::uint64_t converted = 0U;
   double preparation_milliseconds = 0.0;
   std::uint64_t resident_bytes = 0U;
+  std::uint64_t reused_resident_weight_bytes = 0U;
   for (std::size_t index = 0U; index < shapes.size(); ++index) {
+    // Shared runtime ownership handles immutable mapped weights; shape
+    // preparation needs no model-specific host-page retention hints.
     prepared[index] = prepare_tile(
         *backend, checkpoint ? &*checkpoint : nullptr,
         bundle ? &prepared_weights : nullptr, latent_std, latent_mean,
@@ -433,6 +436,8 @@ int run_full(const Arguments &arguments) {
     preparation_milliseconds +=
         prepared[index]->execution->preparation_milliseconds();
     resident_bytes += prepared[index]->execution->resident_bytes();
+    reused_resident_weight_bytes +=
+        prepared[index]->execution->reused_resident_weight_bytes();
   }
   dif::ir::write_file(prepared[0]->build.program, arguments.diffir);
 
@@ -567,7 +572,11 @@ int run_full(const Arguments &arguments) {
          << preparation_milliseconds
          << ",\n  \"tile_kernel_ms\": " << kernel_milliseconds
          << ",\n  \"decode_wall_ms\": " << wall_milliseconds
-         << ",\n  \"resident_bytes\": " << resident_bytes
+         << ",\n  \"resident_bytes\": "
+         << resident_bytes - reused_resident_weight_bytes
+         << ",\n  \"logical_plan_resident_bytes\": " << resident_bytes
+         << ",\n  \"reused_resident_weight_bytes\": "
+         << reused_resident_weight_bytes
          << ",\n  \"free_bytes_before\": " << free_bytes_before
          << ",\n  \"minimum_free_bytes_after\": " << free_bytes_after
          << ",\n  \"run_launches\": " << launches

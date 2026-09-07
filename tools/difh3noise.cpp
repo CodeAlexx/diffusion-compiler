@@ -37,6 +37,7 @@ struct Arguments {
   long long cols = -1;
   unsigned long long seed = 0;
   unsigned long long skip_normal_values = 0;
+  std::vector<std::size_t> skip_normal_draws;
   bool seed_set = false;
   std::string rng{"serenity"};
   std::string layout{"flat"};
@@ -57,6 +58,7 @@ struct Arguments {
                "[--latent-frames N --latent-height N --latent-width N] "
                "[--audio-latents N] "
                "[--skip-normal-values N] "
+               "[--skip-normal-draw N ...] "
                "[--verify-against FILE.diftensor]\n";
   std::exit(2);
 }
@@ -270,6 +272,15 @@ int main(int argc, char **argv) {
       else if (option == "--skip-normal-values")
         arguments.skip_normal_values =
             std::stoull(value("--skip-normal-values"));
+      else if (option == "--skip-normal-draw") {
+        const auto draw = value("--skip-normal-draw");
+        if (draw.empty() || draw.find_first_not_of("0123456789") != std::string::npos)
+          usage_error("--skip-normal-draw must be a nonnegative integer");
+        const auto count = std::stoull(draw);
+        if (count != 0 && count < 16)
+          usage_error("nonempty --skip-normal-draw needs at least 16 values");
+        arguments.skip_normal_draws.push_back(count);
+      }
       else if (option == "--verify-against")
         arguments.verify_against = value("--verify-against");
       else
@@ -292,8 +303,11 @@ int main(int argc, char **argv) {
       usage_error("h3-video requires positive T and even H/W latent geometry");
     if (arguments.layout == "h3-audio" && arguments.audio_latents <= 0)
       usage_error("h3-audio requires --audio-latents");
-    if (arguments.rng == "serenity" && arguments.skip_normal_values != 0U)
-      usage_error("--skip-normal-values is only valid with --rng torch-cpu");
+    if (arguments.rng == "serenity" && (arguments.skip_normal_values != 0U ||
+                                       !arguments.skip_normal_draws.empty()))
+      usage_error("normal draw skipping is only valid with --rng torch-cpu");
+    if (arguments.skip_normal_values != 0U && !arguments.skip_normal_draws.empty())
+      usage_error("use --skip-normal-values or repeated --skip-normal-draw, not both");
     if (arguments.rng == "serenity" && arguments.layout != "flat")
       usage_error("H3 source packing is only valid with --rng torch-cpu");
 
@@ -310,6 +324,11 @@ int main(int argc, char **argv) {
         (void)dif::torch_cpu_normal(
             generator,
             static_cast<std::size_t>(arguments.skip_normal_values));
+      // Preserve individual randn call boundaries. In particular, a tensor
+      // whose size is not divisible by 16 consumes an extra tail fill; adding
+      // counts together does not reproduce the next draw from that generator.
+      for (const auto draw : arguments.skip_normal_draws)
+        (void)dif::torch_cpu_normal(generator, draw);
       values =
           dif::torch_cpu_normal(generator, static_cast<std::size_t>(count));
     } else {
@@ -357,6 +376,7 @@ int main(int argc, char **argv) {
               << " seed=" << arguments.seed << " rng=" << arguments.rng
               << " layout=" << arguments.layout
               << " skip_normal_values=" << arguments.skip_normal_values
+              << " skip_normal_draws=" << arguments.skip_normal_draws.size()
               << " payload_sha256=" << payload_sha
               << "\n";
 

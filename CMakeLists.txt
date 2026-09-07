@@ -59,12 +59,17 @@ add_library(difcore
     src/compiler/residency_plan.cpp
     src/compiler/slice.cpp
   src/frontend/h3.cpp
-  src/frontend/h3_conditioning.cpp
+    src/frontend/h3_conditioning.cpp
+    src/frontend/h3_lora.cpp
+    src/frontend/h3_control.cpp
+    src/frontend/h3_motion.cpp
+    src/frontend/h3_step_cache.cpp
   src/frontend/h3_latents.cpp
   src/frontend/h3_media.cpp
   src/frontend/h3_vae.cpp
   src/frontend/h3_video_encoder.cpp
   src/frontend/h3_audio_vae.cpp
+  src/frontend/h3_audio_encoder.cpp
   src/frontend/qwen3vl_conditioner.cpp
   src/frontend/qwen3vl_vision.cpp
   src/frontend/krea2.cpp
@@ -97,12 +102,14 @@ add_library(difcore
     src/runtime/device_probe.cpp
     src/runtime/executor.cpp
     src/runtime/scalar.cpp
+    src/runtime/residual_cache.cpp
     src/runtime/tensor_io.cpp
     src/sampling/rectified_flow.cpp
     src/support/sha256.cpp
     src/support/wav.cpp
     src/support/json.cpp
     src/support/png.cpp
+    src/support/image_resize.cpp
     src/support/torch_cpu_rng.cpp
     src/target/profile.cpp
     src/telemetry/document.cpp
@@ -164,6 +171,20 @@ if(DIF_ENABLE_CUDA AND CUDAToolkit_FOUND)
   # injecting the CMake list into a compile definition breaks shell quoting.
   list(GET CUDAToolkit_INCLUDE_DIRS 0 DIF_CUDA_PRIMARY_INCLUDE_DIR)
   target_sources(difcore PRIVATE src/runtime/cuda_executor.cpp)
+  # The default checkpoint loader on supported targets: io_uring + O_DIRECT
+  # into pinned slots, then DMA per tensor. Its syscall ABI is Linux x86-64;
+  # every other target keeps the ordinary mapped loader.
+  set(DIF_HAVE_FASTLOAD 0)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+     CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
+     CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    enable_language(ASM)
+    target_sources(difcore PRIVATE src/runtime/fastload/fastload_x86.S
+                                   src/runtime/fastload/fastload_ring.S
+                                   src/runtime/fastload/resident_prefetch.cpp)
+    set(DIF_HAVE_FASTLOAD 1)
+  endif()
+  target_compile_definitions(difcore PUBLIC DIF_HAVE_FASTLOAD=${DIF_HAVE_FASTLOAD})
   target_link_libraries(difcore PRIVATE CUDA::cuda_driver CUDA::nvrtc
                                         CUDA::cublas CUDA::cublasLt)
   target_compile_definitions(
@@ -275,7 +296,8 @@ else()
   target_compile_definitions(difcore PUBLIC DIF_HAS_CUDA=0 DIF_HAS_CUDNN=0
                                             DIF_HAS_CUTLASS=0
                                             DIF_HAS_FLASH_ATTENTION=0
-                                            DIF_HAS_EXACT_STREAM_ATTENTION=0)
+                                            DIF_HAS_EXACT_STREAM_ATTENTION=0
+                                            DIF_HAVE_FASTLOAD=0)
 endif()
 
 add_executable(difc tools/difc.cpp)
@@ -365,6 +387,11 @@ target_link_libraries(difh3encode PRIVATE difcore)
 add_executable(difh3vision tools/difh3vision.cpp)
 target_link_libraries(difh3vision PRIVATE difcore dif_text)
 
+add_executable(difh3motion tools/difh3motion.cpp)
+target_link_libraries(difh3motion PRIVATE difcore)
+add_executable(difh3control tools/difh3control.cpp)
+target_link_libraries(difh3control PRIVATE difcore)
+
 add_executable(difh3state tools/difh3state.cpp)
 target_link_libraries(difh3state PRIVATE difcore)
 
@@ -376,6 +403,9 @@ target_link_libraries(difaudioops PRIVATE difcore)
 
 add_executable(difaudiodecode tools/difaudiodecode.cpp)
 target_link_libraries(difaudiodecode PRIVATE difcore)
+
+add_executable(difaudioencode tools/difaudioencode.cpp)
+target_link_libraries(difaudioencode PRIVATE difcore)
 
 add_executable(difimport tools/difimport.cpp)
 target_link_libraries(difimport PRIVATE difcore)
@@ -417,6 +447,11 @@ add_executable(difsdxlstage tools/difsdxlstage.cpp)
 target_link_libraries(difsdxlstage PRIVATE difcore)
 install(TARGETS difsdxlstage RUNTIME DESTINATION bin)
 
+if(DIF_HAVE_FASTLOAD)
+  add_executable(dif_fastload_bench src/runtime/fastload/fastload_bench.cpp)
+  target_link_libraries(dif_fastload_bench PRIVATE difcore CUDA::cudart)
+endif()
+
 add_executable(difsdxlsample tools/difsdxlsample.cpp)
 install(TARGETS difsdxlsample RUNTIME DESTINATION bin)
 
@@ -457,11 +492,60 @@ else()
   message(STATUS "Diffusion compiler OpenCL backend: disabled")
 endif()
 
-install(TARGETS difc difrun difinspect difprobe diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer difh3media difh3encode difh3vision difh3state difh3convrot difconvrot difslice
+install(TARGETS difc difrun difinspect difprobe diftune difopt difcast difcompare difschedule difh3layout difweights difquant difimage difvaedecode diftrain difh3infer difh3media difh3encode difh3vision difh3state difh3convrot difconvrot difslice difh3motion difh3control difh3noise
         RUNTIME DESTINATION bin)
 
 if(DIF_BUILD_TESTS)
+  add_executable(dif_h3_lora_tests tests/h3_lora_tests.cpp)
+  target_link_libraries(dif_h3_lora_tests PRIVATE difcore)
+  add_test(NAME dif_h3_lora_tests COMMAND dif_h3_lora_tests)
+  add_executable(dif_h3_control_tests tests/h3_control_tests.cpp)
+  target_link_libraries(dif_h3_control_tests PRIVATE difcore)
+  add_test(NAME dif_h3_control_tests COMMAND dif_h3_control_tests)
+  add_executable(dif_h3_motion_tests tests/h3_motion_tests.cpp)
+  target_link_libraries(dif_h3_motion_tests PRIVATE difcore)
+  add_test(NAME dif_h3_motion_tests COMMAND dif_h3_motion_tests)
+  add_executable(dif_h3_media_tests tests/h3_media_tests.cpp)
+  target_link_libraries(dif_h3_media_tests PRIVATE difcore)
+  add_dependencies(dif_h3_media_tests difh3media)
+  add_test(NAME dif_h3_media_tests COMMAND dif_h3_media_tests $<TARGET_FILE:difh3media>)
+  add_executable(dif_h3_audio_rebind_tests tests/h3_audio_rebind_tests.cpp)
+  target_link_libraries(dif_h3_audio_rebind_tests PRIVATE difcore)
+  add_test(NAME dif_h3_audio_rebind_tests COMMAND dif_h3_audio_rebind_tests)
+
+  add_executable(dif_h3_audio_encoder_tests tests/h3_audio_encoder_tests.cpp)
+  target_link_libraries(dif_h3_audio_encoder_tests PRIVATE difcore)
+  add_test(NAME dif_h3_audio_encoder_tests COMMAND dif_h3_audio_encoder_tests)
+  add_executable(dif_h3_step_cache_tests tests/h3_step_cache_tests.cpp)
+  target_link_libraries(dif_h3_step_cache_tests PRIVATE difcore)
+  add_test(NAME dif_h3_step_cache_tests COMMAND dif_h3_step_cache_tests)
+  add_executable(dif_residual_cache_cuda_tests tests/residual_cache_cuda_tests.cpp)
+  target_link_libraries(dif_residual_cache_cuda_tests PRIVATE difcore)
+  add_test(NAME dif_residual_cache_cuda_tests COMMAND dif_residual_cache_cuda_tests)
+  if(DIF_ENABLE_CUDA)
+    add_executable(dif_residual_cache_tests tests/residual_cache_tests.cpp)
+    target_link_libraries(dif_residual_cache_tests PRIVATE difcore CUDA::nvrtc)
+    target_compile_definitions(dif_residual_cache_tests PRIVATE DIF_RESIDUAL_CACHE_NVRTC_TEST=1)
+    add_test(NAME dif_residual_cache_tests COMMAND dif_residual_cache_tests)
+  endif()
+  add_executable(dif_h3_encode_tests tests/h3_encode_tests.cpp)
+  target_link_libraries(dif_h3_encode_tests PRIVATE difcore)
+  add_test(NAME dif_h3_encode_tests COMMAND dif_h3_encode_tests)
   enable_testing()
+  if(DIF_HAVE_FASTLOAD)
+    add_executable(dif_fastload_tests src/runtime/fastload/fastload_test.cpp)
+    target_link_libraries(dif_fastload_tests PRIVATE difcore)
+    add_test(NAME dif_fastload_tests COMMAND dif_fastload_tests)
+    set_tests_properties(dif_fastload_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(dif_fastload_io_tests src/runtime/fastload/fastload_io_test.cpp)
+    target_link_libraries(dif_fastload_io_tests PRIVATE difcore CUDA::cuda_driver)
+    add_test(NAME dif_fastload_io_tests COMMAND dif_fastload_io_tests)
+    set_tests_properties(dif_fastload_io_tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(dif_resident_prefetch_tests src/runtime/fastload/resident_prefetch_test.cpp)
+    target_link_libraries(dif_resident_prefetch_tests PRIVATE difcore CUDA::cuda_driver)
+    add_test(NAME dif_resident_prefetch_tests COMMAND dif_resident_prefetch_tests)
+    set_tests_properties(dif_resident_prefetch_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+  endif()
   add_executable(dif_tests tests/dif_tests.cpp)
   target_link_libraries(dif_tests PRIVATE difcore)
   add_test(NAME dif_tests COMMAND dif_tests)

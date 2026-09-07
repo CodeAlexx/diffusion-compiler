@@ -154,6 +154,10 @@ Object pipeline_profile_section(const runtime::PipelineProfile &profile) {
   out.set("resident_h2d_ms", profile.resident_h2d_milliseconds);
   out.set("resident_upload_ms", profile.resident_upload_milliseconds);
   out.set("streamed_weight_bytes", profile.streamed_weight_bytes);
+  out.set("streamed_fastload_bytes", profile.streamed_fastload_bytes);
+  out.set("streamed_fastload_calls", profile.streamed_fastload_calls);
+  out.set("streamed_fastload_host_ms",
+          profile.streamed_fastload_host_milliseconds);
   out.set("streamed_host_stage_ms", profile.streamed_host_stage_milliseconds);
   out.set("streamed_host_wait_ms", profile.streamed_host_wait_milliseconds);
   out.set("streamed_h2d_ms", profile.streamed_h2d_milliseconds);

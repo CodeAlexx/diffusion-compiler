@@ -2,6 +2,7 @@
 
 #include "dif/ir/ir.hpp"
 #include "dif/runtime/tensor.hpp"
+#include "dif/runtime/residual_cache.hpp"
 #include "dif/target/profile.hpp"
 
 #include <array>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -104,6 +106,22 @@ struct RunOptions {
   // Linear result shape through the shared NVIDIA backend; no model-specific
   // opcode or executor is introduced.
   std::filesystem::path convrot_int8_checkpoint;
+  // Frontend-sealed per-operation physical bindings. These reuse the generic
+  // ConvRot lowering when a source cache has a model-specific container or a
+  // graph transform preserves Linear ids but changes its fingerprint.
+  // Original semantic weights remain immutable; adapters stay ordinary IR.
+  struct ConvRotLinearBinding {
+    std::uint32_t operation{};
+    Tensor weight;
+    Tensor scale;
+    std::filesystem::path source;
+    bool resident{};
+  };
+  std::vector<ConvRotLinearBinding> convrot_linear_bindings;
+  // Explicit approximate contiguous-region reuse. Policy is frontend-owned;
+  // compressed device state and small probes use the shared arena/stream.
+  std::optional<ResidualCacheRegion> residual_cache_region;
+  std::shared_ptr<ResidualCacheCallbacks> residual_cache_callbacks;
   // Explicit prefix of eligible semantic Linear operations to lower through
   // the generic ConvRot cache. Zero means every eligible Linear. This is
   // compiler precision policy: later operations remain on their ordinary
@@ -331,7 +349,8 @@ struct RunOptions {
   bool streamed_keep_mapped_pages_between_runs{false};
   // Pinned staging ring for streamed constants and how many operations
   // ahead the overlapped scheduler prefetches. Defaults (2 buffers,
-  // depth 1) are the historical double-buffer policy, byte-for-byte.
+  // depth 1) preserve the double-buffer schedule. Slots are at most 64 MiB;
+  // larger operations transfer in fenced chunks, not tensor-sized buffers.
   // Depth is fixed at prepare time: the memory plan widens every streamed
   // interval by the same distance, which is what makes a deeper prefetch
   // hazard-free. Buffers must be >= 2 and >= depth + 1.
@@ -395,10 +414,10 @@ struct RunOptions {
   // resident bytes (RESIDENT_HOST_PAGES diagnostic on stderr). Any
   // non-default choice must enter difopt candidate identity.
   bool resident_evict_host_pages{true};
-  // Upper bound on pinned host memory the streamed staging ring may
-  // allocate. The historical two-buffer footprint is always admitted; a
-  // larger ring that would exceed the budget fails closed. This host has
-  // 62 GiB and a documented host-OOM incident: keep this modest.
+  // Streamed staging admission accounts for other live pinned workspaces
+  // and reserves the ASM reader's 128 MiB ring when enabled. All ring sizes
+  // obey the remaining budget, including the default two slots. Outliers
+  // are chunked; no budget exemption or model-specific tuning is needed.
   std::uint64_t streamed_pinned_budget_bytes{2ULL * 1024ULL * 1024ULL *
                                              1024ULL};
   // Route the reusable W8A8 tail weight uploads over the copy stream with
@@ -616,10 +635,11 @@ struct PipelineProfile {
   bool enabled{};
   std::uint32_t measured_iterations{};
   std::uint64_t resident_weight_bytes{};
-  // Profile-only resident preparation is split into an explicit mapped-page
-  // prefault followed by the upload. The latter is wall time after prefaulting
-  // and therefore includes driver pageable-memory staging plus H2D, but not
-  // checkpoint page faults.
+  // With ASM disabled, profile-only resident preparation is split into an
+  // explicit mapped-page prefault followed by upload. With ASM active, the
+  // prefault fields stay zero: touching pages would defeat direct I/O. The
+  // upload interval then includes file reads/staging plus H2D, not isolated
+  // device-copy time; the attributed trace records the combined interval.
   double resident_host_prefault_milliseconds{};
   std::uint64_t resident_minor_page_faults{};
   std::uint64_t resident_major_page_faults{};
@@ -632,6 +652,16 @@ struct PipelineProfile {
   // (RunOptions::h3_resident_direct_io) rather than copied from the mapping.
   std::uint64_t resident_direct_read_bytes{};
   std::uint64_t streamed_direct_read_bytes{};
+  // Constants loaded through the shared assembly io_uring reader: ordinary
+  // host staging or batched direct-to-device resident prefetch. These bytes
+  // are also included in streamed_weight_bytes. Ordinary constants contribute to
+  // streamed_direct_read_bytes; H3 quantized first-use/tail uploads retain
+  // their existing resident_direct_read_bytes accounting.
+  std::uint64_t streamed_fastload_bytes{};
+  std::uint64_t streamed_fastload_calls{};
+  // Caller wall for synchronous staging; worker wall (including DMA) for
+  // prefetch. These overlap the device timeline and are not additive to it.
+  double streamed_fastload_host_milliseconds{};
   std::uint64_t streamed_weight_bytes{};
   double streamed_host_stage_milliseconds{};
   double streamed_host_wait_milliseconds{};
@@ -732,6 +762,11 @@ public:
   virtual std::string name() const = 0;
   virtual double preparation_milliseconds() const { return 0.0; }
   virtual std::uint64_t resident_bytes() const { return 0U; }
+  // Aligned immutable storage reused from earlier live plans at preparation.
+  // resident_bytes() includes it. Subtract when summing a complete cohort,
+  // including the original allocating plans, while all remain alive. This
+  // is not a query of current ownership after another plan is destroyed.
+  virtual std::uint64_t reused_resident_weight_bytes() const { return 0U; }
 
   // Persistent state crosses the host boundary only when asked to. `capture`
   // reads the current device value of every declared state tensor, keyed by
@@ -762,6 +797,11 @@ public:
   RunResult run(const ir::Program &program, const TensorMap &inputs,
                 const RunOptions &options);
   virtual std::string name() const = 0;
+  // Make this executor's device context current on the calling thread, so
+  // a caller may prepare one program on a worker thread while another
+  // proceeds on the main one. Backends without a per-thread context do
+  // nothing.
+  virtual void bind_thread() {}
 };
 
 std::unique_ptr<Executor> make_cpu_executor();

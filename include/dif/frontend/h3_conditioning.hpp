@@ -57,6 +57,17 @@ H3PackedLayout make_h3_ref2va_layout(
     std::uint64_t latent_width, std::uint64_t num_audio_latents,
     std::uint64_t patch_t, std::uint64_t patch_h, std::uint64_t patch_w);
 
+// Latent-native continuation: [text | fixed video | fixed audio | target audio
+// | target video]. Fixed prefixes are excluded from scheduler updates through
+// the existing condition row counts. The target contains the overlap, which
+// must be trimmed from decoded delivery. Other task layouts are unchanged.
+H3PackedLayout make_h3_motion_context_layout(
+    std::span<const std::int32_t> text_token_tags,
+    std::uint64_t num_latent_frames, std::uint64_t latent_height,
+    std::uint64_t latent_width, std::uint64_t num_audio_latents,
+    std::uint64_t patch_t, std::uint64_t patch_h, std::uint64_t patch_w,
+    std::uint64_t context_frames, double source_audio_overhang);
+
 struct H3RowTimestepPlan {
   std::vector<float> timesteps;
   std::vector<std::int32_t> timestep_indices;

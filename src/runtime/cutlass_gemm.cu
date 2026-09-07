@@ -320,9 +320,38 @@ using Int8F16MulColumn = cutlass::epilogue::threadblock::VisitorCompute<
     cutlass::FloatRoundStyle::round_to_nearest>;
 using Int8F16ScaledOutput = cutlass::epilogue::threadblock::Sm80EVT<
     Int8F16MulColumn, Int8F16ScaledRows, Int8F16ColumnScale>;
-using Int8F16Bias = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+using Int8F16BiasBase = cutlass::epilogue::threadblock::VisitorRowBroadcast<
     Int8F16OutputThreadMap, Int8F16Output,
     cute::Stride<cute::_0, cute::_1, std::int64_t>>;
+// The pinned CUTLASS visitor declares null_default but still unconditionally
+// loads ptr_row. A biasless Linear passes nullptr: keep its additive identity
+// in registers instead of issuing an invalid device read.
+struct Int8F16Bias : Int8F16BiasBase {
+  using Int8F16BiasBase::Int8F16BiasBase;
+
+  template <class BaseCallbacks>
+  struct OptionalCallbacks : BaseCallbacks {
+    CUTLASS_DEVICE
+    explicit OptionalCallbacks(BaseCallbacks callbacks)
+        : BaseCallbacks(cute::move(callbacks)) {}
+
+    CUTLASS_DEVICE void begin_epilogue() {
+      if (this->params_ptr->ptr_row != nullptr)
+        BaseCallbacks::begin_epilogue();
+      else
+        cute::clear(this->tC_rRow);
+    }
+  };
+
+  template <class ProblemShape>
+  CUTLASS_DEVICE auto get_callbacks(
+      cutlass::gemm::GemmCoord threadblock_tile_offset, int thread_idx,
+      ProblemShape problem_shape) {
+    auto callbacks = Int8F16BiasBase::get_callbacks(
+        threadblock_tile_offset, thread_idx, problem_shape);
+    return OptionalCallbacks<decltype(callbacks)>(cute::move(callbacks));
+  }
+};
 using Int8F16AddBias = cutlass::epilogue::threadblock::VisitorCompute<
     cutlass::plus, Int8F16Output, float,
     cutlass::FloatRoundStyle::round_to_nearest>;

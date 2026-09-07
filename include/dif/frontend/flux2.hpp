@@ -17,6 +17,9 @@ namespace dif::frontend {
 // the frontend without changing semantics.
 Qwen3VlConditionerConfig
 make_flux2_klein_9b_conditioner_config(std::uint64_t executed_layers = 27U);
+// Klein 4B uses the same raw taps with Qwen3-4B (hidden 2560, MLP 9728).
+Qwen3VlConditionerConfig
+make_flux2_klein_4b_conditioner_config(std::uint64_t executed_layers = 27U);
 // FLUX.2 [dev] conditioner: the Mistral Small 3.1 24B language tower
 // (40 layers, hidden 5120, 32/8 heads, head_dim 128, MLP 32768, vocab
 // 131072, eps 1e-5, rope theta 1e9, no QK-norm, keys under
@@ -43,6 +46,7 @@ struct Flux2Geometry {
   bool guidance_embedding{false};
 };
 Flux2Geometry flux2_klein_9b_geometry();
+Flux2Geometry flux2_klein_4b_geometry();
 Flux2Geometry flux2_dev_geometry();
 
 struct Flux2KleinDoubleBlockConfig {

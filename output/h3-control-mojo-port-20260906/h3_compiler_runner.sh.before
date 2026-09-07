@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# MiniMax-H3 request runner backed by the Diffusion Compiler's native process
+# chain. Speaks the serenity-server H3 runner protocol (video/minimax_h3.rs):
+#
+#   cold:   runner <prompt> <out_dir> <steps> <seed> <blocks> --width=W --height=H
+#                  --frames=F --output-frames=N --fps=24 --output-fps=24 --quant=Q
+#                  --resident-blocks=R ... --defer-video-decode
+#           -> conditioning + denoise; leaves video-latent/audio-rows in out_dir;
+#              progress lines on stdout (the server tails runner.log).
+#   decode: runner decode <out_dir> <steps> <seed> <blocks> decode_video_only --width=...
+#           -> video VAE decode + audio decode + mux -> out_dir/video.mp4, result.json
+#
+# Everything neural runs in the compiler's tools (no Mojo, no PyTorch). Programs
+# are generated per request and their bundles REBOUND from one sealed base
+# bundle per geometry (0.07 s, byte-identical to a fresh seal — see
+# evidence/p3/P3_H3_PREP_COST_2026-09-05.md).
+set -euo pipefail
+
+ROOT="${SERENITY_REPO_ROOT:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
+source "$ROOT/scripts/config.sh"
+for task_arg in "$@"; do
+  if [[ "$task_arg" == --task=* ]]; then
+    selected_task="${task_arg#*=}"
+    if [[ -v "DIFC_VALUES[minimax_h3.task_configs.$selected_task]" ]]; then
+      export DIFC_CONFIG="$(config_get "minimax_h3.task_configs.$selected_task")"
+      source "$ROOT/scripts/config.sh"
+    fi
+  fi
+done
+jq_get() { config_get "$1"; }
+B="$(jq_get compiler_build)"
+CKPT="$(jq_get minimax_h3.checkpoint)"
+CONVROT="$(jq_get minimax_h3.convrot_int8)"
+INT8_ROUTE="$(jq_get minimax_h3.int8_route)"
+CACHE="$(jq_get minimax_h3.cache_dir)"
+RESIDENT_LAYERS_DEFAULT="$(jq_get minimax_h3.resident_layers)"
+
+# Preparation is explicit and uses native compiler tools. Never claim an old
+# Mojo resident-cache build has prepared the native modulation cache.
+for a in "$@"; do
+  if [[ "$a" == "--prepare-runtime-cache" ]]; then
+    if [[ "$INT8_ROUTE" == w8a8 ]]; then
+      "$DIFC_CONFIG_TOOL" check-h3 int8 --task "$(jq_get minimax_h3.profile.task)"
+      exit
+    fi
+    [[ -s "$CONVROT" ]] || { echo "FATAL ConvRot pack missing: $CONVROT" >&2; exit 66; }
+    exec bash "$(jq_get minimax_h3.preparation.runner)"
+  fi
+done
+mode=cold
+REFERENCE_VIDEO_VAE="" REFERENCE_AUDIO_VAE=""
+if [[ "${1:-}" == "decode" ]]; then mode=decode; shift; PROMPT=""; else PROMPT="${1:?prompt}"; shift; fi
+OUT="${1:?out_dir}"; STEPS="${2:?steps}"; SEED="${3:?seed}"; BLOCKS="${4:-$(jq_get minimax_h3.profile.blocks)}"; shift 4 || true
+[[ "$STEPS" =~ ^[1-9][0-9]{0,7}$ && "$BLOCKS" =~ ^[1-9][0-9]{0,7}$ && "$SEED" =~ ^[0-9]{1,10}$ ]] && (( 10#$SEED <= 4294967295 )) || {
+  echo 'FATAL steps/blocks must be positive integers and seed must fit uint32' >&2; exit 65;
+}
+SEED=$((10#$SEED))
+[[ "${1:-}" == "decode_video_only" ]] && shift
+W="$(jq_get minimax_h3.profile.width)"; H="$(jq_get minimax_h3.profile.height)"
+FRAMES="$(jq_get minimax_h3.profile.frames)"; OUT_FRAMES="$FRAMES"
+FPS="$(jq_get minimax_h3.profile.fps)"; OUT_FPS="$FPS"
+QUANT="$(jq_get minimax_h3.profile.quant)"; RESIDENT="$RESIDENT_LAYERS_DEFAULT"
+TASK="$(jq_get minimax_h3.profile.task)"
+SOURCE_IMAGE=""; LAST_FRAME=""
+REFERENCE_IMAGES=()
+REFERENCE_AUDIOS=()
+REFERENCE_KINDS=()
+REFERENCE_PATHS=()
+LORA_ARGS=()
+CONTROL_MANIFEST=""
+CONTROL_ARGS=()
+MOTION_CONTEXT=""; MOTION_FRAMES=0; TRIM_START=0
+MOTION_ARGS=()
+ATTENTION="$(jq_get minimax_h3.profile.attention)"; STEP_CACHE="$(jq_get minimax_h3.profile.step_cache)"
+EVALUATION_LIMIT=()
+for a in "$@"; do
+  case "$a" in
+    --width=*) W="${a#*=}";; --height=*) H="${a#*=}";; --frames=*) FRAMES="${a#*=}";;
+    --output-frames=*) OUT_FRAMES="${a#*=}";; --fps=*) FPS="${a#*=}";; --output-fps=*) OUT_FPS="${a#*=}";;
+    --quant=*) QUANT="${a#*=}";; --resident-blocks=*) RESIDENT="${a#*=}";;
+    --motion-context=*) MOTION_CONTEXT="$(realpath -e "${a#*=}")";;
+    --motion-context-frames=*) MOTION_FRAMES="${a#*=}";;
+    --trim-start-frames=*) TRIM_START="${a#*=}";;
+    --task=*) TASK="${a#*=}";; --source-image=*) SOURCE_IMAGE="${a#*=}";; --last-frame=*) LAST_FRAME="${a#*=}";;
+    --reference-image=*) REFERENCE_IMAGES+=("${a#*=}"); REFERENCE_KINDS+=(image); REFERENCE_PATHS+=("${a#*=}");;
+    --reference-audio=*) REFERENCE_AUDIOS+=("${a#*=}"); REFERENCE_KINDS+=(audio); REFERENCE_PATHS+=("${a#*=}");;
+    --reference-video-vae=*) REFERENCE_VIDEO_VAE="${a#*=}";;
+    --reference-audio-vae=*) REFERENCE_AUDIO_VAE="${a#*=}";;
+    --h3-lora=*) LORA_ARGS+=(--h3-lora "$(realpath -e "${a#*=}")");;
+    --h3-lora-scale=*) LORA_ARGS+=(--h3-lora-scale "${a#*=}");;
+    --control-manifest=*) CONTROL_MANIFEST="$(realpath -e "${a#*=}")";;
+    --attention-backend=*) ATTENTION="${a#*=}";; --step-cache=*) STEP_CACHE="${a#*=}";;
+    --encoder-storage=int8|--defer-video-decode) :;;
+    --max-evaluations=*)
+      limit="${a#*=}"
+      [[ "$limit" =~ ^[1-9][0-9]*$ ]] && (( limit < STEPS )) || { echo 'FATAL max-evaluations must be positive and below schedule points' >&2; exit 65; }
+      EVALUATION_LIMIT=(--max-evaluations "$limit");;
+    *) echo "FATAL unknown H3 runner argument: $a" >&2; exit 65;;
+  esac
+done
+log() { echo "[difc-h3] $*"; }
+for numeric in "$W" "$H" "$FRAMES" "$OUT_FRAMES" "$FPS" "$OUT_FPS"; do
+  [[ "$numeric" =~ ^[1-9][0-9]{0,7}$ ]] || { echo 'FATAL geometry and FPS must be positive integers' >&2; exit 65; }
+done
+EXPECTED_FRAMES="$(jq_get minimax_h3.profile.frames)"
+if [[ "$TASK" == continue ]]; then
+  [[ -n "$MOTION_CONTEXT" && -s "$MOTION_CONTEXT" ]] || { echo 'FATAL continuation needs a native motion context' >&2; exit 66; }
+  jq -e --argjson frames "$MOTION_FRAMES" '.minimax_h3.motion.windows | index($frames) != null' <<<"$DIFC_DOCUMENT" >/dev/null || {
+    echo 'FATAL unsupported motion overlap' >&2; exit 65;
+  }
+  [[ "$TRIM_START" == "$MOTION_FRAMES" ]] || { echo 'FATAL continuation trim must equal motion overlap' >&2; exit 65; }
+  EXPECTED_FRAMES=$(((EXPECTED_FRAMES + MOTION_FRAMES - 5 + 16) / 17 * 17 + 5))
+elif [[ -n "$MOTION_CONTEXT" || "$MOTION_FRAMES" != 0 || "$TRIM_START" != 0 ]]; then
+  echo 'FATAL motion context and overlap require task=continue' >&2; exit 65
+fi
+ATTENTION_ARGS=()
+if [[ "$ATTENTION" == ck-int8 && "$mode" == cold ]]; then
+  CK_DSO="${H3_DENSE_INT8_KERNEL_PATH:-}"
+  [[ -s "$CK_DSO" ]] || { echo 'FATAL selected Ck-INT8 attention library is missing' >&2; exit 66; }
+  ATTENTION_ARGS=(--h3-ck-attention-dso "$CK_DSO" --h3-int8-attention-layers "$BLOCKS")
+else
+  [[ "$ATTENTION" == "$(jq_get minimax_h3.profile.attention)" ]] || { echo 'FATAL attention must match the configured native H3 profile' >&2; exit 65; }
+fi
+jq -e --arg mode "$STEP_CACHE" '.minimax_h3.profile | (.step_cache_modes // [.step_cache]) | index($mode) != null' <<<"$DIFC_DOCUMENT" >/dev/null || {
+  echo 'FATAL step-cache is not enabled in the configured native H3 profile' >&2; exit 65;
+}
+CACHE_ARGS=()
+case "$STEP_CACHE" in
+  exact) ;;
+  high) CACHE_ARGS=(--h3-middle-cache);;
+  *) echo 'FATAL unsupported native H3 step-cache mode' >&2; exit 65;;
+esac
+KEYFRAME_IMAGES=()
+if [[ "$mode" == cold ]]; then
+  case "$TASK" in
+    t2va|continue|controlnet) [[ -z "$SOURCE_IMAGE$LAST_FRAME" ]] || { echo 'FATAL T2VA/continuation does not consume keyframes' >&2; exit 65; };;
+    i2va) KEYFRAME_IMAGES=("$SOURCE_IMAGE"); [[ -z "$LAST_FRAME" ]] || { echo 'FATAL I2VA does not consume last-frame' >&2; exit 65; };;
+    l2va) KEYFRAME_IMAGES=("$LAST_FRAME"); [[ -z "$SOURCE_IMAGE" ]] || { echo 'FATAL L2VA does not consume source-image' >&2; exit 65; };;
+    fl2va) KEYFRAME_IMAGES=("$SOURCE_IMAGE" "$LAST_FRAME");;
+    ref2va)
+      [[ -z "$SOURCE_IMAGE$LAST_FRAME" && ${#REFERENCE_IMAGES[@]} -gt 0 && ${#REFERENCE_IMAGES[@]} -le $(jq_get minimax_h3.references.max_images) ]] || {
+        echo 'FATAL Ref2VA requires ordered reference-image arguments and no keyframe arguments' >&2; exit 65;
+      }
+      (( ${#REFERENCE_AUDIOS[@]} <= $(jq_get minimax_h3.references.max_audios) &&
+         ${#REFERENCE_PATHS[@]} <= $(jq_get minimax_h3.references.max_total) )) || {
+        echo 'FATAL too many Ref2VA audio/combined references' >&2; exit 65;
+      }
+      for index in "${!REFERENCE_PATHS[@]}"; do
+        REFERENCE_PATHS[$index]="$(realpath -e "${REFERENCE_PATHS[$index]}")"
+        [[ -s "${REFERENCE_PATHS[$index]}" ]] || { echo 'FATAL reference media missing' >&2; exit 66; }
+        jq -e --arg kind "${REFERENCE_KINDS[$index]}" '.minimax_h3.references.kinds | index($kind) != null' <<<"$DIFC_DOCUMENT" >/dev/null || {
+          echo 'FATAL reference kind is not enabled in JSON policy' >&2; exit 65;
+        }
+      done;;
+    *) echo "FATAL native H3 task=$TASK is not implemented" >&2; exit 65;;
+  esac
+  [[ "$TASK" == ref2va || ${#REFERENCE_PATHS[@]} -eq 0 ]] || { echo 'FATAL reference-image/audio arguments require Ref2VA' >&2; exit 65; }
+  if [[ -n "$CONTROL_MANIFEST" ]]; then
+    [[ ( "$TASK" == t2va || "$TASK" == controlnet ) && "$(jq_get minimax_h3.control.enabled)" == true && "$STEP_CACHE" == exact ]] || {
+      echo 'FATAL ControlNet requires enabled T2VA with exact steps; combined conditioning/cache is not implemented' >&2; exit 65;
+    }
+  fi
+  for index in "${!KEYFRAME_IMAGES[@]}"; do
+    path="${KEYFRAME_IMAGES[$index]}"
+    [[ -n "$path" && -s "$path" ]] || { echo "FATAL keyframe missing: $path" >&2; exit 66; }
+    KEYFRAME_IMAGES[$index]="$(realpath -e "$path")"
+  done
+fi
+[[ "$RESIDENT" =~ ^[0-9]+$ ]] && (( RESIDENT <= BLOCKS )) || { echo 'FATAL resident-blocks must be in [0, blocks]' >&2; exit 65; }
+if [[ "$QUANT" != bf16 && "$INT8_ROUTE" == w8a8 && ${#LORA_ARGS[@]} -gt 0 ]]; then
+  echo 'FATAL the existing W8A8 loader does not support LoRA overlays; select BF16 for LoRA' >&2; exit 65
+fi
+
+# Geometry (the same rule the server uses): latent grid and packed rows.
+LAT_H=$((H / 16)); LAT_W=$((W / 16))
+LAT_T=$(( (FRAMES - 5) / 17 * 5 + 2 ))
+AUDIO_LATENTS=$(python3 -c "print(round($FRAMES / $FPS * 40))")
+ROWS_PER_FRAME=$(( (LAT_H / 2) * (LAT_W / 2) ))
+VIDEO_ROWS=$((LAT_T * ROWS_PER_FRAME)); AUDIO_ROWS=$((AUDIO_LATENTS * 2))
+log "geometry ${W}x${H}x${FRAMES} latent ${LAT_T}x${LAT_H}x${LAT_W} video_rows=$VIDEO_ROWS audio_latents=$AUDIO_LATENTS audio_rows=$AUDIO_ROWS steps=$STEPS seed=$SEED quant=$QUANT"
+
+# Admitted product geometry: the frozen 832x480x124 contract whose decoder,
+# audio and modulation programs are sealed in the fixture. Others fail loud.
+if [[ "$TASK" != controlnet && ( "$W" != "$(jq_get minimax_h3.profile.width)" || "$H" != "$(jq_get minimax_h3.profile.height)" || "$FRAMES" != "$EXPECTED_FRAMES" || "$FPS" != "$(jq_get minimax_h3.profile.fps)" ) ]]; then
+  echo "FATAL geometry ${W}x${H}x${FRAMES} not admitted by the compiler chain yet; see minimax_h3.profile in $DIFC_CONFIG" >&2; exit 65
+fi
+if [[ ( "$TASK" != controlnet && "$STEPS" != "$(jq_get minimax_h3.profile.steps)" ) || "$BLOCKS" != "$(jq_get minimax_h3.profile.blocks)" ]]; then
+  echo "FATAL steps=$STEPS not admitted: steps/blocks must match minimax_h3.profile" >&2; exit 65
+fi
+if [[ "$TASK" == controlnet ]]; then
+  (( FPS == 24 && OUT_FPS == FPS && OUT_FRAMES >= 120 && OUT_FRAMES <= 360 && OUT_FRAMES % FPS == 0 &&
+     FRAMES == (OUT_FRAMES - 5 + 16) / 17 * 17 + 5 && STEPS >= 2 && STEPS <= 50 )) || {
+    echo 'FATAL ControlNet requires native 5 through 15 whole seconds and 2 through 50 steps' >&2; exit 65;
+  }
+else
+  [[ "$OUT_FRAMES" == "$(jq_get minimax_h3.profile.frames)" && "$OUT_FPS" == "$FPS" ]] || { echo 'FATAL output must match configured delivery frames/FPS' >&2; exit 65; }
+fi
+jq -e --arg quant "$QUANT" '.minimax_h3.profile.quant_modes | index($quant) != null' <<<"$DIFC_DOCUMENT" >/dev/null || { echo "FATAL unsupported quant=$QUANT" >&2; exit 65; }
+"$DIFC_CONFIG_TOOL" check-h3 "$QUANT" --task "$TASK" || exit 66
+MODCACHE="$(jq_get minimax_h3.modulation_cache)"
+if [[ "$TASK" == controlnet && "$STEPS" != "$(jq_get minimax_h3.profile.steps)" ]]; then
+  MODCACHE="" # Existing native online modulation uses the requested schedule.
+fi
+TIMESTEP_TABLES="$(jq_get minimax_h3.profile.timestep_tables)"
+TEXT_ARGS=(); LAYOUT_ARGS=(--keyframes none)
+MIN_FREE="$(jq_get minimax_h3.policy.min_free_mib)"
+STREAMED_PAGE_ARGS=()
+case "$(jq_get minimax_h3.policy.streamed_keep_mapped_pages)" in
+  true) STREAMED_PAGE_ARGS=(--streamed-keep-pages);;
+  false) ;; # Shared runtime releases each mapping after its staging copy.
+  *) echo 'FATAL streamed_keep_mapped_pages must be a JSON boolean' >&2; exit 65;;
+esac
+mkdir -p "$OUT"
+cd "$OUT"
+if [[ -n "${DIFC_LOCK_HELD:-}" ]]; then GPU=(); else GPU=(flock -w "$(jq_get gpu_lock_wait_seconds)" "$(jq_get gpu_lock)"); fi
+
+if [[ "$mode" == cold ]]; then
+  printf '%s' "$PROMPT" > prompt.txt
+  if [[ "$TASK" == ref2va ]]; then
+    source "$(jq_get minimax_h3.references.stage_script)"
+    h3_reference_conditioning
+  elif [[ "$TASK" != t2va && "$TASK" != continue && "$TASK" != controlnet ]]; then
+    source "$(jq_get minimax_h3.keyframes.stage_script)"
+    h3_keyframe_conditioning
+  else
+  log "phase=tokenize"
+  "$B/diftokenize" --processor "$(jq_get minimax_h3.processor)" --prompt-file prompt.txt --strip-trailing-newline --diftensor-out ids.diftensor
+  T=$(python3 -c "import struct,math;b=open('ids.diftensor','rb').read();r=struct.unpack_from('<I',b,16)[0];print(math.prod(struct.unpack_from('<%dQ'%r,b,20)))")
+  log "text_tokens=$T"
+  log "phase=prepare conditioner program (sequence $T) + rebind"
+  "$B/difcondition" program --checkpoint "$CKPT" --sequence "$T" --output "cond-s$T.difir" > prep.log
+  "$B/difcondition" bundle --checkpoint "$CKPT" --program "cond-s$T.difir" --output "cond-s$T.difbind" --sealed-bundle "$(jq_get minimax_h3.conditioner_bundle)" >> prep.log
+  log "phase=conditioning"
+  "${GPU[@]}" "$B/difcondition" run --program "cond-s$T.difir" --bundle "cond-s$T.difbind" --ids ids.diftensor --output conditioning.diftensor --cache-dir "$CACHE" --report conditioner.json
+  log "REAL conditioning: done tokens=$T"
+  TEXT_ARGS=(--all-text-tokens "$T")
+  log "phase=noise"
+  "$B/difh3noise" --rows "$VIDEO_ROWS" --cols 96 --seed "$SEED" --output video-noise.diftensor
+  "$B/difh3noise" --rows "$AUDIO_ROWS" --cols 32 --seed "$((SEED + 1))" --output audio-noise.diftensor
+  fi
+  if [[ "$TASK" == continue ]]; then
+    source "$(jq_get minimax_h3.motion.stage_script)"
+    h3_motion_conditioning
+  fi
+  log "phase=prepare denoiser program + rebind"
+  if [[ -n "$CONTROL_MANIFEST" ]]; then
+    source "$(jq_get minimax_h3.control.stage_script)"
+    h3_control_conditioning
+  fi
+  DEN="h3-$TASK-${W}x${H}x${FRAMES}-t$T-tables$TIMESTEP_TABLES-exact-cudnn"
+  "$B/difc" make-h3-denoiser "$DEN.difir" "$VIDEO_ROWS" "$AUDIO_ROWS" "$T" "$TIMESTEP_TABLES" streamed "$(jq_get minimax_h3.profile.program_attention)" >> prep.log
+  "$B/difweights" rebind-h3-denoiser-bundle "$(jq_get minimax_h3.denoiser_bundle)" "$(jq_get minimax_h3.transformer_index)" "$DEN.difir" "$DEN.difbind" >> prep.log
+  MODCACHE_ARGS=()
+  if [[ -n "$MODCACHE" ]]; then
+    log "modcache: HIT $MODCACHE"
+    MODCACHE_ARGS=(--h3-modulation-cache "$MODCACHE" --h3-modulation-source-index "$(jq_get minimax_h3.transformer_index)" --h3-modulation-steps "$STEPS")
+  fi
+  ROUTE=()
+  if [[ "$QUANT" == bf16 ]]; then
+    log "route=exact-bf16 (no ConvRot; all blocks streamed)"
+  elif [[ "$INT8_ROUTE" == w8a8 ]]; then
+    ROUTE=(--h3-w8a8-cache "$(jq_get minimax_h3.w8a8_cache)" --h3-w8a8-resident-layers "$RESIDENT" --h3-int8-mlp-chunk-rows "$(jq_get minimax_h3.policy.int8_mlp_chunk_rows)")
+    log "route=w8a8 resident_layers=$RESIDENT attention=$ATTENTION (existing Mojo weights)"
+  elif [[ "$INT8_ROUTE" == convrot ]]; then
+    ROUTE=(--h3-convrot-int8-checkpoint "$CONVROT" --h3-convrot-int8-resident-layers "$RESIDENT" --h3-int8-mlp-chunk-rows "$(jq_get minimax_h3.policy.int8_mlp_chunk_rows)")
+    if (( ${#CONTROL_ARGS[@]} )); then
+      ROUTE+=(--h3-convrot-int8-layers "$(jq_get minimax_h3.profile.blocks)")
+    fi
+    if (( ${#LORA_ARGS[@]} == 0 && ${#CONTROL_ARGS[@]} == 0 )); then
+      ROUTE+=(--h3-int8-cutlass-scaled-all --h3-int8-compact-adaln)
+    fi
+    log "route=convrot-int8 resident_layers=$RESIDENT exact cuDNN attention"
+  else
+    echo "FATAL unknown configured INT8 route: $INT8_ROUTE" >&2; exit 65
+  fi
+  log "phase=denoise start step_cache=$STEP_CACHE"
+  MOTION_OUTPUT=()
+  if [[ "$(jq_get minimax_h3.motion.save_context)" == true ]]; then
+    MOTION_OUTPUT=(--output-motion-context "$(jq_get minimax_h3.motion.filename)" --motion-endpoint-frames "$((TRIM_START + OUT_FRAMES))")
+  fi
+  # Translate the compiler's H3_STEP lines into the server's progress grammar.
+  set +e
+  "${GPU[@]}" "$B/difh3infer" --backend cuda --sampler "$(jq_get minimax_h3.profile.sampler)" \
+    --denoiser-program "$DEN.difir" --denoiser-bundle "$DEN.difbind" \
+    "${TEXT_ARGS[@]}" --text conditioning.diftensor --video video-noise.diftensor --audio audio-noise.diftensor \
+    --schedule-points "$STEPS" --latent-t "$LAT_T" --latent-h "$LAT_H" --latent-w "$LAT_W" --audio-latents "$AUDIO_LATENTS" "${LAYOUT_ARGS[@]}" \
+    --output-latent video-latent.diftensor --output-audio audio-rows.diftensor \
+    "${ROUTE[@]}" "${ATTENTION_ARGS[@]}" "${CACHE_ARGS[@]}" "${EVALUATION_LIMIT[@]}" "${LORA_ARGS[@]}" "${CONTROL_ARGS[@]}" "${MOTION_ARGS[@]}" "${MOTION_OUTPUT[@]}" --h3-cache-text-refiner \
+    "${MODCACHE_ARGS[@]}" \
+    --lazy-resident-upload --streamed-stage-threads "$(jq_get minimax_h3.policy.streamed_stage_threads)" "${STREAMED_PAGE_ARGS[@]}" --denoise-only --profile-pipeline \
+    --cache-dir "$CACHE" --min-free-mib "$MIN_FREE" 2>&1 | while IFS= read -r line; do
+      echo "$line"
+      if [[ "$line" == H3_STEP\ index=* ]]; then
+        idx="${line#H3_STEP index=}"; idx="${idx%% *}"
+        echo "[difc-h3] phase=denoise step=$((idx + 1)) total=$((STEPS - 1))"
+      fi
+    done
+  rc=${PIPESTATUS[0]}; set -e
+  if [[ $rc -ne 0 || ! -s video-latent.diftensor ]]; then echo "FATAL denoise failed rc=$rc" >&2; exit 70; fi
+  log "phase=denoise complete"
+  exit 0
+fi
+
+# decode
+log "phase=decode video (tiled VAE)"
+VIDEO_OUTPUT=(--output-rgb frames.rgb)
+if [[ "$TASK" == continue ]]; then
+  VIDEO_OUTPUT=(--output-raw video-raw.diftensor --output-decoded video-decoded.diftensor)
+fi
+"${GPU[@]}" "$B/difvaedecode" --backend cuda --program "$(jq_get minimax_h3.video_program)" --weight-bundle "$(jq_get minimax_h3.video_bundle)" \
+  --input video-latent.diftensor --latent-id "$(jq_get minimax_h3.decoder.latent_id)" --raw-id "$(jq_get minimax_h3.decoder.raw_id)" "${VIDEO_OUTPUT[@]}" \
+  --clip-length "$(jq_get minimax_h3.decoder.clip_length)" --token-drop "$(jq_get minimax_h3.decoder.token_drop)" --tile-size "$(jq_get minimax_h3.decoder.tile_size)" --tile-overlap "$(jq_get minimax_h3.decoder.tile_overlap)" --warmups 0 --iterations 1 --min-free-mib "$MIN_FREE" --cache-dir "$CACHE"
+log "phase=decode audio"
+AUDIO_PROGRAM="$(jq_get minimax_h3.audio_program)"; AUDIO_BUNDLE="$(jq_get minimax_h3.audio_bundle)"
+if [[ "$TASK" == continue || "$TASK" == controlnet ]]; then
+  source "$(jq_get minimax_h3.motion.stage_script)"
+  h3_motion_audio_program
+fi
+# difh3infer saves condition rows followed by generated rows. Match its existing
+# unpack_h3_audio_rows condition-prefix selection; the decoder consumes only the
+# generated tail. This is a byte-only file handoff, with no audio arithmetic.
+python3 - "$AUDIO_LATENTS" <<'PY'
+import hashlib, struct, sys
+from pathlib import Path
+data = Path('audio-rows.diftensor').read_bytes()
+assert data[:8] == b'DIFTNS01' and hashlib.sha256(data[:-32]).digest() == data[-32:]
+version, dtype, rank = struct.unpack_from('<III', data, 8)
+assert (version, dtype, rank) == (1, 1, 2)
+rows, channels, size = struct.unpack_from('<QQQ', data, 20)
+target = int(sys.argv[1]) * 2
+assert channels == 32 and rows >= target and rows % 2 == 0
+assert size == rows * channels * 4 and len(data) == 44 + size + 32
+payload = data[44 + (rows - target) * channels * 4:-32]
+output = data[:20] + struct.pack('<QQQ', target, channels, len(payload)) + payload
+with Path('audio-target-rows.diftensor').open('xb') as file:
+    file.write(output + hashlib.sha256(output).digest())
+PY
+"${GPU[@]}" "$B/difaudiodecode" --backend cuda --program "$AUDIO_PROGRAM" --weight-bundle "$AUDIO_BUNDLE" --input audio-target-rows.diftensor --output-wav audio.wav --cache-dir "$CACHE" --min-free-mib "$MIN_FREE"
+log "phase=mux"
+MEDIA_TRIM=()
+if [[ "$TASK" == continue ]]; then MEDIA_TRIM=(--trim-start-frames "$TRIM_START" --output-frames "$OUT_FRAMES"); fi
+if [[ "$TASK" == continue ]]; then
+  "$B/difh3media" --video video-decoded.diftensor --audio-wav audio.wav --output-dir media --input-fps "$FPS" --output-fps "$OUT_FPS" --encoder "$(jq_get minimax_h3.decoder.encoder)" --ffmpeg "$(jq_get minimax_h3.decoder.ffmpeg)" "${MEDIA_TRIM[@]}"
+  cp media/video.mp4 video.mp4
+  rm -f video-raw.diftensor video-decoded.diftensor
+else
+  # Existing compiler recipe: RGB24 + native audio WAV -> ffmpeg -> MP4.
+  mapfile -t MUX_ARGS < <(jq -r '.minimax_h3.decoder.rgb_mux_args[]' <<<"$DIFC_DOCUMENT")
+  "$(jq_get minimax_h3.decoder.ffmpeg)" -nostdin -hide_banner -loglevel error -n \
+    -f rawvideo -pixel_format rgb24 -video_size "${W}x${H}" -framerate "$FPS" \
+    -i frames.rgb -i audio.wav -frames:v "$OUT_FRAMES" "${MUX_ARGS[@]}" -shortest video.mp4
+fi
+python3 - "$OUT" "$W" "$H" "$OUT_FRAMES" "$OUT_FPS" "$SEED" "$STEPS" "$QUANT" <<'PY'
+import json, sys, os
+out, w, h, frames, fps, seed, steps, quant = sys.argv[1:]
+res = {"state": "done", "artifact_path": os.path.join(out, "video.mp4"), "engine": "diffusion-compiler",
+       "width": int(w), "height": int(h), "frames": int(frames), "fps": int(fps), "seed": int(seed), "steps": int(steps), "quant": quant,
+       "audio": os.path.join(out, "audio.wav"), "conditioner_report": os.path.join(out, "conditioner.json")}
+try:
+    res["media"] = json.load(open(os.path.join(out, "media", "result.json")))
+except Exception:
+    pass
+json.dump(res, open(os.path.join(out, "result.json"), "w"), indent=1)
+PY
+log "done $OUT/video.mp4"

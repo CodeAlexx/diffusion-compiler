@@ -2732,6 +2732,37 @@ void verify_operation(const Program &program, const Operation &op) {
     return;
   }
 
+  if (op.opcode == Opcode::ReduceMean) {
+    expect_counts(op, 1, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    const auto axis = op.u64(AttrKey::Axis, input.dims.size());
+    if (!supported_float(input.dtype) || input.dims.size() < 2U ||
+        axis >= input.dims.size() || out.dtype != input.dtype)
+      fail("reduce_mean requires float input of rank >=2 and an explicit axis");
+    auto dims = input.dims;
+    dims.erase(dims.begin() + static_cast<std::ptrdiff_t>(axis));
+    if (out.dims != dims)
+      fail("reduce_mean output must drop the reduced axis");
+    return;
+  }
+
+  if (op.opcode == Opcode::SnakeAlpha) {
+    expect_counts(op, 2, 1);
+    const auto &input = tensor_or_fail(program, op.inputs[0], op);
+    const auto &alpha = tensor_or_fail(program, op.inputs[1], op);
+    const auto &out = tensor_or_fail(program, op.outputs[0], op);
+    same_shape_dtype(input, out, op);
+    if (!supported_float(input.dtype) || input.dims.size() != 3U ||
+        alpha.dtype != input.dtype ||
+        alpha.dims != std::vector<std::uint64_t>{1U, input.dims[1], 1U})
+      fail("snake_alpha requires float [B,C,L] input and direct [1,C,1] alpha");
+    const auto epsilon = op.f64(AttrKey::Epsilon, 1.0e-9);
+    if (!(epsilon > 0.0) || !std::isfinite(epsilon))
+      fail("snake_alpha epsilon must be finite and positive");
+    return;
+  }
+
   if (op.opcode == Opcode::SnakeBeta) {
     expect_counts(op, 3, 1);
     const auto &input = tensor_or_fail(program, op.inputs[0], op);

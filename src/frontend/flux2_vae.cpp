@@ -12,6 +12,44 @@
 #include <vector>
 
 namespace dif::frontend {
+std::string flux2_vae_diffusers_name(const std::string &creator_name) {
+  const auto replace_prefix = [&](const std::string &from,
+                                  const std::string &to) -> std::string {
+    if (!creator_name.starts_with(from)) return {};
+    auto name = to + creator_name.substr(from.size());
+    const auto shortcut = name.find(".nin_shortcut.");
+    if (shortcut != std::string::npos)
+      name.replace(shortcut, std::string(".nin_shortcut.").size(), ".conv_shortcut.");
+    return name;
+  };
+  for (const auto &[from, to] : std::vector<std::pair<std::string, std::string>>{
+           {"decoder.post_quant_conv.", "post_quant_conv."},
+           {"decoder.norm_out.", "decoder.conv_norm_out."},
+           {"decoder.mid.block_1.", "decoder.mid_block.resnets.0."},
+           {"decoder.mid.block_2.", "decoder.mid_block.resnets.1."},
+           {"decoder.mid.attn_1.norm.", "decoder.mid_block.attentions.0.group_norm."},
+           {"decoder.mid.attn_1.q.", "decoder.mid_block.attentions.0.to_q."},
+           {"decoder.mid.attn_1.k.", "decoder.mid_block.attentions.0.to_k."},
+           {"decoder.mid.attn_1.v.", "decoder.mid_block.attentions.0.to_v."},
+           {"decoder.mid.attn_1.proj_out.", "decoder.mid_block.attentions.0.to_out.0."}}) {
+    if (auto name = replace_prefix(from, to); !name.empty()) return name;
+  }
+  for (unsigned level = 0; level < 4; ++level) {
+    const auto from = "decoder.up." + std::to_string(level);
+    const auto to = "decoder.up_blocks." + std::to_string(3 - level);
+    if (auto name = replace_prefix(from + ".block.", to + ".resnets."); !name.empty())
+      return name;
+    if (level != 0) {
+      if (auto name = replace_prefix(from + ".upsample.conv.", to + ".upsamplers.0.conv.");
+          !name.empty()) return name;
+    }
+  }
+  if (creator_name == "bn.running_var" || creator_name == "bn.running_mean" ||
+      creator_name.starts_with("decoder.conv_in.") ||
+      creator_name.starts_with("decoder.conv_out.")) return creator_name;
+  fail("unknown FLUX.2 VAE decoder checkpoint name: " + creator_name);
+}
+
 namespace {
 
 class Builder {

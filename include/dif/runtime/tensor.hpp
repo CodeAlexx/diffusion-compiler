@@ -35,6 +35,10 @@ public:
   // Fraction of the range's pages currently in the page cache (mincore),
   // 0.0 when unknown.
   double resident_fraction(std::size_t offset, std::size_t bytes) const;
+  // The file descriptors behind the mapping (-1 when absent): a plain one and
+  // one opened O_DIRECT. The assembler loader reads through them.
+  int descriptor() const { return descriptor_; }
+  int direct_descriptor() const { return direct_descriptor_; }
 
 private:
   friend std::shared_ptr<const MappedStorage>

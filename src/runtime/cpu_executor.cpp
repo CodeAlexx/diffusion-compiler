@@ -3650,6 +3650,40 @@ void upsample_nearest_2d(const ir::Operation &op, TensorMap &tensors) {
         }
 }
 
+void reduce_mean(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto axis = op.u64(ir::AttrKey::Axis, input.dims.size());
+  std::uint64_t inner = 1;
+  for (auto d = axis + 1U; d < input.dims.size(); ++d) inner *= input.dims[d];
+  const auto count = input.dims[axis];
+  for (std::uint64_t i = 0; i < out.element_count(); ++i) {
+    const auto base = (i / inner) * count * inner + i % inner;
+    float sum = 0;
+    for (std::uint64_t r = 0; r < count; ++r)
+      sum += load_float(input, base + r * inner);
+    store_float(out, i, sum / static_cast<float>(count));
+  }
+}
+
+void snake_alpha(const ir::Operation &op, TensorMap &tensors) {
+  const auto &input = tensors.at(op.inputs[0]);
+  const auto &alpha = tensors.at(op.inputs[1]);
+  auto &out = tensors.at(op.outputs[0]);
+  const auto eps = static_cast<float>(op.f64(ir::AttrKey::Epsilon, 1.0e-9));
+  const auto channels = input.dims[1], length = input.dims[2];
+  for (std::uint64_t b = 0; b < input.dims[0]; ++b)
+    for (std::uint64_t c = 0; c < channels; ++c) {
+      const float a = load_float(alpha, c), inv = 1.0F / (a + eps);
+      for (std::uint64_t i = 0; i < length; ++i) {
+        const auto index = (b * channels + c) * length + i;
+        const float x = load_float(input, index), s = std::sin(a * x);
+        // Preserve square -> multiply -> add, the creator's eager order.
+        store_float(out, index, x + inv * (s * s));
+      }
+    }
+}
+
 // BigVGAN SnakeBeta: y = x + (exp(beta_c) + eps)^-1 * sin(exp(alpha_c) * x)^2,
 // alpha/beta stored in LOG space as [C] vectors (linear treatment is a
 // near-identity trap; see the audio decode plan).
@@ -4025,6 +4059,12 @@ void execute_operation(const ir::Program &program, const ir::Operation &op,
     case ir::Opcode::SnakeBeta:
       snake_beta(op, tensors);
       break;
+    case ir::Opcode::SnakeAlpha:
+      snake_alpha(op, tensors);
+      break;
+    case ir::Opcode::ReduceMean:
+      reduce_mean(op, tensors);
+      break;
     }
   }
 }
@@ -4085,6 +4125,9 @@ public:
   }
 
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
+    if (options.residual_cache_region || options.residual_cache_callbacks ||
+        !options.convrot_linear_bindings.empty())
+      fail("CPU executor does not implement device residual caching or ConvRot physical bindings");
     if (options.persistent_state != state_)
       fail("persistent state is fixed when the plan is prepared");
     TensorMap bindings = constants_;
@@ -4216,6 +4259,9 @@ public:
   std::unique_ptr<PreparedExecution>
   prepare(const ir::Program &program, const TensorMap &bindings,
           const RunOptions &options) override {
+    if (options.residual_cache_region || options.residual_cache_callbacks ||
+        !options.convrot_linear_bindings.empty())
+      fail("CPU executor does not implement device residual caching or ConvRot physical bindings");
     ir::verify(program);
     return std::make_unique<CpuPreparedExecution>(program, bindings, options);
   }

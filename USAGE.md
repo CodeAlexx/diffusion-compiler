@@ -597,11 +597,17 @@ difh3vision run --program V.difir --bundle V.difbind --inputs INPUTS.safetensors
             [--cudnn-attention-heuristic a|b|fallback|autotune|deterministic]
             [--capture-tensor ID --capture-dir DIR] [--report FILE.json]
 difh3vision combine --vision-input FIRST.safetensors --vision-input LAST.safetensors --output BOTH.safetensors
+difh3vision combine-inputs --vision-input PRESENTATION.safetensors [--text-input IDS.diftensor] [...]
+            --output BOTH.safetensors --ids-out IDS.diftensor --tags-out TAGS.diftensor
 ```
 
 Qwen3-VL vision tower. `inputs` builds the presentation (pixel patches,
 token ids, and token tags) from the keyframes and prompt; `run` produces the
-vision embeddings; `combine` merges two single-image runs.
+vision embeddings; `combine` merges single-image runs. `combine-inputs` merges
+presentations and text-only I32 token parts in command-line order, adjusting
+visual destinations. Ref2VA audio contributes an independently tokenized
+`<Audio N>: ` label, not waveform embeddings; the prompt is the final text part.
+At least one visual presentation is required.
 
 #### difcondition
 
@@ -665,6 +671,8 @@ difh3noise --seed U64 --output FILE.diftensor [--rng serenity|torch-cpu] [--layo
            [--skip-normal-values N] [--verify-against FILE.diftensor]
 difh3state --condition CLEAN.diftensor [--condition CLEAN2] --condition-noise NOISE.diftensor [--condition-noise NOISE2]
            --target-noise NOISE.diftensor --condition-timestep F32 --output STATE.diftensor
+difh3state --clean-conditions --condition AUDIO_ROWS.diftensor [--condition MORE_ROWS]
+           --target-noise NOISE.diftensor --output STATE.diftensor
 ```
 
 `difh3layout` writes the packed row layout tables for text-to-video/audio or
@@ -673,7 +681,10 @@ per-modality indices and maps, timestep and AdaLN indices, and timesteps. `difh3
 with either the torch-parity CPU generator or the GPU generator, in the H3
 video or audio layout. `difh3state` assembles the initial denoiser state from
 keyframe latents, their condition noise, the target noise, and the condition
-timestep.
+timestep. `--clean-conditions` instead copies clean reference-audio rows before
+the target noise without arithmetic or RNG consumption. It rejects condition
+noise and explicit timesteps. Image-plus-audio Ref2VA uses four modulation
+tables (target video/audio and condition video/audio), not the image-only three.
 
 #### difh3encode
 
@@ -800,6 +811,22 @@ intermediate tensor into the same file. `--workers N` caps the host stitching
 threads. `--deterministic-conv` restricts cuDNN convolutions to algorithms
 reported deterministic and fails when none fits the workspace limit.
 
+#### difaudioencode
+
+```text
+difaudioencode --config FILE.json --checkpoint FILE.safetensors --input-f32 RAW
+               --channels 1|2 --output-mean FILE.diftensor [--output-rows FILE.diftensor]
+               [--backend cuda|cpu] [--cache-dir DIR] [--min-free-mib N] [--max-samples N]
+```
+
+Native H3 reference-audio encoder, ported from the existing Mojo implementation.
+RAW is interleaved little-endian F32 at the JSON sampling rate; decode/resample
+media with FFmpeg first. JSON supplies encoder dimensions, sample cap and latent
+normalization. Mono is duplicated to stereo. Outputs are posterior mean `[2,C,T]`
+and optional normalized channel-major rows `[2*T,C]`; no posterior sampling.
+Existing output files are refused. The CUDA path preserves the native port's
+F32 convolutions and BF16 causal cuDNN attention boundary.
+
 #### difaudiodecode
 
 ```text
@@ -870,7 +897,7 @@ given); `--whole-plan` requires an explicit `--resident-plan-mib`.
 `difkrea2vae` decodes with the Qwen-Image VAE in tile mode (fixture) or full
 mode (sampler output, reference, config, PNG).
 
-### FLUX.2 [klein]
+### FLUX.2 [klein] and [dev]
 
 ```text
 difflux2block --checkpoint MODEL.safetensors --fixture creator.safetensors --output native.safetensors --report report.json
@@ -879,6 +906,8 @@ difflux2block --checkpoint MODEL.safetensors --fixture creator.safetensors --out
               [--attention cudnn|flash] [--select-linear-algorithm OP_ID:HEURISTIC_RANK] [--capture-boundary NAME ...]
               [--expand-linear-algorithms]
 difflux2sample --model-dir DIR --vae-checkpoint ae.safetensors --prompt TEXT --output image.png --report report.json
+               [--flux2-model klein4b|klein9b|dev] [--text-encoder-dir DIR] [--tokenizer-dir DIR]
+               [--vae-format creator|diffusers]
                [--state-output state.safetensors] [--transformer-checkpoint model.safetensors]
                [--positive-conditioning positive.safetensors --negative-conditioning empty.safetensors]
                [--initial-latent initial.safetensors] [--initial-latent-tensor NAME]
@@ -927,6 +956,17 @@ plan, or a missing slab tensor. Gate: `dif_squareq_w4_tests` against
 
 `difflux2block` is the source-faithful gate for one double block, single
 block, the whole transformer, or the VAE against a creator fixture.
+`--flux2-model` defaults to `klein9b`. `klein4b` selects Klein Base 4B
+(3072 hidden, 5 double + 20 single blocks, Qwen3-4B with 7680 context);
+`klein9b` selects Base 9B (4096 hidden, 8 + 24 blocks, Qwen3-8B with 12288
+context). These are Base weights, not the four-step distilled checkpoints.
+Use the Base recipe `--steps 50 --guidance 4`. Separate encoder/tokenizer
+directories default to `MODEL_DIR/text_encoder` and `MODEL_DIR/tokenizer`.
+The 4B path currently refuses low-precision policies admitted only for other
+geometries. `dev` uses the existing Dev transformer and Mistral conditioner.
+`--vae-format diffusers` maps Diffusers checkpoint names and 2D attention
+weights onto the shared creator decoder; default `creator` is unchanged.
+
 `difflux2sample` is the complete native prompt-to-PNG path: it tokenizes and
 conditions from `--model-dir`, runs the generalized-time Euler schedule, and
 decodes with the F32 VAE. The `--w8a8-*` flags select the ConvRot W8A8
@@ -993,6 +1033,17 @@ an exported fixture and writes the native output for comparison.
 |---|---|
 | `DIF_TRACE_FILE=path` | Any tool appends one `runtime-trace` JSON document per prepared execution to `path`. `diftrace recipe` sets it per stage; `diftrace merge` reads the file. |
 | `DIF_NVTX=1` | Push NVTX ranges (`dif::prepare`, `dif::run`, `op<id> <opcode>`) for Nsight Systems correlation. Requires the NVTX headers at build time; silently unavailable otherwise. |
+| `DIF_FASTLOAD=1` | Explicitly opt in to experimental ASM resident, streamed, and tool-side host weight loading on a supported Linux x86-64 CUDA build. **Off by default until fixed and re-admitted**: unset, empty, `0`, and all other values use the prior mapped/direct paths. |
+| `DIF_FASTLOAD_STREAMED=0` | With `DIF_FASTLOAD=1`, disable the shared host-stage accelerator, including quantized first-use/tail weights; retain direct-to-device resident fastload. This subordinate flag cannot enable fastload by itself. |
+| `DIF_FASTLOAD_PREFETCH=1` | Experimental H3 lazy-resident block prefetch: the shared pinned ring sends raw weights/scales directly to final GPU buffers on a reusable copy stream, with a two-block demand window. Off by default: byte-exact output is verified, but a repeatable complete-MP4 speedup is not. Requires both fastload policies enabled; unsupported layouts, insufficient pinned budget, or refused reads retain the staged uploader. |
+| `DIF_FASTLOAD_REPORT=1` | Print fastload mode, tensor/byte/chunk counts, elapsed time, and throughput for loader diagnostics. |
+
+Automatic I/O mode probes only the requested pages, counting shared boundary
+pages once; unrelated cold pages in a shard do not force a warm selection to
+disk. `RESIDENT_PREFETCH` reports one-time batch/byte/copy counts, worker load
+wall (including DMA), and consumer wait wall. These clocks overlap GPU work
+and must not be added to denoise time. Only complete saved-output wall is a
+generation-speed result.
 
 ## Runtime knobs that matter
 
@@ -1005,6 +1056,7 @@ by removing run-to-run variance.
 | Knob | Flag | Behavior |
 |---|---|---|
 | Deterministic Linear | `--deterministic-linear` (`difh3vision run`) | Require a cuBLASLt algorithm with no cross-CTA split-K reduction for ordinary Linears. Fails closed when the heuristics expose none. |
+| Fast model-weight loading | **off by default**; `DIF_FASTLOAD=1` explicitly opts in | The prior mapped/direct loader is the production default. The experimental ASM path remains available for controlled testing: model-neutral resident constants use an eight-slot pinned io_uring ring and direct CUDA submissions; qualifying cold streamed constants use the same reader before the existing asynchronous H2D schedule. Unsupported CPUs, refused layouts, and pinned-budget failures retain the prior loader automatically. |
 | Direct-IO weight staging | on by default; `--h3-resident-mapped-copy` (`difh3infer`) turns it off | Resident H3 INT8 checkpoint weights and streamed constants whose mapped pages are cold (under 90% resident by `mincore`) are staged into pinned memory with O_DIRECT reads, sixteen MiB chunks, sixteen in flight, bypassing the page cache; warm pages take the mapping copy. Measured on the H3 checkpoint drive (1909 extents): cold first evaluation 18.1 s -> 8.9 s, page-cache paths cap at about 1 GB/s there. After a direct read the same range is re-read in the background with buffered reads so the next process or evaluation finds warm pages (fadvise/readahead advice is a no-op on ext4 with kernel 6.8), gated on the cgroup being able to hold the charge. Reported as `denoiser_resident_direct_read_bytes` / `denoiser_streamed_direct_read_bytes`. |
 | Resident read-ahead window | `--h3-resident-readahead-mib N` (`difh3infer`), default 0 | Page-cache read-ahead issued ahead of the resident checkpoint upload in file order. Measured no gain on this host (buffered reads cap at about 1 GB/s); kept as an experiment knob. Reported as `denoiser_resident_readahead_bytes`. |
 | cuDNN attention backward | `AttentionBackward` with `Implementation=2` (program attribute) | cuDNN SDPA backward over the program's saved logsumexp (transposed into cuDNN's packed stats layout per call) instead of the generated math kernel: 11x faster at S=1536 (59 vs 655 ms), dK/dV bit-repeatable, dQ not (a few dozen bf16 flips per million on cuDNN's flash backward). `--cudnn-attention-heuristic deterministic` (heuristic 4) requests cuDNN's deterministic algorithms and fails closed when none exists. Gated by `dif_cudnn_attention_backward_tests` against the CPU F32 reference: every element within one bf16 quantum, cosine >= 0.99999. |

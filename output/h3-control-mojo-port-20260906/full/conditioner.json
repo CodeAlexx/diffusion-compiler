@@ -1,0 +1,15 @@
+{
+  "backend": "cuda-nvrtc-cublaslt-cudnn",
+  "device": "NVIDIA GeForce RTX 3090 Ti",
+  "diffir_fingerprint": "b8fb9e4242c7ec268342b8f2b24207898f18edb5c270c6c5ce26103f38ae4a72",
+  "payload_sha256": "d73971da04c14ccdc7cb86aab06d550f35232da987baa0c8520ea10427a208d3",
+  "tokens": 257,
+  "preparation_ms": 490.66177199999998,
+  "execution_ms": 34270.54296875,
+  "wall_seconds": 34.805758787000002,
+  "resident_bytes": 2261697792,
+  "resident_streamed_constants": 0,
+  "pipeline_profile": {"enabled":false,"resident_weight_bytes":0,"resident_host_prefault_ms":0,"resident_h2d_ms":0,"streamed_weight_bytes":0,"streamed_direct_read_bytes":0,"streamed_fastload_bytes":0,"streamed_fastload_calls":0,"streamed_fastload_host_ms":0,"streamed_host_stage_ms":0,"streamed_host_wait_ms":0,"streamed_h2d_ms":0,"operation_kernel_ms":0,"attention_kernel_ms":0,"non_kernel_device_timeline_ms":0},
+  "telemetry": {"kernel_launches":402,"cublaslt_matmuls":350,"cudnn_attention_dispatches":50,"h2d_copies":1125,"h2d_bytes":50315659268,"d2h_copies":1,"d2h_bytes":2631680,"event_records":2479,"stream_wait_events":1095,"host_event_synchronizes":1123,"host_stream_synchronizes":2},
+  "operations": []
+}

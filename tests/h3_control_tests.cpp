@@ -1,0 +1,205 @@
+#include "dif/frontend/h3_control.hpp"
+#include "dif/ir/codec.hpp"
+#include "dif/ir/verify.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <set>
+
+namespace {
+int failures{};
+void expect(bool value, const char *message) {
+  if (!value) { ++failures; std::cerr << "FAIL: " << message << '\n'; }
+}
+template<class F> void rejects(F f, const char *message) {
+  bool failed=false;
+  try { f(); } catch (const std::exception &) { failed=true; }
+  expect(failed,message);
+}
+void fill(dif::runtime::Tensor &tensor, float value) {
+  auto f=dif::runtime::zeros({0,dif::ir::DType::F32,0,tensor.dims});
+  std::fill(f.f32().begin(),f.f32().end(),value);
+  tensor=tensor.dtype==dif::ir::DType::F32 ? std::move(f) :
+      dif::runtime::convert_float_tensor(f,tensor.dtype);
+}
+void i32(dif::runtime::Tensor &tensor, std::initializer_list<std::int32_t> values) {
+  expect(tensor.byte_size()==values.size()*4,"fixture index length");
+  std::memcpy(tensor.mutable_data(),values.begin(),values.size()*4);
+}
+
+}
+
+int main(int argc,char **argv) {
+  using namespace dif;
+  using namespace dif::frontend;
+  using namespace dif::ir;
+  try {
+    expect(h3_control_strength({0.75F,0.2F,0.8F},0.2F)==0.75F,"schedule start inclusive");
+    expect(h3_control_strength({0.75F,0.2F,0.8F},0.8F)==0.75F,"schedule end inclusive");
+    expect(h3_control_strength({0.75F,0.2F,0.8F},0.81F)==0,"outside schedule disabled");
+    rejects([]{h3_control_strength({1,0.8F,0.2F},0.5F);},"inverted schedule rejected");
+    rejects([]{h3_control_strength({std::numeric_limits<float>::infinity(),0,1},0.5F);},"nonfinite strength rejected");
+    auto latent=runtime::zeros({0,DType::F32,0,{1,2,2,2,4}});
+    for (std::size_t i=0;i<latent.f32().size();++i) latent.f32()[i]=float(i);
+    auto rows=h3_control_rows(latent,2,2,12);
+    expect(rows.dims==std::vector<std::uint64_t>{4,12},"patchified row shape");
+    expect(rows.f32()[0]==0 && rows.f32()[1]==1 && rows.f32()[2]==4 &&
+           rows.f32()[3]==5 && rows.f32()[4]==16 && rows.f32()[7]==21 &&
+           rows.f32()[8]==0 && rows.f32()[12]==2 && rows.f32()[24]==8,
+           "channel-slowest patch columns with post-patch zero padding");
+    rejects([&]{h3_control_rows(latent,2,2,4);},"truncated control features rejected");
+    latent.f32()[0]=std::numeric_limits<float>::quiet_NaN();
+    rejects([&]{h3_control_rows(latent);},"nonfinite guide rejected");
+
+    H3DenoiserConfig d;
+    d.video_tokens=2; d.audio_tokens=2; d.text_tokens=1; d.timestep_tables=2;
+    d.hidden=12; d.heads=2; d.head_dim=6; d.ffn=16; d.rotary=6;
+    d.layers=2; d.refiner_layers=1; d.video_input_dim=4; d.audio_input_dim=2;
+    d.text_input_dim=3; d.time_input_dim=4; d.time_hidden_dim=12; d.time_embed_dim=8;
+    const auto base=make_h3_denoiser(d);
+    const auto derived=h3_control_denoiser_config(base);
+    expect(encode(make_h3_denoiser(derived))==encode(base),"derive complete geometry without official-width defaults");
+    H3ControlConfig c; c.patch_features=8; c.injection_layers={0,1};
+    const auto build=add_h3_control(base,d,c);
+    verify(build.program);
+    expect(build.rows_inputs.size()==1 && build.strength_inputs.size()==1 &&
+           build.injected_outputs.size()==2 && build.weights.size()==32,
+           "two-block control graph owns complete weight and injection inventory");
+    for (const auto &t:base.tensors) {
+      const auto *actual=build.program.tensor(t.id);
+      expect(actual && actual->dtype==t.dtype && actual->dims==t.dims && actual->roles==t.roles,
+             "base tensor identity preserved");
+    }
+    const auto count_adaln=[](const auto &p){return std::count_if(p.operations.begin(),p.operations.end(),
+        [](const auto &o){return o.opcode==Opcode::H3AdaLNSelect;});};
+    expect(count_adaln(base)==count_adaln(build.program),"control does not pollute base modulation-cache detection");
+    weights::SafeTensorFile fixture;
+    for (const auto &w:build.weights) {
+      const auto *desc=build.program.tensor(w.tensor_id);
+      fixture.tensors.emplace(w.name,weights::SafeTensorEntry{w.name,desc->dtype,desc->dims,0,desc->byte_count()});
+    }
+    validate_h3_control_checkpoint(fixture,build);
+    fixture.tensors.at("control_blocks.0.adaln_proj.linear.weight").dims[1]=4;
+    rejects([&]{validate_h3_control_checkpoint(fixture,build);},"curve/full timestep width mismatch rejected");
+    fixture.tensors.at("control_blocks.0.adaln_proj.linear.weight").dims[1]=8;
+    fixture.tensors.emplace("control_blocks.2.after_proj.bias",weights::SafeTensorEntry{});
+    rejects([&]{validate_h3_control_checkpoint(fixture,build);},"extra side block never silently ignored");
+    c.controls=2;
+    const auto multi=add_h3_control(base,d,c);
+    expect(multi.weights.size()==build.weights.size() && multi.mapped_weight_bytes==build.mapped_weight_bytes &&
+           multi.rows_inputs.size()==2 && multi.injected_outputs.size()==4,
+           "multiple controls share one immutable checkpoint mapping");
+    c.injection_layers={1};
+    rejects([&]{add_h3_control(base,d,c);},"nonzero initial injection rejected");
+    rejects([&]{add_h3_control(build.program,d);},"already transformed graph rejected");
+
+    runtime::TensorMap inputs;
+    for (const auto &t:build.program.tensors) {
+      if (!t.has_role(TensorRole::Input) && !t.has_role(TensorRole::Constant)) continue;
+      auto value=runtime::zeros(t);
+      if (t.dtype==DType::F32 || t.dtype==DType::BF16) fill(value,0.01F);
+      inputs.emplace(t.id,std::move(value));
+    }
+    i32(inputs.at(5),{0,-1,-1,-1,-1}); i32(inputs.at(6),{-1,-1,-1,0,1});
+    i32(inputs.at(7),{-1,0,1,-1,-1}); i32(inputs.at(8),{1,2,2,0,0});
+    i32(inputs.at(9),{0,0,0,0,0}); i32(inputs.at(10),{3,4}); i32(inputs.at(11),{1,2});
+    for (const auto &w:build.weights) {
+      fill(inputs.at(w.tensor_id),w.name.ends_with("after_proj.bias") ? 1.0F : 0.0F);
+    }
+    runtime::RunOptions options; options.warmups=0; options.iterations=1;
+    const auto clean=runtime::make_cpu_executor()->run(base,inputs,options);
+    fill(inputs.at(build.strength_inputs[0]),0);
+    const auto disabled=runtime::make_cpu_executor()->run(build.program,inputs,options);
+    for (const auto &[id,tensor]:clean.outputs)
+      expect(disabled.outputs.at(id).bytes==tensor.bytes,"zero-strength control preserves base output bytes");
+
+    std::vector<std::uint32_t> original_outputs;
+    bool in_block=false; unsigned gates=0;
+    for (const auto &o:base.operations) {
+      if (o.opcode==Opcode::H3AdaLNSelect) {in_block=true;gates=0;}
+      if (in_block && o.opcode==Opcode::ResidualGate && ++gates==2) {
+        original_outputs.push_back(o.outputs[0]);in_block=false;
+      }
+    }
+    auto captured=build.program;
+    for (auto &t:captured.tensors)
+      if (t.id==original_outputs[0] || t.id==build.injected_outputs[0]) t.roles|=TensorRole::Output;
+    const float alpha=-0.0096F;
+    fill(inputs.at(build.strength_inputs[0]),alpha);
+    const auto active=runtime::make_cpu_executor()->run(captured,inputs,options);
+    const auto before=runtime::convert_float_tensor(active.outputs.at(original_outputs[0]),DType::F32);
+    const auto after=runtime::convert_float_tensor(active.outputs.at(build.injected_outputs[0]),DType::F32);
+    auto expected=before;
+    // Mojo minimax_h3_control_inject_active uses mul_scalar(BF16,F32),
+    // which stores BF16, followed by a separate BF16 add. Preserve both
+    // rounding boundaries even when the strength is not BF16-representable.
+    auto scaled=runtime::zeros({0,DType::F32,0,{1}});
+    scaled.f32()[0]=alpha;
+    scaled=runtime::convert_float_tensor(
+        runtime::convert_float_tensor(scaled,DType::BF16),DType::F32);
+    for (std::size_t r=0;r<5;++r)
+      if (r!=1 && r!=2)
+        for (std::size_t col=0;col<12;++col) expected.f32()[r*12+col]+=scaled.f32()[0];
+    expected=runtime::convert_float_tensor(expected,DType::BF16);
+    expect(expected.bytes==active.outputs.at(build.injected_outputs[0]).bytes,
+           "Mojo post-block residual rounds scaled BF16 before add and zeros only audio rows");
+    auto single_round=before;
+    for (std::size_t r=0;r<5;++r)
+      if (r!=1 && r!=2)
+        for (std::size_t col=0;col<12;++col) single_round.f32()[r*12+col]+=alpha;
+    single_round=runtime::convert_float_tensor(single_round,DType::BF16);
+    expect(single_round.bytes!=expected.bytes,
+           "residual fixture distinguishes Mojo storage from a folded scaled add");
+    expect(after.f32()[0]!=before.f32()[0] && after.f32()[12]==before.f32()[12],
+           "control changes text/video rows but never directly injects audio");
+
+    // The released Union checkpoint stores `ff.net.0.proj` as [value; gate]
+    // (diffusers order) -- the OPPOSITE of the base checkpoint's [gate; value]
+    // `mlp.fc1`.  Measured on the real checkpoints, control_blocks.0's
+    // ff.net.0.proj matches blocks.0.mlp.fc1 only ACROSS halves (cos 0.9995
+    // crossed, -0.006 uncrossed).  So the weight must reach SwiGlu UNREORDERED
+    // with GateFirst=false; a slice/concat swap here silently exchanges the
+    // gate and value halves in all five side blocks and is invisible to every
+    // shape, census and residual check above.
+    {
+      unsigned checked=0;
+      for (const auto &weight:build.weights) {
+        if (!weight.name.ends_with("ff.net.0.proj.weight")) continue;
+        std::uint32_t projected=0;
+        for (const auto &o:build.program.operations)
+          if (o.opcode==Opcode::Linear && o.inputs.size()>1 &&
+              o.inputs[1]==weight.tensor_id) projected=o.outputs[0];
+        expect(projected!=0,"control ff.net.0.proj feeds a Linear directly, unreordered");
+        bool saw=false;
+        for (const auto &o:build.program.operations)
+          if (o.opcode==Opcode::SwiGlu && !o.inputs.empty() && o.inputs[0]==projected) {
+            saw=true;
+            expect(!o.boolean(AttrKey::GateFirst,false),
+                   "control SwiGLU reads ff.net.0.proj as [value; gate]");
+          }
+        expect(saw,"control ff.net.0.proj Linear output reaches SwiGlu");
+        ++checked;
+      }
+      expect(checked==build.side_outputs.size() && checked>0,
+             "every control side block pins the SwiGLU gate/value order");
+    }
+
+
+    if (argc==2) {
+      H3DenoiserConfig real; real.video_tokens=13650;real.audio_tokens=414;real.text_tokens=460;real.timestep_tables=2;
+      const auto actual=add_h3_control(make_h3_denoiser(real),real);
+      const auto checkpoint=weights::read_safetensors(argv[1]);
+      validate_h3_control_checkpoint(checkpoint,actual);
+      const auto mapped=map_h3_control_weights(checkpoint,actual);
+      expect(mapped.size()==actual.weights.size(),"actual released checkpoint maps every control weight");
+      for (const auto &[id,value]:mapped) {
+        (void)id; expect(value.is_mapped() && value.bytes.empty(),"actual control weights remain mapped, not copied");
+      }
+      std::cout<<"REAL_HEADER_OK tensors="<<actual.weights.size()<<" mapped_bytes="<<actual.mapped_weight_bytes<<'\n';
+    }
+  } catch (const std::exception &e) { ++failures;std::cerr<<e.what()<<'\n'; }
+  std::cout<<"H3 ControlNet CPU tests: "<<(failures ? "FAIL" : "PASS")<<'\n';
+  return failures ? 1:0;
+}

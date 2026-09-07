@@ -118,8 +118,11 @@ LoraResult insert_lora(const ir::Program &program, const LoraSpec &spec) {
 
     // The low-rank path. The dense delta is only formed by the second
     // Linear, which is the point of the factorization.
-    auto low_dims = output_dims;
-    low_dims.back() = spec.rank;
+    // Linear permits a flattened projection to declare its output as
+    // [rows,heads,head_dim]. The low-rank space is [rows,rank], not
+    // [rows,heads,rank]; its width replaces the entire projection width.
+    std::vector<std::uint64_t> low_dims{
+        activation_tensor->element_count() / in_features, spec.rank};
     const auto low = add_tensor(compute_dtype, ir::TensorRole::Internal,
                                 std::move(low_dims));
     add_operation(ir::Opcode::Linear, {activation, down}, {low});

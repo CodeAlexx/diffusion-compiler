@@ -21,8 +21,12 @@
 #include "dif/frontend/training.hpp"
 #include "dif/runtime/device_probe.hpp"
 #include "dif/runtime/executor.hpp"
+#if DIF_HAVE_FASTLOAD
+#include "dif/runtime/fastload.h"
+#endif
 #include "dif/runtime/scalar.hpp"
 #include "dif/runtime/tensor.hpp"
+#include "../src/runtime/mapped_weight_cache.hpp"
 #include "dif/sampling/rectified_flow.hpp"
 #include "dif/support/error.hpp"
 #include "dif/support/json.hpp"
@@ -39,6 +43,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <iterator>
@@ -2956,8 +2961,29 @@ void test_h3_mixed_denoiser_frontend_and_cuda_parity() {
   config.block_size = 32;
   config.attention_implementation = 1;
   const auto program = dif::frontend::make_h3_denoiser(config);
-  expect(program.tensors.size() == 117U && program.operations.size() == 57U,
+  expect(program.tensors.size() == 132U && program.operations.size() == 72U,
          "one-layer mixed H3 denoiser has the stable graph ABI");
+  expect(program.operations[16].opcode == Opcode::Slice &&
+             program.operations[17].opcode == Opcode::Slice &&
+             program.operations[18].opcode == Opcode::Concat &&
+             program.operations[21].opcode == Opcode::Linear &&
+             program.operations[22].opcode == Opcode::Linear &&
+             program.operations[23].opcode == Opcode::Concat &&
+             program.operations[24].opcode == Opcode::SwiGlu &&
+             !program.operations[24].boolean(AttrKey::GateFirst, true),
+         "mixed H3 refiner swaps FC1 to source value-gate layout before its two projections");
+  expect(program.operations[42].opcode == Opcode::H3DeinterleaveQkvWeight &&
+             program.operations[43].opcode == Opcode::Concat &&
+             program.operations[44].opcode == Opcode::Linear &&
+             program.operations[45].opcode == Opcode::Slice &&
+             program.operations[48].opcode == Opcode::Reshape &&
+             program.operations[57].opcode == Opcode::Slice &&
+             program.operations[58].opcode == Opcode::Slice &&
+             program.operations[59].opcode == Opcode::Concat &&
+             program.operations[60].opcode == Opcode::Linear &&
+             program.operations[61].opcode == Opcode::SwiGlu &&
+             !program.operations[61].boolean(AttrKey::GateFirst, true),
+         "mixed H3 block applies source QKV and FC1 transforms before packed projections");
   std::size_t casts = 0U;
   std::size_t row_chunk_selects = 0U;
   std::size_t constants = 0U;
@@ -3360,6 +3386,436 @@ void test_cuda_lazy_resident_upload() {
          "lazy resident constant uploads once and remains bit-exact");
 }
 
+void test_cuda_bounded_streamed_staging() {
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  struct SavedEnvironment {
+    const char *name;
+    bool present;
+    std::string value;
+    explicit SavedEnvironment(const char *key)
+        : name(key), present(std::getenv(key) != nullptr),
+          value(present ? std::getenv(key) : "") {}
+    ~SavedEnvironment() {
+      if (present) (void)setenv(name, value.c_str(), 1);
+      else (void)unsetenv(name);
+    }
+  } saved("DIF_FASTLOAD"), saved_streamed("DIF_FASTLOAD_STREAMED");
+  (void)unsetenv("DIF_FASTLOAD_STREAMED");
+  constexpr auto streamed = TensorRole::Constant | TensorRole::Streamed;
+  constexpr std::uint64_t rows = 65537U, columns = 256U;
+  Program program;
+  program.tensors = {
+      {1, DType::I32, TensorRole::Input, {3}},
+      {2, DType::F32, streamed, {rows, columns}},
+      {3, DType::F32, TensorRole::Internal, {3, columns}},
+      {4, DType::F32, streamed, {3, columns}},
+      {5, DType::F32, TensorRole::Output, {3, columns}},
+  };
+  program.operations = {
+      {1, Opcode::GatherRows, {2, 1}, {3}, {}},
+      {2, Opcode::Add, {3, 4}, {5}, {}},
+  };
+  verify(program);
+  std::vector<float> values(rows * columns);
+  for (std::size_t i = 0U; i < values.size(); ++i)
+    values[i] = static_cast<float>(static_cast<int>(i % 251U) - 125) / 16.0F;
+  dif::runtime::Tensor indices{DType::I32, {3}, std::vector<std::uint8_t>(12U)};
+  const std::array<std::int32_t, 3> selected = {0, 65535, 65536};
+  std::memcpy(indices.bytes.data(), selected.data(), indices.bytes.size());
+  dif::runtime::TensorMap bindings = {
+      {1, indices}, {2, f32_tensor({rows, columns}, values)},
+      {4, f32_tensor({3, columns}, std::vector<float>(3U * columns, 0.25F))},
+  };
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 2U;
+  options.minimum_free_bytes = 0U;
+  options.profile_pipeline = true;
+  options.direct_io_warm_page_cache = false;
+  const auto reference =
+      dif::runtime::make_cpu_executor()->run(program, bindings, options);
+  const auto directory = std::filesystem::temp_directory_path() /
+      ("dif-bounded-staging-" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "weights.diftensor";
+  dif::runtime::write_tensor(bindings.at(2), path);
+  for (const auto mapped : {false, true}) {
+    if (mapped)
+      bindings.at(2) = dif::runtime::map_tensor(path);
+    for (const auto disabled : {false, true}) {
+      if (disabled) (void)setenv("DIF_FASTLOAD", "0", 1);
+      else (void)setenv("DIF_FASTLOAD", "1", 1);
+      for (const auto budget : {2048ULL << 20U, 4ULL << 20U}) {
+        bindings.at(2).evict_mapped_pages();
+        options.streamed_pinned_budget_bytes = budget;
+        auto prepared = dif::runtime::make_cuda_executor()->prepare(
+            program, bindings, options);
+        for (unsigned repeat = 0U; repeat < 2U; ++repeat) {
+          const auto result = prepared->run(bindings, options);
+          expect(result.outputs.at(5).bytes == reference.outputs.at(5).bytes,
+                 "bounded staging preserves first/last rows across chunks and runs");
+          const auto expected = options.iterations *
+              (bindings.at(2).byte_size() + bindings.at(4).byte_size());
+          expect(result.pipeline_profile.streamed_weight_bytes == expected,
+                 "chunked profile counts logical weight bytes exactly once");
+          expect(result.run_telemetry.h2d_bytes == expected + indices.byte_size(),
+                 "chunked transfer preserves H2D byte accounting");
+          expect(result.run_telemetry.pinned_mem_allocs == 0U,
+                 "bounded staging allocates no pinned workspaces during execution");
+        }
+      }
+    }
+  }
+  bindings.clear();
+  std::filesystem::remove_all(directory);
+
+  // Two inputs fit individually but not together, and the deliberately odd
+  // slot capacity splits F32 elements. Only bytes are transported; both the
+  // inter-tensor and intra-tensor reuse fences must preserve the result.
+  Program packed;
+  packed.tensors = {
+      {1, DType::F32, streamed, {1, 64}},
+      {2, DType::F32, streamed, {1, 64}},
+      {3, DType::F32, TensorRole::Output, {1, 64}},
+  };
+  packed.operations = {{1, Opcode::Add, {1, 2}, {3}, {}}};
+  dif::runtime::TensorMap packed_bindings = {
+      {1, f32_tensor({1, 64}, std::vector<float>(64U, 1.25F))},
+      {2, f32_tensor({1, 64}, std::vector<float>(64U, 2.5F))},
+  };
+  for (const auto budget : {514U, 62U}) {
+    options.streamed_pinned_budget_bytes = budget;
+    const auto result = dif::runtime::make_cuda_executor()->run(
+        packed, packed_bindings, options);
+    expect(result.outputs.at(3).bytes ==
+               f32_tensor({1, 64}, std::vector<float>(64U, 3.75F)).bytes,
+           "bounded staging handles packed inputs and non-element-aligned chunks");
+  }
+}
+
+void test_cuda_bounded_mapped_resident_eviction() {
+  if (!dif::runtime::cuda_available())
+    return;
+  struct SavedEnvironment {
+    const char *name{"DIF_FASTLOAD"};
+    bool present{std::getenv(name) != nullptr};
+    std::string original{present ? std::getenv(name) : ""};
+    ~SavedEnvironment() {
+      if (present) (void)setenv(name, original.c_str(), 1);
+      else (void)unsetenv(name);
+    }
+  } saved;
+  if (setenv("DIF_FASTLOAD", "0", 1) != 0)
+    dif::fail("cannot disable fastload for mapped resident eviction test");
+
+  using namespace dif::ir;
+  constexpr std::uint64_t rows = 65537U, columns = 256U;
+  constexpr std::uint64_t weight_bytes = rows * columns * sizeof(float);
+  static_assert(weight_bytes == (64ULL << 20U) + 1024U);
+  Program program;
+  program.tensors = {
+      {1, DType::I32, TensorRole::Input, {3}},
+      {2, DType::F32, TensorRole::Constant, {rows, columns}},
+      {3, DType::F32, TensorRole::Output, {3, columns}},
+  };
+  program.operations = {{1, Opcode::GatherRows, {2, 1}, {3}, {}}};
+  verify(program);
+  // The final two rows straddle the 64 MiB upload boundary. Returning only
+  // these rows and the first one keeps both reference and GPU output at 3 KiB.
+  const std::vector<std::int32_t> selected{0, 65535, 65536};
+  const auto indices = i32_tensor({3}, selected);
+  auto expected = dif::runtime::zeros(program.tensors[2]);
+  const auto directory = std::filesystem::temp_directory_path() /
+      ("dif-bounded-resident-eviction-" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "weights.diftensor";
+  {
+    auto weight = dif::runtime::zeros(program.tensors[1]);
+    auto values = weight.f32();
+    for (std::size_t i = 0U; i < values.size(); ++i)
+      values[i] = static_cast<float>(static_cast<int>(i % 251U) - 125) / 16.0F;
+    for (std::size_t row = 0U; row < selected.size(); ++row)
+      for (std::uint64_t column = 0U; column < columns; ++column)
+        expected.f32()[row * columns + column] =
+            values[static_cast<std::uint64_t>(selected[row]) * columns + column];
+    dif::runtime::write_tensor(weight, path);
+  }
+  // Drop the owned fixture before preparation: this must take the ordinary
+  // mapped Constant upload path, never streamed or promoted-resident staging.
+  dif::runtime::TensorMap bindings{
+      {1, indices}, {2, dif::runtime::map_tensor(path)}};
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  options.resident_evict_host_pages = true;
+  auto prepared = dif::runtime::make_cuda_executor()->prepare(
+      program, bindings, options);
+  const auto first = prepared->run(bindings, options);
+  const auto second = prepared->run(bindings, options);
+  expect(first.outputs.at(3U).dims == expected.dims &&
+             first.outputs.at(3U).bytes == expected.bytes &&
+             second.outputs.at(3U).dims == expected.dims &&
+             second.outputs.at(3U).bytes == expected.bytes,
+         "mapped resident eviction preserves exact boundary rows on both runs");
+  expect(first.preparation_reported && !second.preparation_reported &&
+             first.preparation_telemetry.h2d_copies == 2U &&
+             first.preparation_telemetry.h2d_bytes == weight_bytes &&
+             second.preparation_telemetry.h2d_copies == 2U &&
+             second.preparation_telemetry.h2d_bytes == weight_bytes,
+         "one resident weight upload splits into two bounded preparation copies");
+  for (const auto *result : {&first, &second}) {
+    expect(result->run_telemetry.h2d_copies == 1U &&
+               result->run_telemetry.h2d_bytes == indices.byte_size(),
+           "evicted mapped resident weight is never reuploaded during execution");
+    expect(result->run_telemetry.d2h_copies == 1U &&
+               result->run_telemetry.d2h_bytes == expected.byte_size(),
+           "resident eviction regression returns only the selected boundary rows");
+  }
+  prepared.reset();
+  bindings.clear();
+  std::filesystem::remove_all(directory);
+}
+
+void test_cuda_shared_mapped_resident_weights() {
+  if (!dif::runtime::cuda_available())
+    return;
+  using namespace dif::ir;
+  const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory = std::filesystem::temp_directory_path() /
+                        ("dif-shared-weights-test-" + std::to_string(nonce));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "weights.diftensor";
+  const auto weight = f32_tensor({2, 4}, {1, 2, 3, 4, 5, 6, 7, 8});
+  dif::runtime::write_tensor(weight, path);
+  const auto mapped = dif::runtime::map_tensor(path);
+  const auto key = dif::runtime::detail::mapped_weight_key(mapped);
+  expect(key.has_value(), "mapped weight identity is available");
+  const auto shifted = dif::runtime::map_tensor_slice(
+      mapped.mapping, DType::F32, {7}, mapped.mapping_offset + 4U, 28U);
+  expect(key != dif::runtime::detail::mapped_weight_key(shifted),
+         "mapped weight identity includes byte range");
+  auto changed = mapped;
+  changed.dims = {4, 2};
+  expect(key != dif::runtime::detail::mapped_weight_key(changed),
+         "mapped weight identity includes shape");
+  changed.dims = {2, 8};
+  changed.dtype = DType::F16;
+  expect(key != dif::runtime::detail::mapped_weight_key(changed),
+         "mapped weight identity includes dtype");
+  expect(key != dif::runtime::detail::mapped_weight_key(dif::runtime::map_tensor(path)),
+         "separately opened mappings do not alias by path");
+  auto program_for = [](std::uint64_t rows, std::uint32_t weight_id) {
+    Program p;
+    p.tensors = {{weight_id, DType::F32, TensorRole::Constant, {2, 4}},
+                 {1, DType::I32, TensorRole::Input, {rows}},
+                 {3, DType::F32, TensorRole::Output, {rows, 4}}};
+    p.operations = {{1, Opcode::GatherRows, {weight_id, 1}, {3}, {}}};
+    return p;
+  };
+  dif::runtime::Tensor indices{DType::I32, {2}, {}};
+  const std::array<std::int32_t, 2> values{0, 1};
+  indices.bytes.resize(sizeof(values));
+  std::memcpy(indices.bytes.data(), values.data(), sizeof(values));
+  auto short_indices = indices;
+  short_indices.dims = {1};
+  short_indices.bytes.resize(sizeof(std::int32_t));
+  dif::runtime::TensorMap first_bindings{{1, short_indices}, {2, mapped}};
+  dif::runtime::TensorMap second_bindings{{1, indices}, {12, mapped}};
+  dif::runtime::RunOptions options;
+  options.warmups = 0U;
+  options.iterations = 1U;
+  options.minimum_free_bytes = 0U;
+  options.resident_evict_host_pages = false;
+  auto backend = dif::runtime::make_cuda_executor();
+  auto first = backend->prepare(program_for(1, 2), first_bindings, options);
+  auto second = backend->prepare(program_for(2, 12), second_bindings, options);
+  const auto first_result = first->run(first_bindings, options);
+  auto second_result = second->run(second_bindings, options);
+  expect(first_result.preparation_telemetry.h2d_bytes == weight.byte_size() &&
+             second_result.preparation_telemetry.h2d_bytes == 0U,
+         "two shapes and different IR ids upload immutable weights once");
+  expect(second->reused_resident_weight_bytes() == 256U &&
+             first->reused_resident_weight_bytes() == 0U,
+         "shared device footprint reports aligned reused storage");
+  expect(second_result.outputs.at(3).bytes == weight.bytes &&
+             second_result.run_telemetry.device_mem_allocs == 0U &&
+             second_result.run_telemetry.h2d_bytes == indices.byte_size(),
+         "shared weights preserve exact outputs without hot allocations/uploads");
+  first.reset();
+  expect(second->run(second_bindings, options).outputs.at(3).bytes == weight.bytes,
+         "shared weights survive destruction of their first prepared consumer");
+  auto pressure = options;
+  pressure.minimum_free_bytes = std::numeric_limits<std::uint64_t>::max();
+  bool pressure_refused = false;
+  try {
+    (void)backend->prepare(program_for(2, 12), second_bindings, pressure);
+  } catch (const std::exception &) {
+    pressure_refused = true;
+  }
+  expect(pressure_refused,
+         "shared storage never bypasses the remaining VRAM pressure gate");
+  auto owned_bindings = second_bindings;
+  owned_bindings.at(12) = weight;
+  auto owned = backend->prepare(program_for(2, 12), owned_bindings, options);
+  expect(owned->reused_resident_weight_bytes() == 0U &&
+             owned->run(owned_bindings, options).preparation_telemetry.h2d_bytes ==
+                 weight.byte_size(),
+         "owned mutable storage is never implicitly shared");
+  auto remapped_bindings = second_bindings;
+  remapped_bindings.at(12) = dif::runtime::map_tensor(path);
+  auto remapped = backend->prepare(program_for(2, 12), remapped_bindings, options);
+  expect(remapped->reused_resident_weight_bytes() == 0U,
+         "another mapping of the same file is a safe cache miss");
+  second.reset();
+  second = backend->prepare(program_for(2, 12), second_bindings, options);
+  expect(second->reused_resident_weight_bytes() == 0U &&
+             second->run(second_bindings, options).preparation_telemetry.h2d_bytes ==
+                 weight.byte_size(),
+         "weak cache retains no device weights after the last consumer dies");
+  // Change the version on this test-owned file while retaining its mapping.
+  std::filesystem::last_write_time(
+      path, std::filesystem::last_write_time(path) + std::chrono::seconds(1));
+  auto revised = backend->prepare(program_for(2, 12), second_bindings, options);
+  expect(revised->reused_resident_weight_bytes() == 0U,
+         "changed file metadata invalidates same-mapping reuse");
+  revised.reset();
+  second.reset();
+  auto invalid = options;
+  invalid.persistent_state = {{1000, 1001}};
+  bool refused = false;
+  try {
+    (void)backend->prepare(program_for(2, 12), second_bindings, invalid);
+  } catch (const std::exception &) {
+    refused = true;
+  }
+  expect(refused, "invalid late persistent-state seed refuses preparation");
+  second = backend->prepare(program_for(2, 12), second_bindings, options);
+  expect(second->reused_resident_weight_bytes() == 0U &&
+             second->run(second_bindings, options).preparation_telemetry.h2d_bytes ==
+                 weight.byte_size(),
+         "failed preparation never publishes incomplete shared storage");
+  owned.reset();
+  remapped.reset();
+  backend.reset();
+  expect(second->run(second_bindings, options).outputs.at(3).bytes == weight.bytes,
+         "prepared shared storage and CUDA context outlive executor cache");
+  second.reset();
+  std::filesystem::remove_all(directory);
+}
+
+void test_cuda_promoted_mapped_resident_upload() {
+#if DIF_HAVE_FASTLOAD
+  if (!dif::runtime::cuda_available() || !serenity_fastload_cpu_supported())
+    return;
+  struct SavedEnvironment {
+    const char *name{"DIF_FASTLOAD"};
+    bool present{std::getenv(name) != nullptr};
+    std::string original{present ? std::getenv(name) : ""};
+    ~SavedEnvironment() {
+      if (present) (void)setenv(name, original.c_str(), 1);
+      else (void)unsetenv(name);
+    }
+  } saved;
+  using namespace dif::ir;
+  constexpr auto streamed = TensorRole::Constant | TensorRole::Streamed;
+  constexpr std::uint64_t width = 8192U;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, width}},
+      {2, DType::F32, streamed, {1, width}},
+      {3, DType::F32, streamed, {1, width}},
+      {4, DType::F32, TensorRole::Internal, {1, width}},
+      {5, DType::F32, TensorRole::Output, {1, width}},
+  };
+  program.operations = {{1, Opcode::Add, {1, 2}, {4}, {}},
+                        {2, Opcode::Add, {4, 3}, {5}, {}}};
+  const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory = std::filesystem::temp_directory_path() /
+                        ("dif-promoted-upload-test-" + std::to_string(nonce));
+  std::filesystem::create_directories(directory);
+  const auto path = directory / "weights.safetensors";
+  const auto weight = f32_tensor({1, width}, std::vector<float>(width, 0.5F));
+  dif::weights::SafeTensorWriter writer(
+      path, {{"a", DType::F32, {1, width}}, {"b", DType::F32, {1, width}}});
+  writer.append("a", weight.bytes);
+  writer.append("b", weight.bytes);
+  (void)writer.finish();
+  const auto file = dif::weights::read_safetensors(path);
+  for (const auto [promoted, overlapping] :
+       {std::pair{true, false}, std::pair{true, true},
+        std::pair{false, false}, std::pair{false, true}}) {
+    // Ordinary residents enter the profile-only prefault loop; promoted
+    // streamed residents do not. Cover both so the prefault assertion is
+    // not vacuous when testing the promoted transport bypass.
+    program.tensors[1].roles = promoted ? streamed :
+        static_cast<std::uint32_t>(TensorRole::Constant);
+    program.tensors[2].roles = program.tensors[1].roles;
+    dif::runtime::TensorMap bindings = {
+        {1, f32_tensor({1, width}, std::vector<float>(width, 1.0F))},
+        {2, dif::weights::map_safetensor(file, "a")},
+        {3, dif::weights::map_safetensor(file, overlapping ? "a" : "b")},
+    };
+    dif::runtime::RunOptions options;
+    options.warmups = 0U;
+    options.iterations = 1U;
+    options.minimum_free_bytes = 0U;
+    if (promoted)
+      options.resident_streamed_constants = {2U, 3U};
+    options.resident_evict_host_pages = false;
+    options.trace_events = true;
+    options.profile_pipeline = true;
+    if (setenv("DIF_FASTLOAD", "0", 1) != 0)
+      dif::fail("cannot disable promoted upload test fastload");
+    const auto reference =
+        dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    if (!promoted)
+      expect(reference.pipeline_profile.resident_host_prefault_milliseconds > 0.0,
+             "disabled ASM profiles explicit ordinary-resident prefault");
+    // The actual default must take the same prior-loader path as explicit 0.
+    if (unsetenv("DIF_FASTLOAD") != 0)
+      dif::fail("cannot restore default promoted upload policy");
+    const auto default_result =
+        dif::runtime::make_cuda_executor()->run(program, bindings, options);
+    expect(default_result.outputs.at(5U).bytes == reference.outputs.at(5U).bytes,
+           "default mapped resident upload matches the prior loader exactly");
+    for (const auto &event : default_result.preparation_trace_events)
+      expect(!event.name.ends_with("fastload:resident-read-and-upload"),
+             "default mapped resident upload never admits ASM");
+    if (!promoted)
+      expect(default_result.pipeline_profile.resident_host_prefault_milliseconds > 0.0,
+             "default ordinary-resident loading retains prior prefault policy");
+    if (setenv("DIF_FASTLOAD", "1", 1) != 0)
+      dif::fail("cannot opt in to promoted upload test fastload");
+    auto prepared =
+        dif::runtime::make_cuda_executor()->prepare(program, bindings, options);
+    const auto first = prepared->run(bindings, options);
+    const auto second = prepared->run(bindings, options);
+    expect(first.outputs.at(5U).bytes == reference.outputs.at(5U).bytes &&
+               second.outputs.at(5U).bytes == reference.outputs.at(5U).bytes &&
+               first.outputs.at(5U).bytes ==
+                   f32_tensor({1, width}, std::vector<float>(width, 2.0F)).bytes,
+           "mapped resident opt-in/fallback uploads preserve exact values");
+    expect(first.run_telemetry.h2d_bytes == bindings.at(1U).byte_size() &&
+               second.run_telemetry.h2d_bytes == bindings.at(1U).byte_size(),
+           "mapped resident constants upload only at preparation");
+    expect(first.pipeline_profile.resident_host_prefault_milliseconds == 0.0,
+           "profiling does not serially prefault weights before opted-in ASM upload");
+    bool observed_fastload = false;
+    for (const auto &event : first.preparation_trace_events)
+      observed_fastload |=
+          event.name.ends_with("fastload:resident-read-and-upload");
+    expect(observed_fastload == !overlapping,
+           "disjoint resident mappings use ASM; overlapping mappings fall back");
+  }
+  std::filesystem::remove_all(directory);
+#endif
+}
+
 void test_cuda_f16_biased_convrot_int8() {
 #if DIF_HAS_CUTLASS
   if (!dif::runtime::cuda_available())
@@ -3451,6 +3907,129 @@ void test_cuda_f16_biased_convrot_int8() {
            resident
                ? "resident F16 biased ConvRot INT8 fuses bias and matches semantics"
                : "streamed F16 biased ConvRot INT8 fuses bias and matches semantics");
+  }
+  std::filesystem::remove_all(directory);
+#endif
+}
+
+void test_cuda_resident_convrot_nonzero_weights() {
+#if DIF_HAS_CUTLASS && DIF_HAVE_FASTLOAD
+  if (!dif::runtime::cuda_available() || !serenity_fastload_cpu_supported())
+    return;
+  struct SavedEnvironment {
+    explicit SavedEnvironment(const char *key) : name(key) {
+      if (const auto *value = std::getenv(key)) {
+        present = true;
+        original = value;
+      }
+    }
+    ~SavedEnvironment() {
+      if (present)
+        (void)setenv(name, original.c_str(), 1);
+      else
+        (void)unsetenv(name);
+    }
+    const char *name;
+    bool present{};
+    std::string original;
+  } saved_fastload("DIF_FASTLOAD"), saved_streamed("DIF_FASTLOAD_STREAMED");
+  if (setenv("DIF_FASTLOAD_STREAMED", "1", 1) != 0)
+    dif::fail("cannot set streamed fastload test policy");
+
+  using namespace dif::ir;
+  constexpr auto streamed = TensorRole::Constant | TensorRole::Streamed;
+  const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("dif-resident-convrot-test-" + std::to_string(nonce));
+  std::filesystem::create_directories(directory);
+  for (const auto dtype : {DType::F16, DType::BF16}) {
+    for (const auto shared_weight : {false, true}) {
+      Program program;
+      program.tensors = {
+          {1, dtype, TensorRole::Input, {4, 256}},
+          {2, dtype, streamed, {16, 256}},
+          {3, dtype, TensorRole::Output, {4, 16}},
+      };
+      program.operations = {{1, Opcode::Linear, {1, 2}, {3}, {}}};
+      if (shared_weight) {
+        program.tensors.push_back({4, dtype, TensorRole::Output, {4, 16}});
+        program.operations.push_back({2, Opcode::Linear, {1, 2}, {4}, {}});
+      }
+      verify(program);
+      std::vector<float> inputs(4U * 256U);
+      for (std::size_t i = 0U; i < inputs.size(); ++i)
+        inputs[i] = static_cast<float>(static_cast<int>(i % 19U) - 9) / 16.0F;
+      dif::runtime::TensorMap bindings = {
+          {1, float_tensor(dtype, {4, 256}, inputs)},
+          {2, float_tensor(dtype, {16, 256},
+                           std::vector<float>(16U * 256U, 0.0F))},
+      };
+      std::array<std::uint32_t, 20> identity{};
+      identity[0] = 0x31525643U;
+      identity[1] = 1U;
+      identity[2] = 256U;
+      identity[3] = 1U;
+      const auto fingerprint = dif::ir::fingerprint(program);
+      for (std::size_t word = 0U; word < 8U; ++word)
+        for (std::size_t byte = 0U; byte < 4U; ++byte)
+          identity[4U + word] |=
+              static_cast<std::uint32_t>(fingerprint[word * 4U + byte]) <<
+              (byte * 8U);
+      std::vector<std::int8_t> quantized(16U * 256U);
+      for (std::size_t i = 0U; i < quantized.size(); ++i)
+        quantized[i] = static_cast<std::int8_t>(static_cast<int>(i % 31U) - 15);
+      std::vector<float> scales(16U);
+      for (std::size_t i = 0U; i < scales.size(); ++i)
+        scales[i] = static_cast<float>(i + 1U) / 128.0F;
+      const auto path = directory /
+                        (std::string(dtype_name(dtype)) +
+                         (shared_weight ? "-shared" : "-unique") + ".safetensors");
+      dif::weights::SafeTensorWriter writer(
+          path, {{"__meta__.convrot_int8", DType::I32, {20}},
+                 {"linear.2.weight", DType::I8, {16, 256}},
+                 {"linear.2.scale", DType::F32, {16}}});
+      writer.append("__meta__.convrot_int8",
+                    {reinterpret_cast<const std::uint8_t *>(identity.data()),
+                     sizeof(identity)});
+      writer.append("linear.2.weight",
+                    {reinterpret_cast<const std::uint8_t *>(quantized.data()),
+                     quantized.size()});
+      writer.append("linear.2.scale",
+                    {reinterpret_cast<const std::uint8_t *>(scales.data()),
+                     scales.size() * sizeof(float)});
+      (void)writer.finish();
+      dif::runtime::RunOptions options;
+      options.warmups = 0U;
+      options.iterations = 1U;
+      options.minimum_free_bytes = 0U;
+      options.convrot_int8_checkpoint = path;
+      options.convrot_int8_resident = true;
+      options.trace_events = true;
+      options.streamed_release_mapped_pages_per_copy = false;
+      if (setenv("DIF_FASTLOAD", "0", 1) != 0)
+        dif::fail("cannot disable test fastload");
+      const auto reference =
+          dif::runtime::make_cuda_executor()->run(program, bindings, options);
+      expect(reference.outputs.at(3U).bytes !=
+                 float_tensor(dtype, {4, 16}, std::vector<float>(64U, 0.0F)).bytes,
+             "biasless resident ConvRot reference uses nonzero weights and output");
+      if (setenv("DIF_FASTLOAD", "1", 1) != 0)
+        dif::fail("cannot enable test fastload");
+      for (const auto budget : {2048ULL << 20U, 64ULL << 20U}) {
+        options.streamed_pinned_budget_bytes = budget;
+        auto prepared =
+            dif::runtime::make_cuda_executor()->prepare(program, bindings, options);
+        const auto first = prepared->run(bindings, options);
+        const auto second = prepared->run(bindings, options);
+        for (const auto &[id, output] : reference.outputs)
+          expect(first.outputs.at(id).bytes == output.bytes &&
+                     second.outputs.at(id).bytes == output.bytes,
+                 "F16/BF16 unique/shared resident weights preserve every output byte");
+        expect(first.run_telemetry.h2d_bytes == bindings.at(1U).byte_size() &&
+                   second.run_telemetry.h2d_bytes == bindings.at(1U).byte_size(),
+               "resident ConvRot weights upload once, not during inference");
+      }
+    }
   }
   std::filesystem::remove_all(directory);
 #endif
@@ -3596,7 +4175,7 @@ void test_safetensors_tensor_metadata_is_skipped() {
   std::filesystem::create_directories(directory);
   const auto path = directory / "metadata.safetensors";
   const std::string header =
-      R"({"__meta__.version":{"dtype":"I64","shape":[1],"data_offsets":[0,8]},"weight":{"dtype":"F32","shape":[1,4],"data_offsets":[8,24]}})";
+      R"({"__meta__.version":{"dtype":"I64","shape":[1],"data_offsets":[0,8]},"__meta__.row_layout":{"dtype":"U8","shape":[5],"data_offsets":[8,13]},"weight":{"dtype":"F32","shape":[1,4],"data_offsets":[13,29]}})";
   {
     std::ofstream shard(path, std::ios::binary);
     const auto header_size = static_cast<std::uint64_t>(header.size());
@@ -3604,14 +4183,22 @@ void test_safetensors_tensor_metadata_is_skipped() {
       shard.put(static_cast<char>(header_size >> shift));
     shard.write(header.data(), static_cast<std::streamsize>(header.size()));
     const std::int64_t metadata = 1;
+    constexpr std::array<char, 5> row_layout = {'l', 'o', 'c', 'a', 'l'};
     const std::array<float, 4> values = {1, 2, 3, 4};
     shard.write(reinterpret_cast<const char *>(&metadata), sizeof(metadata));
+    shard.write(row_layout.data(),
+                static_cast<std::streamsize>(row_layout.size()));
     shard.write(reinterpret_cast<const char *>(values.data()), sizeof(values));
   }
   const auto file = dif::weights::read_safetensors(path);
   expect(file.tensors.size() == 1U && file.find("weight") != nullptr &&
              file.find("__meta__.version") == nullptr,
          "SafeTensors tensor-form metadata is validated but not exposed");
+  const auto row_layout =
+      dif::weights::read_safetensor_metadata(file, "__meta__.row_layout");
+  expect(row_layout ==
+             std::vector<std::uint8_t>({'l', 'o', 'c', 'a', 'l'}),
+         "SafeTensors U8 tensor-form metadata remains discoverable");
   const auto weight = dif::weights::map_safetensor(file, "weight");
   const auto values = weight.f32();
   expect(values.size() == 4U && values[0] == 1.0F && values[3] == 4.0F,
@@ -4874,7 +5461,12 @@ int main() {
   test_memory_plan_omits_backend_replaced_constants();
   test_compiler_streamed_residency_plan();
   test_cuda_lazy_resident_upload();
+  test_cuda_bounded_streamed_staging();
+  test_cuda_bounded_mapped_resident_eviction();
+  test_cuda_promoted_mapped_resident_upload();
+  test_cuda_shared_mapped_resident_weights();
   test_cuda_f16_biased_convrot_int8();
+  test_cuda_resident_convrot_nonzero_weights();
   test_compiler_and_cuda_reshape_alias_plan();
   test_weight_bundle_roundtrip();
   test_safetensors_streaming_writer();

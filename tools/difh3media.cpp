@@ -3,6 +3,7 @@
 #include "dif/support/error.hpp"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -25,18 +26,22 @@ struct Options {
   std::string encoder{"libx264"};
   std::uint64_t input_fps{};
   std::uint64_t output_fps{};
+  std::uint64_t trim_start_frames{};
+  std::uint64_t output_frames{};
 };
 
-std::uint64_t number(const std::string &text, const char *label) {
+std::uint64_t number(const std::string &text, const char *label, bool allow_zero = false) {
   char *end = nullptr;
+  errno = 0;
   const auto value = std::strtoull(text.c_str(), &end, 10);
-  if (text.empty() || !end || *end != '\0' || value == 0U)
+  if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos ||
+      errno == ERANGE || !end || *end != '\0' || (!allow_zero && value == 0U))
     dif::fail(std::string("invalid ") + label + ": " + text);
   return value;
 }
 
 void usage() {
-  std::cerr << "usage: difh3media --video DECODED.diftensor --audio-wav audio.wav --output-dir DIR --input-fps N [--output-fps N] [--ffmpeg FILE] [--encoder h264_nvenc|libx264]\n";
+  std::cerr << "usage: difh3media --video DECODED.diftensor --audio-wav audio.wav --output-dir DIR --input-fps N [--output-fps N] [--trim-start-frames 0|5|22|39] [--output-frames N] [--ffmpeg FILE] [--encoder h264_nvenc|libx264]\n";
 }
 
 Options parse(int argc, char **argv) {
@@ -58,6 +63,10 @@ Options parse(int argc, char **argv) {
       options.input_fps = number(value("--input-fps"), "input fps");
     else if (option == "--output-fps")
       options.output_fps = number(value("--output-fps"), "output fps");
+    else if (option == "--trim-start-frames")
+      options.trim_start_frames = number(value("--trim-start-frames"), "trim start frames", true);
+    else if (option == "--output-frames")
+      options.output_frames = number(value("--output-frames"), "output frames");
     else if (option == "--ffmpeg")
       options.ffmpeg = value("--ffmpeg");
     else if (option == "--encoder")
@@ -74,6 +83,11 @@ Options parse(int argc, char **argv) {
   }
   if (options.output_fps == 0U)
     options.output_fps = options.input_fps;
+  if ((options.trim_start_frames || options.output_frames) &&
+      (options.input_fps != 24 || options.output_fps != 24))
+    dif::fail("explicit H3 overlap/cap delivery requires native24FPS input and output");
+  if (options.trim_start_frames)
+    (void)dif::frontend::h3_motion_context_steps(options.trim_start_frames);
   if (options.encoder != "h264_nvenc" && options.encoder != "libx264")
     dif::fail("video encoder must be h264_nvenc or libx264");
   if (!std::filesystem::is_regular_file(options.audio_wav) ||
@@ -157,6 +171,7 @@ void write_result(const std::filesystem::path &path,
          << "  \"width\":" << video.width << ",\n"
          << "  \"height\":" << video.height << ",\n"
          << "  \"frames\":" << video.frames << ",\n"
+         << "  \"trim_start_frames\":" << options.trim_start_frames << ",\n"
          << "  \"fps\":" << options.output_fps << ",\n"
          << "  \"audio\":true,\n"
          << "  \"video_encoder\":\"" << json_escape(options.encoder)
@@ -181,7 +196,13 @@ int main(int argc, char **argv) {
         dif::fail("refusing to overwrite output: " + path.string());
     }
     const auto video = dif::frontend::make_h3_rgb24_video(
-        dif::runtime::read_tensor(options.video));
+        dif::runtime::read_tensor(options.video), options.trim_start_frames, options.output_frames);
+    auto audio_path = options.audio_wav;
+    if (options.trim_start_frames || options.output_frames) {
+      audio_path = options.output_directory / "audio_trimmed.wav";
+      const auto trim = dif::frontend::make_h3_motion_trim(options.trim_start_frames, video.frames);
+      dif::frontend::write_h3_trimmed_audio_wav(options.audio_wav, audio_path, trim);
+    }
     write_bytes(rgb_path, video.bytes);
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::string> arguments = {
@@ -189,7 +210,7 @@ int main(int argc, char **argv) {
         "-pixel_format", "rgb24", "-video_size",
         std::to_string(video.width) + "x" + std::to_string(video.height),
         "-framerate", std::to_string(options.input_fps), "-i",
-        rgb_path.string(), "-i", options.audio_wav.string()};
+        rgb_path.string(), "-i", audio_path.string()};
     if (options.output_fps != options.input_fps) {
       arguments.push_back("-vf");
       arguments.push_back("fps=" + std::to_string(options.output_fps));
@@ -226,7 +247,8 @@ int main(int argc, char **argv) {
               << " frames=" << video.frames << " geometry=" << video.width
               << 'x' << video.height << " input_fps=" << options.input_fps
               << " output_fps=" << options.output_fps
-              << " audio_wav=" << options.audio_wav
+              << " trim_start_frames=" << options.trim_start_frames
+              << " audio_wav=" << audio_path
               << " encoder=" << options.encoder
               << " mux_ms=" << mux_milliseconds << " range=["
               << video.minimum << ',' << video.maximum << "]\n";

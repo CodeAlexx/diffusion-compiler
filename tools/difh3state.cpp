@@ -18,6 +18,8 @@ struct Options {
   std::filesystem::path target_noise;
   std::filesystem::path output;
   float condition_timestep{0.999F};
+  bool clean_conditions{};
+  bool explicit_timestep{};
 };
 
 void usage() {
@@ -25,7 +27,9 @@ void usage() {
       << "usage: difh3state --condition CLEAN.diftensor [--condition CLEAN2]"
          " --condition-noise NOISE.diftensor [--condition-noise NOISE2]"
          " --target-noise NOISE.diftensor"
-         " --condition-timestep F32 --output STATE.diftensor\n";
+         " --condition-timestep F32 --output STATE.diftensor\n"
+         "       difh3state --clean-conditions --condition AUDIO_ROWS.diftensor"
+         " [--condition MORE_ROWS] --target-noise NOISE.diftensor --output STATE.diftensor\n";
 }
 
 Options parse(int argc, char **argv) {
@@ -37,13 +41,16 @@ Options parse(int argc, char **argv) {
         dif::fail(std::string("missing value for ") + name);
       return argv[++index];
     };
-    if (option == "--condition")
+    if (option == "--clean-conditions")
+      options.clean_conditions = true;
+    else if (option == "--condition")
       options.conditions.emplace_back(value("--condition"));
     else if (option == "--condition-noise")
       options.condition_noise.emplace_back(value("--condition-noise"));
     else if (option == "--target-noise")
       options.target_noise = value("--target-noise");
     else if (option == "--condition-timestep") {
+      options.explicit_timestep = true;
       const auto text = value("--condition-timestep");
       char *end = nullptr;
       options.condition_timestep = std::strtof(text.c_str(), &end);
@@ -57,12 +64,15 @@ Options parse(int argc, char **argv) {
       dif::fail("invalid difh3state command line");
     }
   }
-  if (options.conditions.empty() || options.condition_noise.empty() ||
+  if (options.conditions.empty() ||
       options.target_noise.empty() || options.output.empty()) {
     usage();
     dif::fail("difh3state is missing a required argument");
   }
-  if (options.condition_noise.size() != options.conditions.size())
+  if (options.clean_conditions &&
+      (!options.condition_noise.empty() || options.explicit_timestep))
+    dif::fail("clean audio conditions do not accept condition noise or a timestep");
+  if (!options.clean_conditions && options.condition_noise.size() != options.conditions.size())
     dif::fail("each H3 visual condition requires its own restarted noise tensor");
   if (options.condition_timestep < 0.0F ||
       options.condition_timestep > 1.0F)
@@ -117,6 +127,14 @@ int main(int argc, char **argv) {
     for (std::size_t condition = 0U; condition < clean.size(); ++condition) {
       const auto &tensor = clean[condition];
       const auto values = tensor.f32();
+      if (options.clean_conditions) {
+        // Native Ref2VA audio rows remain byte-identical posterior-mode rows;
+        // no video-style 0.999 augmentation and no request RNG consumption.
+        std::copy(values.begin(), values.end(),
+                  output.begin() + static_cast<std::ptrdiff_t>(row_offset * columns));
+        row_offset += tensor.dims[0];
+        continue;
+      }
       const auto noise = condition_noise[condition].f32();
       for (std::uint64_t index = 0U; index < tensor.element_count(); ++index) {
         const auto target = row_offset * columns + index;
@@ -136,6 +154,7 @@ int main(int argc, char **argv) {
               << " target_rows=" << target_noise.dims[0]
               << " columns=" << columns
               << " condition_timestep=" << timestep
+              << " clean_conditions=" << options.clean_conditions
               << " payload_sha256=" << dif::hex_digest(hash) << '\n';
     return 0;
   } catch (const std::exception &error) {

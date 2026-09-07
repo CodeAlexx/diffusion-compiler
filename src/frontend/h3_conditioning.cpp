@@ -1,4 +1,5 @@
 #include "dif/frontend/h3_conditioning.hpp"
+#include "dif/frontend/h3_motion.hpp"
 
 #include "dif/support/error.hpp"
 
@@ -409,6 +410,73 @@ H3PackedLayout make_h3_ref2va_layout(
   add_video_block(cursor, target, rotary_time);
   if (cursor != sequence)
     fail("H3 Ref2VA packed layout cursor disagrees with sequence length");
+  return layout;
+}
+
+H3PackedLayout make_h3_motion_context_layout(
+    std::span<const std::int32_t> text_token_tags,
+    std::uint64_t num_latent_frames, std::uint64_t latent_height,
+    std::uint64_t latent_width, std::uint64_t num_audio_latents,
+    std::uint64_t patch_t, std::uint64_t patch_h, std::uint64_t patch_w,
+    std::uint64_t context_frames, double source_audio_overhang) {
+  const auto context_steps = h3_motion_context_steps(context_frames);
+  const auto context_audio = h3_motion_context_audio_latents(context_frames);
+  if (!std::isfinite(source_audio_overhang) || source_audio_overhang < -0.5 ||
+      source_audio_overhang > 0.5)
+    fail("H3 motion context audio rounding residual must be in [-0.5,0.5]");
+  // Reuse the validated padless modality maps, then place the condition rows
+  // on the target clock. Keeping video/audio as separate reference blocks
+  // gives exactly [text|fixed video|fixed audio|target audio|target video].
+  const std::array references = {
+      H3ReferenceGeometry{H3ReferenceKind::Video, context_steps,
+                          latent_height, latent_width, 0U},
+      H3ReferenceGeometry{H3ReferenceKind::Audio, 0U, 0U, 0U, context_audio}};
+  auto layout = make_h3_ref2va_layout(
+      text_token_tags, references, num_latent_frames, latent_height,
+      latent_width, num_audio_latents, patch_t, patch_h, patch_w);
+  const auto rows_per_frame = checked_multiply(
+      latent_height / patch_h, latent_width / patch_w, "motion rows/frame");
+  const auto root_area = std::sqrt(static_cast<double>(
+      checked_multiply(latent_height, latent_width, "motion latent area")));
+  const auto hg = spatial_grid(latent_height, patch_h, root_area);
+  const auto wg = spatial_grid(latent_width, patch_w, root_area);
+  // The vacated audio-reference rotary span remains between text and target.
+  const double origin = static_cast<double>(text_token_tags.size()) +
+                        static_cast<double>(context_audio);
+  std::uint64_t offset = 0U;
+  for (std::uint64_t frame = 0U; frame < context_steps; ++frame) {
+    const double time = origin + kFrameRescale * static_cast<double>(offset);
+    for (std::uint64_t spatial = 0U; spatial < rows_per_frame; ++spatial)
+      set_position(layout.position_ids,
+                   layout.video_indices[frame * rows_per_frame + spatial],
+                   time, hg[spatial / wg.size()], wg[spatial % wg.size()]);
+    offset += kFramesPerLatent[frame % kFramesPerLatent.size()];
+  }
+  // Round-to-nearest-even, independently of the process floating-point mode.
+  const auto raw_end = kFrameRescale * static_cast<double>(context_frames) +
+                       source_audio_overhang;
+  const auto lower = std::floor(raw_end);
+  const auto fraction = raw_end - lower;
+  const auto end = lower + ((fraction > 0.5 ||
+                             (fraction == 0.5 && std::fmod(lower, 2.0) != 0.0))
+                                ? 1.0 : 0.0);
+  const auto condition_origin = origin + end - static_cast<double>(context_audio);
+  for (std::uint64_t i = 0U; i < layout.audio_indices.size(); ++i) {
+    const bool condition = i < layout.num_condition_audio_rows;
+    const auto count = condition ? context_audio : num_audio_latents;
+    const auto local = condition ? i : i - layout.num_condition_audio_rows;
+    set_position(layout.position_ids, layout.audio_indices[i],
+                 (condition ? condition_origin : origin) +
+                     static_cast<double>(local % count),
+                 0.0, local < count ? wg.front() : wg.back());
+  }
+  const auto times = temporal_grid(num_latent_frames, origin);
+  for (std::uint64_t frame = 0U; frame < num_latent_frames; ++frame)
+    for (std::uint64_t spatial = 0U; spatial < rows_per_frame; ++spatial)
+      set_position(layout.position_ids,
+                   layout.video_indices[layout.num_condition_video_rows +
+                                        frame * rows_per_frame + spatial],
+                   times[frame], hg[spatial / wg.size()], wg[spatial % wg.size()]);
   return layout;
 }
 

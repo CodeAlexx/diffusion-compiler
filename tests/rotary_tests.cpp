@@ -101,7 +101,63 @@ void run_layout(dif::ir::RotaryLayout layout, const char *label) {
 }
 } // namespace
 
+void run_frequency_precision() {
+  using namespace dif::ir;
+  // Released Krea axes include thirds (48-wide), and integer positions extend
+  // well past the tiny layout fixture. The semantic CPU path retains F64
+  // through pow/sin/cos and rounds only the final table to F32.
+  constexpr std::uint64_t tokens = 4096, pairs = 64;
+  Program program;
+  program.tensors = {
+      {1, DType::F32, TensorRole::Input, {1, tokens, 3}},
+      {2, DType::I32, TensorRole::Constant, {pairs}},
+      {3, DType::I32, TensorRole::Constant, {pairs}},
+      {4, DType::I32, TensorRole::Constant, {3}},
+      {5, DType::F32, TensorRole::Output, {1, tokens, pairs}},
+      {6, DType::F32, TensorRole::Output, {1, tokens, pairs}},
+  };
+  program.operations = {{1, Opcode::RotaryFrequency, {1, 2, 3, 4}, {5, 6},
+      {Attribute::f64(AttrKey::Theta, 1000.0), Attribute::f64(AttrKey::Ntk, 1.0)}}};
+  verify(program);
+  const auto ints = [](const std::vector<std::int32_t> &values) {
+    dif::runtime::Tensor t{DType::I32, {values.size()}, {}};
+    t.bytes.resize(values.size() * sizeof(std::int32_t));
+    std::memcpy(t.bytes.data(), values.data(), t.bytes.size());
+    return t;
+  };
+  std::vector<std::int32_t> axes, indices;
+  for (int axis = 0; axis < 3; ++axis)
+    for (int pair = 0; pair < (axis == 0 ? 16 : 24); ++pair) {
+      axes.push_back(axis); indices.push_back(pair);
+    }
+  std::vector<float> positions(tokens * 3);
+  for (std::size_t i = 0; i < tokens; ++i) {
+    positions[i * 3] = 0.0F;
+    positions[i * 3 + 1] = static_cast<float>(i / 64);
+    positions[i * 3 + 2] = static_cast<float>(i % 64);
+  }
+  dif::runtime::TensorMap inputs = {
+      {1, f32_tensor({1, tokens, 3}, positions)},
+      {2, ints(axes)}, {3, ints(indices)}, {4, ints({32, 48, 48})}};
+  dif::runtime::RunOptions options;
+  options.warmups = 0; options.iterations = 1; options.minimum_free_bytes = 0;
+  const auto cpu = dif::runtime::make_cpu_executor()->run(program, inputs, options);
+  if (!dif::runtime::cuda_available()) return;
+  const auto gpu = dif::runtime::make_cuda_executor()->run(program, inputs, options);
+  float max_error = 0;
+  for (const auto id : {5U, 6U}) {
+    const auto expected = values_of(cpu.outputs.at(id));
+    const auto actual = values_of(gpu.outputs.at(id));
+    for (std::size_t i = 0; i < expected.size(); ++i)
+      max_error = std::max(max_error, std::fabs(expected[i] - actual[i]));
+  }
+  expect(max_error <= 1.2e-7F,
+         "real-axis rotary tables retain F64 intermediates through final F32 cast");
+  std::cout << "rotary frequency real axes max_abs=" << max_error << "\n";
+}
+
 int main() {
+  run_frequency_precision();
   run_layout(dif::ir::RotaryLayout::Interleaved, "interleaved");
   run_layout(dif::ir::RotaryLayout::HalfSplit, "half-split");
   // The unrotated tail (columns >= 2P) must pass through untouched in both.

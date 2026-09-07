@@ -1,0 +1,2410 @@
+//! Cross-backend video control-plane tests.
+
+use super::*;
+
+#[test]
+fn minimax_h3_compiler_defaults_come_from_json_and_preserve_explicit_values() {
+    let mut doc = difc_config::current().unwrap().clone();
+    doc["minimax_h3"]["profile"]["quant"] = json!("bf16");
+    let body = compiler_h3_request_defaults(&json!({"model":"minimax_h3", "prompt":"test"}), &doc);
+    assert_eq!(body["quant"], "bf16");
+    assert_eq!(body["width"], doc["minimax_h3"]["profile"]["width"]);
+    assert_eq!(body["attention_backend"], doc["minimax_h3"]["profile"]["attention"]);
+    assert!(validate_compiler_h3_request(&body).is_ok());
+    let explicit = compiler_h3_request_defaults(&json!({"task":"i2va", "quant":"int8", "steps":null}), &doc);
+    assert_eq!(explicit["task"], "i2va");
+    assert_eq!(explicit["quant"], "int8");
+    assert!(explicit["steps"].is_null());
+}
+
+#[test]
+fn minimax_h3_compiler_keyframes_validate_and_stage_without_resizing() {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("difc-h3-keyframes-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("input with spaces.png");
+    let pixels = image::RgbImage::from_fn(64, 32, |x, y| image::Rgb([x as u8, y as u8, 127]));
+    pixels.save(&source).unwrap();
+    let mut request = json!({"task":"fl2va", "source_image":source, "last_frame":source});
+    let inputs = compiler_h3_keyframes(&request, 64, 32).unwrap();
+    assert_eq!(inputs.len(), 2);
+    let args = stage_compiler_h3_keyframes(&inputs, &root).unwrap();
+    assert!(args[0].starts_with("--source-image="));
+    assert!(args[1].starts_with("--last-frame="));
+    assert_eq!(image::open(root.join("source_image.png")).unwrap().to_rgb8(), pixels);
+    assert!(compiler_h3_keyframes(&request, 32, 64).unwrap_err().contains("must be 32x64"));
+    request["task"] = json!("t2va");
+    assert!(compiler_h3_keyframes(&request, 64, 32).unwrap_err().contains("does not consume"));
+    request["task"] = json!("i2va");
+    request.as_object_mut().unwrap().remove("last_frame");
+    assert_eq!(compiler_h3_keyframes(&request, 64, 32).unwrap().len(), 1);
+    request["task"] = json!("l2va");
+    request["last_frame"] = request["source_image"].clone();
+    request.as_object_mut().unwrap().remove("source_image");
+    assert_eq!(compiler_h3_keyframes(&request, 64, 32).unwrap().len(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn minimax_h3_compiler_references_preserve_audio_order_roles_and_staging() {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("difc-h3-references-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("image with spaces.png");
+    let pixels = image::RgbImage::from_fn(4, 6, |x, y| image::Rgb([x as u8, y as u8, 127]));
+    pixels.save(&source).unwrap();
+
+    // A two-second, 16 kHz mono PCM fixture exercises the existing stereo
+    // resampling path without a model, GPU, or external source media.
+    let audio = root.join("audio with spaces.wav");
+    let data_len = 16000_u32 * 2 * 2;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&16000_u32.to_le_bytes());
+    wav.extend_from_slice(&32000_u32.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize(44 + data_len as usize, 0);
+    std::fs::write(&audio, wav).unwrap();
+
+    let mut doc = difc_config::h3_task_document(difc_config::current().unwrap(), "ref2va").unwrap();
+    doc["minimax_h3"]["task_configs"] = json!({});
+    doc["minimax_h3"]["references"]["kinds"] = json!(["image", "audio"]);
+    let mut request = json!({"task":"ref2va", "prompt":"summary:\nMake the scene.", "references":[
+        {"kind":"audio", "path":audio, "audio_use":"reuse"},
+        {"kind":"image", "path":source},
+        {"kind":"audio", "path":audio, "audio_use":"voice_timbre"},
+        {"kind":"image", "path":source},
+        {"kind":"audio", "path":audio}
+    ]});
+    let (args, prompt) = stage_compiler_h3_references(&request, &doc, &root).unwrap();
+    assert_eq!(args, vec![
+        format!("--reference-audio={}", root.join("ref_audio_input_0.wav").display()),
+        format!("--reference-image={}", root.join("reference-input-1.png").display()),
+        format!("--reference-audio={}", root.join("ref_audio_input_2.wav").display()),
+        format!("--reference-image={}", root.join("reference-input-3.png").display()),
+        format!("--reference-audio={}", root.join("ref_audio_input_4.wav").display()),
+    ]);
+    assert_eq!(prompt, concat!(
+        "reference_audio_intent:\n",
+        "<Audio 1>: partially_copy - reuse this audio in the target soundtrack where instructed.\n",
+        "<Audio 2>: reference - use its voice timbre for generated speech, without copying its spoken content.\n",
+        "<Audio 3>: reference - use this as an audio-conditioning reference where relevant.\n\n",
+        "summary:\nMake the scene.",
+    ));
+    assert_eq!(image::open(root.join("reference-input-1.png")).unwrap().to_rgb8(), pixels);
+    let probe = probe_video_path(root.join("ref_audio_input_0.wav").to_str().unwrap()).unwrap();
+    assert_eq!(probe["audio_codec"], "pcm_s16le");
+    assert_eq!(probe["audio_sample_rate"], 32000);
+    assert_eq!(probe["audio_channels"], 2);
+    assert_eq!(probe["audio_duration"], 2.0);
+
+    request["references"] = json!([{"kind":"audio", "path":audio}]);
+    assert!(compiler_h3_references(&request, &doc).unwrap_err().contains("must accompany"));
+    request["references"] = json!([
+        {"kind":"image", "path":source},
+        {"kind":"audio", "path":audio}, {"kind":"audio", "path":audio},
+        {"kind":"audio", "path":audio}, {"kind":"audio", "path":audio}
+    ]);
+    assert!(compiler_h3_references(&request, &doc).unwrap_err().contains("at most 3 audio"));
+    request["references"] = json!([{"kind":"image", "path":source}]);
+    let (_, prompt) = stage_compiler_h3_references(&request, &doc, &root).unwrap();
+    assert_eq!(prompt, request["prompt"].as_str().unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn minimax_h3_compiler_rejects_unimplemented_controls() {
+    let doc = difc_config::current().unwrap();
+    let mut request = doc["minimax_h3"]["profile"].clone();
+    request["attention_backend"] = request["attention"].clone();
+    assert!(validate_compiler_h3_request(&request).is_ok());
+    request["seed"] = json!(-1);
+    assert!(validate_compiler_h3_request(&request).unwrap_err().contains("seed"));
+    request["seed"] = json!(9001);
+    request["step_cache"] = json!("unsupported");
+    assert!(validate_compiler_h3_request(&request).is_err());
+    request["step_cache"] = json!("exact");
+    request["lora"] = json!([{"name":"neutral-test.safetensors", "strength":1.0}]);
+    assert!(validate_compiler_h3_request(&request).unwrap_err().contains("LoRA"));
+    request["lora"] = json!([]);
+    request["task"] = json!("ref2va");
+    assert!(validate_compiler_h3_request(&request).is_err());
+    request["task"] = json!("continue");
+    request["motion_context_frames"] = json!(6);
+    assert!(validate_compiler_h3_request(&request).is_err());
+}
+
+#[test]
+fn minimax_h3_compiler_rejects_zero_lora_before_resolving_weights() {
+    let doc = difc_config::current().unwrap();
+    for weight in [0.0, -0.0, 1.0e-50] {
+        let request = json!({"lora":[{"path":"/missing-test-adapter.safetensors", "weight":weight}]});
+        assert!(compiler_h3_lora_args(&request, doc).unwrap_err().contains("nonzero"));
+    }
+}
+
+#[test]
+fn minimax_h3_compiler_step_cache_uses_json_admission_and_keeps_controlnet_exact() {
+    let mut doc = difc_config::current().unwrap().clone();
+    doc["minimax_h3"]["task_configs"] = json!({});
+    doc["minimax_h3"]["profile"]["step_cache"] = json!("exact");
+    doc["minimax_h3"]["profile"]["step_cache_modes"] = json!(["exact", "high"]);
+    let mut request = compiler_h3_request_defaults(&json!({"task":"t2va"}), &doc);
+    assert_eq!(request["step_cache"], "exact");
+    assert!(validate_compiler_h3_request_in(&request, &doc).is_ok());
+
+    request["step_cache"] = json!("high");
+    assert_eq!(compiler_h3_request_defaults(&request, &doc)["step_cache"], "high");
+    for quant in doc["minimax_h3"]["profile"]["quant_modes"].as_array().unwrap() {
+        request["quant"] = quant.clone();
+        assert!(validate_compiler_h3_request_in(&request, &doc).is_ok());
+    }
+    request["controls"] = json!([]);
+    assert!(validate_compiler_h3_request_in(&request, &doc).is_ok());
+    doc["minimax_h3"]["control"]["enabled"] = json!(true);
+    request["controls"] = json!([{}]);
+    assert!(validate_compiler_h3_request_in(&request, &doc).unwrap_err().contains("ControlNet requires exact"));
+    request["controls"] = json!([]);
+
+    request["attention_backend"] = json!("unsupported");
+    assert!(validate_compiler_h3_request_in(&request, &doc).unwrap_err().contains("attention"));
+    request["attention_backend"] = doc["minimax_h3"]["profile"]["attention"].clone();
+    for invalid in [json!("unsupported"), json!(null), json!(1)] {
+        request["step_cache"] = invalid;
+        assert!(validate_compiler_h3_request_in(&request, &doc).unwrap_err().contains("step_cache"));
+    }
+    request["step_cache"] = json!("high");
+    doc["minimax_h3"]["profile"]["step_cache_modes"] = json!(["exact"]);
+    assert!(validate_compiler_h3_request_in(&request, &doc).unwrap_err().contains("step_cache"));
+    doc["minimax_h3"]["profile"].as_object_mut().unwrap().remove("step_cache_modes");
+    assert!(validate_compiler_h3_request_in(&request, &doc).unwrap_err().contains("step_cache"));
+    request.as_object_mut().unwrap().remove("step_cache");
+    assert!(validate_compiler_h3_request_in(&request, &doc).is_ok());
+}
+
+#[test]
+fn ltx2_prompt_normalization_removes_token_changing_edge_whitespace() {
+    let normalized = normalize_ltx2_prompt_fields(&json!({
+        "prompt": "  a woman turns toward camera \n",
+        "negative": "\twatermark  ",
+    }));
+    assert_eq!(normalized["prompt"], "a woman turns toward camera");
+    assert_eq!(normalized["negative"], "watermark");
+}
+
+#[test]
+fn ltx2_camera_motion_attaches_one_real_adapter_and_one_prompt_suffix() {
+    let normalized = normalized_ltx2_camera_motion_request(&json!({
+        "prompt": "A woman turns toward the camera",
+        "camera_motion": "dolly_in",
+    }))
+    .unwrap();
+    assert_eq!(
+        normalized["prompt"],
+        "A woman turns toward the camera, dolly in, camera pushing forward, smooth forward movement"
+    );
+    assert_eq!(
+        normalized["creator_prompt"],
+        "A woman turns toward the camera"
+    );
+    assert_eq!(normalized["creator_camera_motion_applied"], true);
+    assert_eq!(normalized["lora"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        normalized["lora"][0]["name"],
+        "ltx-2-19b-lora-camera-control-dolly-in.safetensors"
+    );
+    assert_eq!(normalized["lora"][0]["source"], "camera_control");
+    let repeated = normalized_ltx2_camera_motion_request(&normalized).unwrap();
+    assert_eq!(repeated["prompt"], normalized["prompt"]);
+    assert_eq!(repeated["lora"].as_array().unwrap().len(), 1);
+    assert!(normalized_ltx2_camera_motion_request(&json!({
+        "prompt": "probe",
+        "camera_motion": "orbit",
+    }))
+    .unwrap_err()
+    .contains("unsupported LTX camera_motion"));
+}
+
+#[test]
+fn wan_camera_motion_is_explicit_and_idempotent() {
+    let normalized = normalized_wan22_camera_motion_request(&json!({
+        "prompt": "A blonde cyborg turns toward the camera",
+        "camera_motion": "dolly_in",
+    }))
+    .unwrap();
+    assert_eq!(
+        normalized["prompt"],
+        "A blonde cyborg turns toward the camera, dolly in, camera pushing forward, smooth forward movement"
+    );
+    assert_eq!(
+        normalized["creator_prompt"],
+        "A blonde cyborg turns toward the camera"
+    );
+    assert_eq!(normalized["creator_camera_motion_applied"], true);
+    let repeated = normalized_wan22_camera_motion_request(&normalized).unwrap();
+    assert_eq!(repeated["prompt"], normalized["prompt"]);
+    assert!(normalized_wan22_camera_motion_request(&json!({
+        "prompt": "probe",
+        "camera_motion": "orbit",
+    }))
+    .unwrap_err()
+    .contains("unsupported Wan camera_motion"));
+}
+
+#[test]
+fn wan_i2v_size_matches_creator_max_area_alignment() {
+    assert_eq!(wan22_creator_i2v_size(544, 960), (704, 1248));
+    assert_eq!(wan22_creator_i2v_size(960, 544), (1248, 704));
+    assert_eq!(wan22_creator_i2v_size(704, 1280), (704, 1280));
+    assert_eq!(wan22_creator_i2v_size(1280, 704), (1280, 704));
+    assert_eq!(wan22_creator_i2v_size(1024, 1024), (960, 928));
+}
+
+#[test]
+fn ltx2_mojo_request_accepts_creator_first_and_last_keyframes() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "serenity-ltx2-keyframes-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let caps = root.join("caps.json");
+    let first = root.join("first.png");
+    let last = root.join("last.png");
+    std::fs::write(&caps, b"{}").unwrap();
+    std::fs::write(&first, b"first-frame fixture").unwrap();
+    std::fs::write(&last, b"last-frame fixture").unwrap();
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "the subject turns and settles into the final pose",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+        "image_path": first,
+        "image_strength": 1.0,
+        "last_image_path": last,
+        "last_image_strength": 1.0,
+    });
+    validate_ltx2_mojo_request(&request).unwrap();
+    let mut with_video = request;
+    with_video["video_path"] = json!(root.join("source.mp4"));
+    std::fs::write(with_video["video_path"].as_str().unwrap(), b"video fixture").unwrap();
+    assert!(validate_ltx2_mojo_request(&with_video)
+        .unwrap_err()
+        .contains("mutually exclusive"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn sulphur_checkpoint_defaults_to_the_creator_workflow() {
+    for checkpoint in [
+        "sulphur_dev_bf16",
+        "sulphur_dev_fp8mixed",
+        "sulphur_dev_fp8_serenity",
+    ] {
+        let normalized = normalized_ltx2_checkpoint_workflow_request(&json!({
+            "checkpoint": checkpoint,
+            "prompt": "creator workflow probe",
+            "negative": "",
+            "guidance_mode": "dev",
+            "sampler": "res2s",
+            "scheduler": "ltx2",
+            "steps": 20,
+            "workflow_profile": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            normalized["workflow_profile"],
+            "sulphur-2-base-distilled-v1"
+        );
+        assert_eq!(normalized["guidance_mode"], "distilled");
+        assert_eq!(normalized["sampler"], "euler_ancestral_cfg_pp");
+        assert_eq!(normalized["scheduler"], "sulphur_creator_8_3");
+        assert_eq!(normalized["steps"], 8);
+        assert_eq!(
+            normalized["negative"],
+            "pc game, console game, video game, cartoon, childish, ugly"
+        );
+        assert_eq!(
+            normalized["creator_workflow_source"],
+            "https://huggingface.co/SulphurAI/Sulphur-2-base/blob/main/workflows/ltx23_t2v%20distilled.json"
+        );
+    }
+}
+
+#[test]
+fn official_ltx2_dev_aliases_share_the_creator_fast_identity() {
+    for checkpoint in [
+        "ltx-2.3-22b-dev",
+        "ltx-2.3-22b-dev.safetensors",
+        LTX2_REFHQ_CHECKPOINT,
+        "ltx-2.3-22b-dev-fp8.safetensors",
+        LTX2_REFHQ_BF16_CHECKPOINT,
+        "ltx-2.3-22b-dev-fp8-dequant-bf16.safetensors",
+    ] {
+        assert!(
+            is_official_ltx2_dev_checkpoint_name(checkpoint),
+            "official alias was not recognized: {checkpoint}"
+        );
+    }
+    assert!(!is_official_ltx2_dev_checkpoint_name(
+        "a-user-ltx23-full-finetune"
+    ));
+}
+
+#[test]
+fn sulphur_creator_registry_uses_the_published_enhancer_artifacts() {
+    let bf16_profile = ltx2_checkpoint_workflow("sulphur_dev_bf16.safetensors").unwrap();
+    let profile = ltx2_checkpoint_workflow("sulphur_dev_fp8_serenity.safetensors").unwrap();
+    assert_eq!(profile["id"], bf16_profile["id"]);
+    assert_eq!(
+        profile["prompt_enhancer"]["weights"],
+        "prompt_enhancer/sulphur_prompt_enhancer_model-q8_0.gguf"
+    );
+    assert_eq!(
+        profile["prompt_enhancer"]["mmproj"],
+        "prompt_enhancer/mmproj-BF16.gguf"
+    );
+    assert_eq!(profile["distillation_adapter"]["stage1_weight"], 0.7);
+    assert_eq!(profile["distillation_adapter"]["stage2_weight"], 0.5);
+}
+
+#[test]
+fn ltx2_temporal_edits_pin_creator_cudnn_before_general_mojo_runtime() {
+    let standard = std::env::split_paths(&ltx2_request_ld_path("standard"))
+        .next()
+        .unwrap();
+    let retake = std::env::split_paths(&ltx2_request_ld_path("retake"))
+        .next()
+        .unwrap();
+    let extend = std::env::split_paths(&ltx2_request_ld_path("extend_end"))
+        .next()
+        .unwrap();
+    assert_eq!(standard, repo_root().join(".pixi/envs/default/lib"));
+    assert_eq!(retake, ltx2_decode_cudnn_lib());
+    assert_eq!(extend, ltx2_decode_cudnn_lib());
+}
+
+#[test]
+fn ltx2_profile_runner_rejects_stale_build_inputs() {
+    let base = std::time::UNIX_EPOCH;
+    let runner = base + std::time::Duration::from_secs(20);
+    assert!(
+        !LTX2_REQUEST_RUNNER_BUILD_INPUTS
+            .contains(&"serenitymojo/configs/ltx2_checkpoint_workflows.json"),
+        "server-only workflow aliases must not stale every AOT geometry runner"
+    );
+    assert!(ltx2_runner_mtime_covers_inputs(
+        runner,
+        &[
+            base + std::time::Duration::from_secs(10),
+            base + std::time::Duration::from_secs(20),
+        ],
+    ));
+    assert!(!ltx2_runner_mtime_covers_inputs(
+        runner,
+        &[base + std::time::Duration::from_secs(21)],
+    ));
+}
+
+#[test]
+fn minimax_h3_request_is_runtime_adjustable_and_switchable() {
+    let registry = minimax_h3_request_profile_registry();
+    assert_eq!(registry.runner, minimax_h3_runner());
+    for profile in &registry.profiles {
+        for quant in &profile.quant_modes {
+            assert_eq!(
+                minimax_h3_request_runner(profile, quant.as_str()),
+                Some(minimax_h3_runner()),
+            );
+        }
+    }
+
+    let mut request = json!({
+        "model": "minimax_h3",
+        "runner": "minimax_h3_mojo_request",
+        "prompt": "an arbitrary authored prompt",
+        "width": 1344,
+        "height": 768,
+        "frames": 48,
+        "fps": 24,
+        "duration_seconds": 2.0,
+        "steps": 20,
+        "seed": 0,
+        "quant": "int8",
+        "attention_backend": "cudnn",
+        "step_cache": "high",
+        "include_audio": true,
+    });
+    validate_minimax_h3_request(&request).unwrap();
+    let geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert_eq!(geometry.output_frames, 48);
+    assert_eq!(geometry.model_output_frames, 48);
+    assert_eq!(geometry.internal_frames, 56);
+
+    request["duration_seconds"] = json!(5.0);
+    request["frames"] = json!(120);
+    request["quant"] = json!("int8-fast");
+    let resident_geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert_eq!(resident_geometry.sequence_tokens, 37_951);
+    assert_eq!(
+        minimax_h3_runtime_resident_blocks(&resident_geometry, "int8-fast"),
+        8,
+    );
+    assert_eq!(
+        minimax_h3_runtime_resident_blocks(&resident_geometry, "int8"),
+        0,
+    );
+    let low_vram = MiniMaxH3GpuMemory {
+        free_mib: 10_748,
+        total_mib: 16_303,
+    };
+    assert!(minimax_h3_low_vram_mode(Some(&low_vram)));
+    assert_eq!(
+        minimax_h3_runtime_resident_blocks_for_memory(
+            &resident_geometry,
+            "int8-fast",
+            Some(&low_vram),
+        ),
+        0,
+    );
+    assert!(minimax_h3_low_vram_admission(Some(&low_vram)).is_err());
+    let low_vram_ready = MiniMaxH3GpuMemory {
+        free_mib: 14_690,
+        total_mib: 16_303,
+    };
+    assert!(minimax_h3_low_vram_admission(Some(&low_vram_ready)).is_ok());
+    let product_vram = MiniMaxH3GpuMemory {
+        free_mib: 22_000,
+        total_mib: 24_000,
+    };
+    assert!(!minimax_h3_low_vram_mode(Some(&product_vram)));
+    assert_eq!(
+        minimax_h3_runtime_resident_blocks_for_memory(
+            &resident_geometry,
+            "int8-fast",
+            Some(&product_vram),
+        ),
+        8,
+    );
+    request["duration_seconds"] = json!(7.0);
+    request["frames"] = json!(168);
+    let streamed_geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert!(streamed_geometry.sequence_tokens > 37_951);
+    assert_eq!(
+        minimax_h3_runtime_resident_blocks(&streamed_geometry, "int8-fast"),
+        0,
+    );
+    request["quant"] = json!("int8");
+
+    for (seconds, output_frames, internal_frames) in
+        [(1.0, 24, 39), (4.0, 96, 107), (15.0, 360, 362)]
+    {
+        request["duration_seconds"] = json!(seconds);
+        request["frames"] = json!(output_frames);
+        let geometry = minimax_h3_runtime_geometry(&request).unwrap();
+        assert_eq!(geometry.output_frames, output_frames);
+        assert_eq!(geometry.internal_frames, internal_frames);
+        validate_minimax_h3_request(&request).unwrap();
+    }
+
+    request["width"] = json!(1536);
+    request["height"] = json!(672);
+    request["fps"] = json!(120);
+    request["frames"] = json!(1800);
+    request["duration_seconds"] = json!(15.0);
+    let geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert_eq!(geometry.output_frames, 1800);
+    assert_eq!(geometry.model_output_frames, 360);
+    assert_eq!(geometry.internal_frames, 362);
+
+    request["quant"] = json!("int8-fast");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("sage-int8");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("ck-int8");
+    validate_minimax_h3_request(&request).unwrap();
+    request["quant"] = json!("bf16");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("sage-int8");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("Sage attention is available only with INT8"));
+    request["attention_backend"] = json!("cudnn");
+    validate_minimax_h3_request(&request).unwrap();
+    request["step_cache"] = json!("invalid");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("step_cache must be 'exact' or 'high'"));
+    request["step_cache"] = json!("exact");
+
+    for (_, width, height) in MINIMAX_H3_NATIVE_RESOLUTIONS {
+        request["width"] = json!(width);
+        request["height"] = json!(height);
+        validate_minimax_h3_request(&request).unwrap();
+    }
+    request["width"] = json!(992);
+    request["height"] = json!(576);
+    validate_minimax_h3_request(&request).unwrap();
+    request["width"] = json!(MINIMAX_H3_MAX_DIMENSION);
+    request["height"] = json!(MINIMAX_H3_MIN_DIMENSION);
+    validate_minimax_h3_request(&request).unwrap();
+
+    request["width"] = json!(33);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("32-pixel steps"));
+    request["width"] = json!(MINIMAX_H3_MAX_DIMENSION);
+    request["height"] = json!(MINIMAX_H3_MAX_DIMENSION);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("24-GB product envelope"));
+    request["width"] = json!(1536);
+    request["height"] = json!(672);
+    request["fps"] = json!(24);
+    request["duration_seconds"] = json!(30.0);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("above the 107000-token 24-GB envelope"));
+    request["width"] = json!(512);
+    request["height"] = json!(320);
+    request["duration_seconds"] = json!(30.0);
+    request["frames"] = json!(720);
+    validate_minimax_h3_request(&request).unwrap();
+    let long_geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert!(long_geometry.internal_frames > 362);
+    assert!(long_geometry.sequence_tokens < MINIMAX_H3_LONG_CONTEXT_MAX_SEQUENCE_TOKENS);
+    request["width"] = json!(320);
+    request["height"] = json!(192);
+    request["duration_seconds"] = json!(180.0);
+    request["frames"] = json!(4320);
+    validate_minimax_h3_request(&request).unwrap();
+    let monolithic_geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert_eq!(monolithic_geometry.output_frames, 4320);
+    assert_eq!(monolithic_geometry.internal_frames, 4323);
+    assert_eq!(monolithic_geometry.sequence_tokens, 90_971);
+    request["duration_seconds"] = json!(180.01);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("1 through 180 seconds"));
+    request["task"] = json!("i2va");
+    request["duration_seconds"] = json!(60.01);
+    assert!(minimax_h3_runtime_geometry(&request)
+        .unwrap_err()
+        .contains("1 through 60 seconds"));
+    request["task"] = json!("t2va");
+    request["duration_seconds"] = json!(2.0);
+    request["frames"] = json!(48);
+    request["prompt"] = json!(" ");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("must not be empty"));
+    request["prompt"] = json!("a different prompt");
+    request["quant"] = json!("fp8");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("'int8-fast', 'int8', or 'bf16'"));
+}
+
+#[test]
+fn minimax_h3_compiler_requires_sealed_caches_but_not_mojo_quality_reports() {
+    let profile = minimax_h3_default_profile();
+    for quant in ["int8-fast", "int8", "bf16"] {
+        assert!(minimax_h3_profile_mode_supported(profile, quant));
+        for missing in minimax_h3_missing(profile, quant) {
+            // The native runner consumes a pre-sealed modulation cache. Unlike
+            // the old Mojo runtime, it does not generate this on first use.
+            assert!(!missing.contains("resident_groupwise"), "{missing}");
+            assert!(!missing.contains("gate.json"), "{missing}");
+        }
+        for missing in minimax_h3_conditioned_missing("i2va", quant) {
+            assert!(!missing.contains("serenity_runtime_cache_v1"), "{missing}");
+            assert!(!missing.contains("gate.json"), "{missing}");
+        }
+    }
+    assert!(minimax_h3_resident_cache_path("bf16", false).is_none());
+    assert!(minimax_h3_resident_cache_path("int8", false)
+        .unwrap()
+        .ends_with("resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors"));
+    assert!(minimax_h3_resident_cache_path("int8-fast", true)
+        .unwrap()
+        .ends_with("resident_w8a8_row_blocks_50.safetensors"));
+}
+
+#[test]
+fn minimax_h3_native_continuation_preserves_authored_time_and_validates_source() {
+    let mut request = json!({
+        "model": "minimax_h3",
+        "runner": "minimax_h3_mojo_request",
+        "task": "continue",
+        "continue_from": "video-0012",
+        "motion_context_frames": 22,
+        "prompt": "continue the motion without a cut",
+        "width": 768,
+        "height": 768,
+        "frames": 48,
+        "fps": 24,
+        "duration_seconds": 2.0,
+        "steps": 20,
+        "seed": 12,
+        "quant": "int8",
+        "attention_backend": "cudnn",
+        "step_cache": "exact",
+        "include_audio": true,
+    });
+    for (context_frames, internal_frames) in [(5, 56), (22, 73), (39, 90)] {
+        request["motion_context_frames"] = json!(context_frames);
+        validate_minimax_h3_request(&request).unwrap();
+        let geometry = minimax_h3_runtime_geometry(&request).unwrap();
+        assert_eq!(geometry.output_frames, 48);
+        assert_eq!(geometry.model_output_frames, 48);
+        assert_eq!(geometry.internal_frames, internal_frames);
+        assert_eq!(geometry.motion_context_frames, context_frames);
+        assert_eq!(geometry.trim_start_frames, context_frames);
+    }
+    request["motion_context_frames"] = json!(6);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("must be 5, 22, or 39"));
+    request["motion_context_frames"] = json!(22);
+    request["continue_from"] = json!("../video-0012");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("local video job id"));
+    request["continue_from"] = json!("video-0012");
+
+    request["references"] = json!([{
+        "kind": "image",
+        "path": repo_path("serenity-server/Cargo.toml"),
+        "audio_use": "reference",
+    }]);
+    assert!(minimax_h3_continue_with_references(&request));
+    validate_minimax_h3_request(&request).unwrap();
+    assert_eq!(minimax_h3_conditioned_runner("ref2va", "int8").as_deref(), Some(minimax_h3_runner()));
+    request["duration_seconds"] = json!(16.0);
+    request["frames"] = json!(384);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("reference-conditioned Continue segments remain limited"));
+    request["duration_seconds"] = json!(2.0);
+    request["frames"] = json!(48);
+    request["references"] = json!([{
+        "kind": "audio",
+        "path": repo_path("serenity-server/Cargo.toml"),
+        "audio_use": "voice_timbre",
+    }]);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("audio references must accompany at least one image or video"));
+    request["references"] = json!([{
+        "kind": "image",
+        "path": repo_path("serenity-server/Cargo.toml"),
+        "audio_use": "reference",
+    }]);
+
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let root = std::env::temp_dir().join(format!("serenity-h3-motion-{suffix}"));
+    let source_dir = root.join("video-0012");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(
+        source_dir.join("result.json"),
+        serde_json::to_vec(&json!({
+            "state": "done",
+            "model": "minimax_h3",
+            "width": 768,
+            "height": 768,
+            "motion_context_available": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(source_dir.join("motion_context.safetensors"), b"tail").unwrap();
+    let source = minimax_h3_continuation_source(&root, &request).unwrap();
+    assert_eq!(source.job_id, "video-0012");
+    assert_eq!(
+        source.latent_path,
+        source_dir.join("motion_context.safetensors")
+    );
+
+    request["width"] = json!(1024);
+    assert!(minimax_h3_continuation_source(&root, &request)
+        .unwrap_err()
+        .contains("must keep the source resolution"));
+    request["width"] = json!(768);
+    std::fs::remove_file(source_dir.join("motion_context.safetensors")).unwrap();
+    assert!(minimax_h3_continuation_source(&root, &request)
+        .unwrap_err()
+        .contains("no retained native latent tail"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn minimax_h3_conditioned_requests_preserve_exact_media_contracts() {
+    let media = repo_path("serenity-server/Cargo.toml");
+    assert!(nonempty_file(&media));
+    let mut request = json!({
+        "model": "minimax_h3",
+        "runner": "minimax_h3_mojo_request",
+        "task": "i2va",
+        "prompt": "an arbitrary conditioned prompt",
+        "source_image": media,
+        "width": 1024,
+        "height": 768,
+        "frames": 96,
+        "fps": 24,
+        "duration_seconds": 4.0,
+        "steps": 19,
+        "seed": 7,
+        "quant": "int8",
+        "attention_backend": "cudnn",
+        "step_cache": "high",
+        "include_audio": true,
+    });
+    validate_minimax_h3_request(&request).unwrap();
+    request["quant"] = json!("int8-fast");
+    request["attention_backend"] = json!("sage-int8");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("ck-int8");
+    validate_minimax_h3_request(&request).unwrap();
+    request["quant"] = json!("bf16");
+    validate_minimax_h3_request(&request).unwrap();
+    request["attention_backend"] = json!("sage-int8");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("Sage attention is available only with INT8"));
+    request["attention_backend"] = json!("ck-int8");
+    let geometry = minimax_h3_runtime_geometry(&request).unwrap();
+    assert_eq!((geometry.width, geometry.height), (1024, 768));
+    assert_eq!(geometry.output_frames, 96);
+    assert_eq!(geometry.internal_frames, 107);
+    let mut long_request = request.clone();
+    long_request["width"] = json!(512);
+    long_request["height"] = json!(320);
+    long_request["frames"] = json!(720);
+    long_request["duration_seconds"] = json!(30.0);
+    validate_minimax_h3_request(&long_request).unwrap();
+    assert!(
+        minimax_h3_runtime_geometry(&long_request)
+            .unwrap()
+            .internal_frames
+            > 362
+    );
+    long_request["task"] = json!("ref2va");
+    assert!(validate_minimax_h3_request(&long_request)
+        .unwrap_err()
+        .contains("Ref2VA remains limited to the trained 15-second window"));
+    request["task"] = json!("fl2va");
+    request["last_frame"] = request["source_image"].clone();
+    validate_minimax_h3_request(&request).unwrap();
+    request["task"] = json!("l2va");
+    request.as_object_mut().unwrap().remove("source_image");
+    validate_minimax_h3_request(&request).unwrap();
+    request["task"] = json!("ref2va");
+    request["source_image"] = json!(media);
+    validate_minimax_h3_request(&request).unwrap();
+    request["task"] = json!("fl2va");
+    request.as_object_mut().unwrap().remove("last_frame");
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("last_frame is required"));
+}
+
+#[test]
+fn minimax_h3_ref2va_preserves_order_limits_and_audio_intent() {
+    let media = repo_path("serenity-server/Cargo.toml");
+    let mut request = json!({
+        "model": "minimax_h3",
+        "task": "ref2va",
+        "prompt": "Keep <Image 1> and the lighting from <Image 2>.",
+        "references": [
+            {"kind": "image", "path": media, "audio_use": "reference"},
+            {"kind": "image", "path": media, "audio_use": "reuse"}
+        ],
+        "width": 768,
+        "height": 768,
+        "duration_seconds": 4.0,
+        "frames": 96,
+        "fps": 24,
+        "steps": 20,
+        "quant": "int8",
+        "attention_backend": "cudnn",
+        "step_cache": "exact",
+        "include_audio": true,
+    });
+    validate_minimax_h3_request(&request).unwrap();
+    let references = minimax_h3_ref2va_references(&request).unwrap();
+    assert_eq!(references.len(), 2);
+    assert_eq!(references[0].kind, "image");
+    assert_eq!(references[1].audio_use, "reuse");
+
+    request["references"] = Value::Array(
+        (0..10)
+            .map(|_| json!({"kind": "image", "path": media}))
+            .collect(),
+    );
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("at most 9 image references"));
+
+    request["references"] = json!([
+        {"kind": "audio", "path": media, "audio_use": "voice_timbre"}
+    ]);
+    assert!(validate_minimax_h3_request(&request)
+        .unwrap_err()
+        .contains("must accompany at least one image or video"));
+
+    let roles = minimax_h3_ref2va_prompt_with_audio_roles(
+        "summary:\nMake the scene.",
+        &[
+            MiniMaxH3ReferenceInput {
+                kind: "video".to_string(),
+                path: media.clone(),
+                audio_use: "reuse".to_string(),
+                has_audio: true,
+                duration: 4.0,
+            },
+            MiniMaxH3ReferenceInput {
+                kind: "audio".to_string(),
+                path: media,
+                audio_use: "voice_timbre".to_string(),
+                has_audio: true,
+                duration: 3.0,
+            },
+        ],
+    );
+    assert!(roles.contains("<Audio 1>: partially_copy"));
+    assert!(roles.contains("<Audio 2>: reference - use its voice timbre"));
+    assert!(roles.ends_with("summary:\nMake the scene."));
+}
+
+#[test]
+fn minimax_h3_ref2va_long_sequences_stream_the_w8a8_tail() {
+    let short = minimax_h3_runtime_geometry(&json!({
+        "width": 768,
+        "height": 768,
+        "frames": 24,
+        "fps": 24,
+        "duration_seconds": 1.0,
+    }))
+    .unwrap();
+    assert_eq!(minimax_h3_ref2va_resident_blocks(&short, "int8-fast"), 4);
+
+    let long = minimax_h3_runtime_geometry(&json!({
+        "width": 1344,
+        "height": 768,
+        "frames": 288,
+        "fps": 24,
+        "duration_seconds": 12.0,
+    }))
+    .unwrap();
+    assert!(long.sequence_tokens > MINIMAX_H3_REF2VA_RESIDENT_SEQUENCE_LIMIT);
+    assert_eq!(minimax_h3_ref2va_resident_blocks(&long, "int8-fast"), 0);
+    assert_eq!(minimax_h3_ref2va_resident_blocks(&long, "int8"), 0);
+    assert_eq!(minimax_h3_ref2va_resident_blocks(&long, "bf16"), 0);
+}
+
+#[test]
+fn minimax_h3_ref2va_portrait_source_stages_square_identity_canvas() {
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let root = std::env::temp_dir().join(format!("serenity-h3-ref2va-{suffix}"));
+    std::fs::create_dir_all(&root).unwrap();
+    let source_path = root.join("portrait.png");
+    let source = image::RgbImage::from_fn(4, 6, |x, y| {
+        image::Rgb([(x * 40) as u8, (y * 30) as u8, 90])
+    });
+    source.save(&source_path).unwrap();
+
+    let (prepared_path, metadata) =
+        stage_minimax_h3_ref2va_image_reference(&source_path, &root).unwrap();
+    assert_eq!(
+        image::image_dimensions(&prepared_path).unwrap(),
+        (MINIMAX_H3_REF2VA_IMAGE_SIDE, MINIMAX_H3_REF2VA_IMAGE_SIDE),
+    );
+    assert_eq!(metadata["policy"], "cover_center_crop_square_768");
+    assert_eq!(metadata["original_width"], 4);
+    assert_eq!(metadata["original_height"], 6);
+    assert_eq!(metadata["crop_left"], 0);
+    assert_eq!(metadata["crop_top"], 1);
+    assert_eq!(metadata["crop_width"], 4);
+    assert_eq!(metadata["crop_height"], 4);
+    assert_eq!(metadata["model_inference"], "gpu");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn minimax_h3_runner_log_reports_cache_and_real_denoise_progress() {
+    let cache = minimax_h3_progress_from_log(
+        "  conditioning cache: HIT /tmp/cond.bin\n\
+         resident cache: loaded block 15 / 40\n",
+        20,
+    )
+    .unwrap();
+    assert_eq!(cache.0, "resident_cache");
+    assert_eq!(cache.1, 0);
+    assert_eq!(cache.2, 20);
+    assert!(cache.3.contains("15 of 40"));
+
+    let denoise =
+        minimax_h3_progress_from_log("phase=denoise step= 7 total= 19 video_t= 0.5\n", 20).unwrap();
+    assert_eq!(denoise.0, "denoise");
+    assert_eq!(denoise.1, 7);
+    assert_eq!(denoise.2, 20);
+    assert!(denoise.3.contains("7 of 19"));
+
+    let streamed_tail = minimax_h3_progress_from_log(
+        "resident cache: HIT /tmp/cache.safetensors\n\
+         phase=denoise step= 7 total= 19 video_t= 0.5\n\
+         resident cache: loaded block 1 / 1\n",
+        20,
+    )
+    .unwrap();
+    assert_eq!(streamed_tail.0, "denoise");
+    assert_eq!(streamed_tail.1, 7);
+    assert_eq!(streamed_tail.2, 20);
+    assert!(streamed_tail.3.contains("7 of 19"));
+}
+
+#[test]
+fn minimax_h3_native_compiler_progress_counts_completed_evaluations() {
+    let start = minimax_h3_progress_from_log("[difc-h3] phase=denoise start\n", 20).unwrap();
+    assert_eq!(start, ("denoise".into(), 0, 20, "Denoising evaluation 0 of 19".into()));
+    for mode in ["exact", "high"] {
+        let log = format!("[difc-h3] phase=denoise start step_cache={mode}\n");
+        assert_eq!(minimax_h3_progress_from_log(&log, 20).unwrap(), start);
+    }
+
+    let first = "H3_STEP index=0 video_t=0 audio_t=0 denoiser_ms=55899.4 text_refiner_cache=miss\n";
+    let progress = minimax_h3_progress_from_log(first, 20).unwrap();
+    assert_eq!(progress, ("denoise".into(), 1, 20, "Denoising evaluation 1 of 19".into()));
+    let wrapped = format!("{first}[difc-h3] phase=denoise step=1 total=19\n");
+    assert_eq!(minimax_h3_progress_from_log(&wrapped, 20).unwrap(), progress);
+
+    let later = minimax_h3_progress_from_log(
+        "H3_STEP index=6 video_t=0.5 audio_t=0.6 denoiser_ms=54000\n\
+         resident cache: loaded block 1 / 1\n\
+         H3_MIDDLE_CACHE step=7 decision=reuse main_diff=0.01 audio_diff=0.01\n", 20,
+    ).unwrap();
+    assert_eq!(later, ("denoise".into(), 7, 20, "Denoising evaluation 7 of 19".into()));
+    let complete = minimax_h3_progress_from_log(
+        "H3_STEP index=18 video_t=0.99 audio_t=0.99 denoiser_ms=54000\n\
+         [difc-h3] phase=denoise complete\n", 20,
+    ).unwrap();
+    assert_eq!(complete, ("denoise".into(), 19, 20, "Denoising evaluation 19 of 19".into()));
+    assert!(minimax_h3_progress_from_log("H3_STEP index=invalid\n", 20).is_none());
+    assert!(minimax_h3_progress_from_log("H3_STEP index=19\n", 20).is_none());
+    assert!(minimax_h3_progress_from_log("H3_STEP index=0\n", 1).is_none());
+}
+
+#[test]
+fn minimax_h3_ck_attention_selects_the_exact_visible_gpu_sm() {
+    let inventory = nvidia_gpu_inventory_from_csv(
+        "0, GPU-aaaa1111, 8.6, NVIDIA GeForce RTX 3090 Ti\n\
+         1, GPU-bbbb2222, 8.9, NVIDIA GeForce RTX 4090\n",
+    );
+    assert_eq!(inventory.len(), 2);
+    assert_eq!(inventory[0].sm, 86);
+    assert_eq!(inventory[1].sm, 89);
+    assert_eq!(select_nvidia_gpu(&inventory, None).unwrap().sm, 86);
+    assert_eq!(select_nvidia_gpu(&inventory, Some("1")).unwrap().sm, 89);
+    assert_eq!(
+        select_nvidia_gpu(&inventory, Some("GPU-bbbb")).unwrap().sm,
+        89
+    );
+    assert!(select_nvidia_gpu(&inventory, Some("")).is_none());
+    assert!(select_nvidia_gpu(&inventory, Some("-1")).is_none());
+    assert!(select_nvidia_gpu(&inventory, Some("2")).is_none());
+    assert_eq!(nvidia_sm_from_compute_capability("12.0"), Some(120));
+    assert_eq!(
+        minimax_h3_ck_dso_path_for_sm(89),
+        None
+    );
+}
+
+#[test]
+fn minimax_h3_gpu_memory_parser_is_strict_and_nounits_compatible() {
+    assert_eq!(
+        minimax_h3_gpu_memory_from_csv("10748, 16303\n"),
+        Some(MiniMaxH3GpuMemory {
+            free_mib: 10_748,
+            total_mib: 16_303,
+        })
+    );
+    assert_eq!(
+        minimax_h3_gpu_memory_from_csv("\n22000, 24564\n18000, 24564\n"),
+        Some(MiniMaxH3GpuMemory {
+            free_mib: 22_000,
+            total_mib: 24_564,
+        })
+    );
+    assert!(minimax_h3_gpu_memory_from_csv("N/A, 16303").is_none());
+    assert!(minimax_h3_gpu_memory_from_csv("17000, 16303").is_none());
+}
+
+#[test]
+fn minimax_h3_ck_attention_metadata_is_server_owned() {
+    let mut request = json!({
+        "attention_backend": "cudnn",
+        "attention_backend_dso": "/tmp/client-selected.so",
+        "attention_backend_sm": 999,
+        "attention_backend_compute_capability": "99.9",
+    });
+    admit_minimax_h3_ck_attention(&mut request).unwrap();
+    assert!(request.get("attention_backend_dso").is_none());
+    assert!(request.get("attention_backend_sm").is_none());
+    assert!(request
+        .get("attention_backend_compute_capability")
+        .is_none());
+}
+
+#[test]
+fn readiness_shape() {
+    let d = readiness_doc();
+    assert_eq!(d.get("schema").unwrap(), "serenity.video_status.v1");
+    assert_eq!(d.get("endpoint").unwrap(), "/v1/video");
+    // bin_x resolves against the active repo root, so runner presence is
+    // machine-dependent (built on the dev boxes, absent on CI).
+    let ltx2_request_ready = ltx2_resolved_profiles()
+        .iter()
+        .any(ltx2_profile_runner_available);
+    let ltx2_ready = ltx2_request_ready || (runner_available() && ltx2_decode_runtime_available());
+    let wan22_built = wan22_missing().is_empty();
+    let bernini_built = bernini_missing().is_empty();
+    let scail2_built = scail2_missing().is_empty();
+    let h3_any_ready = minimax_h3_request_profile_registry()
+        .profiles
+        .iter()
+        .any(|profile| {
+            ["int8-fast", "int8", "bf16"]
+                .iter()
+                .any(|quant| minimax_h3_profile_mode_ready(profile, quant))
+        })
+        || ["i2va", "l2va", "fl2va"].iter().any(|task| {
+            ["int8-fast", "int8", "bf16"]
+                .iter()
+                .any(|quant| minimax_h3_conditioned_missing(task, quant).is_empty())
+        });
+    if !ltx2_ready && !wan22_built && !bernini_built && !scail2_built && !h3_any_ready {
+        assert_eq!(d.get("state").unwrap(), "runner_missing");
+        assert_eq!(d.get("readiness_label").unwrap(), "build_required");
+    }
+    assert_eq!(d.get("accepted").unwrap(), false);
+    assert_eq!(d.get("backend").unwrap(), "mojo");
+    assert_eq!(d.get("control_plane").unwrap(), "serenity-server");
+    let runners = d.get("candidate_runners").unwrap().as_array().unwrap();
+    assert_eq!(runners.len(), 6);
+    assert_eq!(runners[1].get("model").unwrap(), "ltx2_t2v_av");
+    assert_eq!(runners[1].get("target_frame_count").unwrap(), 121);
+    let refhq = &runners[1]["modes"]["ltx2_refhq"];
+    assert_eq!(refhq.get("prompt_driven").unwrap(), true);
+    assert_eq!(refhq.get("target_width").unwrap(), 1920);
+    assert_eq!(refhq.get("target_height").unwrap(), 1088);
+    assert_eq!(refhq.get("target_frame_count").unwrap(), 121);
+    assert_eq!(refhq.get("checkpoint").unwrap(), LTX2_REFHQ_CHECKPOINT);
+    assert_eq!(
+        refhq.get("processes").unwrap(),
+        &json!(["stage1", "upscaler", "stage2", "decode"])
+    );
+    assert!(refhq.get("accepted_audio_parity").unwrap().is_boolean());
+    assert_eq!(
+        refhq["conditioning_cache"].get("producer").unwrap(),
+        LTX2_CONTEXT_SCRIPT
+    );
+    let request_runner = &runners[1]["modes"]["ltx2_mojo_request"];
+    assert_eq!(request_runner["runner"], LTX2_MOJO_REQUEST_RUNNER);
+    assert_eq!(
+        request_runner["supported_profiles"]
+            .as_array()
+            .unwrap()
+            .len(),
+        31
+    );
+    let post_upscalers = request_runner["post_upscalers"].as_array().unwrap();
+    assert_eq!(post_upscalers.len(), 3);
+    let feature_adapters = request_runner["feature_adapters"].as_array().unwrap();
+    assert_eq!(feature_adapters.len(), 19);
+    let checkpoint_workflows = request_runner["checkpoint_workflows"].as_array().unwrap();
+    let sulphur = checkpoint_workflows
+        .iter()
+        .find(|entry| entry["id"] == "sulphur-2-base-distilled-v1")
+        .unwrap();
+    assert_eq!(sulphur["sampler"], "euler_ancestral_cfg_pp");
+    assert_eq!(sulphur["scheduler"], "sulphur_creator_8_3");
+    assert!(sulphur["adapter_available"].is_boolean());
+    assert_eq!(sulphur["prompt_enhancer_available"], false);
+    assert!(sulphur["prompt_enhancer_files_available"].is_boolean());
+    assert_eq!(sulphur["prompt_enhancer_runtime"], "not_implemented");
+    assert_eq!(
+        feature_adapters
+            .iter()
+            .find(|entry| entry["id"] == "cinemagraph")
+            .unwrap()["status"],
+        "overlay_admitted"
+    );
+    assert_eq!(
+        feature_adapters
+            .iter()
+            .find(|entry| entry["id"] == "foley-v2a")
+            .unwrap()["status"],
+        "v2a_admitted"
+    );
+    let realesrgan = post_upscalers
+        .iter()
+        .find(|entry| entry["id"] == "realesrgan-x4plus")
+        .unwrap();
+    assert_eq!(
+        realesrgan["available"],
+        bin_x(REALESRGAN_X4_RUNNER) && nonempty_file(&model_path(REALESRGAN_X4_WEIGHTS))
+    );
+    if realesrgan["available"] == true {
+        assert_eq!(realesrgan["status"], "experimental_slow");
+    }
+    let realesrgan_fast = post_upscalers
+        .iter()
+        .find(|entry| entry["id"] == "realesrgan-fast-x4v3")
+        .unwrap();
+    assert_eq!(
+        realesrgan_fast["available"],
+        bin_x(REALESRGAN_X4_RUNNER) && nonempty_file(&model_path(REALESRGAN_FAST_X4_WEIGHTS))
+    );
+    let seedvr2 = post_upscalers
+        .iter()
+        .find(|entry| entry["id"] == "seedvr2-3b")
+        .unwrap();
+    let seedvr2_available = bin_x(SEEDVR2_PRODUCT_RUNNER)
+        && SEEDVR2_WEIGHTS
+            .iter()
+            .all(|weight| nonempty_file(&model_path(weight)));
+    assert_eq!(seedvr2["available"], false);
+    assert_eq!(seedvr2["status"], "source_only");
+    assert!(seedvr2["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "product user-video adapter is not implemented"));
+    if !seedvr2_available {
+        assert!(seedvr2["missing"].as_array().unwrap().len() > 1);
+    }
+    assert_eq!(request_runner["asynchronous"], true);
+    assert_eq!(request_runner["ui_progress"], true);
+    assert_eq!(request_runner["available"], ltx2_request_ready);
+    assert_eq!(request_runner["requires_authored_conditioning"], false);
+    assert_eq!(request_runner["automatic_conditioning"]["backend"], "mojo");
+    assert_eq!(
+        request_runner["automatic_conditioning"]["available"],
+        ltx2_mojo_conditioning_missing().is_empty()
+    );
+    let h3 = runners
+        .iter()
+        .find(|entry| entry.get("model").and_then(Value::as_str) == Some("minimax_h3_t2va"))
+        .unwrap();
+    assert_eq!(h3["runner"], minimax_h3_runner());
+    assert_eq!(
+        h3["runner_topology"],
+        "one_request_runner_runtime_geometry_length_fps_and_quant"
+    );
+    assert_eq!(h3["default_steps"], MINIMAX_H3_STEPS);
+    // Only the selected native profile is a product admission.
+    let config = difc_config::current().unwrap();
+    let native = &config["minimax_h3"]["profile"];
+    assert_eq!(h3["supported_profiles"].as_array().unwrap().len(), 1);
+    for field in ["width", "height", "frames", "fps", "steps"] {
+        assert_eq!(h3["supported_profiles"][0][field], native[field]);
+    }
+    assert_eq!(h3["quant_modes"][0]["id"], "int8-fast");
+    assert_eq!(h3["quant_modes"][1]["id"], "int8");
+    assert_eq!(h3["quant_modes"][2]["id"], "bf16");
+    assert_eq!(h3["attention_backends"][0]["id"], "ck-int8");
+    assert_eq!(h3["attention_backends"][1]["id"], "cudnn");
+    assert_eq!(h3["attention_backends"][2]["id"], "sage-int8");
+    assert_eq!(
+        h3["attention_backends"][0]["quant_modes"],
+        json!(["int8-fast", "int8", "bf16"])
+    );
+    assert_eq!(
+        h3["attention_backends"][0]["accepted_quality_default"],
+        false
+    );
+    assert_eq!(
+        h3["attention_backends"][0]["accepted_fast_default"],
+        h3["attention_backends"][0]["available"] == true
+            && h3["attention_backends"][0]["current_sm"] == 86
+    );
+    assert_eq!(
+        h3["attention_backends"][0]["measured_reference"]["decoded_visual_prompt_gate_count"],
+        2
+    );
+    assert_eq!(
+        h3["attention_backends"][0]["measured_reference"]["gpu"],
+        "NVIDIA GeForce RTX 3090 Ti"
+    );
+    assert_eq!(h3["attention_backends"][0]["measured_reference"]["sm"], 86);
+    assert_eq!(
+        h3["attention_backends"][0]["selection_policy"],
+        "exact_active_gpu_sm_only"
+    );
+    assert_eq!(h3["attention_backends"][0]["portable_fallback"], "cudnn");
+    assert!(!h3["attention_backends"][0]["label"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .contains("fastest"));
+    let ck_capability = minimax_h3_ck_attention_capability();
+    if let Some(gpu) = ck_capability.gpu.as_ref() {
+        assert_eq!(h3["attention_backends"][0]["current_sm"], gpu.sm);
+        assert_eq!(
+            h3["attention_backends"][0]["current_compute_capability"],
+            gpu.compute_capability
+        );
+        assert_eq!(
+            h3["attention_backends"][0]["selected_dso"],
+            json!(ck_capability
+                .dso_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()))
+        );
+    }
+    assert_eq!(
+        h3["attention_backends"][1]["accepted_quality_default"],
+        true
+    );
+    assert_eq!(
+        h3["attention_backends"][2]["accepted_quality_default"],
+        false
+    );
+    assert_eq!(h3["step_cache_modes"][0]["id"], "exact");
+    assert_eq!(h3["step_cache_modes"][1]["id"], "high");
+    assert_eq!(h3["geometry_constraints"], compiler_h3_geometry_document());
+    let native_cache_profile = &difc_config::current().unwrap()["minimax_h3"]["profile"];
+    let high_cache_enabled = match native_cache_profile.get("step_cache_modes") {
+        Some(modes) => modes.as_array().is_some_and(|modes| modes.iter().any(|mode| mode == "high")),
+        None => native_cache_profile["step_cache"] == "high",
+    };
+    assert_eq!(h3["step_cache_modes"][1]["available"], h3["available"] == true && high_cache_enabled);
+    assert_eq!(h3["step_cache_modes"][1]["exact"], false);
+    assert_eq!(h3["step_cache_modes"][1]["accepted_quality_default"], false);
+    assert_eq!(h3["attention_backends"][2]["available"], false);
+    assert_eq!(
+        h3["prompt_contract"],
+        "arbitrary_nonempty_prompt_runtime_conditioning"
+    );
+    assert_eq!(h3["conditioned_modes"][0]["id"], "i2va");
+    assert_eq!(h3["conditioned_modes"][1]["id"], "l2va");
+    assert_eq!(h3["conditioned_modes"][2]["id"], "fl2va");
+    assert_eq!(h3["conditioned_modes"][3]["id"], "ref2va");
+    assert_eq!(h3["conditioned_modes"][4]["id"], "continue");
+    assert_eq!(
+        h3["conditioned_modes"][4]["motion_context"]["windows"],
+        json!([5, 22, 39])
+    );
+    assert_eq!(
+        h3["conditioned_modes"][4]["motion_context"]["default_frames"],
+        22
+    );
+    assert_eq!(h3["conditioned_modes"][0]["geometry"]["width"], native["width"]);
+    assert_eq!(h3["conditioned_modes"][0]["input_policy"], "exact_canvas_rgb_no_resize");
+    assert_eq!(h3["conditioned_modes"][3]["available"], false);
+    assert_eq!(h3["conditioned_modes"][4]["available"], false);
+    assert_eq!(
+        h3["conditioned_modes"][3]["available"],
+        ["int8-fast", "int8", "bf16"]
+            .iter()
+            .any(|quant| minimax_h3_conditioned_missing("ref2va", quant).is_empty())
+    );
+    let h3_ready = minimax_h3_request_profile_registry()
+        .profiles
+        .iter()
+        .any(|profile| {
+            ["int8-fast", "int8", "bf16"]
+                .iter()
+                .any(|quant| minimax_h3_profile_mode_ready(profile, quant))
+        });
+    let h3_conditioned_ready = h3["conditioned_modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|mode| mode["available"].as_bool() == Some(true));
+    assert_eq!(h3["available"], h3_ready || h3_conditioned_ready);
+    let wan = runners
+        .iter()
+        .find(|entry| entry.get("model").and_then(Value::as_str) == Some("wan22_t2v"))
+        .unwrap();
+    assert_eq!(wan.get("model").unwrap(), "wan22_t2v");
+    if !wan22_built {
+        assert_eq!(wan.get("status").unwrap(), "prerequisites_missing");
+        assert!(!wan.get("missing").unwrap().as_array().unwrap().is_empty());
+    }
+    assert_eq!(wan.get("target_frame_count").unwrap(), 121);
+    assert_eq!(wan.get("target_width").unwrap(), WAN22_WIDTH);
+    assert_eq!(wan.get("target_height").unwrap(), WAN22_HEIGHT);
+    assert_eq!(
+        wan.pointer("/native_profiles/1/width").unwrap(),
+        WAN22_PORTRAIT_WIDTH
+    );
+    assert_eq!(
+        wan.pointer("/native_profiles/1/height").unwrap(),
+        WAN22_PORTRAIT_HEIGHT
+    );
+    assert_eq!(
+        wan.pointer("/native_profiles/2/width").unwrap(),
+        WAN22_I2V_LANDSCAPE_WIDTH
+    );
+    assert_eq!(
+        wan.pointer("/native_profiles/3/height").unwrap(),
+        WAN22_I2V_PORTRAIT_HEIGHT
+    );
+    assert_eq!(wan.get("i2v_steps").unwrap(), WAN22_I2V_STEPS);
+    assert_eq!(wan.get("default_steps").unwrap(), 50);
+    assert_eq!(wan.get("default_guidance").unwrap(), 5.0);
+    assert_eq!(wan.get("quant_modes").unwrap(), &json!(["bf16", "fp8"]));
+    assert_eq!(wan.pointer("/modes/lora/max_count").unwrap(), 1);
+    assert_eq!(
+        wan.pointer("/modes/lora/base_model").unwrap(),
+        "Wan-AI/Wan2.2-TI2V-5B"
+    );
+    assert_eq!(
+        wan.get("accepted_video_parity").unwrap(),
+        &(wan22_built && wan22_product_gate_passed())
+    );
+    // both arms report readiness under arms_ready, matching disk state
+    let arms = d.get("arms_ready").unwrap();
+    assert_eq!(arms.get("ltx2_t2v_av").unwrap(), ltx2_ready);
+    assert_eq!(arms.get("minimax_h3_t2va").unwrap(), h3_ready);
+    assert_eq!(arms.get("wan22_t2v").unwrap(), wan22_built);
+    let bernini = runners
+        .iter()
+        .find(|entry| entry.get("model").and_then(Value::as_str) == Some("bernini_r_t2v"))
+        .unwrap();
+    assert_eq!(bernini.get("model").unwrap(), "bernini_r_t2v");
+    assert_eq!(bernini.get("target_width").unwrap(), BERNINI_WIDTH);
+    assert_eq!(bernini.get("target_height").unwrap(), BERNINI_HEIGHT);
+    assert_eq!(bernini.get("target_frame_count").unwrap(), BERNINI_FRAMES);
+    assert_eq!(bernini.get("target_fps").unwrap(), BERNINI_FPS);
+    assert_eq!(bernini.get("default_steps").unwrap(), BERNINI_DEFAULT_STEPS);
+    assert_eq!(bernini.get("quant_modes").unwrap(), &json!(["fp8"]));
+    assert_eq!(
+        arms.get("bernini_r_t2v").unwrap(),
+        &(bernini_built && bernini_product_gate_passed())
+    );
+    let scail2 = runners
+        .iter()
+        .find(|entry| entry.get("model").and_then(Value::as_str) == Some("scail2_animation"))
+        .unwrap();
+    assert_eq!(scail2.get("model").unwrap(), "scail2_animation");
+    assert_eq!(scail2.get("target_width").unwrap(), SCAIL2_WIDTH);
+    assert_eq!(scail2.get("target_height").unwrap(), SCAIL2_HEIGHT);
+    assert_eq!(scail2.get("target_frame_count").unwrap(), SCAIL2_FRAMES);
+    assert_eq!(scail2.get("target_fps").unwrap(), SCAIL2_FPS);
+    assert_eq!(scail2.get("default_steps").unwrap(), SCAIL2_STEPS);
+    assert_eq!(scail2.get("default_guidance").unwrap(), SCAIL2_GUIDANCE);
+    assert_eq!(scail2.get("quant_modes").unwrap(), &json!(["fp8"]));
+    assert_eq!(
+        arms.get("scail2_animation").unwrap(),
+        &(scail2_built && scail2_product_gate_passed())
+    );
+}
+
+#[test]
+fn wan22_ti2v5b_lora_header_rejects_14b_dimensions() {
+    let compatible = json!({
+        "diffusion_model.blocks.0.self_attn.q.lora_A.weight": {
+            "dtype": "BF16", "shape": [32, 3072], "data_offsets": [0, 1]
+        },
+        "diffusion_model.blocks.0.self_attn.q.lora_B.weight": {
+            "dtype": "BF16", "shape": [3072, 32], "data_offsets": [1, 2]
+        }
+    });
+    assert_eq!(wan22_ti2v5b_lora_header(&compatible).unwrap(), 1);
+
+    let incompatible = json!({
+        "diffusion_model.blocks.0.self_attn.q.lora_A.weight": {
+            "dtype": "BF16", "shape": [32, 5120], "data_offsets": [0, 1]
+        },
+        "diffusion_model.blocks.0.self_attn.q.lora_B.weight": {
+            "dtype": "BF16", "shape": [5120, 32], "data_offsets": [1, 2]
+        }
+    });
+    assert!(wan22_ti2v5b_lora_header(&incompatible)
+        .unwrap_err()
+        .contains("probably a 14B adapter"));
+}
+
+#[test]
+fn realesrgan_video_post_upscale_product_smoke() {
+    if !bin_x(REALESRGAN_X4_RUNNER) || !nonempty_file(&model_path(REALESRGAN_X4_WEIGHTS)) {
+        return;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "serenity-realesrgan-video-smoke-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let native = root.join("native.mp4");
+    let fixture = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=24",
+            "-frames:v",
+            "2",
+            "-pix_fmt",
+            "yuv420p",
+            &native.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fixture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fixture.stderr)
+    );
+    let (artifact, probe) = run_realesrgan_video_post_upscale(
+        "realesrgan-x4plus",
+        &native,
+        &root,
+        160,
+        120,
+        2,
+        24,
+        2,
+        |_, _, _| {},
+    )
+    .unwrap();
+    assert!(artifact.is_file());
+    assert_eq!(probe["width"], 320);
+    assert_eq!(probe["height"], 240);
+    assert_eq!(probe["frame_count"], 2);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn fps_parse() {
+    assert_eq!(fps_from_rate("24/1"), 24.0);
+    assert_eq!(fps_from_rate("30000/1001"), 30000.0 / 1001.0);
+    assert_eq!(fps_from_rate("0/0"), 0.0);
+}
+
+#[test]
+fn wan22_profiles_accept_their_declared_fps() {
+    let a14b = json!({
+        "muxing": "probe_ok",
+        "width": WAN22_A14B_WIDTH,
+        "height": WAN22_A14B_HEIGHT,
+        "frame_count": WAN22_A14B_FRAMES,
+        "fps": WAN22_A14B_FPS as f64,
+        "has_audio": false,
+    });
+    assert!(probe_matches_video_profile(
+        &a14b,
+        WAN22_A14B_WIDTH,
+        WAN22_A14B_HEIGHT,
+        WAN22_A14B_FRAMES,
+        WAN22_A14B_FPS,
+        false,
+    ));
+    assert!(!probe_matches_video_profile(
+        &a14b,
+        WAN22_A14B_WIDTH,
+        WAN22_A14B_HEIGHT,
+        WAN22_A14B_FRAMES,
+        WAN22_FPS,
+        false,
+    ));
+
+    let wan22 = json!({
+        "muxing": "probe_ok",
+        "width": WAN22_WIDTH,
+        "height": WAN22_HEIGHT,
+        "frame_count": WAN22_FRAMES,
+        "fps": WAN22_FPS as f64,
+        "has_audio": false,
+    });
+    assert!(probe_matches_video_profile(
+        &wan22,
+        WAN22_WIDTH,
+        WAN22_HEIGHT,
+        WAN22_FRAMES,
+        WAN22_FPS,
+        false,
+    ));
+}
+
+#[test]
+fn wan22_command_keeps_cuda_runtime_io_before_sampling() {
+    let command = wan22_command(std::path::Path::new("/tmp/wan22-test-runner"));
+    let cache = command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new("CUDA_CACHE_PATH"))
+        .and_then(|(_, value)| value)
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap();
+    assert_eq!(cache, WAN22_CUDA_CACHE);
+
+    let preload = command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new("LD_PRELOAD"))
+        .and_then(|(_, value)| value)
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap();
+    for required in [
+        "libcudnn_graph.so.9",
+        "libcudnn_engines_precompiled.so.9",
+        "libcudnn_engines_runtime_compiled.so.9",
+        "libcudnn_engines_tensor_ir.so.9",
+        "libcudnn_heuristic.so.9",
+        "libnvidia-ptxjitcompiler.so.1",
+        "libnvidia-nvvm70.so.4",
+        "libnvidia-gpucomp.so.",
+    ] {
+        assert!(preload.contains(required), "missing preload: {required}");
+    }
+}
+
+#[test]
+fn scail2_publishes_only_the_final_mp4_to_output() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "serenity-scail2-output-policy-{}-{nonce}",
+        std::process::id()
+    ));
+    let runtime_root = root.join("runtime");
+    let output_root = root.join("output");
+    let paths = scail2_run_paths(&runtime_root, &output_root, "video-0001");
+    std::fs::create_dir_all(&paths.decode_dir).unwrap();
+    std::fs::write(&paths.decoded_mp4, b"measured mp4 fixture").unwrap();
+    std::fs::write(paths.decode_dir.join("frame_0.png"), b"internal frame").unwrap();
+    std::fs::write(paths.run_dir.join("scail2_denoise.log"), b"internal log").unwrap();
+
+    publish_scail2_mp4(&paths).unwrap();
+
+    let public_files = std::fs::read_dir(&paths.public_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .collect::<Vec<_>>();
+    assert_eq!(public_files.len(), 1);
+    assert_eq!(public_files[0].path(), paths.public_mp4);
+    assert_eq!(
+        std::fs::read(&paths.public_mp4).unwrap(),
+        b"measured mp4 fixture"
+    );
+    assert!(!paths.decoded_mp4.exists());
+    assert!(paths.decode_dir.join("frame_0.png").is_file());
+    assert!(paths.run_dir.join("scail2_denoise.log").is_file());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn ltx2_mojo_request_preflight_preserves_ui_owned_profile() {
+    let caps = std::env::temp_dir().join(format!(
+        "serenity-ltx2-ui-caps-{}-{}.json",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&caps, b"{}").unwrap();
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "vrtlEri2 turns toward camera",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+    });
+    validate_ltx2_mojo_request(&request).unwrap();
+    let _ = std::fs::remove_file(caps);
+}
+
+#[test]
+fn ltx2_mojo_request_bf16_requires_and_accepts_dequantized_checkpoint() {
+    let caps = std::env::temp_dir().join(format!(
+        "serenity-ltx2-bf16-caps-{}-{}.json",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&caps, b"{}").unwrap();
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_BF16_CHECKPOINT,
+        "quant": "bf16",
+        "prompt": "BF16 request contract probe",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+    });
+    validate_ltx2_mojo_request(&request).unwrap();
+    let result = validate_ltx2_runtime_artifacts(&request);
+    if nonempty_file(&model_path(LTX2_REFHQ_BF16)) {
+        result.unwrap();
+    } else {
+        assert!(result
+            .unwrap_err()
+            .contains("dequantized dev checkpoint is missing"));
+    }
+    let _ = std::fs::remove_file(caps);
+}
+
+#[test]
+fn ltx2_checkpoint_registry_separates_dev_support_lora_from_baked_finetune() {
+    let dev = ltx2_checkpoint_profile("ltx-2.3-22b-dev-fp8").unwrap();
+    assert_eq!(dev.support_lora, "official");
+    assert!(dev.guidance_modes.iter().any(|mode| mode == "dev"));
+    assert!(dev.quant_modes.iter().any(|mode| mode == "int4"));
+
+    let sulphur = ltx2_checkpoint_profile("sulphur_distill_fp8.safetensors").unwrap();
+    assert_eq!(sulphur.id, "sulphur-distill-fp8");
+    assert_eq!(sulphur.support_lora, "baked");
+    assert_eq!(sulphur.guidance_modes, ["distilled"]);
+    assert_eq!(sulphur.quant_modes, ["fp8"]);
+    assert_eq!(sulphur.path, "checkpoints/sulphur_distill_fp8.safetensors");
+}
+
+#[test]
+fn ltx2_mojo_request_preflight_accepts_i2v_source_and_strength() {
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    );
+    let caps = std::env::temp_dir().join(format!("serenity-ltx2-i2v-caps-{suffix}.bin"));
+    let image = std::env::temp_dir().join(format!("serenity-ltx2-i2v-source-{suffix}.png"));
+    std::fs::write(&caps, b"conditioning fixture").unwrap();
+    std::fs::write(&image, b"image fixture").unwrap();
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "the subject turns toward camera",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+        "image_path": image,
+        "image_strength": 0.8,
+    });
+    validate_ltx2_mojo_request(&request).unwrap();
+    let _ = std::fs::remove_file(caps);
+    let _ = std::fs::remove_file(image);
+}
+
+#[test]
+fn ltx2_cinemagraph_feature_is_explicit_and_normalizes_to_one_overlay() {
+    let adapter = model_path("loras/ltx-2.3-22b-lora-cinemagraph-0.9.safetensors");
+    if !nonempty_file(&adapter) {
+        return;
+    }
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    );
+    let caps = std::env::temp_dir().join(format!("serenity-ltx2-cinemagraph-caps-{suffix}.bin"));
+    let image = std::env::temp_dir().join(format!("serenity-ltx2-cinemagraph-source-{suffix}.png"));
+    std::fs::write(&caps, b"conditioning fixture").unwrap();
+    std::fs::write(&image, b"image fixture").unwrap();
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "CINEMAGRAPH_MOTION only the candle flame moves",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "audio_policy": "none",
+        "lora": [],
+        "image_path": image,
+        "image_strength": 0.8,
+        "feature_id": "cinemagraph",
+        "feature_weight": 0.9,
+    });
+    validate_ltx2_mojo_request(&request).unwrap();
+    let normalized = normalized_ltx2_feature_request(&request).unwrap();
+    assert_eq!(normalized["feature_adapter"]["id"], "cinemagraph");
+    assert_eq!(normalized["lora"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        normalized["lora"][0]["name"],
+        "ltx-2.3-22b-lora-cinemagraph-0.9.safetensors"
+    );
+    assert_eq!(normalized["lora"][0]["weight"], 0.9);
+    let _ = std::fs::remove_file(caps);
+    let _ = std::fs::remove_file(image);
+}
+
+#[test]
+fn ltx2_mojo_request_preflight_rejects_invalid_i2v_source_before_gpu() {
+    let caps = std::env::temp_dir().join(format!(
+        "serenity-ltx2-i2v-invalid-caps-{}-{}.bin",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&caps, b"conditioning fixture").unwrap();
+    let mut request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "the subject turns toward camera",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+        "image_path": "/definitely/missing/ltx2-source.png",
+        "image_strength": 1.0,
+    });
+    assert!(validate_ltx2_mojo_request(&request)
+        .unwrap_err()
+        .contains("I2V source image not found"));
+    request["image_path"] = json!("");
+    request["image_strength"] = json!(1.5);
+    assert!(validate_ltx2_mojo_request(&request)
+        .unwrap_err()
+        .contains("image_strength must be in [0, 1]"));
+    let _ = std::fs::remove_file(caps);
+}
+
+#[test]
+fn ltx2_mojo_request_preflight_accepts_v2v_and_rejects_conflicting_sources() {
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    );
+    let caps = std::env::temp_dir().join(format!("serenity-ltx2-v2v-caps-{suffix}.bin"));
+    let video = std::env::temp_dir().join(format!("serenity-ltx2-v2v-source-{suffix}.mp4"));
+    let image = std::env::temp_dir().join(format!("serenity-ltx2-v2v-source-{suffix}.png"));
+    let mask = std::env::temp_dir().join(format!("serenity-ltx2-v2v-mask-{suffix}.png"));
+    std::fs::write(&caps, b"conditioning fixture").unwrap();
+    std::fs::write(&video, b"video fixture").unwrap();
+    std::fs::write(&image, b"image fixture").unwrap();
+    std::fs::write(&mask, b"mask fixture").unwrap();
+    let mut request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "restyle the source clip while preserving its motion",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+        "video_path": video,
+        "video_strength": 0.7,
+        "video_mask_path": mask,
+    });
+    validate_ltx2_mojo_request(&request).unwrap();
+    request["image_path"] = json!(image);
+    request["image_strength"] = json!(1.0);
+    assert!(validate_ltx2_mojo_request(&request)
+        .unwrap_err()
+        .contains("mutually exclusive"));
+    request.as_object_mut().unwrap().remove("image_path");
+    request.as_object_mut().unwrap().remove("image_strength");
+    request["video_strength"] = json!(1.5);
+    assert!(validate_ltx2_mojo_request(&request)
+        .unwrap_err()
+        .contains("video_strength must be in [0, 1]"));
+    request.as_object_mut().unwrap().remove("video_path");
+    request.as_object_mut().unwrap().remove("video_strength");
+    assert!(validate_ltx2_mojo_request(&request)
+        .unwrap_err()
+        .contains("video_mask_path requires video_path"));
+    let _ = std::fs::remove_file(caps);
+    let _ = std::fs::remove_file(video);
+    let _ = std::fs::remove_file(image);
+    let _ = std::fs::remove_file(mask);
+}
+
+#[test]
+fn ltx2_temporal_edit_normalizes_retake_and_extend_from_real_probe() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let video = std::env::temp_dir().join(format!(
+        "serenity-ltx2-temporal-source-{}-{nonce}.mp4",
+        std::process::id()
+    ));
+    let fixture = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=navy:size=960x544:rate=24",
+            "-frames:v",
+            "121",
+            "-pix_fmt",
+            "yuv420p",
+            &video.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fixture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fixture.stderr)
+    );
+
+    let retake = normalized_ltx2_video_edit_request(&json!({
+        "video_edit_mode": "retake",
+        "video_edit_start": 1.0,
+        "video_edit_end": 3.5,
+        "video_path": video,
+        "video_strength": 0.7,
+        "width": 960,
+        "height": 544,
+        "frames": 121,
+        "fps": 24.0,
+    }))
+    .unwrap();
+    assert_eq!(retake["video_source_frames"], 121);
+    assert_eq!(retake["video_strength"], 0.0);
+    assert_eq!(retake["video_edit_start"], 1.0);
+    assert_eq!(retake["video_edit_end"], 3.5);
+
+    let extend_end = normalized_ltx2_video_edit_request(&json!({
+        "video_edit_mode": "extend_end",
+        "video_path": video,
+        "width": 960,
+        "height": 544,
+        "frames": 193,
+        "fps": 24.0,
+    }))
+    .unwrap();
+    assert_eq!(extend_end["video_source_frames"], 121);
+    assert_eq!(extend_end["video_extend_frames"], 72);
+    assert_eq!(extend_end["video_extend_seconds"], 3.0);
+    assert_eq!(extend_end["video_edit_start"], 4.5);
+    assert_eq!(extend_end["video_edit_end"], 8.0);
+
+    let extend_start = normalized_ltx2_video_edit_request(&json!({
+        "video_edit_mode": "extend_start",
+        "video_path": video,
+        "width": 960,
+        "height": 544,
+        "frames": 193,
+        "fps": 24.0,
+    }))
+    .unwrap();
+    assert_eq!(extend_start["video_edit_start"], 0.0);
+    assert_eq!(extend_start["video_edit_end"], 3.5);
+
+    let too_short = normalized_ltx2_video_edit_request(&json!({
+        "video_edit_mode": "retake",
+        "video_edit_start": 1.0,
+        "video_edit_end": 2.0,
+        "video_path": video,
+        "width": 960,
+        "height": 544,
+        "frames": 121,
+        "fps": 24.0,
+    }))
+    .unwrap_err();
+    assert!(too_short.contains("at least 2 seconds"));
+    let _ = std::fs::remove_file(video);
+}
+
+#[test]
+fn ltx2_source_audio_policy_preflights_and_remuxes() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "serenity-ltx2-source-audio-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let caps = root.join("caps.bin");
+    let source = root.join("source.mp4");
+    let generated = root.join("generated.mp4");
+    std::fs::write(&caps, b"conditioning fixture").unwrap();
+    let source_result = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-frames:v",
+            "4",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            &source.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        source_result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&source_result.stderr)
+    );
+    let generated_result = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:size=160x120:rate=24",
+            "-frames:v",
+            "4",
+            "-pix_fmt",
+            "yuv420p",
+            &generated.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(generated_result.status.success());
+
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "preserve the source motion",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": caps,
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "audio_policy": "preserve",
+        "lora": [],
+        "video_path": source,
+        "video_strength": 0.7,
+    });
+    validate_ltx2_mojo_request(&request).unwrap();
+
+    let (artifact, probe) = remux_ltx2_source_audio(&generated, &source, &root, 4).unwrap();
+    assert!(artifact.is_file());
+    assert_eq!(probe["has_audio"], true);
+    assert_eq!(probe["frame_count"], 4);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn ltx2_mojo_request_accepts_blank_conditioning_when_auto_encoder_is_available() {
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "a lighthouse on a rocky coast at sunset",
+        "negative": "watermark",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": "",
+        "caps_negative": "",
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+    });
+    let missing = ltx2_mojo_conditioning_missing();
+    let result = validate_ltx2_mojo_request(&request);
+    if missing.is_empty() {
+        result.unwrap();
+    } else {
+        assert!(result
+            .unwrap_err()
+            .contains("automatic prompt conditioning is unavailable"));
+    }
+}
+
+#[test]
+fn ltx2_mojo_request_rejects_geometry_outside_published_profile_before_gpu() {
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "profile mismatch probe",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": "/not/reached",
+        "width": 1024,
+        "height": 1024,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 24,
+        "include_audio": false,
+        "lora": [],
+    });
+    let error = validate_ltx2_mojo_request(&request).unwrap_err();
+    assert!(error.contains("unsupported LTX2 standard native profile 1024x1024"));
+    assert!(!error.contains("conditioning artifact"));
+}
+
+#[test]
+fn ltx2_mojo_request_accepts_every_registry_profile_before_artifact_checks() {
+    for profile in ltx2_resolved_profiles() {
+        for mode in &profile.modes {
+            assert!(
+                ltx2_request_profile_for_mode(
+                    profile.width,
+                    profile.height,
+                    profile.frames,
+                    profile.fps as f64,
+                    mode,
+                )
+                .is_some(),
+                "profile {}x{} {}f@{} did not resolve for declared mode {mode}",
+                profile.width,
+                profile.height,
+                profile.frames,
+                profile.fps,
+            );
+        }
+        if !profile.modes.iter().any(|mode| mode == "standard") {
+            continue;
+        }
+        let request = json!({
+            "checkpoint": LTX2_REFHQ_CHECKPOINT,
+            "quant": "fp8",
+            "prompt": "native profile contract probe",
+            "sampler": "euler",
+            "scheduler": "ltx2_distilled",
+            "guidance_mode": "distilled",
+            "caps_positive": "/not/reached",
+            "width": profile.width,
+            "height": profile.height,
+            "frames": profile.frames,
+            "steps": 8,
+            "seed": 42,
+            "fps": profile.fps,
+            "include_audio": false,
+            "lora": [],
+        });
+        let error = validate_ltx2_mojo_request(&request).unwrap_err();
+        assert!(
+            error.contains("conditioning artifact not found"),
+            "profile {}x{} {}f@{} was rejected before artifact validation: {error}",
+            profile.width,
+            profile.height,
+            profile.frames,
+            profile.fps,
+        );
+    }
+}
+
+#[test]
+fn ltx2_mojo_request_preflight_rejects_missing_conditioning_before_gpu() {
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "vrtlEri2 turns toward camera",
+        "sampler": "euler",
+        "scheduler": "ltx2_distilled",
+        "guidance_mode": "distilled",
+        "caps_positive": "/definitely/missing/ltx2-conditioning.json",
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+    });
+    assert!(validate_ltx2_mojo_request(&request)
+        .unwrap_err()
+        .contains("conditioning artifact not found"));
+}
+
+#[test]
+fn ltx2_mojo_request_preflight_rejects_mismatched_distilled_sampler_before_gpu() {
+    let request = json!({
+        "checkpoint": LTX2_REFHQ_CHECKPOINT,
+        "quant": "fp8",
+        "prompt": "vrtlEri2 turns toward camera",
+        "sampler": "res2s",
+        "scheduler": "ltx2",
+        "guidance_mode": "distilled",
+        "caps_positive": "/not/reached",
+        "width": 512,
+        "height": 768,
+        "frames": 121,
+        "steps": 8,
+        "seed": 42,
+        "fps": 25.0,
+        "include_audio": false,
+        "lora": [],
+    });
+    assert!(validate_ltx2_mojo_request(&request)
+        .unwrap_err()
+        .contains("distilled mode requires sampler=euler"));
+}
+
+#[test]
+fn ltx2_seed_is_bounded_and_defaults_only_when_absent() {
+    assert_eq!(ltx2_seed(&json!({})), Ok(42));
+    assert_eq!(ltx2_seed(&json!({ "seed": 0 })), Ok(0));
+    assert_eq!(
+        ltx2_seed(&json!({ "seed": 4_294_967_295_u64 })),
+        Ok(4_294_967_295)
+    );
+    assert!(ltx2_seed(&json!({ "seed": -1 })).is_err());
+    assert!(ltx2_seed(&json!({ "seed": 4_294_967_296_u64 })).is_err());
+    assert!(ltx2_seed(&json!({ "seed": 1.5 })).is_err());
+}
+
+#[test]
+fn ltx2_context_cache_key_is_stable_and_prompt_specific() {
+    let a = ltx2_context_key("a red balloon", "<creator-default-negative>");
+    assert_eq!(
+        a,
+        ltx2_context_key("a red balloon", "<creator-default-negative>")
+    );
+    assert_ne!(
+        a,
+        ltx2_context_key("a blue balloon", "<creator-default-negative>")
+    );
+    assert_ne!(a, ltx2_context_key("a red balloon", "flicker"));
+}
+
+#[test]
+fn ltx2_parity_report_is_bound_to_exact_mojo_runner() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "serenity-ltx2-parity-runner-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let runner = root.join("ltx2_video_smoke_runner");
+    let report = root.join("sampler.json");
+    std::fs::write(&runner, b"measured runner A").unwrap();
+    let digest = sha256sum(&runner).unwrap();
+    std::fs::write(
+        &report,
+        serde_json::to_vec(&json!({
+            "schema": "serenity.ltx2.sampler_parity.v1",
+            "creator_revision": LTX2_CREATOR_REVISION,
+            "mojo_runner_sha256": digest,
+            "bar": 0.999,
+            "passed": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(ltx2_parity_report_matches(
+        &report,
+        &runner,
+        "serenity.ltx2.sampler_parity.v1",
+        false,
+    ));
+
+    std::fs::write(&runner, b"changed runner B").unwrap();
+    assert!(!ltx2_parity_report_matches(
+        &report,
+        &runner,
+        "serenity.ltx2.sampler_parity.v1",
+        false,
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn ltx2_context_cache_reuses_existing_prompt_entry() {
+    let root = std::env::temp_dir().join(format!("serenity-ltx2-cache-hit-{}", std::process::id()));
+    let prompt = "a red balloon over a meadow";
+    let key = ltx2_context_key(prompt, "<creator-default-negative>");
+    let dir = root
+        .join("conditioning_cache")
+        .join("ltx2")
+        .join("creator-refhq-v1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let expected = dir.join(format!("{key}.safetensors"));
+    let mut header = serde_json::to_vec(&json!({
+        "__metadata__": { "creator_revision": LTX2_CREATOR_REVISION },
+        "video_context": { "dtype": "BF16", "shape": [1, 1024, 4096], "data_offsets": [0, 0] },
+        "audio_context": { "dtype": "BF16", "shape": [1, 1024, 2048], "data_offsets": [0, 0] },
+        "neg_video_context": { "dtype": "BF16", "shape": [1, 1024, 4096], "data_offsets": [0, 0] },
+        "neg_audio_context": { "dtype": "BF16", "shape": [1, 1024, 2048], "data_offsets": [0, 0] },
+        "video_len": { "dtype": "F32", "shape": [1], "data_offsets": [0, 0] },
+        "neg_video_len": { "dtype": "F32", "shape": [1], "data_offsets": [0, 0] },
+    }))
+    .unwrap();
+    while header.len() % 8 != 0 {
+        header.push(b' ');
+    }
+    let mut fixture = (header.len() as u64).to_le_bytes().to_vec();
+    fixture.extend(header);
+    std::fs::write(&expected, fixture).unwrap();
+
+    let cache = prepare_ltx2_refhq_context(&root, prompt, "").unwrap();
+    assert!(cache.hit);
+    assert_eq!(cache.key, key);
+    assert_eq!(cache.path, expected);
+    assert_eq!(cache.encoder_seconds, 0.0);
+    let _ = std::fs::remove_dir_all(root);
+}
+#[test]
+fn compiler_h3_adapter_and_control_requests_fail_closed() {
+    let doc = json!({"minimax_h3":{
+        "lora":{"enabled":true,"max_count":2,"max_abs_scale":10.0},
+        "control":{"enabled":true,"max_count":2,"max_abs_strength":10.0}
+    }});
+    for field in ["lora", "controls"] {
+        for bad in [json!("bad"), json!({}), json!(["bad"])] {
+            let mut request = json!({"task":"t2va"}); request[field] = bad;
+            if field == "lora" { assert!(compiler_h3_lora_args(&request, &doc).is_err()); }
+            else { assert!(compiler_h3_controls(&request, &doc).is_err()); }
+        }
+    }
+    assert!(compiler_h3_lora_args(&json!({"lora":[]}), &doc).unwrap().is_empty());
+    assert!(compiler_h3_controls(&json!({"controls":null}), &doc).unwrap().is_empty());
+    for bad in [json!({"weight":"1"}), json!({"weight":11}), json!({"path":"/no/such/adapter"})] {
+        assert!(compiler_h3_lora_args(&json!({"lora":[bad]}), &doc).is_err());
+    }
+    for bad in [json!({"source":"x"}), json!({"preprocessor":"canny"}),
+                json!({"strength":"1"}), json!({"start":0.9,"end":0.2})] {
+        assert!(compiler_h3_controls(&json!({"task":"t2va","controls":[bad]}), &doc).is_err());
+    }
+    assert!(compiler_h3_controls(&json!({"task":"ref2va","controls":[{}]}), &doc).is_err());
+    assert!(compiler_h3_controls(&json!({"task":"t2va","step_cache":"high","controls":[{}]}), &doc).is_err());
+}
+
+#[test]
+fn compiler_h3_control_media_ports_mojo_request_fields() {
+    // Zero strength skips heavyweight checkpoint prerequisites, not media parsing.
+    let doc = json!({"minimax_h3":{"control":{
+        "enabled":true,"max_count":4,"max_abs_strength":10.0,
+        "defaults":{"preprocessor":"prepared","resize_mode":"crop",
+            "canny_low":100,"canny_high":200,"strength":0,"start":0,"end":1,"invert_mask":false}
+    }}});
+    let media = std::env::temp_dir().join(format!("difc-control-media-{}.png", std::process::id()));
+    std::fs::write(&media, b"request parsing only").unwrap();
+    let mut request = json!({"task":"t2va","controls":[{
+        "path":media,"preprocessor":"canny","resize_mode":"pad",
+        "canny_low":50,"canny_high":150,"source_path":media,"mask_path":media,"invert_mask":true
+    }]});
+    let rows = compiler_h3_controls(&request, &doc).unwrap();
+    assert_eq!(rows[0]["preprocessor"], "canny");
+    assert_eq!(rows[0]["resize_mode"], "pad");
+    assert_eq!(rows[0]["source_path"], json!(media));
+    assert_eq!(rows[0]["mask_path"], json!(media));
+    assert_eq!(rows[0]["invert_mask"], true);
+    request["controls"][0]["mask_path"] = json!(null);
+    assert!(compiler_h3_controls(&request, &doc).unwrap_err().contains("together"));
+    request["controls"][0]["mask_path"] = json!(media);
+    request["controls"][0]["canny_low"] = json!(151);
+    assert!(compiler_h3_controls(&request, &doc).unwrap_err().contains("low < high"));
+    request["controls"][0]["canny_low"] = json!(50.5);
+    assert!(compiler_h3_controls(&request, &doc).unwrap_err().contains("integer"));
+    std::fs::remove_file(media).unwrap();
+}

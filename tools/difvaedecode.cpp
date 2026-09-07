@@ -909,7 +909,7 @@ int run_request(const Options &options, ServerState &state) {
       auto representative = extract_tile(
           latent, 0U, tile_tokens, y_plan.starts.front() / spatial_ratio,
           x_plan.starts.front() / spatial_ratio, tile_latent_h, tile_latent_w);
-      bindings.emplace(options.latent_id, representative);
+      bindings.emplace(options.latent_id, std::move(representative));
 
       std::unique_ptr<dif::runtime::Executor> executor;
       if (!options.backend_plugin.empty())
@@ -929,6 +929,8 @@ int run_request(const Options &options, ServerState &state) {
     ++state.requests;
     const auto &bindings = state.bindings;
     auto &prepared = state.prepared;
+    const auto preparation_milliseconds = prepared->preparation_milliseconds();
+    const auto resident_bytes = prepared->resident_bytes();
     // --trace-ops: per-operation device timings aggregated over every tile
     // execution, printed by opcode so the decode's launch mix is attributable.
     std::map<std::string, std::pair<std::uint64_t, double>> opcode_timings;
@@ -1018,7 +1020,7 @@ int run_request(const Options &options, ServerState &state) {
           const auto found = result.outputs.find(options.raw_id);
           if (found == result.outputs.end())
             dif::fail("tile execution did not return the requested raw output");
-          tiles.push_back(found->second);
+          tiles.push_back(std::move(found->second));
           kernel_milliseconds += result.mean_milliseconds;
           if (backend_name.empty()) {
             backend_name = result.backend_name;
@@ -1042,6 +1044,14 @@ int run_request(const Options &options, ServerState &state) {
       }
     }
 
+    // One-shot requests have no further GPU consumer. Release the prepared
+    // model and CUDA context before allocating full-clip host outputs. Served
+    // requests retain them for the next request as before.
+    if (options.serve_socket.empty() && !reuse) {
+      state.prepared.reset();
+      state.backend.reset();
+      state.bindings.clear();
+    }
     const auto temporal_assembly_start = std::chrono::steady_clock::now();
     const auto padded_frames =
         pad_frames(latent.dims[2], padding_tokens, tokens_per_chunk,
@@ -1140,7 +1150,16 @@ int run_request(const Options &options, ServerState &state) {
         dif::fail("temporal VAE assembly frame count mismatch");
       if (padded_frames >= total_frames)
         dif::fail("temporal VAE padding removed every decoded frame");
-      raw = trim_temporal(assembled, total_frames - padded_frames);
+      // All spatial/temporal blends and the final tail copy have completed.
+      // Their source clips are no longer needed during trim, denormalization,
+      // or tensor serialization.
+      temporal_clips.clear();
+      if (padded_frames == 0U) {
+        raw = std::move(assembled);
+      } else {
+        raw = trim_temporal(assembled, total_frames - padded_frames);
+        assembled = {};
+      }
       temporal_assembly_milliseconds =
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - temporal_assembly_start)
@@ -1168,6 +1187,9 @@ int run_request(const Options &options, ServerState &state) {
                                                          : "product-rgb24";
     if (options.output_rgb.empty()) {
       dif::runtime::write_tensor(raw, options.output_raw);
+      // The raw file is complete and denormalization already consumed it.
+      // Do not retain its full payload while serializing the decoded copy.
+      raw = {};
       dif::runtime::write_tensor(decoded, options.output_decoded);
     } else {
       std::ofstream output(options.output_rgb,
@@ -1188,11 +1210,11 @@ int run_request(const Options &options, ServerState &state) {
             std::chrono::steady_clock::now() - wall_start)
             .count();
     const auto delivered_frames =
-        options.output_rgb.empty() ? raw.dims[2] : rgb.frames;
+        options.output_rgb.empty() ? decoded.dims[2] : rgb.frames;
     const auto delivered_height =
-        options.output_rgb.empty() ? raw.dims[3] : rgb.height;
+        options.output_rgb.empty() ? decoded.dims[3] : rgb.height;
     const auto delivered_width =
-        options.output_rgb.empty() ? raw.dims[4] : rgb.width;
+        options.output_rgb.empty() ? decoded.dims[4] : rgb.width;
     if (!opcode_timings.empty()) {
       std::vector<std::pair<std::string, std::pair<std::uint64_t, double>>> rows(
           opcode_timings.begin(), opcode_timings.end());
@@ -1218,7 +1240,7 @@ int run_request(const Options &options, ServerState &state) {
               << " spatial_tiles="
               << y_plan.starts.size() * x_plan.starts.size()
               << " executions=" << decoded_tile_count
-              << " prepare_ms=" << prepared->preparation_milliseconds()
+              << " prepare_ms=" << preparation_milliseconds
               << " persistent_reuse=" << (reuse ? 1 : 0)
               << " persistent_request=" << state.requests
               << " kernel_sum_ms=" << kernel_milliseconds
@@ -1231,7 +1253,7 @@ int run_request(const Options &options, ServerState &state) {
               << " output_class=" << output_class
               << " wall_ms=" << wall_milliseconds
               << " convrot_int8_linears=" << convrot_linear_count
-              << " resident_bytes=" << prepared->resident_bytes()
+              << " resident_bytes=" << resident_bytes
               << " free_before=" << free_before << " free_after=" << free_after
               << " range=[" << minimum << ',' << maximum << "]"
               << " source_hash=" << source_hash << "\n";

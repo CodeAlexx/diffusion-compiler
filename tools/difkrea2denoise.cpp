@@ -237,6 +237,13 @@ int main(int argc, char **argv) {
            << "  \"resident_bytes\": " << result.resident_bytes << ",\n"
            << "  \"streamed_weight_bytes\": "
            << result.pipeline_profile.streamed_weight_bytes << ",\n"
+           << "  \"streamed_fastload_bytes\": "
+           << result.pipeline_profile.streamed_fastload_bytes << ",\n"
+           << "  \"streamed_fastload_calls\": "
+           << result.pipeline_profile.streamed_fastload_calls << ",\n"
+           << "  \"streamed_fastload_host_ms\": "
+           << result.pipeline_profile.streamed_fastload_host_milliseconds
+           << ",\n"
            << "  \"streamed_host_stage_ms\": "
            << result.pipeline_profile.streamed_host_stage_milliseconds << ",\n"
            << "  \"streamed_host_wait_ms\": "

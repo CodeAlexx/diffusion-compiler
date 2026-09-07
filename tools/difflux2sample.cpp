@@ -1,4 +1,4 @@
-// difflux2sample -- native FLUX.2 [klein] Base 9B prompt-to-PNG path.
+// difflux2sample -- shared native FLUX.2 prompt-to-PNG path.
 //
 // The accepted execution path is C++/DiffIR only.  Creator/PyTorch artifacts
 // may be supplied as optional parity fixtures, but neither Python nor a
@@ -53,6 +53,9 @@ constexpr std::string_view kModelRevision =
 
 struct Arguments {
   fs::path model_directory;
+  fs::path text_encoder_directory;
+  fs::path tokenizer_directory;
+  std::string vae_format{"creator"};
   fs::path transformer_checkpoint;
   fs::path vae_checkpoint;
   fs::path positive_conditioning;
@@ -66,10 +69,9 @@ struct Arguments {
   std::string prompt;
   std::uint64_t seed{20260901U};
   std::uint32_t steps{50U};
-  // --flux2-model klein9b|dev. dev = FLUX.2 [dev] geometry (8 + 48 blocks,
+  // --flux2-model klein4b|klein9b|dev. dev = FLUX.2 [dev] geometry (8 + 48 blocks,
   // hidden 6144, Mistral context 15360, guidance embedding, no CFG batch);
-  // its conditioning must come from --positive-conditioning until the Mistral
-  // conditioner frontend lands.
+  // Klein variants use the corresponding Qwen tower and batch-two Base CFG.
   std::string flux2_model{"klein9b"};
   std::uint32_t start_step{};
   std::uint32_t stop_after{};
@@ -161,6 +163,9 @@ struct Arguments {
       << "difflux2sample: " << message << "\n"
       << "usage: difflux2sample --model-dir DIR --vae-checkpoint ae.safetensors "
          "--prompt TEXT --output image.png --report report.json "
+         "[--flux2-model klein4b|klein9b|dev] "
+         "[--text-encoder-dir DIR --tokenizer-dir DIR] "
+         "[--vae-format creator|diffusers] "
          "[--state-output state.safetensors] "
          "[--transformer-checkpoint model.safetensors] "
          "[--positive-conditioning positive.safetensors "
@@ -233,8 +238,11 @@ struct Arguments {
 Arguments parse(int argc, char **argv) {
   Arguments result;
   bool w8a8_quantization_option{};
+  bool low_precision_option{};
   for (int index = 1; index < argc; ++index) {
     const std::string option = argv[index];
+    low_precision_option |= option.starts_with("--w8a8") || option.starts_with("--fp8") ||
+                            option.starts_with("--int8") || option.starts_with("--squareq");
     const auto value = [&]() -> std::string {
       if (++index >= argc)
         usage_error(option + " requires a value");
@@ -242,6 +250,12 @@ Arguments parse(int argc, char **argv) {
     };
     if (option == "--model-dir")
       result.model_directory = value();
+    else if (option == "--text-encoder-dir")
+      result.text_encoder_directory = value();
+    else if (option == "--tokenizer-dir")
+      result.tokenizer_directory = value();
+    else if (option == "--vae-format")
+      result.vae_format = value();
     else if (option == "--transformer-checkpoint")
       result.transformer_checkpoint = value();
     else if (option == "--vae-checkpoint")
@@ -802,11 +816,26 @@ Arguments parse(int argc, char **argv) {
   if (result.resident_plan_mib >
       std::numeric_limits<std::uint64_t>::max() / (1024ULL * 1024ULL))
     usage_error("resident plan MiB overflows bytes");
-  if (result.flux2_model != "klein9b" && result.flux2_model != "dev")
-    usage_error("--flux2-model must be klein9b or dev");
+  if (result.vae_format != "creator" && result.vae_format != "diffusers")
+    usage_error("--vae-format must be creator or diffusers");
+  if (result.flux2_model != "klein4b" && result.flux2_model != "klein9b" &&
+      result.flux2_model != "dev")
+    usage_error("--flux2-model must be klein4b, klein9b or dev");
+  if (result.flux2_model == "klein4b" && low_precision_option) {
+    // Existing experimental low-precision rewrites include 4096-wide layout
+    // assumptions. Do not silently apply the 9B policy to a 3072-wide model.
+    usage_error("Klein Base 4B currently supports the BF16 path only; "
+                "low-precision policies require a separate parity gate");
+  }
+  if (result.text_encoder_directory.empty())
+    result.text_encoder_directory = result.model_directory / "text_encoder";
+  if (result.tokenizer_directory.empty())
+    result.tokenizer_directory = result.model_directory / "tokenizer";
   if (result.transformer_checkpoint.empty())
     result.transformer_checkpoint =
-        result.model_directory / "flux-2-klein-base-9b.safetensors";
+        result.model_directory / (result.flux2_model == "klein4b"
+            ? "flux-2-klein-base-4b.safetensors" : result.flux2_model == "dev"
+            ? "flux2-dev.safetensors" : "flux-2-klein-base-9b.safetensors");
   if (fs::exists(result.output_png) || fs::exists(result.report) ||
       (!result.state_output.empty() && fs::exists(result.state_output)))
     dif::fail("refusing to overwrite an output artifact");
@@ -913,10 +942,9 @@ struct ConditioningResult {
 };
 
 dif::runtime::TensorMap bind_indexed_conditioner_weights(
-    const fs::path &model_directory,
+    const fs::path &text_encoder_directory,
     const dif::frontend::Qwen3VlConditionerBuild &build) {
-  const auto index_path = model_directory / "text_encoder" /
-                          "model.safetensors.index.json";
+  const auto index_path = text_encoder_directory / "model.safetensors.index.json";
   const auto index = dif::weights::read_safetensors_index(index_path);
   std::map<fs::path, dif::weights::SafeTensorFile> shards;
   dif::runtime::TensorMap result = build.generated_constants;
@@ -989,8 +1017,8 @@ ConditioningResult condition(const Arguments &arguments) {
   auto started = Clock::now();
   const bool dev = arguments.flux2_model == "dev";
   const auto tokenizer = dif::text::QwenBpeTokenizer::load(
-      arguments.model_directory / "tokenizer" / "tokenizer.json",
-      arguments.model_directory / "tokenizer" / "tokenizer_config.json");
+      arguments.tokenizer_directory / "tokenizer.json",
+      arguments.tokenizer_directory / "tokenizer_config.json");
   const auto positive_inputs =
       dev ? dif::frontend::make_flux2_mistral_prompt_inputs(tokenizer,
                                                             arguments.prompt)
@@ -1004,11 +1032,13 @@ ConditioningResult condition(const Arguments &arguments) {
   result.tokenizer_ms = elapsed_ms(started);
 
   const auto config = dev ? dif::frontend::make_flux2_dev_conditioner_config()
-                          : dif::frontend::make_flux2_klein_9b_conditioner_config();
+      : arguments.flux2_model == "klein4b"
+          ? dif::frontend::make_flux2_klein_4b_conditioner_config()
+          : dif::frontend::make_flux2_klein_9b_conditioner_config();
   const auto build =
       dif::frontend::build_qwen3vl_conditioner_program(512U, config);
   auto bindings =
-      bind_indexed_conditioner_weights(arguments.model_directory, build);
+      bind_indexed_conditioner_weights(arguments.text_encoder_directory, build);
   bind_prompt_inputs(bindings, build, positive_inputs);
   dif::runtime::RunOptions options;
   options.warmups = 0U;
@@ -3310,13 +3340,15 @@ DenoiseResult denoise(const Arguments &arguments,
   dif::frontend::Flux2KleinTransformerConfig config;
   if (dev)
     config.geometry = dif::frontend::flux2_dev_geometry();
+  else if (arguments.flux2_model == "klein4b")
+    config.geometry = dif::frontend::flux2_klein_4b_geometry();
   // The executed depth is the geometry's full depth: the config defaults are
   // Klein's 8+24 and would silently truncate [dev] (8+48) to half its single
   // blocks. Truncated ladders are a parity-harness concern, not this tool's.
   config.double_depth = config.geometry.double_depth;
   config.single_depth = config.geometry.single_depth;
   std::cerr << "FLUX2_TRANSFORMER_GEOMETRY model="
-            << (dev ? "dev" : "klein9b")
+            << arguments.flux2_model
             << " hidden=" << config.geometry.hidden
             << " heads=" << config.geometry.heads
             << " double_depth=" << config.double_depth
@@ -4136,6 +4168,12 @@ DenoiseResult denoise(const Arguments &arguments,
       const auto &telemetry = prediction.run_telemetry;
       std::cerr << "FLUX2_PIPELINE_PROFILE step=" << (step + 1U)
                 << " streamed_weight_bytes=" << profile.streamed_weight_bytes
+                << " streamed_fastload_bytes="
+                << profile.streamed_fastload_bytes
+                << " streamed_fastload_calls="
+                << profile.streamed_fastload_calls
+                << " streamed_fastload_host_ms="
+                << profile.streamed_fastload_host_milliseconds
                 << " host_stage_ms="
                 << profile.streamed_host_stage_milliseconds
                 << " host_wait_ms="
@@ -4274,7 +4312,23 @@ VaeResult decode(const Arguments &arguments,
   dif::runtime::TensorMap bindings;
   bindings.emplace(vae.latent_tokens_input, latent);
   for (const auto &binding : vae.weights) {
-    auto tensor = dif::weights::map_safetensor(checkpoint, binding.name);
+    const auto name = arguments.vae_format == "diffusers"
+        ? dif::frontend::flux2_vae_diffusers_name(binding.name) : binding.name;
+    auto tensor = dif::weights::map_safetensor(checkpoint, name);
+    const auto *description = vae.program.tensor(binding.tensor_id);
+    if (arguments.vae_format == "diffusers" &&
+        binding.name.starts_with("decoder.mid.attn_1.") &&
+        binding.name.ends_with(".weight") && tensor.dims.size() == 2U &&
+        description && description->dims.size() == 4U &&
+        description->dims[2] == 1U && description->dims[3] == 1U &&
+        tensor.dims[0] == description->dims[0] &&
+        tensor.dims[1] == description->dims[1]) {
+      // Linear and 1x1 convolution store exactly the same ordered values.
+      tensor.dims = description->dims;
+    }
+    if (!description || tensor.dtype != description->dtype ||
+        tensor.dims != description->dims)
+      dif::fail("VAE checkpoint disagrees with FLUX.2 decoder: " + name);
     if (binding.transform ==
         dif::frontend::Flux2VaeWeightTransform::
             BatchNormStandardDeviation) {
@@ -4288,7 +4342,6 @@ VaeResult decode(const Arguments &arguments,
       transformed.validate();
       tensor = std::move(transformed);
     }
-    const auto *description = vae.program.tensor(binding.tensor_id);
     if (!description || tensor.dtype != description->dtype ||
         tensor.dims != description->dims)
       dif::fail("VAE checkpoint disagreement at " + binding.name);
@@ -4469,8 +4522,14 @@ int main(int argc, char **argv) {
     std::ofstream report(arguments.report, std::ios::trunc);
     report << std::setprecision(17)
            << "{\n  \"creator_commit\": " << std::quoted(kCreatorCommit)
-           << ",\n  \"model_revision\": " << std::quoted(kModelRevision)
-           << ",\n  \"model_family\": \"FLUX.2-klein-base-9B\",\n"
+           << ",\n  \"model_revision\": " << std::quoted(
+                  arguments.flux2_model == "klein9b" ? kModelRevision :
+                  arguments.flux2_model == "dev" ? std::string_view(
+                      "26afe3a78bb242c0a8bb181dcc8937bb16e5c66c") : std::string_view())
+           << ",\n  \"model_family\": " << std::quoted(
+                  arguments.flux2_model == "klein4b" ? "FLUX.2-klein-base-4B" :
+                  arguments.flux2_model == "dev" ? "FLUX.2-dev" : "FLUX.2-klein-base-9B")
+           << ",\n"
            << "  \"prompt\": " << std::quoted(arguments.prompt)
            << ",\n  \"seed\": " << arguments.seed
            << ",\n  \"noise_generator\": "

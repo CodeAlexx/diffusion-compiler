@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -282,6 +283,86 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     return std::vector<Attribute>{
         Attribute::f64(AttrKey::Epsilon, config.rms_norm_epsilon)};
   };
+  std::uint32_t norm_ones = 0U, norm_zeros = 0U;
+  if (config.eager_norm_rounding) {
+    norm_ones = builder.internal({hidden});
+    norm_zeros = builder.internal({hidden});
+    builder.operation(Opcode::Fill, {}, {norm_ones},
+                      {Attribute::f64(AttrKey::Value, 1.0)});
+    builder.operation(Opcode::Fill, {}, {norm_zeros},
+                      {Attribute::f64(AttrKey::Value, 0.0)});
+  }
+  const auto residual_norm = [&](std::uint32_t input, std::uint32_t weight,
+                                  std::uint32_t output) {
+    if (config.eager_norm_rounding) {
+      const auto normalized = builder.internal({sequence, hidden});
+      builder.operation(Opcode::RmsNorm, {input, norm_ones}, {normalized}, rms_attributes());
+      builder.operation(Opcode::AffineLastDim, {normalized, weight, norm_zeros}, {output});
+    } else {
+      builder.operation(Opcode::RmsNorm, {input, weight}, {output}, rms_attributes());
+    }
+  };
+
+  // Eager BF16 QK normalization/RoPE. Repeated position tables are shared
+  // across all layers, and every arithmetic storage boundary remains in IR.
+  std::uint32_t head_ones = 0U, head_zeros = 0U, rotate_signs = 0U;
+  std::map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> head_tables;
+  if (config.eager_norm_rounding && config.qk_norm) {
+    head_ones = builder.internal({head_dim});
+    head_zeros = builder.internal({head_dim});
+    builder.operation(Opcode::Fill, {}, {head_ones}, {Attribute::f64(AttrKey::Value, 1.0)});
+    builder.operation(Opcode::Fill, {}, {head_zeros}, {Attribute::f64(AttrKey::Value, 0.0)});
+    const auto negative = builder.internal({half_dim});
+    const auto positive = builder.internal({half_dim});
+    builder.operation(Opcode::Fill, {}, {negative}, {Attribute::f64(AttrKey::Value, -1.0)});
+    builder.operation(Opcode::Fill, {}, {positive}, {Attribute::f64(AttrKey::Value, 1.0)});
+    rotate_signs = builder.internal({head_dim});
+    builder.operation(Opcode::Concat, {negative, positive}, {rotate_signs},
+                      {Attribute::u64(AttrKey::Axis, 0U)});
+    for (const auto head_count : {heads, kv_heads}) {
+      if (head_tables.contains(head_count)) continue;
+      std::vector<std::int32_t> rows(sequence * head_count);
+      for (std::size_t i = 0; i < rows.size(); ++i) rows[i] = static_cast<std::int32_t>(i / head_count);
+      runtime::Tensor indices{DType::I32, {rows.size()}, std::vector<std::uint8_t>(rows.size() * sizeof(std::int32_t))};
+      std::memcpy(indices.bytes.data(), rows.data(), indices.bytes.size());
+      const auto ids = builder.generated(std::move(indices));
+      const auto cosine = builder.internal({sequence * head_count, head_dim});
+      const auto sine = builder.internal({sequence * head_count, head_dim});
+      builder.operation(Opcode::GatherRows, {cosine_id, ids}, {cosine});
+      builder.operation(Opcode::GatherRows, {sine_id, ids}, {sine});
+      head_tables.emplace(head_count, std::pair{cosine, sine});
+    }
+  }
+  const auto eager_qk = [&](std::uint32_t input, std::uint32_t weight,
+                             std::uint64_t head_count) {
+    const auto rows = sequence * head_count;
+    const auto flat = builder.internal({rows, head_dim});
+    builder.operation(Opcode::Reshape, {input}, {flat});
+    const auto normalized = builder.internal({rows, head_dim});
+    builder.operation(Opcode::RmsNorm, {flat, head_ones}, {normalized}, rms_attributes());
+    const auto scaled = builder.internal({rows, head_dim});
+    builder.operation(Opcode::AffineLastDim, {normalized, weight, head_zeros}, {scaled});
+    const auto first = builder.internal({rows, half_dim});
+    const auto second = builder.internal({rows, half_dim});
+    builder.operation(Opcode::Slice, {scaled}, {first},
+                      {Attribute::u64(AttrKey::Axis, 1U), Attribute::u64(AttrKey::Start, 0U)});
+    builder.operation(Opcode::Slice, {scaled}, {second},
+                      {Attribute::u64(AttrKey::Axis, 1U), Attribute::u64(AttrKey::Start, half_dim)});
+    const auto swapped = builder.internal({rows, head_dim});
+    builder.operation(Opcode::Concat, {second, first}, {swapped}, {Attribute::u64(AttrKey::Axis, 1U)});
+    const auto rotated_half = builder.internal({rows, head_dim});
+    builder.operation(Opcode::AffineLastDim, {swapped, rotate_signs, head_zeros}, {rotated_half});
+    const auto [cosine, sine] = head_tables.at(head_count);
+    const auto cos_product = builder.internal({rows, head_dim});
+    const auto sin_product = builder.internal({rows, head_dim});
+    builder.operation(Opcode::Multiply, {scaled, cosine}, {cos_product});
+    builder.operation(Opcode::Multiply, {rotated_half, sine}, {sin_product});
+    const auto sum = builder.internal({rows, head_dim});
+    builder.operation(Opcode::Add, {cos_product, sin_product}, {sum});
+    const auto output = builder.internal({sequence, head_count, head_dim});
+    builder.operation(Opcode::Reshape, {sum}, {output});
+    return output;
+  };
 
   // ---- layers 0 .. executed_layers-1 --------------------------------------
   for (std::uint64_t layer = 0U; layer < config.executed_layers; ++layer) {
@@ -291,8 +372,7 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     const auto input_norm_weight_id =
         builder.streamed(prefix + "input_layernorm.weight", {hidden});
     const auto normed_id = builder.internal({sequence, hidden});
-    builder.operation(Opcode::RmsNorm, {residual_id, input_norm_weight_id},
-                      {normed_id}, rms_attributes());
+    residual_norm(residual_id, input_norm_weight_id, normed_id);
     capture(layer, "input_norm", normed_id);
 
     // Linear flattens trailing output dims, so the projections write the
@@ -316,7 +396,14 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
 
     std::uint32_t rotated_query_id = 0U;
     std::uint32_t rotated_key_id = 0U;
-    if (config.qk_norm) {
+    if (config.qk_norm && config.eager_norm_rounding) {
+      const auto query_weight = builder.streamed(prefix + "self_attn.q_norm.weight", {head_dim});
+      const auto key_weight = builder.streamed(prefix + "self_attn.k_norm.weight", {head_dim});
+      rotated_query_id = eager_qk(query_id, query_weight, heads);
+      rotated_key_id = eager_qk(key_id, key_weight, kv_heads);
+      capture(layer, "rotated_q", rotated_query_id);
+      capture(layer, "rotated_k", rotated_key_id);
+    } else if (config.qk_norm) {
       // Qwen3 per-head QK RMSNorm followed by full-width rotate-half RoPE:
       // exactly QkNormPartialRope with RotaryDim == head_dim. Every shape
       // attribute is stamped so no consumer can resolve a different default.
@@ -426,8 +513,7 @@ build_qwen3vl_conditioner_program(std::uint64_t sequence_length,
     const auto post_norm_weight_id =
         builder.streamed(prefix + "post_attention_layernorm.weight", {hidden});
     const auto post_normed_id = builder.internal({sequence, hidden});
-    builder.operation(Opcode::RmsNorm, {residual_id, post_norm_weight_id},
-                      {post_normed_id}, rms_attributes());
+    residual_norm(residual_id, post_norm_weight_id, post_normed_id);
     capture(layer, "post_attention_norm", post_normed_id);
     const auto gate_weight_id =
         builder.streamed(prefix + "mlp.gate_proj.weight", {intermediate, hidden});

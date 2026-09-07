@@ -22,9 +22,20 @@
 #include "dif/support/png.hpp"
 #include "dif/support/torch_cpu_rng.hpp"
 #include "dif/text/clip_bpe_tokenizer.hpp"
+#if DIF_HAVE_FASTLOAD
+#include "dif/runtime/fastload.h"
+#endif
+
+#include <unordered_map>
 #include "dif/weights/safetensors.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <optional>
+#include <thread>
+#include <exception>
+#include <string_view>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -210,6 +221,104 @@ Tensor as_dtype(Tensor tensor, DType dtype) {
   return dif::runtime::convert_float_tensor(tensor, dtype);
 }
 
+// Checkpoint tensors the tool must touch on the host (fused row splits,
+// transposes, dtype casts) are materialized into host memory through the
+// assembler loader first: one sequential pass over the file at drive speed
+// (O_DIRECT when cold), instead of faulting every byte through the mapping
+// at page-cache read-ahead speed. Returns an empty map when the loader is
+// disabled (DIF_FASTLOAD=0) or declines, and the caller stays on the mapping.
+// With `target` == BF16, F16 and F32 sources arrive already converted: the
+// loader's AVX2 kernels round to nearest even in the pinned slot, the same
+// rule as convert_float_tensor, so the bytes are identical to the host cast
+// (DIF_FASTLOAD_VERIFY=1 checks that on every tensor and reports).
+std::unordered_map<std::string, Tensor>
+materialize_host(const dif::weights::SafeTensorFile &checkpoint,
+                 const std::vector<std::string> &names,
+                 std::optional<DType> target = std::nullopt) {
+  std::unordered_map<std::string, Tensor> out;
+#if !DIF_HAVE_FASTLOAD
+  (void)checkpoint;
+  (void)names;
+  (void)target;
+  return out;
+#else
+  if (names.empty())
+    return out;
+  if (!serenity_fastload_runtime_enabled())
+    return out;
+  std::vector<serenity_fastload_span> spans;
+  const dif::runtime::MappedStorage *storage = nullptr;
+  std::vector<std::pair<std::string, Tensor>> verify_sources;
+  for (const auto &name : names) {
+    if (out.contains(name))
+      continue;  // fused q/k/v rows share one source tensor: read it once
+    auto mapped = dif::weights::map_safetensor(checkpoint, name);
+    if (!mapped.is_mapped() || mapped.byte_size() == 0U ||
+        (storage && mapped.mapping.get() != storage))
+      return {};
+    storage = mapped.mapping.get();
+    std::uint32_t convert = 0U;
+    auto dtype = mapped.dtype;
+    std::size_t bytes = mapped.byte_size();
+    if (target && *target == DType::BF16 && mapped.dtype == DType::F16) {
+      convert = 1U; dtype = DType::BF16;
+    } else if (target && *target == DType::BF16 && mapped.dtype == DType::F32) {
+      convert = 2U; dtype = DType::BF16; bytes /= 2U;
+    }
+    Tensor tensor{dtype, mapped.dims, {}};
+    tensor.bytes.resize(bytes);
+    spans.push_back({mapped.mapping_offset, mapped.byte_size(),
+                     reinterpret_cast<std::uint64_t>(tensor.bytes.data()),
+                     convert, 1U});
+    if (convert != 0U && std::getenv("DIF_FASTLOAD_VERIFY"))
+      verify_sources.emplace_back(name, mapped);
+    out.emplace(name, std::move(tensor));
+  }
+  std::sort(spans.begin(), spans.end(),
+            [](const auto &a, const auto &b) { return a.file_off < b.file_off; });
+  serenity_fastload_request request{};
+  request.fd = storage->descriptor();
+  request.fd_direct = storage->direct_descriptor();
+  request.spans = spans.data();
+  request.nspans = spans.size();
+  request.mode = 0;
+  serenity_fastload_stats stats{};
+  std::array<char, 256> error{};
+  request.stats = &stats;
+  request.err = error.data();
+  request.err_capacity = error.size();
+  const auto started = Clock::now();
+  const int rc = serenity_fastload_run(&request);
+  if (rc != 0) {
+    std::cerr << "FASTLOAD_HOST_FALLBACK rc=" << rc << " " << error.data()
+              << '\n';
+    return {};
+  }
+  if (std::getenv("DIF_FASTLOAD_REPORT")) {
+    std::uint64_t bytes = 0U;
+    for (const auto &span : spans)
+      bytes += span.nbytes;
+    std::cerr << "FASTLOAD_HOST tensors=" << spans.size() << " bytes=" << bytes
+              << " mode=" << stats.mode_used << " seconds="
+              << ms_since(started) / 1000.0 << '\n';
+  }
+  if (!verify_sources.empty()) {
+    std::size_t bad = 0U;
+    for (const auto &[name, mapped] : verify_sources) {
+      const auto reference = dif::runtime::convert_float_tensor(mapped, *target);
+      const auto &loaded = out.at(name);
+      if (reference.bytes != loaded.bytes)
+        ++bad;
+    }
+    std::cerr << "FASTLOAD_VERIFY converted_tensors=" << verify_sources.size()
+              << " mismatching=" << bad
+              << (bad ? " FAIL" : " identical to convert_float_tensor")
+              << '\n';
+  }
+  return out;
+#endif
+}
+
 void check_binding(const dif::ir::Program &program, std::uint32_t id,
                    const Tensor &tensor, const std::string &name) {
   const auto *description = program.tensor(id);
@@ -236,9 +345,18 @@ Tower prepare_tower(const dif::weights::SafeTensorFile &checkpoint,
   tower.hidden_size = config.hidden_size;
   tower.build = dif::frontend::make_clip_text_tower(config);
   const auto hidden = config.hidden_size;
+  using Transform = dif::frontend::ClipWeightTransform;
+  std::vector<std::string> host_names;
   for (const auto &weight : tower.build.weights) {
-    auto source = dif::weights::map_safetensor(checkpoint, weight.source_name);
-    using Transform = dif::frontend::ClipWeightTransform;
+    const auto mapped = dif::weights::map_safetensor(checkpoint, weight.source_name);
+    if (weight.transform != Transform::Direct || mapped.dtype != config.dtype)
+      host_names.push_back(weight.source_name);
+  }
+  auto host_sources = materialize_host(checkpoint, host_names);
+  for (const auto &weight : tower.build.weights) {
+    auto source = host_sources.contains(weight.source_name)
+                      ? host_sources.at(weight.source_name)
+                      : dif::weights::map_safetensor(checkpoint, weight.source_name);
     switch (weight.transform) {
     case Transform::Direct:
       break;
@@ -372,6 +490,58 @@ std::vector<std::uint8_t> rgb8(const Tensor &pixels, std::uint64_t width,
 
 } // namespace
 
+// The two text towers' prepare AND encode as one unit of work on a thread
+// of their own: their preparation (about 1.5 s of weight streaming plus
+// 0.6 s of analysis) overlaps the denoiser's, which runs on the main thread.
+// Everything the towers create -- prepared executions and their cuDNN plans,
+// which are bound to the creating thread's cuDNN handle -- lives and dies on
+// that thread; only the encodings (plain host vectors) come back.
+struct TowerStage {
+  Encoding l_positive, g_positive, l_negative, g_negative;
+  std::uint64_t l_hidden{}, g_hidden{};
+  double prepare_ms{}, encode_ms{};
+  std::exception_ptr error;
+  std::thread worker;
+
+  template <class Tokenizer, class Prompt>
+  void start(const dif::weights::SafeTensorFile &checkpoint,
+             dif::frontend::ClipTextTowerConfig l_config,
+             dif::frontend::ClipTextTowerConfig g_config,
+             const Tokenizer &tokenizer, const Prompt &positive,
+             const Prompt &negative, dif::runtime::Executor &backend,
+             const dif::runtime::RunOptions &options, std::uint64_t positions) {
+    worker = std::thread([this, &checkpoint, l_config, g_config, &tokenizer,
+                          &positive, &negative, &backend, &options, positions] {
+      try {
+        backend.bind_thread();
+        auto started = Clock::now();
+        auto l_tower = prepare_tower(checkpoint, l_config, backend, options);
+        auto g_tower = prepare_tower(checkpoint, g_config, backend, options);
+        prepare_ms = ms_since(started);
+        started = Clock::now();
+        const auto l_empty =
+            dif::text::clip_empty_chunk(tokenizer, tokenizer.eos_id());
+        const auto g_empty = dif::text::clip_empty_chunk(
+            tokenizer, dif::text::kSdxlClipGPadToken);
+        l_positive = encode_tower(l_tower, positive.l, l_empty, options, positions);
+        g_positive = encode_tower(g_tower, positive.g, g_empty, options, positions);
+        l_negative = encode_tower(l_tower, negative.l, l_empty, options, positions);
+        g_negative = encode_tower(g_tower, negative.g, g_empty, options, positions);
+        l_hidden = l_tower.hidden_size;
+        g_hidden = g_tower.hidden_size;
+        encode_ms = ms_since(started);
+      } catch (...) {
+        error = std::current_exception();
+      }
+    });
+  }
+  void join() {
+    if (worker.joinable())
+      worker.join();
+  }
+  ~TowerStage() { join(); }
+};
+
 int main(int argc, char **argv) {
   try {
     const auto arguments = parse(argc, argv);
@@ -410,8 +580,9 @@ int main(int argc, char **argv) {
     const auto checkpoint = dif::weights::read_safetensors(arguments.checkpoint);
     auto backend = dif::runtime::make_cuda_executor();
 
-    // --- text -------------------------------------------------------------
-    started = Clock::now();
+    // --- text, on its own thread ------------------------------------------
+    // The towers prepare and encode there while the denoiser prepares here;
+    // loader calls from both threads serialize on the loader's own lock.
     auto l_config = dif::frontend::sdxl_clip_l_config();
     auto g_config = dif::frontend::sdxl_clip_g_config();
     for (auto *config : {&l_config, &g_config}) {
@@ -420,24 +591,9 @@ int main(int argc, char **argv) {
       if (config->dtype != DType::F32)
         config->attention_implementation = 2U;
     }
-    auto l_tower = prepare_tower(checkpoint, l_config, *backend, options);
-    auto g_tower = prepare_tower(checkpoint, g_config, *backend, options);
-    const auto text_prepare_ms = ms_since(started);
-
-    started = Clock::now();
-    const auto l_empty = dif::text::clip_empty_chunk(tokenizer,
-                                                     tokenizer.eos_id());
-    const auto g_empty =
-        dif::text::clip_empty_chunk(tokenizer, dif::text::kSdxlClipGPadToken);
-    const auto l_positive =
-        encode_tower(l_tower, positive.l, l_empty, options, kPositions);
-    const auto g_positive =
-        encode_tower(g_tower, positive.g, g_empty, options, kPositions);
-    const auto l_negative =
-        encode_tower(l_tower, negative.l, l_empty, options, kPositions);
-    const auto g_negative =
-        encode_tower(g_tower, negative.g, g_empty, options, kPositions);
-    const auto text_ms = ms_since(started);
+    TowerStage towers;
+    towers.start(checkpoint, l_config, g_config, tokenizer, positive, negative,
+                 *backend, options, kPositions);
 
     const auto context_tokens = chunks * kPositions;
     const std::uint64_t context_width = 2048;
@@ -453,13 +609,48 @@ int main(int argc, char **argv) {
     unet_config.capture_boundaries = false;
     auto unet = dif::frontend::make_sdxl_unet(unet_config);
     dif::runtime::TensorMap unet_bindings;
+    std::vector<std::string> unet_host_names;
+    for (const auto &weight : unet.weights)
+      if (dif::weights::map_safetensor(checkpoint, weight.source_name).dtype !=
+          unet_config.dtype)
+        unet_host_names.push_back(weight.source_name);
+    auto unet_host_sources =
+        materialize_host(checkpoint, unet_host_names, unet_config.dtype);
     for (const auto &weight : unet.weights) {
       auto tensor = as_dtype(
-          dif::weights::map_safetensor(checkpoint, weight.source_name),
+          unet_host_sources.contains(weight.source_name)
+              ? unet_host_sources.at(weight.source_name)
+              : dif::weights::map_safetensor(checkpoint, weight.source_name),
           unet_config.dtype);
       check_binding(unet.program, weight.tensor, tensor, weight.source_name);
       unet_bindings.emplace(weight.tensor, std::move(tensor));
     }
+    // Prompt-dependent inputs are bound as placeholders of the final shape;
+    // prepare reads only the constants, inputs are uploaded per run.
+    unet_bindings.emplace(
+        unet.context_input,
+        make_tensor(unet_config.dtype, {2U, context_tokens, context_width}));
+    unet_bindings.emplace(unet.vector_input,
+                          make_tensor(unet_config.dtype, {2U, 2816U}));
+    unet_bindings.emplace(unet.timestep_input, make_tensor(DType::F32, {2U}));
+    unet_bindings.emplace(
+        unet.latent_input,
+        make_tensor(unet_config.dtype, {2U, 4U, latent_height, latent_width}));
+    auto unet_prepared = backend->prepare(unet.program, unet_bindings, options);
+    const auto unet_prepare_ms = ms_since(started);
+
+    started = Clock::now();
+    towers.join();
+    if (towers.error)
+      std::rethrow_exception(towers.error);
+    const auto text_prepare_ms = towers.prepare_ms;
+    const auto text_ms = towers.encode_ms;
+    const auto &l_positive = towers.l_positive;
+    const auto &g_positive = towers.g_positive;
+    const auto &l_negative = towers.l_negative;
+    const auto &g_negative = towers.g_negative;
+    const auto tower_wait_ms = ms_since(started);
+    started = Clock::now();
     // Row 0 is the prompt, row 1 the negative prompt.
     auto context = make_tensor(unet_config.dtype,
                                {2U, context_tokens, context_width});
@@ -469,10 +660,10 @@ int main(int argc, char **argv) {
           // Repeat the shorter encoding over the batched row count.
           const auto l_row = row % l.rows;
           const auto g_row = row % g.rows;
-          return column < l_tower.hidden_size
-                     ? l.hidden[l_row * l_tower.hidden_size + column]
-                     : g.hidden[g_row * g_tower.hidden_size + column -
-                                l_tower.hidden_size];
+          return column < towers.l_hidden
+                     ? l.hidden[l_row * towers.l_hidden + column]
+                     : g.hidden[g_row * towers.g_hidden + column -
+                                towers.l_hidden];
         };
         dif::runtime::store_float(context, row * context_width + column,
                                   value(l_positive, g_positive));
@@ -502,14 +693,9 @@ int main(int argc, char **argv) {
             column < pooled.size() ? pooled[column]
                                    : size_part[column - pooled.size()]);
     }
-    unet_bindings.emplace(unet.context_input, std::move(context));
-    unet_bindings.emplace(unet.vector_input, std::move(vector));
-    unet_bindings.emplace(unet.timestep_input, make_tensor(DType::F32, {2U}));
-    unet_bindings.emplace(
-        unet.latent_input,
-        make_tensor(unet_config.dtype, {2U, 4U, latent_height, latent_width}));
-    auto unet_prepared = backend->prepare(unet.program, unet_bindings, options);
-    const auto unet_prepare_ms = ms_since(started);
+    unet_bindings.insert_or_assign(unet.context_input, std::move(context));
+    unet_bindings.insert_or_assign(unet.vector_input, std::move(vector));
+    const auto unet_condition_ms = ms_since(started);
 
     // --- the decoder ------------------------------------------------------
     // Built and prepared before sampling so a repeat pays neither again.
@@ -521,9 +707,17 @@ int main(int argc, char **argv) {
     vae_config.capture_boundaries = false;
     auto vae = dif::frontend::make_sdxl_vae_decoder(vae_config);
     dif::runtime::TensorMap vae_bindings;
+    std::vector<std::string> vae_host_names;
+    for (const auto &weight : vae.weights)
+      if (dif::weights::map_safetensor(checkpoint, weight.source_name).dtype !=
+          vae_config.dtype)
+        vae_host_names.push_back(weight.source_name);
+    auto vae_host_sources = materialize_host(checkpoint, vae_host_names, vae_config.dtype);
     for (const auto &weight : vae.weights) {
       auto tensor = as_dtype(
-          dif::weights::map_safetensor(checkpoint, weight.source_name),
+          vae_host_sources.contains(weight.source_name)
+              ? vae_host_sources.at(weight.source_name)
+              : dif::weights::map_safetensor(checkpoint, weight.source_name),
           vae_config.dtype);
       check_binding(vae.program, weight.tensor, tensor, weight.source_name);
       vae_bindings.emplace(weight.tensor, std::move(tensor));
@@ -594,10 +788,14 @@ int main(int argc, char **argv) {
         latent[index] += derivative * (next_sigma - sigma);
       }
       step_ms.push_back(ms_since(step_start));
-      if (arguments.report_steps)
+      if (arguments.report_steps) {
         std::cerr << "SDXL_STEP " << step << " sigma=" << sigma
                   << " timestep=" << timesteps[step]
                   << " ms=" << step_ms.back() << "\n";
+        // Shared compiler-worker progress protocol: completed, one-based step.
+        std::cout << "SDXL_NATIVE_STEP step=" << (step + 1U) << '/'
+                  << arguments.steps << " ms=" << step_ms.back() << std::endl;
+      }
     }
     sample_ms = ms_since(started);
 
@@ -642,6 +840,8 @@ int main(int argc, char **argv) {
               << " text_prepare_ms=" << text_prepare_ms
               << " text_ms=" << text_ms
               << " unet_prepare_ms=" << unet_prepare_ms
+              << " unet_condition_ms=" << unet_condition_ms
+              << " tower_wait_ms=" << tower_wait_ms
               << " vae_prepare_ms=" << vae_prepare_ms
               << " ready_ms=" << ready_ms
               << " images=" << arguments.images

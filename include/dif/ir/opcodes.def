@@ -230,3 +230,10 @@ DIF_OPCODE(RotaryApplyBackward, 98, "rotary_apply_backward", None)
 // linear per step, which is the cost the resident format exists to avoid.
 DIF_OPCODE(LinearInt8WeightScaledBackwardInput, 99,
            "linear_int8_weight_scaled_backward_input", None)
+// Direct-alpha periodic activation on [B,C,L], alpha stored as [1,C,1]:
+// x + reciprocal(alpha + epsilon) * square(sin(alpha*x)). Unlike SnakeBeta,
+// alpha is NOT logarithmic and also controls the reciprocal magnitude.
+DIF_OPCODE(SnakeAlpha, 100, "snake_alpha", PinnedNumerics | DtypeUniform)
+// One-axis mean, dropping Axis. Ascending-index F32 sum followed by division,
+// translated from serenitymojo/ops/reduce.mojo's single-axis mean path.
+DIF_OPCODE(ReduceMean, 101, "reduce_mean", PinnedNumerics | DtypeUniform)

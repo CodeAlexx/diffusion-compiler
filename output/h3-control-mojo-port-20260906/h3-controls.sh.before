@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Sourced request orchestration. CONTROL_MANIFEST is a JSON-file path, not a
+# shell expression. The caller supplies resolved JSON config, OUT working
+# directory, W/H/FPS/FRAMES/LAT_T/LAT_H/LAT_W, B/CACHE/MIN_FREE, and GPU[].
+# All learned operations use the compiler's existing shared native runtime.
+# Media semantics ported from Mojo's pipeline/minimax_h3_control_media.mojo.
+
+h3_control_decode_media() {
+  local input="$1" output="$2" resize="$3" filter
+  [[ "$input" == /* ]] || input="$manifest_dir/$input"
+  input="$(realpath -e "$input")" || return 66
+  case "$resize" in
+    crop) filter="scale=$W:$H:force_original_aspect_ratio=increase:flags=bilinear,crop=$W:$H";;
+    pad) filter="scale=$W:$H:force_original_aspect_ratio=decrease:flags=bilinear,pad=$W:$H:(ow-iw)/2:(oh-ih)/2:black";;
+    stretch) filter="scale=$W:$H:flags=bilinear";;
+    *) echo 'FATAL ControlNet resize must be crop, pad, or stretch' >&2; return 65;;
+  esac
+  "$ffmpeg" -v error -nostdin -n -i "$input" -an \
+    -vf "fps=$FPS,$filter,tpad=stop_mode=clone:stop_duration=3600" \
+    -frames:v "$FRAMES" -f rawvideo -pix_fmt rgb24 "$output" || return 65
+  [[ "$(stat -c %s "$output")" == "$((W * H * FRAMES * 3))" ]] || {
+    echo 'FATAL ControlNet media decode did not produce the requested frame count' >&2; return 65;
+  }
+}
+
+h3_control_encode_mean() {
+  local rgb="$1" prefix="$2"
+  "${GPU[@]}" "$B/difh3encode" --backend cuda --program "$encoder_program" \
+    --weight-bundle "$encoder_bundle" --video-rgb "$rgb" \
+    --width "$W" --height "$H" --frames "$FRAMES" \
+    --pixels-id "$(jq_get minimax_h3.control.encoder_pixels_id)" \
+    --moments-id "$(jq_get minimax_h3.control.encoder_moments_id)" \
+    --tile-size "$tile_size" --tile-overlap "$tile_overlap" \
+    --clip-length "$clip_length" --token-drop "$token_drop" --posterior-mode mean \
+    --output-moments "$prefix-moments.diftensor" \
+    --output-latent "$prefix-raw-latent.diftensor" \
+    --output-normalized-latent "$prefix-normalized-latent.diftensor" \
+    --output-rows "$prefix-vae-rows.diftensor" \
+    --cache-dir "$CACHE" --min-free-mib "$MIN_FREE"
+}
+
+h3_control_conditioning() {
+  CONTROL_ARGS=()
+  [[ -n "${CONTROL_MANIFEST:-}" ]] || return 0
+  [[ "$TASK" == t2va || "$TASK" == controlnet ]] || { echo 'FATAL ControlNet currently requires the T2VA layout' >&2; return 65; }
+
+  local max_count max_strength manifest_doc manifest_dir count
+  max_count="$(jq_get minimax_h3.control.max_count)" || return
+  max_strength="$(jq_get minimax_h3.control.max_abs_strength)" || return
+  [[ "$max_count" =~ ^[1-4]$ ]] || { echo 'FATAL invalid configured ControlNet count' >&2; return 65; }
+  [[ -f "$CONTROL_MANIFEST" && -s "$CONTROL_MANIFEST" ]] || { echo 'FATAL control manifest is missing' >&2; return 66; }
+  manifest_dir="$(dirname "$(realpath -e "$CONTROL_MANIFEST")")" || return
+  manifest_doc="$(jq -ce --argjson defaults "$(jq -c '.minimax_h3.control.defaults' <<<"$DIFC_DOCUMENT")" \
+    --argjson max "$max_count" --argjson strength_limit "$max_strength" '
+    def finite_number: type == "number" and isinfinite == false and isnan == false;
+    map($defaults + .) |
+    if ($strength_limit | finite_number) and $strength_limit > 0 and
+       type == "array" and length <= $max and all(.[];
+         type == "object" and
+         (keys - ["path", "strength", "start", "end", "preprocessor", "resize_mode", "canny_low", "canny_high", "source_path", "mask_path", "invert_mask"] | length == 0) and
+         (.path | type == "string" and length > 0 and (contains("\u0000") | not)) and
+         (.preprocessor == "prepared" or .preprocessor == "canny") and
+         (.resize_mode == "crop" or .resize_mode == "pad" or .resize_mode == "stretch") and
+         (.canny_low | type == "number" and floor == . and . >= 0) and
+         (.canny_high | type == "number" and floor == . and . <= 255) and
+         .canny_low < .canny_high and
+         (.invert_mask | type == "boolean") and
+         ((.source_path // "") | type == "string" and (contains("\u0000") | not)) and
+         ((.mask_path // "") | type == "string" and (contains("\u0000") | not)) and
+         (((.source_path // "") == "") == ((.mask_path // "") == "")) and
+         ((.strength // 1) | finite_number and fabs <= $strength_limit) and
+         ((.start // 0) | finite_number and . >= 0 and . <= 1) and
+         ((.end // 1) | finite_number and . >= 0 and . <= 1) and
+         (.start // 0) <= (.end // 1))
+    then map(select(.strength != 0))
+    else error("ControlNet needs ordered image/video guides, prepared or Canny, crop/pad/stretch, finite strength/start/end, and paired source/mask") end
+  ' "$CONTROL_MANIFEST")" || return 65
+  count="$(jq '[.[] | select(.strength != 0)] | length' <<<"$manifest_doc")" || return
+  (( count > 0 )) || { log 'phase=control disabled (all strengths zero)'; return 0; }
+  [[ "$(jq_get minimax_h3.control.input_policy)" == mojo_resize_trim_hold_last ]] || {
+    echo 'FATAL unsupported ControlNet media policy' >&2; return 65;
+  }
+
+  local ffmpeg ffprobe checkpoint encoder_program encoder_bundle source_bundle residency media_program
+  local tile_size tile_overlap clip_length token_drop patch_h patch_w features
+  ffmpeg="$(jq_get minimax_h3.control.ffmpeg)" || return
+  ffprobe="$(jq_get minimax_h3.control.ffprobe)" || return
+  media_program="$(jq_get minimax_h3.control.media_program)" || return
+  checkpoint="$(jq_get minimax_h3.control.checkpoint)" || return
+  encoder_program="$(jq_get minimax_h3.control.encoder_program)" || return
+  encoder_bundle="$(jq_get minimax_h3.control.encoder_bundle)" || return
+  source_bundle="$(jq_get minimax_h3.control.encoder_source_bundle)" || return
+  residency="$(jq_get minimax_h3.control.encoder_residency)" || return
+  tile_size="$(jq_get minimax_h3.control.tile_size)" || return
+  tile_overlap="$(jq_get minimax_h3.control.tile_overlap)" || return
+  clip_length="$(jq_get minimax_h3.control.clip_length)" || return
+  token_drop="$(jq_get minimax_h3.control.token_drop)" || return
+  patch_h="$(jq_get minimax_h3.control.patch_height)" || return
+  patch_w="$(jq_get minimax_h3.control.patch_width)" || return
+  features="$(jq_get minimax_h3.control.patch_features)" || return
+  local value
+  for value in "$W" "$H" "$FPS" "$FRAMES" "$LAT_T" "$LAT_H" "$LAT_W" "$tile_size" "$clip_length" "$patch_h" "$patch_w" "$features"; do
+    [[ "$value" =~ ^[1-9][0-9]{0,7}$ ]] || { echo 'FATAL invalid ControlNet geometry config' >&2; return 65; }
+  done
+  for value in "$tile_overlap" "$token_drop"; do
+    [[ "$value" =~ ^[0-9]{1,8}$ ]] || { echo 'FATAL invalid ControlNet overlap/drop config' >&2; return 65; }
+  done
+  [[ "$residency" == resident || "$residency" == streamed ]] || { echo 'FATAL invalid ControlNet encoder residency' >&2; return 65; }
+  (( FRAMES > 1 && H >= tile_size && W >= tile_size && tile_overlap < tile_size &&
+     ((FRAMES + clip_length - 1) / clip_length) * ((clip_length + 3) / 4) - token_drop == LAT_T )) || {
+    echo 'FATAL ControlNet encoder timeline does not match the denoiser latent grid' >&2; return 65;
+  }
+  [[ -x "$ffmpeg" && -x "$ffprobe" && -x "$media_program" && -s "$checkpoint" && -s "$source_bundle" ]] || {
+    echo 'FATAL ControlNet media tools, dense checkpoint, or sealed VAE bundle missing' >&2; return 66;
+  }
+  "$B/difh3control" inspect "$checkpoint" || return
+
+  local control_dir="$PWD/control"
+  [[ ! -e "$control_dir" ]] || { echo 'FATAL ControlNet request artifacts already exist; use a fresh request directory' >&2; return 65; }
+  mkdir "$control_dir" || return
+
+  # Derive only new graph receipts. The original sealed VAE payload is mapped,
+  # never copied/re-hashed into another model. A lock + hard-link publication
+  # prevents readers seeing partial receipts or replacing another request's.
+  local prep_parent prep_dir lock_fd
+  prep_parent="$(dirname "$encoder_program")"
+  [[ "$(dirname "$encoder_bundle")" == "$prep_parent" ]] || {
+    echo 'FATAL ControlNet encoder receipts must share their preparation directory' >&2; return 65;
+  }
+  mkdir -p "$prep_parent" || return
+  exec {lock_fd}>"$encoder_program.prepare.lock" || return
+  flock -x "$lock_fd" || { exec {lock_fd}>&-; return 70; }
+  if [[ ! -s "$encoder_program" || ! -s "$encoder_bundle" ]]; then
+    if [[ -e "$encoder_program" || -e "$encoder_bundle" ]]; then
+      exec {lock_fd}>&-
+      echo 'FATAL incomplete ControlNet encoder receipt pair; explicit repair is required' >&2; return 66
+    fi
+    prep_dir="$(mktemp -d "$prep_parent/.control-encoder.XXXXXX")" || { exec {lock_fd}>&-; return 70; }
+    if ! "$B/difc" make-h3-video-encoder "$prep_dir/tile.difir" "$clip_length" "$tile_size" "$tile_size" "$residency" ||
+       ! "$B/difweights" rebind-program "$source_bundle" "$prep_dir/tile.difir" "$prep_dir/tile.difbind" ||
+       ! ln "$prep_dir/tile.difir" "$encoder_program" ||
+       ! ln "$prep_dir/tile.difbind" "$encoder_bundle"; then
+      exec {lock_fd}>&-
+      echo 'FATAL ControlNet native encoder preparation failed; staging evidence retained' >&2; return 70
+    fi
+  fi
+  exec {lock_fd}>&-
+
+  CONTROL_ARGS=(--h3-control-checkpoint "$checkpoint")
+  local i path strength start end preprocessor resize low high source mask invert guide
+  local -a fields=() packing=()
+  for ((i=0; i<count; ++i)); do
+    mapfile -d '' -t fields < <(jq -jr --argjson i "$i" '.[$i] | [.path,.strength,.start,.end,.preprocessor,.resize_mode,.canny_low,.canny_high,(.source_path // ""),(.mask_path // ""),.invert_mask] | .[] | tostring,"\u0000"' <<<"$manifest_doc")
+    path="${fields[0]}"; strength="${fields[1]}"; start="${fields[2]}"; end="${fields[3]}"
+    preprocessor="${fields[4]}"; resize="${fields[5]}"; low="${fields[6]}"; high="${fields[7]}"
+    source="${fields[8]}"; mask="${fields[9]}"; invert=0
+    [[ "${fields[10]}" != true ]] || invert=1
+    log "phase=control-media index=$i preprocessor=$preprocessor resize=$resize"
+    guide="$control_dir/guide-$i.rgb"
+    h3_control_decode_media "$path" "$guide" "$resize" || return
+    if [[ "$preprocessor" == canny ]]; then
+      "$media_program" canny "$guide" "$control_dir/guide-$i-canny.rgb" "$W" "$H" "$FRAMES" "$low" "$high" || return
+      guide="$control_dir/guide-$i-canny.rgb"
+    fi
+    log "phase=control-encode index=$i posterior=mean"
+    h3_control_encode_mean "$guide" "$control_dir/guide-$i" || return
+    packing=()
+    if [[ -n "$source" ]]; then
+      log "phase=control-inpaint index=$i invert_mask=$invert"
+      h3_control_decode_media "$source" "$control_dir/guide-$i-source.rgb" "$resize" || return
+      h3_control_decode_media "$mask" "$control_dir/guide-$i-mask.rgb" "$resize" || return
+      "$media_program" mask "$control_dir/guide-$i-source.rgb" "$control_dir/guide-$i-mask.rgb" \
+        "$control_dir/guide-$i-masked-source.rgb" "$W" "$H" "$FRAMES" "$invert" || return
+      h3_control_encode_mean "$control_dir/guide-$i-masked-source.rgb" "$control_dir/guide-$i-source" || return
+      packing=("$control_dir/guide-$i-source-normalized-latent.diftensor" "$control_dir/guide-$i-mask.rgb" "$W" "$H" "$FRAMES" "$invert")
+    fi
+    "$media_program" rows "$control_dir/guide-$i-normalized-latent.diftensor" \
+      "$control_dir/guide-$i-control-rows.diftensor" "${packing[@]}" || return
+    CONTROL_ARGS+=(--h3-control-rows "$control_dir/guide-$i-control-rows.diftensor" \
+      --h3-control-strength "$strength" --h3-control-start "$start" --h3-control-end "$end")
+  done
+  log "phase=control-ready streams=$count channels=49 padded_features=$features audio_injection=off"
+}

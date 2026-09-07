@@ -658,6 +658,12 @@ int main(int argc, char **argv) {
               const dif::runtime::Tensor &bias, int out_dim) -> CUdeviceptr {
         const auto d_weight = engine.upload(weight.data(), weight.byte_size());
         const auto d_bias = engine.upload(bias.data(), bias.byte_size());
+        // One-time cache construction consumes each checkpoint tensor once.
+        // These H2D copies are synchronous; retaining clean file-cache pages
+        // after this final host use only grows the preparation cgroup. This is
+        // intentionally not the streamed inference weight-retention policy.
+        weight.evict_mapped_pages();
+        bias.evict_mapped_pages();
         CUdeviceptr d_gemm{}, d_out{};
         check_cu(cuMemAlloc(&d_gemm,
                             static_cast<std::size_t>(rows) * out_dim * 4U),
@@ -723,7 +729,8 @@ int main(int argc, char **argv) {
           dif::fail("adaln tensor geometry mismatch: " + weight_name);
         const auto d_weight = engine.upload(weight.data(), weight.byte_size());
         const auto d_bias = engine.upload(bias.data(), bias.byte_size());
-        weight.discard_mapped_pages();
+        weight.evict_mapped_pages();
+        bias.evict_mapped_pages();
         CUdeviceptr d_gemm{}, d_out{};
         check_cu(cuMemAlloc(&d_gemm,
                             static_cast<std::size_t>(rows) * out_dim * 4U),
@@ -786,6 +793,10 @@ int main(int argc, char **argv) {
           hidden, rows, embed_hidden,
           reinterpret_cast<const float *>(proj_out_w.data()),
           reinterpret_cast<const float *>(proj_out_b.data()), time_embed_dim);
+      proj_in_w.evict_mapped_pages();
+      proj_in_b.evict_mapped_pages();
+      proj_out_w.evict_mapped_pages();
+      proj_out_b.evict_mapped_pages();
       std::vector<std::uint16_t> activated(temb.size());
       for (std::size_t i = 0; i < temb.size(); ++i)
         activated[i] = bf16_rne_host(temb[i] / (1.0F + std::exp(-temb[i])));
@@ -819,7 +830,8 @@ int main(int argc, char **argv) {
             out_u16[static_cast<std::size_t>(row) * out_dim + column] =
                 bf16_rne_host(with_bias);
           }
-        weight.discard_mapped_pages();
+        weight.evict_mapped_pages();
+        bias.evict_mapped_pages();
         return payload;
       };
       for (std::size_t block = 0; block < num_blocks; ++block) {

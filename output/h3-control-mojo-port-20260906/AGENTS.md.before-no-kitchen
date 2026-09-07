@@ -1,0 +1,46 @@
+# Diffusion Compiler Codex routing
+
+Current loader policy (user request, 2026-09-06): **ASM fastload is OFF by
+default until fixed and re-admitted**. The prior mapped/direct path is default;
+only exact `DIF_FASTLOAD=1` opts in. Streamed/prefetch flags alone cannot enable
+it. Preserve bounded staging, shared weight lifetime and rotary fixes. Earlier
+"default ASM" benchmark descriptions are historical, not current policy.
+
+Read the applicable skill before editing:
+
+- Architecture or ownership boundary: `$diffusion-architecture`
+- New model family/frontend: `$model-intake` + `$diffusion-architecture`
+- Port, kernel, schedule, or optimization parity: `$numerical-parity`
+- Decoded image/video/audio acceptance: `$quality-gates`
+- C++ runtime, weights, CUDA resources, or memory lifecycle: `$native-runtime`
+- Full-model profiling or speed work: `$whole-system-performance`
+- Graph transformation/search/replay candidate: `$compiler-optimization`
+- Backward, LoRA, AdamW, checkpoint, or resume: `$training`
+- Git, worktrees, evidence, docs, commit, or push: `$repo-hygiene`
+
+Use multiple skills when a task crosses boundaries. Read
+`/home/alex/diffusion-compiler-docs/TENETS.md` and `MAP.md` for the durable
+Compiler context. Creator source and measured artifacts outrank summaries.
+
+Performance terminology: **PTF** means prompt / Generate submission to the
+finished, saved PNG or MP4, not loader or denoiser time. Use the timing and
+cache-state rules in `/home/alex/diffusion-compiler-docs/docs/SPEED_CONTRACT.md`.
+As of 2026-09-06, **Krea 2 ASM-loader PTF reaches a quality-gated PNG** after
+fixing promoted-resident upload and restoring F64 rotary intermediates.
+The eight-step sampler is byte-exact to the creator reference. Read current
+matched timings and cache limits in
+`/home/alex/diffusion-compiler-docs/docs/BENCHMARKS.md`; do not reuse the
+earlier failed-gate timings as PTF.
+
+The same-day loader-design follow-up is
+`/home/alex/diffusion-compiler-docs/docs/runtime/FASTLOAD_BOUNDED_STAGING_2026-09-06.md`.
+Ordinary streamed slots are bounded; H3's old oversized embedding staging
+denied ASM and caused host-memory pressure. Keep pressure-affected rollback
+controls separate from clean performance admissions. Read the current report
+before changing staging size, fallback, cache eviction or related telemetry.
+
+The later same-day lifetime follow-up is
+`/home/alex/diffusion-compiler-docs/docs/runtime/SHARED_RESIDENT_WEIGHTS_2026-09-06.md`.
+Compatible shape plans share immutable mapped resident device weights with
+weak executor-local lookup. This supersedes Krea's shape-indexed host-cache
+hint. Measured storage reduction is not a meaningful new complete-PTF win.

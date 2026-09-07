@@ -308,10 +308,19 @@ SafeTensorFile read_safetensors(const std::filesystem::path &path) {
     if (elements > std::numeric_limits<std::uint64_t>::max() / width ||
         elements * width != entry.byte_count)
       fail("SafeTensors tensor byte count mismatch: " + name);
-    if (parsed_dtype) {
+    // U8 is a valid packed runtime dtype, but H3 cache provenance strings are
+    // encoded as U8 tensors under __meta__.* and must remain discoverable
+    // through find_metadata(). Numeric __meta__ tensors such as the I32
+    // ConvRot descriptors remain ordinary executable tensors.
+    if (name.starts_with("__meta__.") &&
+        (!parsed_dtype || dtype_name == "U8")) {
+      output.metadata_tensors.emplace(
+          name, SafeTensorMetadataEntry{name, dtype_name, entry.dims,
+                                        entry.file_offset, entry.byte_count});
+    } else if (parsed_dtype) {
       entry.dtype = *parsed_dtype;
       output.tensors.emplace(name, std::move(entry));
-    } else if (name.starts_with("__meta__.") || entry.dims.empty()) {
+    } else if (entry.dims.empty()) {
       // Creator checkpoints commonly carry unsupported scalar bookkeeping
       // buffers (not executable weights), such as an I64 BatchNorm counter.
       // Preserve their metadata/range while keeping them unbindable.

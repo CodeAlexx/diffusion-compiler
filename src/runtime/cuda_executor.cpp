@@ -1,4 +1,5 @@
 #include "dif/runtime/executor.hpp"
+#include "mapped_weight_cache.hpp"
 
 #include "dif/compiler/compiler.hpp"
 #include "dif/compiler/memory_plan.hpp"
@@ -21,6 +22,13 @@
 #if DIF_HAS_EXACT_STREAM_ATTENTION
 #include "dif/runtime/exact_stream_attention.hpp"
 #endif
+#if DIF_HAVE_FASTLOAD
+#include "dif/runtime/fastload.h"
+#include "fastload/resident_prefetch.hpp"
+#endif
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include "dif/support/error.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/telemetry/trace_sink.hpp"
@@ -31,6 +39,7 @@
 #endif
 
 #include <cuda.h>
+#include "residual_cache_cuda.hpp"
 #include <cublasLt.h>
 #include <cublas_v2.h>
 
@@ -600,6 +609,7 @@ public:
   CUdevice device() const { return device_; }
   int ordinal() const { return ordinal_; }
   CUstream stream() const { return stream_; }
+  CUcontext handle() const { return context_; }
   CUstream copy_stream() const { return copy_stream_; }
   cublasHandle_t cublas() const { return cublas_; }
   cublasLtHandle_t cublas_lt() const { return cublas_lt_; }
@@ -810,16 +820,22 @@ private:
   bool owns_{true};
 };
 
+// Shared admission accounting includes staging held by other prepared
+// executors, including the specialized quantized-weight paths.
+std::atomic<std::uint64_t> pinned_workspace_bytes{0U};
+
 class PinnedHostWorkspace {
 public:
   explicit PinnedHostWorkspace(std::size_t bytes) : bytes_(bytes) {
     if (bytes_ != 0U)
       check(counted_mem_host_alloc(&pointer_, bytes_, CU_MEMHOSTALLOC_PORTABLE),
             "cuMemHostAlloc streamed staging");
+    pinned_workspace_bytes.fetch_add(bytes_, std::memory_order_relaxed);
   }
   ~PinnedHostWorkspace() {
     if (pointer_)
       (void)cuMemFreeHost(pointer_);
+    pinned_workspace_bytes.fetch_sub(bytes_, std::memory_order_relaxed);
   }
   PinnedHostWorkspace(const PinnedHostWorkspace &) = delete;
   PinnedHostWorkspace &operator=(const PinnedHostWorkspace &) = delete;
@@ -3181,6 +3197,7 @@ struct ConvRotInt8LinearPlan {
   std::filesystem::path cache_path;
   CUdeviceptr weight_device{};
   CUdeviceptr scale_device{};
+  bool resident{};
 };
 
 std::uint64_t align_256(std::uint64_t value) {
@@ -3189,26 +3206,11 @@ std::uint64_t align_256(std::uint64_t value) {
   return (value + 255U) & ~std::uint64_t{255U};
 }
 
-// Architecture-tagged development DSO adapter. The project-owned ABI and the
-// legacy Serenity oracle ABI are detected and reported separately. The loaded
+// Architecture-tagged adapter for the project-owned H3 dense ABI. The loaded
 // DSO contains raw CUDA launchers plus ABI/target-SM metadata; no Mojo, Python,
 // or external model weights participate in prepared execution.
 class CkAttentionLibrary {
 public:
-  using QuantQK = void (*)(
-      const void *, void *, void *, const void *, void *, void *, int, int,
-      int, int, int, int, int, int, int, int, std::int64_t, std::int64_t,
-      std::int64_t, std::int64_t, std::int64_t, std::int64_t, int, void *,
-      void *);
-  using QuantV = void (*)(const void *, void *, void *, int, int, int, int,
-                          int, std::int64_t, std::int64_t, std::int64_t, int,
-                          void *);
-  using Attend = void (*)(
-      const void *, const void *, const void *, void *, const void *,
-      const void *, const void *, const void *, std::int64_t, std::int64_t,
-      std::int64_t, std::int64_t, int, int, int, int, int, int, int,
-      int, int, int, int, int, int, int, int, int, int, int, int, int,
-      float, int, void *);
   using MetadataInt = int (*)();
   using OwnedQuantKv = int (*)(
       const void *, const void *, void *, void *, void *, void *, int, int,
@@ -3242,7 +3244,6 @@ public:
     owned_attend_ = &h3_owned_attention::attention_bf16;
     owned_error_ = &h3_owned_attention::cuda_error;
     owned_quant_kv_centered_ = &h3_owned_attention::quantize_kv_centered_bf16;
-    owned_dense_ = true;
     in_tree_ = true;
 #else
     (void)current_sm;
@@ -3302,39 +3303,11 @@ public:
       owned_error_ = reinterpret_cast<OwnedError>(
           symbol("codealexx_h3_dense_cuda_error"));
       owned_abi_version_ = abi_version;
-      owned_dense_ = true;
       handle_ = candidate;
       return;
     }
-    auto *ck_int8_abi_address =
-        optional_symbol("ck_int8_kernel_abi_version");
-    const auto abi = reinterpret_cast<MetadataInt>(
-        ck_int8_abi_address
-            ? ck_int8_abi_address
-            : symbol("serenity_ck_attention_abi_version"));
-    const auto target = reinterpret_cast<MetadataInt>(
-        ck_int8_abi_address
-            ? symbol("ck_int8_kernel_target_sm")
-            : symbol("serenity_ck_attention_target_sm"));
-    const auto abi_version = abi();
-    target_sm_ = target();
-    if (abi_version != 1 || target_sm_ != current_sm) {
-      const auto message =
-          std::string(ck_int8_abi_address ? "CodeAlexx CK-INT8" : "H3 CK") +
-          " attention DSO admission failed: ABI=" +
-          std::to_string(abi_version) + " target_sm=" +
-          std::to_string(target_sm_) + " current_sm=" +
-          std::to_string(current_sm);
-      dlclose(candidate);
-      fail(message);
-    }
-    quant_qk_ = reinterpret_cast<QuantQK>(
-        symbol("launch_quant_qk_per_thread_int8"));
-    quant_v_ = reinterpret_cast<QuantV>(
-        symbol("launch_quant_v_int8_kernel"));
-    attend_ = reinterpret_cast<Attend>(symbol("launch_sage_attn_kernel"));
-    codealexx_ck_int8_ = ck_int8_abi_address != nullptr;
-    handle_ = candidate;
+    dlclose(candidate);
+    fail("H3 CK attention requires the owned codealexx_h3_dense ABI");
   }
 
   ~CkAttentionLibrary() {
@@ -3345,118 +3318,71 @@ public:
   CkAttentionLibrary &operator=(const CkAttentionLibrary &) = delete;
 
   void launch(CUdeviceptr query, CUdeviceptr key, CUdeviceptr value,
-              CUdeviceptr output, CUdeviceptr q_int8, CUdeviceptr q_scale,
-              CUdeviceptr k_int8, CUdeviceptr k_scale, CUdeviceptr v_int8,
-              CUdeviceptr v_scale, CUdeviceptr anchor_indices, int sequence,
+              CUdeviceptr output, CUdeviceptr k_int8, CUdeviceptr k_scale,
+              CUdeviceptr v_int8, CUdeviceptr v_scale, int sequence,
               int heads, float scale, CUstream stream,
               CUdeviceptr k_mean_partials = 0, CUdeviceptr k_mean = 0) const {
     constexpr int head_dim = 128;
-    constexpr int cta_q = 128;
-    constexpr int warp_q = 32;
     constexpr int cta_k = 128;
-    constexpr int warp_k = 128;
-    constexpr int bf16_code = 2;
     constexpr int batch = 1;
-    const int padded_sequence =
-        (sequence + cta_k - 1) / cta_k * cta_k;
     const auto in_sb = static_cast<std::int64_t>(sequence) * heads * head_dim;
     constexpr std::int64_t in_sh = head_dim;
     const auto in_sn = static_cast<std::int64_t>(heads) * head_dim;
     auto pointer = [](CUdeviceptr value) {
       return reinterpret_cast<void *>(value);
     };
-    if (owned_dense_) {
-      const auto padded_sequence =
-          (sequence + cta_k - 1) / cta_k * cta_k;
-      auto status =
-          center_k_
-              ? owned_quant_kv_centered_(
-                    pointer(key), pointer(value), pointer(k_int8),
-                    pointer(k_scale), pointer(v_int8), pointer(v_scale),
-                    pointer(k_mean_partials), pointer(k_mean), batch, heads,
-                    sequence, padded_sequence, in_sb, in_sh, in_sn, in_sb,
-                    in_sh, in_sn, reinterpret_cast<void *>(stream))
-              : owned_quant_kv_(
-                    pointer(key), pointer(value), pointer(k_int8),
-                    pointer(k_scale), pointer(v_int8), pointer(v_scale), batch,
-                    heads, sequence, padded_sequence, in_sb, in_sh, in_sn,
-                    in_sb, in_sh, in_sn, reinterpret_cast<void *>(stream));
-      if (status == 0)
-        status = owned_attend_(
-            pointer(query), pointer(k_int8), pointer(k_scale), pointer(v_int8),
-            pointer(v_scale), pointer(output), batch, heads, sequence,
-            padded_sequence, scale, in_sb, in_sh, in_sn, in_sb, in_sh, in_sn,
-            reinterpret_cast<void *>(stream));
-      if (status != 0) {
-        const char *reason = owned_error_ ? owned_error_(status) : nullptr;
-        fail("owned H3 dense attention launch failed: " +
-             std::string(reason ? reason : "unknown CUDA error"));
-      }
-      return;
+    const auto padded_sequence =
+        (sequence + cta_k - 1) / cta_k * cta_k;
+    auto status =
+        center_k_
+            ? owned_quant_kv_centered_(
+                  pointer(key), pointer(value), pointer(k_int8),
+                  pointer(k_scale), pointer(v_int8), pointer(v_scale),
+                  pointer(k_mean_partials), pointer(k_mean), batch, heads,
+                  sequence, padded_sequence, in_sb, in_sh, in_sn, in_sb,
+                  in_sh, in_sn, reinterpret_cast<void *>(stream))
+            : owned_quant_kv_(
+                  pointer(key), pointer(value), pointer(k_int8),
+                  pointer(k_scale), pointer(v_int8), pointer(v_scale), batch,
+                  heads, sequence, padded_sequence, in_sb, in_sh, in_sn,
+                  in_sb, in_sh, in_sn, reinterpret_cast<void *>(stream));
+    if (status == 0)
+      status = owned_attend_(
+          pointer(query), pointer(k_int8), pointer(k_scale), pointer(v_int8),
+          pointer(v_scale), pointer(output), batch, heads, sequence,
+          padded_sequence, scale, in_sb, in_sh, in_sn, in_sb, in_sh, in_sn,
+          reinterpret_cast<void *>(stream));
+    if (status != 0) {
+      const char *reason = owned_error_ ? owned_error_(status) : nullptr;
+      fail("owned H3 dense attention launch failed: " +
+           std::string(reason ? reason : "unknown CUDA error"));
     }
-    quant_qk_(pointer(query), pointer(q_int8), pointer(q_scale), pointer(key),
-              pointer(k_int8), pointer(k_scale), batch, heads, sequence, heads,
-              sequence, head_dim, cta_q, warp_q, cta_k, warp_k, in_sb, in_sh,
-              in_sn, in_sb, in_sh, in_sn, bf16_code,
-              pointer(anchor_indices), reinterpret_cast<void *>(stream));
-    quant_v_(pointer(value), pointer(v_int8), pointer(v_scale), batch, heads,
-             sequence, head_dim, padded_sequence, in_sb, in_sh, in_sn,
-             bf16_code, reinterpret_cast<void *>(stream));
-
-    const int q_b = heads * sequence * head_dim;
-    constexpr int q_n = head_dim;
-    const int q_h = sequence * head_dim;
-    const int v_b = heads * head_dim * padded_sequence;
-    const int v_h = head_dim * padded_sequence;
-    const int v_d = padded_sequence;
-    const int o_b = sequence * heads * head_dim;
-    const int o_n = heads * head_dim;
-    constexpr int o_h = head_dim;
-    attend_(pointer(q_int8), pointer(k_int8), pointer(v_int8), pointer(output),
-            pointer(q_scale), pointer(k_scale), pointer(v_scale), nullptr, 0, 0,
-            0, 0, 0, cta_k, batch, sequence, sequence, heads, heads, head_dim,
-            q_b, q_n, q_h, q_b, q_n, q_h, v_b, v_h, v_d, o_b, o_n, o_h,
-            scale, bf16_code, reinterpret_cast<void *>(stream));
   }
 
   int target_sm() const { return target_sm_; }
-  bool owned_dense() const { return owned_dense_; }
-  bool codealexx_ck_int8() const { return codealexx_ck_int8_; }
   int owned_abi_version() const { return owned_abi_version_; }
   std::string classification() const {
-    return owned_dense_ ? "approximate_owned_h3_dense_int8_gate"
-           : codealexx_ck_int8_
-               ? "approximate_codealexx_ck_int8_established_h3_gate"
-               : "approximate_ck_int8_established_h3_gate";
+    return "approximate_owned_h3_dense_int8_gate";
   }
   bool in_tree() const { return in_tree_; }
   bool center_k() const { return center_k_; }
   std::string implementation() const {
-    return owned_dense_
-               ? (in_tree_ ? (center_k_
+    return in_tree_ ? (center_k_
                                   ? "owned_h3_dense_int8_v4_in_tree_center_k"
                                   : "owned_h3_dense_int8_v4_in_tree")
                            : "codealexx_h3_dense_int8_v" +
-                                 std::to_string(owned_abi_version_))
-           : codealexx_ck_int8_
-               ? "codealexx_ck_int8_comfy_kitchen_sage_bf16"
-               : "serenity_comfy_kitchen_sage_bf16";
+                                 std::to_string(owned_abi_version_);
   }
   const std::filesystem::path &path() const { return path_; }
 
 private:
   std::filesystem::path path_;
   void *handle_{};
-  QuantQK quant_qk_{};
-  QuantV quant_v_{};
-  Attend attend_{};
   OwnedQuantKv owned_quant_kv_{};
   OwnedAttend owned_attend_{};
   OwnedError owned_error_{};
   int target_sm_{};
   int owned_abi_version_{};
-  bool owned_dense_{};
-  bool codealexx_ck_int8_{};
   bool in_tree_{};
   bool center_k_{};
   OwnedQuantKvCentered owned_quant_kv_centered_{};
@@ -3484,41 +3410,27 @@ public:
     const auto sequence = static_cast<std::uint64_t>(sequence_);
     const auto heads = static_cast<std::uint64_t>(heads_);
     const auto padded_sequence = (sequence + 127U) / 128U * 128U;
-    const auto elements = sequence * heads * 128U;
-    const auto q_scale_elements = heads * ((sequence + 127U) / 128U) * 32U;
     const auto k_scale_elements =
-        library_->owned_dense()
-            ? (library_->owned_abi_version() == 3
-                   ? heads * padded_sequence
-                   : heads * (padded_sequence / 128U))
-            : heads * ((sequence + 127U) / 128U) * 4U;
+        library_->owned_abi_version() == 3
+            ? heads * padded_sequence : heads * (padded_sequence / 128U);
     const auto v_scale_elements =
-        library_->owned_dense() && library_->owned_abi_version() == 3
+        library_->owned_abi_version() == 3
             ? heads * (padded_sequence / 128U) * 128U
             : heads * 128U;
     const auto v_elements = heads * 128U * padded_sequence;
     // The owned kernels write K as [B,H,S_pad,128]: every padded row is
     // stored (zero-filled past the sequence), so the INT8 K scratch is sized
-    // by the padded sequence. The DSO route's K stays [B,H,S,128].
-    const auto k_elements =
-        library_->owned_dense() ? heads * 128U * padded_sequence : elements;
-    if (library_->owned_dense()) {
-      scratch_bytes_ = align_256(k_elements) +
-                       align_256(k_scale_elements * sizeof(float)) +
-                       align_256(v_elements) +
-                       align_256(v_scale_elements * sizeof(float));
-      if (library_->center_k())
-        scratch_bytes_ +=
-            align_256(heads * (padded_sequence / 128U) * 128U * sizeof(float)) +
-            align_256(heads * 128U * sizeof(float));
-    } else {
-      scratch_bytes_ = align_256(elements) + align_256(elements) +
-                       align_256(q_scale_elements * sizeof(float)) +
-                       align_256(k_scale_elements * sizeof(float)) +
-                       align_256(v_elements) +
-                       align_256(heads * 128U * sizeof(float)) +
-                       align_256(heads * sizeof(std::int32_t));
-    }
+    // by the padded sequence for both owned library entry points.
+    const auto k_elements = heads * 128U * padded_sequence;
+    scratch_bytes_ = align_256(k_elements) +
+                     align_256(k_scale_elements * sizeof(float)) +
+                     align_256(v_elements) +
+                     align_256(v_scale_elements * sizeof(float));
+    if (library_->center_k())
+      scratch_bytes_ +=
+          align_256(heads * (padded_sequence / 128U) * 128U * sizeof(float)) +
+          align_256(heads * 128U * sizeof(float));
+
   }
 
   void allocate(DeviceArena *arena) {
@@ -3527,21 +3439,15 @@ public:
     const auto sequence = static_cast<std::uint64_t>(sequence_);
     const auto heads = static_cast<std::uint64_t>(heads_);
     const auto padded_sequence = (sequence + 127U) / 128U * 128U;
-    const auto elements = sequence * heads * 128U;
-    const auto q_scale_elements = heads * ((sequence + 127U) / 128U) * 32U;
     const auto k_scale_elements =
-        library_->owned_dense()
-            ? (library_->owned_abi_version() == 3
-                   ? heads * padded_sequence
-                   : heads * (padded_sequence / 128U))
-            : heads * ((sequence + 127U) / 128U) * 4U;
+        library_->owned_abi_version() == 3
+            ? heads * padded_sequence : heads * (padded_sequence / 128U);
     const auto v_scale_elements =
-        library_->owned_dense() && library_->owned_abi_version() == 3
+        library_->owned_abi_version() == 3
             ? heads * (padded_sequence / 128U) * 128U
             : heads * 128U;
     const auto v_elements = heads * 128U * padded_sequence;
-    const auto k_elements =
-        library_->owned_dense() ? heads * 128U * padded_sequence : elements;
+    const auto k_elements = heads * 128U * padded_sequence;
     storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(scratch_bytes_), arena);
     auto offset = std::uint64_t{0U};
@@ -3549,25 +3455,16 @@ public:
       target = storage_->pointer() + offset;
       offset += align_256(bytes);
     };
-    if (library_->owned_dense()) {
-      assign(k_int8_, k_elements);
-      assign(k_scale_, k_scale_elements * sizeof(float));
-      assign(v_int8_, v_elements);
-      assign(v_scale_, v_scale_elements * sizeof(float));
-      if (library_->center_k()) {
-        assign(k_mean_partials_,
-               heads * (padded_sequence / 128U) * 128U * sizeof(float));
-        assign(k_mean_, heads * 128U * sizeof(float));
-      }
-    } else {
-      assign(q_int8_, elements);
-      assign(k_int8_, elements);
-      assign(q_scale_, q_scale_elements * sizeof(float));
-      assign(k_scale_, k_scale_elements * sizeof(float));
-      assign(v_int8_, v_elements);
-      assign(v_scale_, heads * 128U * sizeof(float));
-      assign(anchor_indices_, heads * sizeof(std::int32_t));
+    assign(k_int8_, k_elements);
+    assign(k_scale_, k_scale_elements * sizeof(float));
+    assign(v_int8_, v_elements);
+    assign(v_scale_, v_scale_elements * sizeof(float));
+    if (library_->center_k()) {
+      assign(k_mean_partials_,
+             heads * (padded_sequence / 128U) * 128U * sizeof(float));
+      assign(k_mean_, heads * 128U * sizeof(float));
     }
+
     if (offset != scratch_bytes_)
       fail("H3 CK attention scratch layout mismatch");
   }
@@ -3577,8 +3474,8 @@ public:
     library_->launch(buffers.at(operation.inputs.at(0)),
                      buffers.at(operation.inputs.at(1)),
                      buffers.at(operation.inputs.at(2)),
-                     buffers.at(operation.outputs.at(0)), q_int8_, q_scale_,
-                     k_int8_, k_scale_, v_int8_, v_scale_, anchor_indices_,
+                     buffers.at(operation.outputs.at(0)),
+                     k_int8_, k_scale_, v_int8_, v_scale_,
                      sequence_, heads_, scale_, stream, k_mean_partials_,
                      k_mean_);
   }
@@ -3598,8 +3495,6 @@ public:
   std::uint32_t operation_id() const { return operation_id_; }
   std::uint64_t scratch_bytes() const { return scratch_bytes_; }
   int target_sm() const { return library_->target_sm(); }
-  bool owned_dense() const { return library_->owned_dense(); }
-  bool codealexx_ck_int8() const { return library_->codealexx_ck_int8(); }
   const std::string classification() const { return library_->classification(); }
   const std::string implementation() const {
     return library_->implementation();
@@ -3610,15 +3505,12 @@ private:
   std::uint32_t operation_id_{};
   std::shared_ptr<CkAttentionLibrary> library_;
   std::unique_ptr<Workspace> storage_;
-  CUdeviceptr q_int8_{};
-  CUdeviceptr q_scale_{};
   CUdeviceptr k_int8_{};
   CUdeviceptr k_scale_{};
   CUdeviceptr v_int8_{};
   CUdeviceptr k_mean_partials_{};
   CUdeviceptr k_mean_{};
   CUdeviceptr v_scale_{};
-  CUdeviceptr anchor_indices_{};
   int sequence_{};
   int heads_{};
   float scale_{};
@@ -3937,12 +3829,24 @@ void select_h3_modulation_slice(
   }
 }
 
+// Plan-owned constants use the same batched mapped-file upload as ordinary
+// DiffIR constants; a pageable CUDA copy can fault a cold file serially.
+struct ResidentTensorUpload {
+  const Tensor *tensor;
+  CUdeviceptr destination;
+};
+
+void upload_resident_tensors(const std::vector<ResidentTensorUpload> &resident,
+                             CUstream stream,
+                             bool evict_mapped_after_upload = false);
+
 void upload_h3_modulation_cache(
     const std::vector<H3ModulationCachePlan> &plans, CUstream stream) {
+  std::vector<ResidentTensorUpload> resident;
+  resident.reserve(plans.size());
   for (const auto &plan : plans)
-    check(counted_memcpy_htod(plan.modulation_device, plan.modulation.data(),
-                            plan.modulation.byte_size(), stream),
-          "cuMemcpyHtoDAsync H3 modulation cache");
+    resident.push_back({&plan.modulation, plan.modulation_device});
+  upload_resident_tensors(resident, stream);
 }
 
 struct H3GroupwiseProjection {
@@ -4341,6 +4245,44 @@ void validate_h3_convrot_metadata(const weights::SafeTensorFile &cache,
 
 std::vector<ConvRotInt8LinearPlan> find_convrot_int8_linear_plans(
     const ir::Program &program, const RunOptions &options) {
+  if (!options.convrot_linear_bindings.empty()) {
+    if (!options.convrot_int8_checkpoint.empty() ||
+        options.convrot_int8_linear_count != 0U ||
+        options.convrot_int8_weight_only_quality || options.convrot_int8_resident)
+      fail("explicit ConvRot bindings conflict with checkpoint-wide policy");
+#if !DIF_HAS_CUTLASS
+    fail("explicit ConvRot bindings require CUTLASS support");
+#endif
+    std::vector<ConvRotInt8LinearPlan> result;
+    std::unordered_set<std::uint32_t> seen;
+    for (const auto &binding : options.convrot_linear_bindings) {
+      if (!seen.insert(binding.operation).second)
+        fail("duplicate explicit ConvRot Linear binding");
+      const auto found = std::find_if(program.operations.begin(), program.operations.end(),
+          [&](const auto &op) { return op.id == binding.operation; });
+      if (found == program.operations.end() || found->opcode != ir::Opcode::Linear ||
+          found->inputs.size() != 2U || found->outputs.size() != 1U)
+        fail("explicit ConvRot binding must name an unbiased Linear");
+      const auto *input = program.tensor(found->inputs[0]);
+      const auto *weight = program.tensor(found->inputs[1]);
+      const auto *output = program.tensor(found->outputs[0]);
+      binding.weight.validate(); binding.scale.validate();
+      if (!input || !weight || !output || input->dtype != ir::DType::BF16 ||
+          output->dtype != input->dtype || weight->dtype != input->dtype ||
+          weight->dims.size() != 2U || weight->dims[1] % 256U != 0U ||
+          binding.weight.dtype != ir::DType::I8 || binding.weight.dims != weight->dims ||
+          binding.scale.dtype != ir::DType::F32 ||
+          binding.scale.dims != std::vector<std::uint64_t>{weight->dims[0]})
+        fail("explicit ConvRot physical binding disagrees with semantic Linear");
+      const auto rows = input->element_count() / weight->dims[1];
+      if (rows * weight->dims[0] != output->element_count())
+        fail("explicit ConvRot output geometry mismatch");
+      result.push_back({found->id, input->id, weight->id, output->id, 0U,
+          input->dtype, rows, weight->dims[0], weight->dims[1], binding.weight,
+          binding.scale, binding.source, 0U, 0U, binding.resident});
+    }
+    return result;
+  }
   if (options.convrot_int8_checkpoint.empty())
     return {};
 #if !DIF_HAS_CUTLASS
@@ -4437,7 +4379,8 @@ std::vector<ConvRotInt8LinearPlan> find_convrot_int8_linear_plans(
                         weight->dims[1],
                         std::move(quantized),
                         std::move(scale),
-                        options.convrot_int8_checkpoint});
+                        options.convrot_int8_checkpoint, 0U, 0U,
+                        options.convrot_int8_resident});
   }
   if (result.empty())
     fail("generic ConvRot checkpoint requested but no eligible Linear was found");
@@ -4457,6 +4400,7 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
   if (options.h3_int8_mlp_chunk_rows == 0U)
     fail("H3 direct INT8 MLP chunk rows must be positive");
   const auto cache = weights::read_safetensors(config.path);
+  std::map<std::string,int> dif_mlp_reject;
   std::unordered_map<std::uint32_t, const ir::Operation *> producer;
   std::unordered_map<std::uint32_t, std::vector<const ir::Operation *>> consumers;
   for (const auto &operation : program.operations) {
@@ -4465,6 +4409,11 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
     for (const auto input : operation.inputs)
       consumers[input].push_back(&operation);
   }
+  const auto has_h3_adaln_select = std::any_of(
+      program.operations.begin(), program.operations.end(),
+      [](const auto &operation) {
+        return operation.opcode == ir::Opcode::H3AdaLNSelect;
+      });
 
   std::vector<H3W8A8MlpPlan> result;
   for (const auto &swiglu : program.operations) {
@@ -4472,32 +4421,42 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
       break;
     if (swiglu.opcode != ir::Opcode::SwiGlu || swiglu.inputs.size() != 1U ||
         swiglu.outputs.size() != 1U)
-      continue;
+      { dif_mlp_reject["r1"]++; continue; }
     const auto fc1_found = producer.find(swiglu.inputs.at(0));
     if (fc1_found == producer.end() ||
         fc1_found->second->opcode != ir::Opcode::Linear ||
         consumers[swiglu.inputs.at(0)].size() != 1U)
-      continue;
+      { dif_mlp_reject["r2"]++; continue; }
     const auto &fc1 = *fc1_found->second;
     // DiffIR and the official checkpoint both bind FC1 as [gate|value].
     if (fc1.inputs.size() != 2U || fc1.outputs.size() != 1U ||
         !swiglu.boolean(ir::AttrKey::GateFirst, false))
-      continue;
+      { dif_mlp_reject["r3"]++; continue; }
     const auto activation_consumers = consumers[swiglu.outputs.at(0)];
     if (activation_consumers.size() != 1U ||
         activation_consumers.front()->opcode != ir::Opcode::Linear)
-      continue;
+      { dif_mlp_reject["r4"]++; continue; }
     const auto &fc2 = *activation_consumers.front();
     if (fc2.inputs.size() != 2U || fc2.outputs.size() != 1U)
-      continue;
+      { dif_mlp_reject["r5"]++; continue; }
     const auto projected_consumers = consumers[fc2.outputs.at(0)];
     if (projected_consumers.size() != 1U ||
         projected_consumers.front()->opcode != ir::Opcode::ResidualGate)
-      continue;
+      { dif_mlp_reject["r6"]++; continue; }
     const auto &residual = *projected_consumers.front();
     if (residual.inputs.size() != 3U || residual.outputs.size() != 1U ||
         residual.inputs.at(1) != fc2.outputs.at(0))
-      continue;
+      { dif_mlp_reject["r7"]++; continue; }
+    // Full H3 programs identify creator trunk MLPs by the gate selected from
+    // the block's AdaLN output. ControlNet side blocks use SelectRowChunks and
+    // must retain their own dense weights instead of consuming block.N INT8
+    // weights from the base-model cache.
+    if (has_h3_adaln_select) {
+      const auto gate_found = producer.find(residual.inputs.at(2));
+      if (gate_found == producer.end() ||
+          gate_found->second->opcode != ir::Opcode::H3AdaLNSelect)
+        { dif_mlp_reject["r8"]++; continue; }
+    }
 
     const auto *input = program.tensor(fc1.inputs.at(0));
     const auto *fc1_weight = program.tensor(fc1.inputs.at(1));
@@ -4517,14 +4476,14 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
         input->dims.size() != 2U || activation->dims.size() != 2U ||
         input->dims != residual_input->dims || input->dims != gate->dims ||
         input->dims != output->dims || fc1_weight->dims.at(0) % 2U != 0U)
-      continue;
+      { dif_mlp_reject["r9"]++; continue; }
     const auto hidden = input->dims.at(1);
     const auto packed_ffn = fc1_weight->dims.at(0);
     const auto ffn = packed_ffn / 2U;
     if (fc1_weight->dims.at(1) != hidden ||
         activation->dims != std::vector<std::uint64_t>{input->dims.at(0), ffn} ||
         fc2_weight->dims != std::vector<std::uint64_t>{hidden, ffn})
-      continue;
+      { dif_mlp_reject["r10"]++; continue; }
     for (const auto tensor_id :
          {fc1.outputs.at(0), swiglu.outputs.at(0), fc2.outputs.at(0)}) {
       const auto *tensor = program.tensor(tensor_id);
@@ -4645,6 +4604,16 @@ std::vector<H3W8A8MlpPlan> find_h3_w8a8_mlp_plans(
           align_256(chunk_rows * hidden * sizeof(float));
     plan.cache_path = config.path;
     result.push_back(std::move(plan));
+  }
+  if (const char *v = std::getenv("DIF_MLP_PLAN_DEBUG"); v && *v == '1') {
+    std::fprintf(stderr, "DIF_MLP_PLAN_DEBUG admitted=%zu layers_cap=%u swiglu_seen=%zu",
+                 result.size(), config.layers,
+                 static_cast<std::size_t>(std::count_if(
+                     program.operations.begin(), program.operations.end(),
+                     [](const auto &o){ return o.opcode == ir::Opcode::SwiGlu; })));
+    for (const auto &[k, n] : dif_mlp_reject)
+      std::fprintf(stderr, " %s=%d", k.c_str(), n);
+    std::fprintf(stderr, "\n");
   }
   return result;
 }
@@ -5995,6 +5964,29 @@ void evict_h3_w8a8_weights(const H3W8A8MlpPlan &plan, bool evict) {
   release_resident_host_pages(plan.fc2_weight, evict);
   release_resident_host_pages(plan.fc2_scale, evict);
 }
+
+#if DIF_HAVE_FASTLOAD
+std::vector<ResidentTensorUpload> resident_uploads(const H3W8A8MlpPlan &plan) {
+  return {{&plan.fc1_weight, plan.fc1_weight_device},
+          {&plan.fc1_scale, plan.fc1_scale_device},
+          {&plan.fc2_weight, plan.fc2_weight_device},
+          {&plan.fc2_scale, plan.fc2_scale_device}};
+}
+
+std::vector<ResidentTensorUpload>
+resident_uploads(const H3W8A8AttentionPlan &plan) {
+  std::vector<ResidentTensorUpload> result;
+  if (plan.has_qkv_projection) {
+    result.push_back({&plan.qkv_weight, plan.qkv_weight_device});
+    result.push_back({&plan.qkv_scale, plan.qkv_scale_device});
+  }
+  if (plan.has_output_projection) {
+    result.push_back({&plan.output_weight, plan.output_weight_device});
+    result.push_back({&plan.output_scale, plan.output_scale_device});
+  }
+  return result;
+}
+#endif
 
 std::uint64_t stage_h3_w8a8_weights(const H3W8A8MlpPlan &plan,
                                     void *staging,
@@ -7464,6 +7456,101 @@ private:
   bool stopping_{};
 };
 
+struct FastloadHostReceipt {
+  std::uint64_t bytes{};
+  std::uint64_t calls{};
+  double milliseconds{};
+};
+
+// The same raw-byte reader serves ordinary DiffIR constants and weights held
+// by prepared quantized plans. The destination remains the caller's pinned
+// buffer, so its existing copy-stream ordering and reuse fences still apply.
+bool fastload_host_stage(std::uint8_t *destination, const Tensor &tensor,
+                         std::uint64_t pinned_budget_bytes,
+                         FastloadHostReceipt *receipt = nullptr,
+                         std::size_t offset = 0U,
+                         std::size_t bytes = 0U) {
+  if (offset > tensor.byte_size())
+    fail("fastload host range exceeds tensor");
+  if (bytes == 0U)
+    bytes = tensor.byte_size() - offset;
+  if (bytes > tensor.byte_size() - offset)
+    fail("fastload host range exceeds tensor");
+#if DIF_HAVE_FASTLOAD
+  constexpr auto ring_bytes = 128ULL << 20U;
+  const auto staging_bytes =
+      pinned_workspace_bytes.load(std::memory_order_relaxed);
+  if (!serenity_fastload_streamed_runtime_enabled() || !tensor.is_mapped() ||
+      bytes < (16ULL << 20U) ||
+      tensor.mapping->direct_descriptor() < 0 ||
+      staging_bytes > pinned_budget_bytes ||
+      ring_bytes > pinned_budget_bytes - staging_bytes)
+    return false;
+  serenity_fastload_span span{
+      tensor.mapping_offset + offset, bytes,
+      reinterpret_cast<std::uint64_t>(destination), 0U, 1U};
+  serenity_fastload_request request{};
+  request.fd = tensor.mapping->descriptor();
+  request.fd_direct = tensor.mapping->direct_descriptor();
+  request.spans = &span;
+  request.nspans = 1U;
+  request.mode = 1;
+  serenity_fastload_stats stats{};
+  std::array<char, 256> error{};
+  request.stats = &stats;
+  request.err = error.data();
+  request.err_capacity = error.size();
+  const auto started = std::chrono::steady_clock::now();
+  const auto rc = serenity_fastload_run(&request);
+  const auto milliseconds = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+  if (rc != 0) {
+    if (std::getenv("DIF_FASTLOAD_REPORT"))
+      std::cerr << "FASTLOAD_HOST_FALLBACK rc=" << rc << " " << error.data()
+                << '\n';
+    return false;
+  }
+  if (receipt) {
+    receipt->bytes += bytes;
+    ++receipt->calls;
+    receipt->milliseconds += milliseconds;
+  }
+  if (std::getenv("DIF_FASTLOAD_REPORT"))
+    std::cerr << "FASTLOAD_HOST bytes=" << bytes
+              << " read_bytes=" << stats.bytes_read << " chunks=" << stats.chunks
+              << " milliseconds=" << milliseconds << '\n';
+  return true;
+#else
+  (void)destination;
+  (void)tensor;
+  (void)pinned_budget_bytes;
+  (void)receipt;
+  return false;
+#endif
+}
+
+// One raw-byte transport policy for ordinary and prepared quantized weights.
+// Ranges let the scheduler keep its staging capacity independent of tensor
+// size. Unsupported/disabled ASM retains direct reads before mmap fallback.
+bool stage_tensor_range(StagingPool &pool, std::uint8_t *destination,
+                        const Tensor &tensor, std::size_t offset,
+                        std::size_t bytes, bool cold_mapped, bool fastload,
+                        std::uint64_t pinned_budget_bytes,
+                        FastloadHostReceipt *receipt) {
+  if (offset > tensor.byte_size() || bytes > tensor.byte_size() - offset)
+    fail("staging range exceeds tensor");
+  if (cold_mapped &&
+      ((fastload && fastload_host_stage(destination, tensor,
+                                        pinned_budget_bytes, receipt,
+                                        offset, bytes)) ||
+       tensor.mapping->read_direct(tensor.mapping_offset + offset, bytes,
+                                    destination)))
+    return true;
+  pool.copy(destination, tensor.data() + offset, bytes);
+  return false;
+}
+
 class StreamedPrefetcher {
 public:
   // resident_overrides: streamed constants the caller promoted to dedicated
@@ -7483,7 +7570,12 @@ public:
         context_(context), staging_pool_(stage_threads),
         resident_overrides_(std::move(resident_overrides)),
         lazy_resident_overrides_(std::move(lazy_resident_overrides)),
-        direct_io_(direct_io), warm_page_cache_(warm_page_cache) {
+        direct_io_(direct_io), warm_page_cache_(warm_page_cache),
+        pinned_budget_bytes_(pinned_budget_bytes) {
+#if DIF_HAVE_FASTLOAD
+    fastload_streamed_enabled_ =
+        direct_io_ && serenity_fastload_streamed_runtime_enabled();
+#endif
     std::uint64_t maximum = 0U;
     for (const auto &op : program_.operations) {
       std::uint64_t bytes = 0U;
@@ -7501,23 +7593,35 @@ public:
     }
     if (maximum > std::numeric_limits<std::size_t>::max())
       fail("streamed prefetch staging size is not representable");
-    // The historical two-buffer footprint is always admitted; growing the
-    // ring beyond it must fit the pinned budget (fail-closed: this host
-    // has a documented host-OOM incident, pinned staging stays bounded).
+    // Staging is transport scratch, not a second host copy of the largest
+    // operation. A one-off embedding table must not reserve gigabytes and
+    // crowd out the assembly reader for every subsequent weight. Keep small
+    // operations packed as before; split outliers through bounded slots.
     if (staging_buffers < 2U)
       fail("streamed staging ring needs at least two buffers");
-    if (staging_buffers > 2U && maximum != 0U &&
-        static_cast<std::uint64_t>(staging_buffers) >
-            pinned_budget_bytes / maximum)
-      fail("streamed staging ring exceeds the pinned budget: buffers=" +
-           std::to_string(staging_buffers) + " buffer_bytes=" +
-           std::to_string(maximum) + " budget_bytes=" +
-           std::to_string(pinned_budget_bytes));
+    const auto held = pinned_workspace_bytes.load(std::memory_order_relaxed);
+    auto available = pinned_budget_bytes - std::min(held, pinned_budget_bytes);
+#if DIF_HAVE_FASTLOAD
+    constexpr std::uint64_t fastload_ring_bytes = 128ULL << 20U;
+    if (fastload_streamed_enabled_) {
+      if (available >= fastload_ring_bytes + staging_buffers) {
+        available -= fastload_ring_bytes;
+      } else {
+        fastload_streamed_enabled_ = false;
+        fastload_streamed_budget_rejected_ = true;
+      }
+    }
+#endif
+    constexpr std::uint64_t maximum_slot_bytes = 64ULL << 20U;
+    const auto capacity = std::min({maximum, maximum_slot_bytes,
+                                    available / staging_buffers});
+    if (maximum && !capacity)
+      fail("streamed staging has no pinned budget remaining");
     staging_.resize(staging_buffers);
     copy_done_.resize(staging_buffers);
     for (auto &staging : staging_)
       staging = std::make_unique<PinnedHostWorkspace>(
-          static_cast<std::size_t>(maximum));
+          static_cast<std::size_t>(capacity));
     for (auto &event : copy_done_)
       event = std::make_unique<Event>(CU_EVENT_DISABLE_TIMING);
     copy_recorded_.assign(staging_buffers, false);
@@ -7581,7 +7685,14 @@ public:
       std::cerr << "STREAMED_PREFETCH_PLAN tensors=" << first_consumer_.size()
                 << " bytes_per_iteration=" << total
                 << " direct_io=" << direct_io_
-                << " warm_page_cache=" << warm_page_cache_ << '\n';
+                << " warm_page_cache=" << warm_page_cache_
+                << " fastload_streamed=" << fastload_streamed_enabled_
+                << " staging_slot_bytes=" << capacity
+                << " staging_bytes=" << capacity * staging_buffers
+                << " maximum_operation_bytes=" << maximum;
+      if (fastload_streamed_budget_rejected_)
+        std::cerr << " fastload_reason=pinned_budget";
+      std::cerr << '\n';
       for (const auto &[id, first] : first_consumer_) {
         const auto bytes = constants_.at(id).byte_size();
         if (bytes >= 64ULL * 1024ULL * 1024ULL)
@@ -7600,6 +7711,9 @@ public:
     streamed_bytes_ = 0U;
     host_stage_milliseconds_ = 0.0;
     direct_read_bytes_ = 0U;
+    fastload_bytes_ = 0U;
+    fastload_calls_ = 0U;
+    fastload_host_milliseconds_ = 0.0;
     host_wait_milliseconds_ = 0.0;
     profiled_copy_counts_.clear();
     next_copy_timing_ = 0U;
@@ -7608,14 +7722,17 @@ public:
     for (const auto &[id, first] : first_consumer_) {
       if (!active(id))
         continue;
+      const auto bytes = constants_.at(id).byte_size();
+      const auto capacity = staging_.front()->size();
+      const auto chunks = bytes / capacity + (bytes % capacity != 0U);
       if (lazy_resident_overrides_.contains(id)) {
-        count += 1U;
+        count += chunks;
         continue;
       }
       const auto invariant = repeated_invariant_operations.contains(
           program_.operations.at(first).id);
-      count += invariant ? repeated_invariant_executions
-                         : static_cast<std::size_t>(iterations);
+      count += chunks * (invariant ? repeated_invariant_executions
+                                  : static_cast<std::size_t>(iterations));
     }
     copy_timings_.reserve(count);
     for (std::size_t index = 0U; index < count; ++index)
@@ -7639,6 +7756,10 @@ public:
     profile.streamed_weight_bytes = streamed_bytes_;
     profile.streamed_host_stage_milliseconds = host_stage_milliseconds_;
     profile.streamed_direct_read_bytes = direct_read_bytes_;
+    profile.streamed_fastload_bytes = fastload_bytes_;
+    profile.streamed_fastload_calls = fastload_calls_;
+    profile.streamed_fastload_host_milliseconds =
+        fastload_host_milliseconds_;
     profile.streamed_host_wait_milliseconds = host_wait_milliseconds_;
     profile.streamed_h2d_milliseconds = h2d_milliseconds;
     std::vector<std::pair<std::uint32_t, std::size_t>> copied;
@@ -7709,50 +7830,78 @@ public:
       if (!force && first_consumer_.at(id) != operation_index)
         continue;
       const auto &tensor = constants_.at(id);
-      if (tensor.byte_size() > staging_[parity]->size() - offset)
-        fail("streamed tensor exceeds prefetch staging capacity");
-      auto *destination = static_cast<std::uint8_t *>(staging_[parity]->data()) +
-                          offset;
-      const auto host_stage_start = std::chrono::steady_clock::now();
-      const auto trace_stage_start =
-          active_tracer ? active_tracer->now_ms() : 0.0;
-      if (direct_io_ && tensor.mapped_resident_fraction() < 0.9 &&
-          tensor.read_direct_into(destination)) {
-        direct_read_bytes_ += tensor.byte_size();
-        if (warm_page_cache_)
-          tensor.prefetch_mapped_pages();
-      } else {
-        staging_pool_.copy(destination, tensor.data(), tensor.byte_size());
+      const auto capacity = staging_[parity]->size();
+      const bool cold_mapped =
+          direct_io_ && tensor.is_mapped() &&
+          tensor.mapped_resident_fraction() < 0.9;
+      bool read_direct = false;
+      // Pack a whole small tensor if it fits. Otherwise recycle this slot
+      // only after its prior DMA has completed; never overwrite in-flight
+      // pinned bytes. Device slot-release waits above remain unchanged.
+      for (std::size_t tensor_offset = 0U; tensor_offset < tensor.byte_size();) {
+        const auto bytes = std::min(capacity, tensor.byte_size() - tensor_offset);
+        if (bytes > capacity - offset) {
+          const auto wait_start = std::chrono::steady_clock::now();
+          check(counted_event_record(copy_done_[parity]->get(),
+                                      context_.copy_stream()),
+                "cuEventRecord streamed chunk reuse");
+          check(counted_event_synchronize(copy_done_[parity]->get()),
+                "cuEventSynchronize streamed chunk reuse");
+          if (profiling_)
+            host_wait_milliseconds_ +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+          offset = 0U;
+        }
+        auto *destination =
+            static_cast<std::uint8_t *>(staging_[parity]->data()) + offset;
+        const auto host_stage_start = std::chrono::steady_clock::now();
+        const auto trace_stage_start = active_tracer ? active_tracer->now_ms() : 0.0;
+        FastloadHostReceipt receipt;
+        if (stage_tensor_range(staging_pool_, destination, tensor, tensor_offset,
+                               bytes, cold_mapped, fastload_streamed_enabled_,
+                               pinned_budget_bytes_, &receipt)) {
+          read_direct = true;
+          direct_read_bytes_ += bytes;
+        }
+        fastload_bytes_ += receipt.bytes;
+        fastload_calls_ += receipt.calls;
+        fastload_host_milliseconds_ += receipt.milliseconds;
+        if (active_tracer)
+          active_tracer->record(telemetry::category::staging,
+                                receipt.calls
+                                    ? "streamed-constant:fastload-host-stage"
+                                    : "streamed-constant:host-stage",
+                                bytes, "host", trace_stage_start,
+                                active_tracer->now_ms());
+        TraceLabelScope streamed_label("streamed-constant");
+        if (profiling_) {
+          host_stage_milliseconds_ +=
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - host_stage_start).count();
+          streamed_bytes_ += bytes;
+          if (next_copy_timing_ >= copy_timings_.size())
+            fail("streamed pipeline profile observed an unexpected weight copy");
+          auto &timing = copy_timings_.at(next_copy_timing_++);
+          check(counted_event_record(timing.start->get(), context_.copy_stream()),
+                "cuEventRecord streamed H2D start");
+          check(counted_memcpy_htod(buffers_.at(id) + tensor_offset, destination,
+                                    bytes, context_.copy_stream()),
+                "cuMemcpyHtoDAsync profiled constant chunk");
+          check(counted_event_record(timing.stop->get(), context_.copy_stream()),
+                "cuEventRecord streamed H2D stop");
+        } else {
+          check(counted_memcpy_htod(buffers_.at(id) + tensor_offset, destination,
+                                    bytes, context_.copy_stream()),
+                "cuMemcpyHtoDAsync prefetched constant chunk");
+        }
+        offset += bytes;
+        tensor_offset += bytes;
       }
-      if (active_tracer)
-        active_tracer->record(telemetry::category::staging,
-                              "streamed-constant:host-stage",
-                              tensor.byte_size(), "host", trace_stage_start,
-                              active_tracer->now_ms());
-      TraceLabelScope streamed_label("streamed-constant");
-      if (profiling_) {
-        host_stage_milliseconds_ +=
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - host_stage_start)
-                .count();
-        streamed_bytes_ += tensor.byte_size();
+      if (read_direct && warm_page_cache_)
+        tensor.prefetch_mapped_pages();
+      if (profiling_)
         ++profiled_copy_counts_[id];
-        if (next_copy_timing_ >= copy_timings_.size())
-          fail("streamed pipeline profile observed an unexpected weight copy");
-        auto &timing = copy_timings_.at(next_copy_timing_++);
-        check(counted_event_record(timing.start->get(), context_.copy_stream()),
-              "cuEventRecord streamed H2D start");
-        check(counted_memcpy_htod(buffers_.at(id), destination,
-                                tensor.byte_size(), context_.copy_stream()),
-              "cuMemcpyHtoDAsync profiled constant");
-        check(counted_event_record(timing.stop->get(), context_.copy_stream()),
-              "cuEventRecord streamed H2D stop");
-      } else {
-        check(counted_memcpy_htod(buffers_.at(id), destination,
-                                tensor.byte_size(), context_.copy_stream()),
-              "cuMemcpyHtoDAsync prefetched constant");
-      }
-      offset += tensor.byte_size();
       if (release_mapped_pages_per_copy_)
         tensor.discard_mapped_pages();
     }
@@ -7823,7 +7972,13 @@ private:
   std::unordered_set<std::uint32_t> lazy_resident_overrides_;
   bool direct_io_{true};
   bool warm_page_cache_{true};
+  std::uint64_t pinned_budget_bytes_{};
+  bool fastload_streamed_enabled_{};
+  bool fastload_streamed_budget_rejected_{};
   std::uint64_t direct_read_bytes_{};
+  std::uint64_t fastload_bytes_{};
+  std::uint64_t fastload_calls_{};
+  double fastload_host_milliseconds_{};
   std::unordered_set<std::uint32_t> loaded_lazy_residents_;
   std::vector<std::unique_ptr<PinnedHostWorkspace>> staging_;
   std::vector<std::unique_ptr<Event>> copy_done_;
@@ -7843,27 +7998,165 @@ private:
   std::unordered_map<std::uint32_t, std::size_t> profiled_copy_counts_;
 };
 
-void upload_resident_constants(const ir::Program &program,
-                               const TensorMap &inputs,
-                               DeviceBuffers &buffers, CUstream stream) {
-  std::vector<std::uint32_t> resident;
-  std::size_t largest = 0U;
-  for (const auto &desc : program.tensors) {
-    if (!desc.has_role(ir::TensorRole::Constant) ||
-        desc.has_role(ir::TensorRole::Streamed) || !buffers.contains(desc.id))
-      continue;
-    resident.push_back(desc.id);
-    largest = std::max(largest, inputs.at(desc.id).byte_size());
-  }
+void upload_resident_tensors(const std::vector<ResidentTensorUpload> &resident,
+                             CUstream stream,
+                             bool evict_mapped_after_upload) {
   if (resident.empty())
     return;
-  // Ask the kernel to read every mapped constant ahead of the copies. The
-  // driver's copy out of a mapping otherwise faults the file in one page at
-  // a time, which on a cold checkpoint costs seconds per gigabyte; issuing
-  // the read-ahead first lets the drive stream while earlier tensors upload.
-  // Weights already in the page cache are untouched by this.
-  for (const auto id : resident) {
-    const auto &tensor = inputs.at(id);
+  std::unordered_set<std::size_t> fastloaded;
+#if DIF_HAVE_FASTLOAD
+  // The assembler loader (src/runtime/fastload): every resident tensor that
+  // lives in a mapped checkpoint goes disk -> pinned -> device by DMA, 16 MiB
+  // io_uring reads with eight in flight, O_DIRECT when the file is cold and
+  // plain reads out of the page cache when it is warm. The mapping's page
+  // faults (128 KB read-ahead, one request in flight, 0.33 GB/s on this
+  // drive) never happen. Tensors it cannot take, or a load it refuses, fall
+  // back to the copies below. DIF_FASTLOAD=1 explicitly opts in; default is off.
+  {
+    const bool enabled = serenity_fastload_runtime_enabled();
+    std::unordered_map<const MappedStorage *, std::vector<std::size_t>> by_file;
+    if (enabled)
+      for (std::size_t id = 0; id < resident.size(); ++id) {
+        const auto &tensor = *resident[id].tensor;
+        if (tensor.is_mapped() && tensor.mapping->descriptor() >= 0 &&
+            tensor.byte_size() != 0U &&
+            tensor.mapping_bytes == tensor.byte_size())
+          by_file[tensor.mapping.get()].push_back(id);
+      }
+    for (auto &[storage, ids] : by_file) {
+      std::sort(ids.begin(), ids.end(), [&](std::size_t a, std::size_t b) {
+        return resident[a].tensor->mapping_offset <
+               resident[b].tensor->mapping_offset;
+      });
+      std::vector<serenity_fastload_span> spans;
+      spans.reserve(ids.size());
+      bool overlapping = false;
+      std::size_t previous_end = 0U;
+      for (const auto id : ids) {
+        const auto &tensor = *resident[id].tensor;
+        if (tensor.mapping_offset < previous_end) {
+          overlapping = true;  // shared bytes: leave this file to the copies
+          break;
+        }
+        previous_end = tensor.mapping_offset + tensor.byte_size();
+        spans.push_back({tensor.mapping_offset, tensor.byte_size(),
+                         static_cast<std::uint64_t>(resident[id].destination),
+                         0U, 0U});
+      }
+      if (overlapping)
+        continue;
+      serenity_fastload_request request{};
+      request.fd = storage->descriptor();
+      request.fd_direct = storage->direct_descriptor();
+      request.spans = spans.data();
+      request.nspans = spans.size();
+      request.cuda_stream = stream;
+      request.mode = 0;
+      serenity_fastload_stats stats{};
+      std::array<char, 256> error{};
+      request.stats = &stats;
+      request.err = error.data();
+      request.err_capacity = error.size();
+      const auto trace_start = active_tracer ? active_tracer->now_ms() : 0.0;
+      const auto started = std::chrono::steady_clock::now();
+      const int rc = serenity_fastload_run(&request);
+      const auto seconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+      if (rc != 0) {
+        // The reader may have issued DMA before refusing a later chunk.
+        // Do not let fallback overwrite a destination before that DMA drains.
+        check(counted_stream_synchronize(stream),
+              "fastload resident fallback drain");
+        std::cerr << "FASTLOAD_FALLBACK rc=" << rc << " " << error.data()
+                  << '\n';
+        continue;
+      }
+      std::uint64_t bytes = 0U;
+      for (const auto id : ids) {
+        fastloaded.insert(id);
+        bytes += resident[id].tensor->byte_size();
+      }
+      if (active_telemetry) {
+        active_telemetry->h2d_copies += stats.h2d_copies;
+        active_telemetry->h2d_bytes += bytes;
+      }
+      // This blocking interval includes file reads and DMA, not just device
+      // copy time. Keep the H2D byte submission separate and zero-duration.
+      if (active_tracer)
+        active_tracer->record(telemetry::category::filesystem,
+                              "fastload:resident-read-and-upload", bytes,
+                              "host", trace_start, active_tracer->now_ms());
+      trace_submit(telemetry::category::h2d, "fastload", bytes);
+      if (std::getenv("DIF_FASTLOAD_REPORT"))
+        std::cerr << "FASTLOAD tensors=" << ids.size() << " bytes=" << bytes
+                  << " mode=" << stats.mode_used << " chunks=" << stats.chunks
+                  << " h2d_copies=" << stats.h2d_copies
+                  << " resident_pages=" << stats.resident_pages << "/"
+                  << stats.total_pages << " seconds=" << seconds << " GB/s="
+                  << bytes / seconds / 1e9 << '\n';
+    }
+  }
+#endif
+  // Honor the existing eviction policy during upload, not only after the
+  // entire checkpoint has become resident. Prefetching all mappings first
+  // charges the whole checkpoint to the process cgroup and can exhaust host
+  // memory before the old end-of-prepare eviction is ever reached. A bounded
+  // batch also handles a single tensor larger than the host working set.
+  // Fence the actual CUDA stream before discarding any source pages; pageable
+  // asynchronous copies must not be assumed to have finished on return.
+  if (evict_mapped_after_upload) {
+    constexpr std::size_t batch_limit = 64U * 1024U * 1024U;
+    struct MappedRange {
+      const MappedStorage *storage;
+      std::size_t offset;
+      std::size_t bytes;
+    };
+    std::vector<MappedRange> pending;
+    std::size_t pending_bytes = 0U;
+    const auto drain = [&] {
+      if (pending.empty())
+        return;
+      check(counted_stream_synchronize(stream),
+            "resident mapped upload batch synchronization");
+      for (const auto &range : pending)
+        range.storage->evict(range.offset, range.bytes);
+      pending.clear();
+      pending_bytes = 0U;
+    };
+    for (std::size_t id = 0U; id < resident.size(); ++id) {
+      if (fastloaded.contains(id))
+        continue;
+      const auto &tensor = *resident[id].tensor;
+      if (!tensor.is_mapped()) {
+        check(counted_memcpy_htod(resident[id].destination, tensor.data(),
+                                  tensor.byte_size(), stream),
+              "cuMemcpyHtoDAsync resident owned tensor");
+        continue;
+      }
+      for (std::size_t offset = 0U; offset < tensor.byte_size();) {
+        const auto bytes = std::min(tensor.byte_size() - offset,
+                                    batch_limit - pending_bytes);
+        check(counted_memcpy_htod(resident[id].destination + offset,
+                                  tensor.data() + offset, bytes, stream),
+              "cuMemcpyHtoDAsync resident mapped batch");
+        pending.push_back({tensor.mapping.get(), tensor.mapping_offset + offset,
+                           bytes});
+        pending_bytes += bytes;
+        offset += bytes;
+        if (pending_bytes == batch_limit)
+          drain();
+      }
+    }
+    drain();
+    return;
+  }
+  // Prefetch only the fallback mappings. Assembly has already completed the
+  // selected uploads without faulting the mapped file through the CPU.
+  for (std::size_t id = 0; id < resident.size(); ++id) {
+    if (fastloaded.contains(id))
+      continue;
+    const auto &tensor = *resident[id].tensor;
     if (tensor.is_mapped())
       tensor.prefetch_mapped_pages();
   }
@@ -7879,12 +8172,30 @@ void upload_resident_constants(const ir::Program &program,
   //     on a single upload (18-22 s).
   // A process that prepares once and samples many times should page-lock;
   // that belongs to the caller's lifetime policy, not to this copy.
-  for (const auto id : resident) {
-    const auto &tensor = inputs.at(id);
-    check(counted_memcpy_htod(buffers.at(id), tensor.data(),
+  for (std::size_t id = 0; id < resident.size(); ++id) {
+    if (fastloaded.contains(id))
+      continue;
+    const auto &tensor = *resident[id].tensor;
+    check(counted_memcpy_htod(resident[id].destination, tensor.data(),
                               tensor.byte_size(), stream),
           "cuMemcpyHtoDAsync");
   }
+}
+
+void upload_resident_constants(const ir::Program &program,
+                               const TensorMap &inputs,
+                               DeviceBuffers &buffers, CUstream stream,
+                               const std::unordered_set<std::uint32_t> &reused,
+                               bool evict_mapped_after_upload) {
+  std::vector<ResidentTensorUpload> resident;
+  for (const auto &desc : program.tensors) {
+    if (!desc.has_role(ir::TensorRole::Constant) ||
+        desc.has_role(ir::TensorRole::Streamed) || !buffers.contains(desc.id) ||
+        reused.contains(desc.id))
+      continue;
+    resident.push_back({&inputs.at(desc.id), buffers.at(desc.id)});
+  }
+  upload_resident_tensors(resident, stream, evict_mapped_after_upload);
 }
 
 void upload_dynamic_inputs(const ir::Program &program, const TensorMap &inputs,
@@ -8145,11 +8456,22 @@ RepeatedInvariantPlan find_repeated_invariant_plan(
   return result;
 }
 
+// Weight-only storage: sharing never retains another plan's scratch arena.
+// Each prepared consumer keeps its Context alive until this group is freed.
+struct MappedResidentWeights {
+  explicit MappedResidentWeights(std::uint64_t bytes) : arena(bytes) {}
+  DeviceArena arena;
+  std::vector<CUdeviceptr> pointers;
+  std::vector<std::shared_ptr<const MappedStorage>> mappings;
+};
+using MappedResidentCache = detail::MappedWeightCache<MappedResidentWeights>;
+
 class CudaPreparedExecution final : public PreparedExecution {
 public:
   CudaPreparedExecution(ir::Program program, const TensorMap &bindings,
                         const RunOptions &options,
-                        std::shared_ptr<Context> context)
+                        std::shared_ptr<Context> context,
+                        MappedResidentCache &weight_cache)
       : program_(std::move(program)), context_owner_(std::move(context)),
         context_(*context_owner_) {
     const auto preparation_start = std::chrono::steady_clock::now();
@@ -8162,6 +8484,9 @@ public:
     nvtx_enabled = telemetry::nvtx_ranges_requested(options);
     TraceLabelScope preparation_label("prepare");
     nvtx_push("dif::prepare");
+    const auto prepare_entry = std::chrono::steady_clock::now();
+    auto prepare_probe_done = prepare_entry;
+    auto prepare_plan_done = prepare_entry;
     if (options.lazy_resident_upload && options.pipelined_resident_upload)
       fail("lazy and pipelined resident upload are mutually exclusive");
     if (options.cudnn_attention_heuristic > 4U)
@@ -8169,6 +8494,51 @@ public:
     cudnn_attention_heuristic_ = options.cudnn_attention_heuristic;
     lazy_resident_upload_ = options.lazy_resident_upload;
     ir::verify(program_);
+    if (options.residual_cache_region.has_value() != bool(options.residual_cache_callbacks))
+      fail("residual cache requires both an explicit region and policy callbacks");
+    if (options.residual_cache_region) {
+      if (options.warmups != 0U || options.iterations != 1U || options.trace_operations ||
+          !options.parallel_linear_groups.empty())
+        fail("residual cache requires one evaluation, no warmups/replay, and ordered operations");
+      residual_cache_region_ = options.residual_cache_region;
+      residual_cache_callbacks_ = options.residual_cache_callbacks;
+      const auto &region = *residual_cache_region_;
+      residual_cache_bytes_ = residual_cache_device_layout(region).required_bytes;
+      const auto position = [&](std::uint32_t id) {
+        const auto found = std::find_if(program_.operations.begin(), program_.operations.end(),
+            [&](const auto &op) { return op.id == id; });
+        if (found == program_.operations.end()) fail("residual cache boundary operation is missing");
+        return static_cast<std::size_t>(found - program_.operations.begin());
+      };
+      residual_cache_front_ = position(region.front_first_operation);
+      residual_cache_middle_ = position(region.middle_first_operation);
+      residual_cache_back_ = position(region.back_first_operation);
+      if (!(residual_cache_front_ < residual_cache_middle_ && residual_cache_middle_ < residual_cache_back_))
+        fail("residual cache region is not source-ordered");
+      for (const auto id : {region.before_front_tensor, region.after_front_tensor, region.after_middle_tensor}) {
+        const auto *tensor = program_.tensor(id);
+        if (!tensor || tensor->dtype != ir::DType::BF16 ||
+            tensor->dims != std::vector<std::uint64_t>{region.sequence, region.hidden})
+          fail("residual cache boundary requires the declared BF16 hidden geometry");
+      }
+      std::unordered_set<std::uint32_t> middle_values;
+      for (std::size_t i = residual_cache_middle_; i < residual_cache_back_; ++i)
+        for (const auto id : program_.operations[i].outputs) {
+          if (id == region.after_middle_tensor) continue;
+          if (program_.tensor(id)->has_role(ir::TensorRole::Output))
+            fail("residual cache cannot hide another observable middle output");
+          middle_values.insert(id);
+        }
+      for (std::size_t i = residual_cache_back_; i < program_.operations.size(); ++i)
+        for (const auto id : program_.operations[i].inputs)
+          if (middle_values.contains(id))
+            fail("residual cache has an undeclared cross-region dependency");
+      for (const auto id : options.capture_intermediate_tensors)
+        if (middle_values.contains(id)) fail("residual cache cannot capture skipped middle intermediates");
+      for (const auto id : options.repeated_invariant_operations)
+        if (position(id) >= residual_cache_front_)
+          fail("residual cache edge/middle operations cannot be invariant-skipped");
+    }
     // Grad-flow gate (Flame lesson, three silent zero-LoRA-B incidents):
     // fused inference plans replace semantic operations with kernels that
     // declare no backward. A differentiated program must not be executed
@@ -8320,6 +8690,7 @@ public:
         options.streamed_pinned_budget_bytes;
     budget_request.staging_budget_bytes = options.streamed_pinned_budget_bytes;
     runtime_budget_ = probe_runtime_budget(target_profile_, budget_request);
+    prepare_probe_done = std::chrono::steady_clock::now();
     const auto major = static_cast<int>(target_profile_.compute_major);
     const auto minor = static_cast<int>(target_profile_.compute_minor);
     device_name_ = target_profile_.product_name;
@@ -8715,6 +9086,50 @@ public:
       }
     }
     auto generated = compiler::emit_cuda(program_);
+    if (residual_cache_region_) {
+      // Source H3 uses the explicit library/fused plans below, not an
+      // unstated elementwise/packed-weight region. Reject opaque generated
+      // fusion spans until their source-span ownership can be verified.
+      if (!generated.skipped_operations.empty())
+        fail("residual cache requires source-visible generated operation boundaries");
+      std::unordered_map<std::uint32_t, std::size_t> positions;
+      for (std::size_t i = 0U; i < program_.operations.size(); ++i)
+        positions.emplace(program_.operations[i].id, i);
+      const auto band = [&](std::uint32_t id) {
+        const auto index = positions.at(id);
+        return index < residual_cache_front_ ? 0 : index < residual_cache_middle_ ? 1 :
+               index < residual_cache_back_ ? 2 : 3;
+      };
+      const auto same_band = [&](std::initializer_list<std::uint32_t> operations) {
+        std::optional<int> first;
+        for (const auto id : operations) {
+          if (id == 0U) continue;
+          const auto current = band(id);
+          if (first && *first != current) fail("fused execution plan crosses residual-cache boundary");
+          first = current;
+        }
+      };
+      for (const auto &plan : fused_linear_swiglu_plans_)
+        same_band({plan.linear_operation, plan.swiglu_operation});
+      for (const auto &plan : absorbed_linear_bias_plans_)
+        same_band({plan.linear_operation, plan.bias_operation});
+      for (const auto &plan : h3_modulation_cache_plans_)
+        same_band({plan.linear_operation, plan.select_operation});
+      for (const auto &plan : h3_w8a8_mlp_plans_)
+        same_band({plan.fc1_operation, plan.swiglu_operation, plan.fc2_operation,
+                   plan.residual_operation, plan.compact_adaln.norm_operation});
+      for (const auto &plan : h3_w8a8_attention_plans_) {
+        if (plan.has_qkv_projection)
+          same_band({plan.qkv_layout_operation, plan.qkv_linear_operations[0],
+                     plan.qkv_linear_operations[1], plan.qkv_linear_operations[2],
+                     plan.compact_adaln.norm_operation});
+        if (plan.has_output_projection)
+          same_band({plan.output_linear_operation, plan.residual_operation});
+      }
+      for (const auto &plan : h3_compact_adaln_plans_)
+        same_band({plan.select_operation, plan.norm_operations[0], plan.norm_operations[1]});
+      generated.source += residual_cache_cuda_source();
+    }
     generated.skipped_operations.insert(reshape_alias_operations_.begin(),
                                         reshape_alias_operations_.end());
     generated.source +=
@@ -8737,6 +9152,7 @@ public:
     std::unordered_set<std::uint32_t> fused_linear_operations;
     std::unordered_set<std::uint32_t> excluded_tensors;
     std::unordered_set<std::uint32_t> replaced_constant_tensors;
+    std::unordered_set<std::uint32_t> convrot_replaced_weight_tensors;
     for (const auto &operation : program_.operations) {
       if (!generated.skipped_operations.contains(operation.id))
         continue;
@@ -8783,7 +9199,39 @@ public:
     for (const auto &plan : convrot_int8_linear_plans_) {
       if (!options.convrot_int8_weight_only_quality)
         fused_linear_operations.insert(plan.operation);
-      replaced_constant_tensors.insert(plan.weight_tensor);
+      convrot_replaced_weight_tensors.insert(plan.weight_tensor);
+      if (program_.tensor(plan.weight_tensor)->has_role(ir::TensorRole::Constant))
+        replaced_constant_tensors.insert(plan.weight_tensor);
+      else
+        excluded_tensors.insert(plan.weight_tensor);
+    }
+    // Quantized bindings can replace a derived semantic weight (for example
+    // packed-checkpoint deinterleave). Retire an upstream pure weight-layout
+    // operation only when every output is replaced, unobservable, and read
+    // exclusively as a replaced Linear weight. Never stage its obsolete base.
+    for (const auto &operation : program_.operations) {
+      if (operation.outputs.empty() ||
+          !std::all_of(operation.outputs.begin(), operation.outputs.end(),
+              [&](auto id) { return convrot_replaced_weight_tensors.contains(id) &&
+                  program_.tensor(id)->roles == ir::TensorRole::Internal; }))
+        continue;
+      bool exclusive = true;
+      for (const auto &consumer : program_.operations)
+        for (const auto id : operation.outputs)
+          if (std::find(consumer.inputs.begin(), consumer.inputs.end(), id) != consumer.inputs.end() &&
+              !(fused_linear_operations.contains(consumer.id) &&
+                consumer.opcode == ir::Opcode::Linear && consumer.inputs.at(1) == id))
+            exclusive = false;
+      if (!exclusive) fail("quantized derived weight has an observable consumer");
+      generated.skipped_operations.insert(operation.id);
+      for (const auto id : operation.inputs) {
+        const auto *description = program_.tensor(id);
+        if (!description->has_role(ir::TensorRole::Constant)) continue;
+        const auto other_consumer = std::any_of(program_.operations.begin(), program_.operations.end(),
+            [&](const auto &op) { return op.id != operation.id &&
+                std::find(op.inputs.begin(), op.inputs.end(), id) != op.inputs.end(); });
+        if (!other_consumer) replaced_constant_tensors.insert(id);
+      }
     }
     for (const auto &plan : h3_compact_adaln_plans_) {
       excluded_tensors.insert(plan.expanded_tensors.begin(),
@@ -9343,11 +9791,49 @@ public:
     // every later run reads them where they were produced.
     excluded_tensors.insert(repeated_invariant_persistent_tensors_.begin(),
                             repeated_invariant_persistent_tensors_.end());
+    // Compiler-selected residency is unchanged. Only ordinary immutable
+    // mapped constants share a weight-only allocation across shape plans.
+    struct MappedBinding {
+      detail::MappedWeightKey key;
+      std::uint32_t id;
+    };
+    std::vector<MappedBinding> mapped_bindings;
+    for (const auto &desc : program_.tensors) {
+      if (desc.roles != static_cast<std::uint32_t>(ir::TensorRole::Constant) ||
+          replaced_constant_tensors.contains(desc.id))
+        continue;
+      if (auto key = detail::mapped_weight_key(constants_.at(desc.id)))
+        mapped_bindings.push_back({std::move(*key), desc.id});
+    }
+    std::sort(mapped_bindings.begin(), mapped_bindings.end(),
+              [](const auto &a, const auto &b) { return a.key < b.key; });
+    MappedResidentCache::Key mapped_key;
+    std::uint64_t mapped_storage_bytes = 0U;
+    auto externally_stored_constants = replaced_constant_tensors;
+    for (const auto &binding : mapped_bindings) {
+      mapped_key.push_back(binding.key);
+      const auto bytes = align_256(binding.key.bytes);
+      if (mapped_storage_bytes >
+          std::numeric_limits<std::uint64_t>::max() - bytes)
+        fail("shared mapped weight storage overflow");
+      mapped_storage_bytes += bytes;
+      externally_stored_constants.insert(binding.id);
+    }
+    std::unordered_set<std::uint32_t> reused_mapped_constants;
+    if (!mapped_key.empty()) {
+      mapped_weights_ = weight_cache.find(mapped_key);
+      if (mapped_weights_) {
+        reused_resident_weight_bytes_ = mapped_storage_bytes;
+        for (const auto &binding : mapped_bindings)
+          reused_mapped_constants.insert(binding.id);
+      }
+    }
     memory_plan_ = compiler::plan_memory(
         program_, 256U,
         options.overlap_streaming ? streamed_prefetch_depth_ : 0U,
-        excluded_tensors, replaced_constant_tensors, reshape_aliases_, true,
+        excluded_tensors, externally_stored_constants, reshape_aliases_, true,
         repeated_invariant_persistent_tensors_);
+    prepare_plan_done = std::chrono::steady_clock::now();
     const auto tensor_bytes = memory_plan_.total_bytes;
     if (tensor_bytes > std::numeric_limits<std::uint64_t>::max() - workspace_bytes_ ||
         tensor_bytes + workspace_bytes_ >
@@ -9445,7 +9931,7 @@ public:
       if (convrot_resident_weight_bytes >
           std::numeric_limits<std::uint64_t>::max() - resident_plan_bytes)
         fail("resident generic ConvRot weight storage overflow");
-      convrot_resident_weight_bytes += resident_plan_bytes;
+      if (plan.resident) convrot_resident_weight_bytes += resident_plan_bytes;
     }
     const auto convrot_weight_slot_bytes =
         align_256(convrot_weight_bytes) + align_256(convrot_scale_bytes);
@@ -9453,14 +9939,16 @@ public:
         align_256(convrot_activation_bytes) +
         align_256(convrot_activation_scale_bytes) +
         align_256(convrot_quality_weight_bytes);
-    if (!options.convrot_int8_resident &&
+    const auto convrot_has_streamed = std::any_of(
+        convrot_int8_linear_plans_.begin(), convrot_int8_linear_plans_.end(),
+        [](const auto &plan) { return !plan.resident; });
+    if (convrot_has_streamed &&
         convrot_weight_slot_bytes >
             std::numeric_limits<std::uint64_t>::max() / 2U)
       fail("generic ConvRot streamed slot storage overflow");
     const auto convrot_weight_storage_bytes =
-        options.convrot_int8_resident
-            ? convrot_resident_weight_bytes
-            : 2U * convrot_weight_slot_bytes;
+        convrot_resident_weight_bytes +
+        (convrot_has_streamed ? 2U * convrot_weight_slot_bytes : 0U);
     if (convrot_weight_storage_bytes >
         std::numeric_limits<std::uint64_t>::max() - convrot_scratch_bytes)
       fail("generic ConvRot prepared storage overflow");
@@ -9549,8 +10037,19 @@ public:
     if (base_with_repeated > std::numeric_limits<std::uint64_t>::max() -
                                  h3_convrot_correction_bytes)
       fail("DiffIR allocation plus H3 ConvRot correction storage overflow");
-    const auto required =
+    const auto without_residual_cache =
         base_with_repeated + h3_convrot_correction_bytes;
+    if (without_residual_cache > std::numeric_limits<std::uint64_t>::max() - residual_cache_bytes_)
+      fail("DiffIR allocation plus residual cache storage overflow");
+    const auto required = without_residual_cache + residual_cache_bytes_;
+    const auto mapped_new_bytes = mapped_weights_ ? 0U : mapped_storage_bytes;
+    constexpr std::uint64_t arena_slack = 64U * 1024U;
+    if (mapped_storage_bytes >
+            std::numeric_limits<std::uint64_t>::max() - arena_slack ||
+        required > std::numeric_limits<std::uint64_t>::max() -
+                       mapped_storage_bytes - arena_slack)
+      fail("DiffIR allocation plus shared mapped weight storage overflow");
+    const auto allocation_required = required + mapped_new_bytes + arena_slack;
     if (options.profile_pipeline) {
       std::cerr << "CUDA_MEMORY_PLAN tensor_bytes=" << tensor_bytes
                 << " linear_workspace_bytes=" << workspace_bytes_
@@ -9576,7 +10075,11 @@ public:
                 << repeated_invariant_cache_bytes_
                 << " h3_convrot_correction_bytes="
                 << h3_convrot_correction_bytes
-                << " required_bytes=" << required
+                << " required_bytes=" << required + mapped_storage_bytes
+                << " private_storage_bytes=" << required
+                << " mapped_weight_storage_bytes=" << mapped_storage_bytes
+                << " reused_mapped_weight_bytes=" << reused_resident_weight_bytes_
+                << " new_allocation_bytes=" << allocation_required
                 << " free_before_bytes=" << free_bytes_before_
                 << " minimum_free_bytes=" << options.minimum_free_bytes
                 << '\n';
@@ -9586,18 +10089,26 @@ public:
                     << " bytes=" << slot.bytes << '\n';
       }
     }
-    if (required > free_bytes_before_ ||
-        free_bytes_before_ - required < options.minimum_free_bytes)
+    if (allocation_required > free_bytes_before_ ||
+        free_bytes_before_ - allocation_required < options.minimum_free_bytes)
       fail("GPU pressure gate refused candidate: required=" +
-           std::to_string(required) + " free_before=" +
+           std::to_string(allocation_required) + " free_before=" +
            std::to_string(free_bytes_before_) + " minimum_free=" +
            std::to_string(options.minimum_free_bytes));
-    resident_bytes_ = required;
-    // Single device reservation backing every prepare-time allocation
-    // below (memory-plan slots + all feature workspaces). The slack
+    resident_bytes_ = required + mapped_storage_bytes;
+    if (mapped_storage_bytes != 0U && !mapped_weights_) {
+      mapped_weights_ = std::make_shared<MappedResidentWeights>(mapped_storage_bytes);
+      for (const auto &binding : mapped_bindings) {
+        mapped_weights_->pointers.push_back(
+            mapped_weights_->arena.take(binding.key.bytes, "mapped resident weight"));
+        mapped_weights_->mappings.push_back(constants_.at(binding.id).mapping);
+      }
+    }
+    // Private device reservation for memory-plan slots and feature scratch;
+    // immutable mapped weights have a separate shareable reservation. Slack
     // absorbs the per-take 256-byte alignment padding; take() fails
     // closed if the accounting above ever under-covers.
-    arena_ = std::make_unique<DeviceArena>(required + 64U * 1024U);
+    arena_ = std::make_unique<DeviceArena>(required + arena_slack);
 
     fused_launch_inputs_ = generated.launch_inputs;
     skipped_operations_ = generated.skipped_operations;
@@ -9885,12 +10396,30 @@ public:
             "cuModuleGetFunction H3 groupwise INT8 dequant");
     excluded_tensors.insert(replaced_constant_tensors.begin(),
                             replaced_constant_tensors.end());
-    buffers_.allocate(program_, memory_plan_, excluded_tensors, arena_.get());
+    auto buffer_exclusions = excluded_tensors;
+    for (const auto &binding : mapped_bindings)
+      buffer_exclusions.insert(binding.id);
+    buffers_.allocate(program_, memory_plan_, buffer_exclusions, arena_.get());
+    for (std::size_t i = 0U; i < mapped_bindings.size(); ++i)
+      buffers_.bind_external(mapped_bindings[i].id, mapped_weights_->pointers[i]);
     repeated_invariant_cache_storage_ = std::make_unique<Workspace>(
         repeated_invariant_cache_bytes_, arena_.get());
     for (const auto &[tensor_id, offset] : repeated_invariant_cache_offsets_)
       buffers_.bind_external(
           tensor_id, repeated_invariant_cache_storage_->pointer() + offset);
+    if (residual_cache_region_) {
+      residual_cache_storage_ = std::make_unique<Workspace>(residual_cache_bytes_, arena_.get());
+      ResidualCacheKernelHandles handles;
+      check(cuModuleGetFunction(&handles.gather, module_->get(), "dif_residual_cache_gather"), "load residual-cache gather");
+      check(cuModuleGetFunction(&handles.quantize, module_->get(), "dif_residual_cache_quantize"), "load residual-cache quantize");
+      check(cuModuleGetFunction(&handles.store, module_->get(), "dif_residual_cache_store"), "load residual-cache store");
+      check(cuModuleGetFunction(&handles.apply, module_->get(), "dif_residual_cache_apply"), "load residual-cache apply");
+      residual_cache_ = std::make_unique<CudaResidualCache>(*residual_cache_region_,
+          residual_cache_storage_->pointer(), context_.stream(), handles,
+          ResidualCacheCudaDispatch{counted_launch_kernel, counted_memcpy_htod,
+                                   counted_memcpy_dtoh, counted_stream_synchronize},
+          residual_cache_callbacks_);
+    }
     workspace_ = std::make_unique<Workspace>(workspace_bytes_, arena_.get());
     if (parallel_workspace_bytes_ != 0U) {
       const auto auxiliary_count =
@@ -9969,10 +10498,11 @@ public:
     convrot_scratch_storage_ = std::make_unique<Workspace>(
         static_cast<std::size_t>(convrot_scratch_bytes), arena_.get());
     if (!convrot_int8_linear_plans_.empty()) {
-      convrot_resident_ = options.convrot_int8_resident;
-      if (convrot_resident_) {
-        auto offset = std::uint64_t{0U};
+      convrot_resident_ = !convrot_has_streamed;
+      {
+        auto offset = convrot_has_streamed ? 2U * convrot_weight_slot_bytes : 0U;
         for (auto &plan : convrot_int8_linear_plans_) {
+          if (!plan.resident) continue;
           plan.weight_device = convrot_weight_storage_->pointer() + offset;
           offset += align_256(plan.weight.byte_size());
           plan.scale_device = convrot_weight_storage_->pointer() + offset;
@@ -9980,7 +10510,8 @@ public:
         }
         if (offset != convrot_weight_storage_bytes)
           fail("resident generic ConvRot storage layout mismatch");
-      } else {
+      }
+      if (convrot_has_streamed) {
         if (options.streamed_stage_threads == 0U)
           fail("generic ConvRot staging worker count must be positive");
         convrot_staging_ = std::make_unique<PinnedHostWorkspace>(
@@ -10148,14 +10679,14 @@ public:
           break;
         if (plan.dtype != ir::DType::BF16)
           continue;
-        const auto slots = convrot_resident_ ? 1U : 2U;
+        const auto slots = plan.resident ? 1U : 2U;
         for (std::size_t slot = 0U; slot < slots; ++slot) {
           const auto slot_base = convrot_weight_storage_->pointer() +
                                  slot * convrot_weight_slot_bytes_;
           const auto weight_device =
-              convrot_resident_ ? plan.weight_device : slot_base;
+              plan.resident ? plan.weight_device : slot_base;
           const auto scale_device =
-              convrot_resident_
+              plan.resident
                   ? plan.scale_device
                   : slot_base + align_256(convrot_weight_bytes_);
           h3_int8_scaled_gemm_registry_->add(
@@ -10178,14 +10709,14 @@ public:
       for (const auto &plan : convrot_int8_linear_plans_) {
         if (plan.dtype != ir::DType::F16)
           continue;
-        const auto slots = convrot_resident_ ? 1U : 2U;
+        const auto slots = plan.resident ? 1U : 2U;
         for (std::size_t slot = 0U; slot < slots; ++slot) {
           const auto slot_base = convrot_weight_storage_->pointer() +
                                  slot * convrot_weight_slot_bytes_;
           const auto weight_device =
-              convrot_resident_ ? plan.weight_device : slot_base;
+              plan.resident ? plan.weight_device : slot_base;
           const auto scale_device =
-              convrot_resident_
+              plan.resident
                   ? plan.scale_device
                   : slot_base + align_256(convrot_weight_bytes_);
           int8_scaled_f16_gemm_registry_->add(
@@ -10500,8 +11031,7 @@ public:
     resident_weight_bytes_ += h3_w8a8_tail_weight_bytes_;
     for (const auto &plan : h3_groupwise_plans_)
       resident_weight_bytes_ += plan.weight_storage_bytes;
-    if (convrot_resident_)
-      resident_weight_bytes_ += convrot_resident_weight_bytes;
+    resident_weight_bytes_ += convrot_resident_weight_bytes;
     resident_weight_bytes_ += h3_modulation_bytes;
     for (const auto id : promoted_streamed_constants_)
       resident_weight_bytes_ += program_.tensor(id)->byte_count();
@@ -10522,7 +11052,14 @@ public:
       selected_linear_algorithms_.push_back(choice);
     }
     const auto resident_upload_start = std::chrono::steady_clock::now();
-    if (options.profile_pipeline && resident_weight_bytes_ != 0U) {
+    bool profile_resident_prefault = options.profile_pipeline;
+#if DIF_HAVE_FASTLOAD
+    // A serial CPU prefault defeats the mapped-file bypass before ASM gets
+    // to run. Its blocking read-and-upload interval is already traced; only
+    // the pageable fallback needs the optional split prefault measurement.
+    profile_resident_prefault &= !serenity_fastload_runtime_enabled();
+#endif
+    if (profile_resident_prefault && resident_weight_bytes_ != 0U) {
       struct rusage before {};
       struct rusage after {};
       if (getrusage(RUSAGE_SELF, &before) != 0)
@@ -10535,7 +11072,8 @@ public:
       for (const auto &description : program_.tensors) {
         if (!description.has_role(ir::TensorRole::Constant) ||
             description.has_role(ir::TensorRole::Streamed) ||
-            !buffers_.contains(description.id))
+            !buffers_.contains(description.id) ||
+            reused_mapped_constants.contains(description.id))
           continue;
         const auto &constant = constants_.at(description.id);
         const auto bytes = constant.byte_size();
@@ -10546,8 +11084,9 @@ public:
         if (bytes != 0U)
           checksum += data[bytes - 1U];
       }
-      if (convrot_resident_)
+      if (convrot_resident_weight_bytes != 0U)
         for (const auto &plan : convrot_int8_linear_plans_) {
+          if (!plan.resident) continue;
           for (const auto *tensor : {&plan.weight, &plan.scale}) {
             const auto bytes = tensor->byte_size();
             const auto *data = tensor->data();
@@ -10573,7 +11112,9 @@ public:
     const auto resident_h2d_start = std::chrono::steady_clock::now();
     prepare_phase_rest_ms_ = phase_since(phase_mark);
     phase_mark = std::chrono::steady_clock::now();
-    upload_resident_constants(program_, constants_, buffers_, context_.stream());
+    upload_resident_constants(program_, constants_, buffers_, context_.stream(),
+                              reused_mapped_constants,
+                              options.resident_evict_host_pages);
     prepare_phase_issue_ms_ = phase_since(phase_mark);
     phase_mark = std::chrono::steady_clock::now();
     constexpr std::size_t h3_resident_staging_slots = 2U;
@@ -10619,7 +11160,9 @@ public:
           // 2-4 s per checkpoint, a fresh disk read costs 8-9 s.
           if (h3_resident_direct_io_ &&
               tensor.mapped_resident_fraction() < 0.9 &&
-              tensor.read_direct_into(destination)) {
+              (fastload_host_stage(destination, tensor,
+                                   options.streamed_pinned_budget_bytes) ||
+               tensor.read_direct_into(destination))) {
             h3_resident_direct_read_bytes_ += tensor.byte_size();
             if (direct_io_warm_page_cache_)
               h3_resident_warm_list_.push_back({&tensor, true});
@@ -10699,7 +11242,7 @@ public:
     for (const auto &plan : h3_groupwise_plans_)
       upload_h3_groupwise_weights(plan, context_.stream());
     upload_h3_modulation_cache(h3_modulation_cache_plans_, context_.stream());
-    if (convrot_resident_) {
+    if (convrot_resident_weight_bytes != 0U) {
       // Cold mapped weights go through pinned staging with direct IO (the
       // mapping copy would fault them in at page-cache speed); warm ones are
       // copied from the mapping as before.
@@ -10730,7 +11273,9 @@ public:
           convrot_stage_armed = false;
         }
         auto *staging = static_cast<std::uint8_t *>(convrot_stage->data());
-        if (!tensor.read_direct_into(staging)) {
+        if (!fastload_host_stage(staging, tensor,
+                                 options.streamed_pinned_budget_bytes) &&
+            !tensor.read_direct_into(staging)) {
           check(counted_memcpy_htod(device, tensor.data(), tensor.byte_size(),
                                     context_.stream()),
                 label);
@@ -10747,6 +11292,7 @@ public:
         convrot_stage_armed = true;
       };
       for (const auto &plan : convrot_int8_linear_plans_) {
+        if (!plan.resident) continue;
         upload_convrot(plan.weight_device, plan.weight,
                        "cuMemcpyHtoDAsync resident generic ConvRot weight");
         upload_convrot(plan.scale_device, plan.scale,
@@ -10760,12 +11306,16 @@ public:
       // Dedicated storage is populated at first semantic use by the prepared
       // prefetcher, then remains valid for the lifetime of this execution.
     } else if (!options.pipelined_resident_upload) {
+      // Promotion changes lifetime, not transport: mapped streamed constants
+      // must use the same batched loader and fallback as ordinary residents.
+      std::vector<ResidentTensorUpload> resident;
+      resident.reserve(promoted_streamed_constants_.size());
       for (const auto id : promoted_streamed_constants_) {
         const auto &tensor = constants_.at(id);
-        check(counted_memcpy_htod(buffers_.at(id), tensor.data(),
-                                  tensor.byte_size(), context_.stream()),
-              "cuMemcpyHtoDAsync promoted streamed constant");
+        resident.push_back({&tensor, buffers_.at(id)});
       }
+      upload_resident_tensors(resident, context_.stream(),
+                               options.resident_evict_host_pages);
     } else if (!promoted_streamed_constants_.empty()) {
       constexpr std::size_t staging_slots = 2U;
       std::size_t maximum_bytes = 0U;
@@ -10812,15 +11362,22 @@ public:
     // events change the very thing being measured.
     if (options.profile_pipeline ||
         std::getenv("DIF_PREPARE_PHASES") != nullptr)
-      std::cerr << "CUDA_PREPARE_PHASES compile_ms=" << prepare_phase_compile_ms_
+      std::cerr << "CUDA_PREPARE_PHASES pre_probe_ms="
+                << std::chrono::duration<double, std::milli>(prepare_probe_done - prepare_entry).count()
+                << " pre_analysis_ms="
+                << std::chrono::duration<double, std::milli>(prepare_plan_done - prepare_probe_done).count()
+                << " pre_module_ms="
+                << std::chrono::duration<double, std::milli>(phase_start - prepare_plan_done).count()
+                << " compile_ms=" << prepare_phase_compile_ms_
                 << " module_load_ms=" << prepare_phase_module_ms_
                 << " linear_plans_ms=" << prepare_phase_linear_plans_ms_
                 << " other_plans_and_alloc_ms=" << prepare_phase_rest_ms_
                 << " weight_read_and_issue_ms=" << prepare_phase_issue_ms_
                 << " weight_upload_ms=" << prepare_phase_upload_ms_
                 << " total_ms=" << phase_since(phase_start) << "\n";
-    if (convrot_resident_)
+    if (convrot_resident_weight_bytes != 0U)
       for (auto &plan : convrot_int8_linear_plans_) {
+        if (!plan.resident) continue;
         plan.weight.discard_mapped_pages();
         plan.scale.discard_mapped_pages();
       }
@@ -10980,6 +11537,23 @@ public:
     if (!state_.empty())
       check(counted_stream_synchronize(context_.stream()),
             "persistent state seed synchronization");
+#if DIF_HAVE_FASTLOAD
+    initialize_resident_prefetch(options);
+#endif
+    // Publish last: failed preparation cannot expose incomplete weights. A
+    // rewritten backing file is never published under its earlier version.
+    if (!mapped_bindings.empty() && reused_mapped_constants.empty() &&
+        std::all_of(mapped_bindings.begin(), mapped_bindings.end(),
+                    [&](const auto &binding) {
+                      return detail::mapped_weight_key(constants_.at(binding.id)) ==
+                             std::optional{binding.key};
+                    }))
+      weight_cache.publish(std::move(mapped_key), mapped_weights_);
+    if (options.profile_pipeline || std::getenv("DIF_PREPARE_PHASES"))
+      std::cerr << "CUDA_MAPPED_WEIGHTS tensors=" << mapped_bindings.size()
+                << " storage_bytes=" << mapped_storage_bytes
+                << " reused_bytes=" << reused_resident_weight_bytes_
+                << " new_bytes=" << mapped_new_bytes << '\n';
     const auto preparation_stop = std::chrono::steady_clock::now();
     preparation_milliseconds_ =
         std::chrono::duration<double, std::milli>(preparation_stop -
@@ -10990,9 +11564,21 @@ public:
       preparation_trace_milliseconds_ = preparation_milliseconds_;
   }
 
+  ~CudaPreparedExecution() override {
+#if DIF_HAVE_FASTLOAD
+    // Join while all plan-owned destinations and mappings still exist.
+    resident_prefetch_.reset();
+#endif
+  }
+
   RunResult run(const TensorMap &inputs, const RunOptions &options) override {
     if (options.iterations == 0)
       fail("run iterations must be nonzero");
+    if (options.residual_cache_region != residual_cache_region_ ||
+        options.residual_cache_callbacks != residual_cache_callbacks_)
+      fail("residual cache region and callbacks are fixed during prepared execution");
+    if (residual_cache_region_ && (options.warmups != 0U || options.iterations != 1U || options.trace_operations))
+      fail("residual cache requires one evaluation without warmups or operation replay");
     if (options.streamed_keep_mapped_pages_between_runs &&
         options.streamed_release_mapped_pages_per_copy)
       fail("streamed mapped pages cannot be kept between runs and released per copy");
@@ -11122,6 +11708,7 @@ public:
 
     auto h3_w8a8_tail_streamed_bytes = std::uint64_t{0U};
     auto h3_w8a8_tail_host_stage_milliseconds = 0.0;
+    FastloadHostReceipt quantized_fastload_receipt;
     // Per-run receipt counters (the prepare-time upload's bytes are reported
     // by the first run).
     if (h3_resident_counters_reported_) {
@@ -11129,6 +11716,10 @@ public:
       h3_resident_readahead_advised_bytes_ = 0U;
     }
     h3_resident_counters_reported_ = true;
+#if DIF_HAVE_FASTLOAD
+    if (resident_prefetch_)
+      resident_prefetch_->start();
+#endif
     auto convrot_streamed_bytes = std::uint64_t{0U};
     auto convrot_host_stage_milliseconds = 0.0;
     auto stage_h3_w8a8_tail = [&](auto &plan, bool profile) {
@@ -11137,6 +11728,22 @@ public:
         return;
       if (populate_resident && !lazy_resident_upload_)
         fail("H3 resident projection was not populated during preparation");
+#if DIF_HAVE_FASTLOAD
+      if (populate_resident && resident_prefetch_) {
+        const auto ready = resident_prefetch_->wait(
+            resident_prefetch_order_.at(plan.upload_order));
+        if (ready.event) {
+          check(counted_stream_wait_event(context_.stream(), ready.event, 0U),
+                "cuStreamWaitEvent resident weight batch");
+          if (ready.direct && direct_io_warm_page_cache_)
+            for (const auto &upload : resident_uploads(plan))
+              h3_resident_warm_list_.push_back({upload.tensor, true});
+          evict_h3_w8a8_weights(plan, resident_evict_host_pages_);
+          plan.uploaded = true;
+          return;
+        }
+      }
+#endif
       if (!h3_w8a8_tail_stage_ || h3_w8a8_tail_stage_half_bytes_ == 0U)
         fail("H3 W8A8 tail plan lacks reusable host staging");
       const auto half = h3_w8a8_tail_stage_turn_ % 2U;
@@ -11170,7 +11777,11 @@ public:
           [&](std::uint8_t *destination, const Tensor &tensor) {
             if (h3_resident_direct_io_ &&
                 tensor.mapped_resident_fraction() < 0.9 &&
-                tensor.read_direct_into(destination)) {
+                (fastload_host_stage(destination, tensor,
+                                     options.streamed_pinned_budget_bytes,
+                                     profile ? &quantized_fastload_receipt
+                                             : nullptr) ||
+                 tensor.read_direct_into(destination))) {
               h3_resident_direct_read_bytes_ += tensor.byte_size();
               if (direct_io_warm_page_cache_)
                 h3_resident_warm_list_.push_back({&tensor, plan.resident});
@@ -11212,7 +11823,7 @@ public:
                                      const ir::Operation &operation,
                                      bool profile) {
 #if DIF_HAS_CUTLASS
-      if (!convrot_resident_ &&
+      if (!plan.resident &&
           (!convrot_staging_ || !convrot_staging_pool_))
         fail("generic ConvRot Linear plan is not fully prepared");
       if (convrot_weight_only_quality_ &&
@@ -11228,26 +11839,33 @@ public:
             !int8_scaled_f16_gemm_registry_)))
         fail("generic ConvRot fast plan is not fully prepared");
       const auto slot = static_cast<std::size_t>(convrot_turn_ % 2U);
-      if (!convrot_resident_ && convrot_slot_armed_.at(slot))
+      if (!plan.resident && convrot_slot_armed_.at(slot))
         check(counted_event_synchronize(convrot_slot_done_.at(slot)->get()),
               "cuEventSynchronize generic ConvRot slot reuse");
       const auto slot_base = convrot_weight_storage_->pointer() +
                              slot * convrot_weight_slot_bytes_;
-      auto weight_device = convrot_resident_ ? plan.weight_device : slot_base;
+      auto weight_device = plan.resident ? plan.weight_device : slot_base;
       auto scale_device =
-          convrot_resident_
+          plan.resident
               ? plan.scale_device
               : slot_base + align_256(convrot_weight_bytes_);
-      if (!convrot_resident_) {
+      if (!plan.resident) {
         auto *host_base =
             static_cast<std::uint8_t *>(convrot_staging_->data()) +
             slot * convrot_weight_slot_bytes_;
         const auto stage_start = std::chrono::steady_clock::now();
-        convrot_staging_pool_->copy(host_base, plan.weight.data(),
-                                    plan.weight.byte_size());
-        convrot_staging_pool_->copy(
-            host_base + align_256(convrot_weight_bytes_), plan.scale.data(),
-            plan.scale.byte_size());
+        const auto stage_quantized = [&](std::uint8_t *destination,
+                                          const Tensor &tensor) {
+          stage_tensor_range(
+              *convrot_staging_pool_, destination, tensor, 0U, tensor.byte_size(),
+              options.streamed_direct_io && tensor.is_mapped() &&
+                  tensor.mapped_resident_fraction() < 0.9,
+              true, options.streamed_pinned_budget_bytes,
+              profile ? &quantized_fastload_receipt : nullptr);
+        };
+        stage_quantized(host_base, plan.weight);
+        stage_quantized(host_base + align_256(convrot_weight_bytes_),
+                         plan.scale);
         if (profile)
           convrot_host_stage_milliseconds +=
               std::chrono::duration<double, std::milli>(
@@ -11334,7 +11952,7 @@ public:
               convrot_activation_scale_device_, scale_device,
               buffers_.at(plan.output_tensor), context_.stream());
       }
-      if (!convrot_resident_) {
+      if (!plan.resident) {
         check(counted_event_record(convrot_slot_done_.at(slot)->get(),
                                    context_.stream()),
               "cuEventRecord generic ConvRot slot completion");
@@ -11836,6 +12454,21 @@ public:
                        bool reuse_invariants) {
       if (program_.operations.empty())
         return;
+      bool skip_middle = false;
+      const auto cache_skipped = [&](std::size_t index) {
+        return skip_middle && index >= residual_cache_middle_ && index < residual_cache_back_;
+      };
+      const auto cache_boundary = [&](std::size_t index) {
+        if (!residual_cache_) return;
+        const auto &region = *residual_cache_region_;
+        if (index == residual_cache_front_)
+          residual_cache_->before_front(buffers_.at(region.before_front_tensor));
+        if (index == residual_cache_middle_)
+          skip_middle = residual_cache_->before_middle(buffers_.at(region.after_front_tensor),
+                                                       buffers_.at(region.after_middle_tensor));
+        if (index == residual_cache_back_)
+          residual_cache_->before_back(buffers_.at(region.after_middle_tensor));
+      };
       if (reuse_invariants &&
           (!repeated_invariant_cache_storage_ ||
            repeated_invariant_cache_storage_->pointer() == 0U))
@@ -11854,10 +12487,16 @@ public:
               index) = true;
       };
       const auto prefetch = [&](std::size_t index) {
-        return !reused(index) && streamed_prefetcher_->prefetch(index);
+        return !cache_skipped(index) && !reused(index) && streamed_prefetcher_->prefetch(index);
       };
       if (!options.overlap_streaming) {
         for (std::size_t index = 0; index < program_.operations.size(); ++index) {
+          cache_boundary(index);
+          if (cache_skipped(index)) {
+            mark_reused(index);
+            streamed_prefetcher_->complete(index);
+            continue;
+          }
           if (reused(index)) {
             mark_reused(index);
             capture_intermediate_outputs(program_.operations.at(index).id,
@@ -11906,6 +12545,17 @@ public:
            ++ahead)
         prefetched[ahead] = prefetch(ahead);
       for (std::size_t index = 0; index < operation_count; ++index) {
+        cache_boundary(index);
+        if (cache_skipped(index)) {
+          // A few middle weights may have been prefetched before the probe
+          // decision. Drain their copy fences before reusing streamed slots.
+          streamed_prefetcher_->wait(index, prefetched[index]);
+          mark_reused(index);
+          streamed_prefetcher_->complete(index);
+          if (index + depth < operation_count)
+            prefetched[index + depth] = prefetch(index + depth);
+          continue;
+        }
         if (reused(index)) {
           mark_reused(index);
           capture_intermediate_outputs(program_.operations.at(index).id,
@@ -11956,6 +12606,28 @@ public:
       }
     };
 
+#if DIF_HAVE_FASTLOAD
+    const auto collect_resident_prefetch = [&] {
+      fastload::PrefetchReceipt receipt;
+      if (resident_prefetch_) {
+        receipt = resident_prefetch_->take_receipt();
+        h3_resident_direct_read_bytes_ += receipt.direct_bytes;
+        run_telemetry.h2d_bytes += receipt.bytes;
+        run_telemetry.h2d_copies += receipt.copies;
+        run_telemetry.event_records += receipt.batches;
+        if (std::getenv("DIF_FASTLOAD_REPORT") &&
+            (receipt.batches || receipt.failures))
+          std::cerr << "RESIDENT_PREFETCH batches=" << receipt.batches
+                    << " bytes=" << receipt.bytes
+                    << " direct_bytes=" << receipt.direct_bytes
+                    << " h2d_copies=" << receipt.copies
+                    << " load_ms=" << receipt.load_ms
+                    << " host_wait_ms=" << receipt.wait_ms
+                    << " failures=" << receipt.failures << '\n';
+      }
+      return receipt;
+    };
+#endif
     for (std::uint32_t warmup = 0; warmup < options.warmups; ++warmup) {
       execute(0U, false, repeated_cache_ready);
       if (!repeated_invariant_operations_.empty())
@@ -11963,6 +12635,11 @@ public:
       streamed_prefetcher_->complete_iteration();
       check(counted_stream_synchronize(context_.stream()), "warmup synchronization");
     }
+#if DIF_HAVE_FASTLOAD
+    // Uploads performed by warmup belong to run telemetry, but not to the
+    // measured-iteration pipeline profile below.
+    if (options.warmups) (void)collect_resident_prefetch();
+#endif
     const auto repeated_invariant_executions =
         repeated_invariant_operations_.empty() || repeated_cache_ready
             ? 0U
@@ -12113,7 +12790,7 @@ public:
            plan.weight.byte_size() + plan.scale.byte_size(),
            options.convrot_int8_weight_only_quality
                ? "approximate_native_h256_convrot_int8_weight_only_gate"
-               : options.convrot_int8_resident
+               : plan.resident
                      ? "approximate_native_h256_convrot_int8_resident_gate"
                      : "approximate_native_h256_convrot_int8_gate",
            options.convrot_int8_weight_only_quality
@@ -12151,6 +12828,10 @@ public:
     result.maximum_milliseconds = *std::max_element(elapsed.begin(), elapsed.end());
     result.mean_milliseconds =
         std::accumulate(elapsed.begin(), elapsed.end(), 0.0) / elapsed.size();
+
+#if DIF_HAVE_FASTLOAD
+    const auto resident_prefetch_receipt = collect_resident_prefetch();
+#endif
 
     if (options.profile_pipeline) {
       result.pipeline_profile.enabled = true;
@@ -12234,6 +12915,19 @@ public:
           convrot_streamed_bytes;
       result.pipeline_profile.streamed_host_stage_milliseconds +=
           convrot_host_stage_milliseconds;
+      result.pipeline_profile.streamed_fastload_bytes +=
+          quantized_fastload_receipt.bytes;
+      result.pipeline_profile.streamed_fastload_calls +=
+          quantized_fastload_receipt.calls;
+      result.pipeline_profile.streamed_fastload_host_milliseconds +=
+          quantized_fastload_receipt.milliseconds;
+#if DIF_HAVE_FASTLOAD
+      result.pipeline_profile.streamed_weight_bytes += resident_prefetch_receipt.bytes;
+      result.pipeline_profile.streamed_fastload_bytes += resident_prefetch_receipt.bytes;
+      result.pipeline_profile.streamed_fastload_calls += resident_prefetch_receipt.batches;
+      result.pipeline_profile.streamed_fastload_host_milliseconds += resident_prefetch_receipt.load_ms;
+      result.pipeline_profile.streamed_host_wait_milliseconds += resident_prefetch_receipt.wait_ms;
+#endif
     }
 
     if (options.trace_operations && !options.profile_pipeline) {
@@ -12494,12 +13188,7 @@ public:
     if (!h3_groupwise_plans_.empty())
       result += "-h3-groupwise-int8";
     if (!h3_ck_attention_plans_.empty())
-      result += h3_ck_attention_plan_ && h3_ck_attention_plan_->owned_dense()
-                    ? "-owned-h3-dense-int8"
-                : h3_ck_attention_plan_ &&
-                          h3_ck_attention_plan_->codealexx_ck_int8()
-                    ? "-codealexx-ck-int8"
-                    : "-legacy-ck-int8";
+      result += "-owned-h3-dense-int8";
     if (!h3_modulation_cache_plans_.empty())
       result += "-h3-modcache";
     if (!repeated_invariant_operations_.empty())
@@ -12525,18 +13214,29 @@ public:
     return preparation_milliseconds_;
   }
   std::uint64_t resident_bytes() const override { return resident_bytes_; }
+  std::uint64_t reused_resident_weight_bytes() const override {
+    return reused_resident_weight_bytes_;
+  }
 
 private:
   ir::Program program_;
   TensorMap constants_;
   // All prepared executables made by one Executor share its CUDA session.
-  // Shape-specialized plans and storage remain independently owned, while
+  // Shape-specialized plans and scratch remain independently owned, while
   // streams and vendor handles are created once and reused serially.
   std::shared_ptr<Context> context_owner_;
   Context &context_;
+  std::shared_ptr<MappedResidentWeights> mapped_weights_;
+  std::uint64_t reused_resident_weight_bytes_{};
   std::unique_ptr<Module> module_;
   compiler::MemoryPlan memory_plan_;
+  std::optional<ResidualCacheRegion> residual_cache_region_;
+  std::shared_ptr<ResidualCacheCallbacks> residual_cache_callbacks_;
+  std::uint64_t residual_cache_bytes_{};
+  std::size_t residual_cache_front_{}, residual_cache_middle_{}, residual_cache_back_{};
   std::unique_ptr<DeviceArena> arena_;
+  std::unique_ptr<CudaResidualCache> residual_cache_;
+  std::unique_ptr<Workspace> residual_cache_storage_;
   DeviceBuffers buffers_;
   std::unique_ptr<Workspace> workspace_;
   std::vector<std::unique_ptr<Stream>> parallel_streams_;
@@ -12652,6 +13352,78 @@ private:
     bool device_resident{};
   };
   std::vector<HostCacheWarmRequest> h3_resident_warm_list_;
+
+#if DIF_HAVE_FASTLOAD
+  std::unique_ptr<fastload::ResidentPrefetch> resident_prefetch_;
+  std::vector<std::size_t> resident_prefetch_order_;
+
+  void initialize_resident_prefetch(const RunOptions &options) {
+    const auto *toggle = std::getenv("DIF_FASTLOAD_PREFETCH");
+    const auto staging = pinned_workspace_bytes.load(std::memory_order_relaxed);
+    constexpr auto ring_bytes = 128ULL << 20U;
+    // The byte-correct prefetch candidate has not demonstrated a repeatable
+    // complete-output win. Keep it explicitly opt-in, independent of the
+    // admitted default fastloader used by the existing upload schedule.
+    if (!toggle || std::strcmp(toggle, "1") != 0 ||
+        !options.lazy_resident_upload || !options.h3_resident_direct_io ||
+        !serenity_fastload_streamed_runtime_enabled() ||
+        h3_w8a8_upload_order_.empty() ||
+        staging > options.streamed_pinned_budget_bytes ||
+        ring_bytes > options.streamed_pinned_budget_bytes - staging)
+      return;
+    std::vector<fastload::ResidentBatch> batches;
+    std::vector<std::size_t> order;
+    const MappedStorage *storage = nullptr;
+    using FileIdentity = std::pair<dev_t, ino_t>;
+    std::unordered_map<const MappedStorage *, FileIdentity> identities;
+    std::optional<FileIdentity> batch_file;
+    auto previous_layer = std::numeric_limits<std::uint32_t>::max();
+    for (const auto &[attention, slot] : h3_w8a8_upload_order_) {
+      const auto layer = attention ? h3_w8a8_attention_plans_[slot].layer
+                                   : h3_w8a8_mlp_plans_[slot].layer;
+      if (batches.empty() || layer != previous_layer) {
+        batches.emplace_back();
+        storage = nullptr;
+        batch_file.reset();
+        previous_layer = layer;
+      }
+      const auto uploads = attention
+          ? resident_uploads(h3_w8a8_attention_plans_[slot])
+          : resident_uploads(h3_w8a8_mlp_plans_[slot]);
+      for (const auto &upload : uploads) {
+        const auto &tensor = *upload.tensor;
+        // Prepared INT8 weights/scales are already in their device byte
+        // layout. Owned/transformed data or mixed-file blocks keep fallback.
+        if (!tensor.is_mapped() || !tensor.byte_size() ||
+            tensor.mapping_bytes != tensor.byte_size() ||
+            tensor.mapping->descriptor() < 0)
+          return;
+        storage = tensor.mapping.get();
+        auto identity = identities.find(storage);
+        if (identity == identities.end()) {
+          struct stat info{};
+          if (fstat(storage->descriptor(), &info) != 0) return;
+          identity = identities.emplace(storage,
+              FileIdentity{info.st_dev, info.st_ino}).first;
+        }
+        if (batch_file && *batch_file != identity->second) return;
+        batch_file = identity->second;
+        auto &batch = batches.back();
+        batch.fd = storage->descriptor();
+        batch.direct_fd = storage->direct_descriptor();
+        batch.spans.push_back({tensor.mapping_offset, tensor.byte_size(),
+                               upload.destination, 0U, 0U});
+      }
+      order.push_back(batches.size() - 1U);
+    }
+    for (auto &batch : batches)
+      std::sort(batch.spans.begin(), batch.spans.end(),
+                [](const auto &a, const auto &b) { return a.file_off < b.file_off; });
+    resident_prefetch_order_ = std::move(order);
+    resident_prefetch_ = std::make_unique<fastload::ResidentPrefetch>(
+        context_.handle(), std::move(batches), 2U);
+  }
+#endif
 
   // Background page-cache read of everything staged with direct IO since the
   // last call, so the next process (or evaluation) takes the mapping copy.
@@ -12828,13 +13600,20 @@ public:
   prepare(const ir::Program &program, const TensorMap &bindings,
           const RunOptions &options) override {
     return std::make_unique<CudaPreparedExecution>(program, bindings, options,
-                                                   context_);
+                                                   context_, weight_cache_);
   }
 
   std::string name() const override { return "cuda-nvrtc-cublaslt"; }
 
+  // A caller's other thread must hold the same primary context before it
+  // prepares or runs anything; the driver does not carry it across threads.
+  void bind_thread() override {
+    check(cuCtxSetCurrent(context_->handle()), "cuCtxSetCurrent bind_thread");
+  }
+
 private:
   std::shared_ptr<Context> context_;
+  MappedResidentCache weight_cache_;
 };
 
 } // namespace

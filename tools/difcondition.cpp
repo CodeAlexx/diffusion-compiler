@@ -536,6 +536,10 @@ void command_run(const Options &options) {
            << ",\"resident_h2d_ms\":" << profile.resident_h2d_milliseconds
            << ",\"streamed_weight_bytes\":" << profile.streamed_weight_bytes
            << ",\"streamed_direct_read_bytes\":" << profile.streamed_direct_read_bytes
+           << ",\"streamed_fastload_bytes\":" << profile.streamed_fastload_bytes
+           << ",\"streamed_fastload_calls\":" << profile.streamed_fastload_calls
+           << ",\"streamed_fastload_host_ms\":"
+           << profile.streamed_fastload_host_milliseconds
            << ",\"streamed_host_stage_ms\":"
            << profile.streamed_host_stage_milliseconds
            << ",\"streamed_host_wait_ms\":"

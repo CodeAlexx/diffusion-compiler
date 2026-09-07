@@ -40,4 +40,9 @@ struct Flux2VaeBuild {
 // Creator FLUX.2 autoencoder decoder expressed only with shared DiffIR math.
 Flux2VaeBuild make_flux2_vae_decoder(const Flux2VaeConfig &config = {});
 
+// Checkpoint naming only: the Diffusers-packaged VAE uses the same decoder
+// tensors with renamed modules and squeezed 1x1 attention projections.
+// Unknown creator names fail closed; this does not alter the decoder graph.
+std::string flux2_vae_diffusers_name(const std::string &creator_name);
+
 } // namespace dif::frontend

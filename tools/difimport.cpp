@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <fstream>
 #include <string>
@@ -422,6 +423,133 @@ void make_audio_bundle(const fs::path &folded_path,
             << " bindings=" << bundle.bindings.size() << "\n";
 }
 
+// Unlike generic bundle rebinding, BigVGAN changes generated [T] block-average
+// constants when the latent geometry changes. Only this native builder's
+// constants may be regenerated; learned tensor receipts remain immutable.
+void rebind_audio_bundle(
+    const fs::path &sealed_path, const fs::path &old_program_path,
+    const fs::path &new_program_path, const fs::path &generated_path,
+    const fs::path &bundle_path, std::uint64_t batch, std::uint64_t frames,
+    std::uint64_t stages, bool verify_source_payload = false,
+    const dif::frontend::AudioBigVganConfig &config = {}) {
+  if (fs::exists(generated_path) || fs::exists(bundle_path) ||
+      fs::is_symlink(generated_path) || fs::is_symlink(bundle_path) ||
+      resolved(generated_path) == resolved(bundle_path))
+    dif::fail("refusing to overwrite or alias audio generated shard or bundle");
+  if (stages > config.upsample_rates.size() + 1U)
+    dif::fail("audio rebind stage count exceeds the native decoder");
+  const auto old_program = dif::ir::read_file(old_program_path);
+  const auto new_program = dif::ir::read_file(new_program_path);
+  dif::ir::verify(old_program);
+  dif::ir::verify(new_program);
+  const dif::ir::TensorDesc *latent = nullptr;
+  for (const auto &tensor : old_program.tensors) {
+    if (!tensor.has_role(dif::ir::TensorRole::Input)) continue;
+    if (latent) dif::fail("audio source program must have exactly one latent input");
+    latent = &tensor;
+  }
+  if (!latent || latent->dtype != dif::ir::DType::F32 ||
+      latent->dims.size() != 3U || latent->dims[1] != config.latent_channels)
+    dif::fail("audio source program lacks the native F32 [B,C,T] latent input");
+  const auto old_build = dif::frontend::build_audio_bigvgan_program(
+      latent->dims[0], latent->dims[2], stages, config);
+  const auto new_build = dif::frontend::build_audio_bigvgan_program(
+      batch, frames, stages, config);
+  if (dif::ir::encode(old_program) != dif::ir::encode(old_build.program))
+    dif::fail("audio source program does not match the native decoder builder");
+  if (dif::ir::encode(new_program) != dif::ir::encode(new_build.program))
+    dif::fail("audio destination program does not match the requested native geometry");
+
+  const auto source = dif::weights::read_weight_bundle(sealed_path);
+  // The seal, graph fingerprint, exact file size and SafeTensors descriptors
+  // are always checked. Rehashing all learned payloads is an explicit audit,
+  // not an unconditional per-request scan of an already sealed checkpoint.
+  const auto mapped = dif::weights::load_weight_bundle(
+      source, old_program, verify_source_payload);
+  if (source.bindings.size() != old_build.bindings.size() ||
+      old_build.bindings.size() != new_build.bindings.size())
+    dif::fail("audio sealed bundle does not cover exactly the native constants");
+  std::map<std::uint32_t, const dif::weights::BundleBinding *> source_bindings;
+  for (const auto &binding : source.bindings)
+    source_bindings.emplace(binding.tensor_id, &binding);
+
+  dif::weights::WeightBundle output;
+  output.program_fingerprint = dif::ir::fingerprint(new_program);
+  output.index_fingerprint = source.index_fingerprint;
+  std::map<std::uint32_t, std::uint32_t> reused_shards;
+  std::vector<dif::weights::SafeTensorWriteSpec> generated_specs;
+  std::uint64_t reused_bytes = 0U;
+  for (std::size_t i = 0U; i < old_build.bindings.size(); ++i) {
+    const auto &old_binding = old_build.bindings[i];
+    const auto &new_binding = new_build.bindings[i];
+    const auto found = source_bindings.find(old_binding.tensor_id);
+    if (found == source_bindings.end() ||
+        found->second->tensor_name != old_binding.name ||
+        old_binding.tensor_id != new_binding.tensor_id ||
+        old_binding.name != new_binding.name ||
+        old_binding.source_name != new_binding.source_name)
+      dif::fail("audio rebind constant identity differs from the native builder");
+    const auto &binding = *found->second;
+    const auto *description = new_program.tensor(new_binding.tensor_id);
+    if (!description) dif::fail("audio destination constant is missing");
+    if (old_binding.source_name.empty()) {
+      const auto &expected = old_build.generated_constants.at(old_binding.tensor_id);
+      const auto &actual = mapped.at(old_binding.tensor_id);
+      if (actual.byte_size() != expected.byte_size() ||
+          std::memcmp(actual.data(), expected.data(), expected.byte_size()) != 0)
+        dif::fail("audio source generated constant differs from native payload: " + old_binding.name);
+      const auto &generated = new_build.generated_constants.at(new_binding.tensor_id);
+      if (generated.dtype != description->dtype || generated.dims != description->dims)
+        dif::fail("audio generated constant differs from destination geometry");
+      generated_specs.push_back({new_binding.name, generated.dtype, generated.dims});
+      continue;
+    }
+    if (binding.dtype != description->dtype || binding.dims != description->dims ||
+        binding.byte_count != description->byte_count())
+      dif::fail("audio geometry rebind attempted to change learned tensor: " + old_binding.name);
+    auto [shard, inserted] = reused_shards.emplace(
+        binding.shard_index, static_cast<std::uint32_t>(output.shards.size()));
+    if (inserted) output.shards.push_back(source.shards.at(binding.shard_index));
+    auto reused = binding;
+    reused.shard_index = shard->second;
+    output.bindings.push_back(std::move(reused));
+    reused_bytes += binding.byte_count;
+  }
+
+  // Every source/schema rejection above precedes creating any output.
+  const auto learned_count = output.bindings.size();
+  const auto generated_count = generated_specs.size();
+  dif::weights::SafeTensorWriter writer(generated_path, std::move(generated_specs));
+  for (const auto &binding : new_build.bindings) {
+    if (!binding.source_name.empty()) continue;
+    const auto &tensor = new_build.generated_constants.at(binding.tensor_id);
+    writer.append(binding.name, {tensor.data(), tensor.byte_size()});
+  }
+  const auto generated = writer.finish();
+  const auto generated_shard = static_cast<std::uint32_t>(output.shards.size());
+  output.shards.push_back({resolved(generated_path), generated.file_size,
+                          dif::sha256_file(generated_path)});
+  for (const auto &binding : new_build.bindings) {
+    if (!binding.source_name.empty()) continue;
+    const auto *entry = generated.find(binding.name);
+    if (!entry) dif::fail("audio generated shard lost " + binding.name);
+    output.bindings.push_back({binding.tensor_id, generated_shard, binding.name,
+        entry->dtype, entry->dims, entry->file_offset, entry->byte_count});
+  }
+  dif::weights::verify_weight_bundle(output, new_program, false);
+  dif::weights::write_weight_bundle(output, bundle_path);
+  std::cout << "AUDIO_REBIND PASS source_bundle_sha256="
+            << dif::hex_digest(dif::sha256_file(sealed_path))
+            << " source_program=" << dif::hex_digest(source.program_fingerprint)
+            << " program=" << dif::hex_digest(output.program_fingerprint)
+            << " index=" << dif::hex_digest(output.index_fingerprint)
+            << " learned_bindings=" << learned_count << " reused_bytes=" << reused_bytes
+            << " generated_bindings=" << generated_count
+            << " generated_file_bytes=" << generated.file_size
+            << " source_payload_verified=" << (verify_source_payload ? "true" : "false")
+            << " path=" << bundle_path.string() << "\n";
+}
+
 void unpack_audio_rows(const fs::path &rows_path, const fs::path &out_path) {
   const auto rows = dif::runtime::read_tensor(rows_path);
   if (rows.dtype != dif::ir::DType::F32 || rows.dims.size() != 2U ||
@@ -469,6 +597,23 @@ int main(int argc, char **argv) {
       make_audio_bundle(argv[2], argv[3], argv[4], argv[5],
                         std::stoull(argv[6]), std::stoull(argv[7]),
                         std::stoull(argv[8]));
+      return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "rebind-audio-bundle") {
+      if ((argc != 10 && argc != 11) ||
+          (argc == 11 && std::string(argv[10]) != "--verify-source-payload"))
+        usage_error("rebind-audio-bundle expects SEALED.difbind OLD_PROGRAM.difir "
+                    "NEW_PROGRAM.difir GENERATED.safetensors OUT.difbind B T STAGES "
+                    "[--verify-source-payload]");
+      const auto batch = parse_integer(argv[7], "B");
+      const auto frames = parse_integer(argv[8], "T");
+      const auto stages = parse_integer(argv[9], "STAGES");
+      if (batch <= 0 || frames <= 0 || stages < 0)
+        usage_error("audio rebind requires positive B/T and nonnegative STAGES");
+      rebind_audio_bundle(argv[2], argv[3], argv[4], argv[5], argv[6],
+                          static_cast<std::uint64_t>(batch),
+                          static_cast<std::uint64_t>(frames),
+                          static_cast<std::uint64_t>(stages), argc == 11);
       return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "unpack-audio-rows") {

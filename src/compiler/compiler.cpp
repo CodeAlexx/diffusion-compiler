@@ -461,13 +461,27 @@ void emit_snake_beta(std::ostringstream &out, const ir::Program &program,
   std::ostringstream epsilon_literal;
   epsilon_literal << std::scientific << std::setprecision(9) << epsilon;
   out << render_kernel_template(
-      "snake_beta", {{"function", function_name(op)},
+      op.opcode == ir::Opcode::SnakeAlpha ? "snake_alpha" : "snake_beta",
+                    {{"function", function_name(op)},
                      {"count", std::to_string(count)},
                      {"length", std::to_string(length)},
                      {"channels", std::to_string(channels)},
                      {"epsilon", epsilon_literal.str()}});
   // The historical emitter left the stream at precision 9, defaultfloat.
   out << std::setprecision(9) << std::defaultfloat;
+}
+
+void emit_reduce_mean(std::ostringstream &out, const ir::Program &program,
+                      const ir::Operation &op) {
+  const auto &dims = program.tensor(op.inputs[0])->dims;
+  const auto axis = op.u64(ir::AttrKey::Axis, dims.size());
+  std::uint64_t inner = 1;
+  for (auto d = axis + 1U; d < dims.size(); ++d) inner *= dims[d];
+  out << render_kernel_template(
+      "reduce_mean", {{"function", function_name(op)},
+                      {"count", std::to_string(program.tensor(op.outputs[0])->element_count())},
+                      {"inner", std::to_string(inner)},
+                      {"reduced", std::to_string(dims[axis])}});
 }
 
 void emit_header(std::ostringstream &out) {
@@ -744,10 +758,9 @@ void emit_dequantize_int8_blocks(std::ostringstream &out,
                                  const ir::Program &program,
                                  const ir::Operation &op) {
   const auto *input = program.tensor(op.inputs[0]);
-  const auto *scales = program.tensor(op.inputs[1]);
   const auto count = input->element_count();
   const auto columns = input->dims[1];
-  const auto scale_columns = scales->dims[1];
+  const auto scale_columns = program.tensor(op.inputs[1])->dims[1];
   const auto block = op.u64(ir::AttrKey::BlockSize, 0U);
   out << render_kernel_template(
       "dequantize_int8_blocks", {{"function", function_name(op)},
@@ -3750,7 +3763,11 @@ GeneratedCuda emit_cuda(const ir::Program &program) {
     case ir::Opcode::Conv3d:
       break;
     case ir::Opcode::SnakeBeta:
+    case ir::Opcode::SnakeAlpha:
       emit_snake_beta(source, program, op);
+      break;
+    case ir::Opcode::ReduceMean:
+      emit_reduce_mean(source, program, op);
       break;
     case ir::Opcode::QuantizeInt8Rows:
     case ir::Opcode::LinearInt8Scaled:

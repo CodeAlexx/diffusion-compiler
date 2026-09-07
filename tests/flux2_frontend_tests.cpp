@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <set>
 #include <string>
 
 namespace {
@@ -23,9 +24,78 @@ void expect(bool condition, const std::string &message) {
 
 int main() {
   try {
+    {
+      const auto config = dif::frontend::make_flux2_klein_4b_conditioner_config();
+      expect(config.hidden_size == 2560U && config.intermediate_size == 9728U &&
+                 config.attention_heads == 32U && config.head_dim == 128U &&
+                 config.selected_hidden_states == std::vector<std::uint64_t>{9U, 18U, 27U},
+             "Klein 4B uses Qwen3-4B widths and the creator raw hidden-state taps");
+      const auto build = dif::frontend::build_qwen3vl_conditioner_program(512U, config);
+      dif::ir::verify(build.program);
+      expect(build.program.tensor(build.conditioning_output_id)->dims ==
+                 std::vector<std::uint64_t>{512U, 7680U},
+             "Klein 4B conditioner concatenates to [512,7680]");
+      expect(build.attention_operations == 27U,
+             "Klein 4B executes all observable conditioner layers");
+      expect(config.eager_norm_rounding &&
+                 std::none_of(build.program.operations.begin(), build.program.operations.end(),
+                              [](const auto &op) {
+                                return op.opcode == dif::ir::Opcode::QkNormPartialRope;
+                              }),
+             "Klein 4B preserves creator BF16 norm and RoPE rounding boundaries");
+    }
+    {
+      dif::frontend::Flux2KleinTransformerConfig config;
+      config.geometry = dif::frontend::flux2_klein_4b_geometry();
+      config.double_depth = config.geometry.double_depth;
+      config.single_depth = config.geometry.single_depth;
+      config.batch_size = 2U;
+      const auto build = dif::frontend::make_flux2_klein_9b_transformer(config);
+      dif::ir::verify(build.program);
+      expect(build.checkpoint_names.size() == 149U && build.guidance_input == 0U,
+             "Klein Base 4B binds all 149 creator weights without guidance embedding");
+      const auto shape = [&](const std::string &name) {
+        const auto it = std::find(build.checkpoint_names.begin(), build.checkpoint_names.end(), name);
+        if (it == build.checkpoint_names.end()) return std::vector<std::uint64_t>{};
+        return build.program.tensor(build.checkpoint_tensors.at(
+            static_cast<std::size_t>(it - build.checkpoint_names.begin())))->dims;
+      };
+      expect(shape("txt_in.weight") == std::vector<std::uint64_t>{3072U, 7680U} &&
+                 shape("double_blocks.4.img_attn.qkv.weight") ==
+                     std::vector<std::uint64_t>{9216U, 3072U} &&
+                 shape("single_blocks.19.linear1.weight") ==
+                     std::vector<std::uint64_t>{27648U, 3072U},
+             "Klein 4B has the real context, attention, MLP and full 5+20 depths");
+      expect(shape("double_blocks.5.img_attn.qkv.weight").empty() &&
+                 shape("single_blocks.20.linear1.weight").empty(),
+             "Klein 4B never inherits extra 9B blocks");
+      expect(build.program.tensor(build.prediction_output)->dims ==
+                 std::vector<std::uint64_t>{2U, 4096U, 128U},
+             "Klein Base 4B preserves the full batch-two 1024x1024 token shape");
+    }
+    {
+      const auto vae = dif::frontend::make_flux2_vae_decoder();
+      std::set<std::string> names;
+      for (const auto &binding : vae.weights)
+        expect(names.insert(dif::frontend::flux2_vae_diffusers_name(binding.name)).second,
+               "VAE Diffusers mapping covers every decoder binding without collisions");
+      expect(dif::frontend::flux2_vae_diffusers_name("decoder.up.1.block.0.nin_shortcut.weight") ==
+                 "decoder.up_blocks.2.resnets.0.conv_shortcut.weight" &&
+                 dif::frontend::flux2_vae_diffusers_name("decoder.up.3.upsample.conv.weight") ==
+                 "decoder.up_blocks.0.upsamplers.0.conv.weight" &&
+                 dif::frontend::flux2_vae_diffusers_name("decoder.mid.attn_1.proj_out.weight") ==
+                 "decoder.mid_block.attentions.0.to_out.0.weight",
+             "VAE aliases preserve reversed stage order, shortcuts and output projections");
+      bool refused = false;
+      try { (void)dif::frontend::flux2_vae_diffusers_name("unrelated.weight"); }
+      catch (const std::exception &) { refused = true; }
+      expect(refused, "VAE mapping rejects unknown checkpoint semantics");
+    }
   {
       const auto config =
           dif::frontend::make_flux2_klein_9b_conditioner_config(1U);
+      expect(!config.eager_norm_rounding,
+             "existing Klein 9B conditioning keeps its admitted execution semantics");
       const auto build = dif::frontend::build_qwen3vl_conditioner_program(
           512U, config);
       dif::ir::verify(build.program);

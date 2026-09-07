@@ -48,6 +48,17 @@ make_flux2_klein_9b_conditioner_config(std::uint64_t executed_layers) {
   return config;
 }
 
+Qwen3VlConditionerConfig
+make_flux2_klein_4b_conditioner_config(std::uint64_t executed_layers) {
+  // Same 36-layer Qwen architecture and taps; Q projection remains 32 x 128,
+  // even though the residual stream is 2560 wide (not heads * head_dim).
+  auto config = make_flux2_klein_9b_conditioner_config(executed_layers);
+  config.hidden_size = 2560U;
+  config.intermediate_size = 9728U;
+  config.eager_norm_rounding = true;
+  return config;
+}
+
 namespace {
 
 runtime::Tensor i32_tensor(std::vector<std::int32_t> values) {
@@ -94,6 +105,17 @@ make_flux2_dev_conditioner_config(std::uint64_t executed_layers) {
 }
 
 Flux2Geometry flux2_klein_9b_geometry() { return Flux2Geometry{}; }
+
+Flux2Geometry flux2_klein_4b_geometry() {
+  Flux2Geometry geometry;
+  geometry.hidden = 3072U;
+  geometry.heads = 24U;
+  geometry.mlp = 9216U;
+  geometry.double_depth = 5U;
+  geometry.single_depth = 20U;
+  geometry.context_width = 7680U;
+  return geometry;
+}
 
 Flux2Geometry flux2_dev_geometry() {
   Flux2Geometry geometry;

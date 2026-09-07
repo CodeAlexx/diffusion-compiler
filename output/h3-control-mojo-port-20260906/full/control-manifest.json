@@ -1,0 +1,15 @@
+[
+  {
+    "path": "/home/alex/dif-inference/output/run/uploads/video-0021.mp4",
+    "strength": 1.0,
+    "start": 0.0,
+    "end": 1.0,
+    "preprocessor": "canny",
+    "resize_mode": "crop",
+    "canny_low": 100,
+    "canny_high": 200,
+    "source_path": "/home/alex/dif-inference/output/run/uploads/video-0022.mp4",
+    "mask_path": "/home/alex/dif-inference/output/run/uploads/h3-control-mask-test-0023.png",
+    "invert_mask": false
+  }
+]

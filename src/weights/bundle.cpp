@@ -285,7 +285,15 @@ runtime::TensorMap load_weight_bundle(const WeightBundle &bundle,
     }
     if (selected.empty())
       continue;
-    auto mapped = runtime::map_tensor_slices(shard.path, slices);
+    // read_safetensors already owns the shard's validated shared mapping.
+    // Reuse it here instead of opening and mapping the same multi-gigabyte
+    // shard a second time just to construct the selected tensor views.
+    std::vector<runtime::Tensor> mapped;
+    mapped.reserve(slices.size());
+    for (auto &slice : slices)
+      mapped.push_back(runtime::map_tensor_slice(
+          metadata.mapping, slice.dtype, std::move(slice.dims),
+          slice.file_offset, slice.byte_count));
     for (std::size_t i = 0; i < selected.size(); ++i)
       tensors.emplace(selected[i]->tensor_id, std::move(mapped[i]));
   }

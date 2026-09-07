@@ -1,0 +1,66 @@
+{
+  "schema": {
+    "name": "diffusion-compiler-telemetry",
+    "version": 1
+  },
+  "kind": "device-probe",
+  "provenance": {
+    "compiler": "diffusion-compiler",
+    "version": "0.1.0",
+    "revision": "7dad5e29f5a03f13decc62714f41cfe0c83fb46f",
+    "generated_at": "2026-09-07T01:34:23Z"
+  },
+  "hardware": {
+    "backend": "cuda",
+    "vendor": "nvidia",
+    "product_name": "NVIDIA GeForce RTX 3090 Ti",
+    "architecture_family": "ampere",
+    "device_ordinal": 0,
+    "compute_capability": {
+      "major": 8,
+      "minor": 6,
+      "sm": "sm_86"
+    },
+    "multiprocessor_count": 84,
+    "warp_size": 32,
+    "total_vram_bytes": 25248202752,
+    "l2_cache_bytes": 6291456,
+    "shared_memory": {
+      "per_block_bytes": 49152,
+      "per_block_optin_bytes": 101376,
+      "per_multiprocessor_bytes": 102400
+    },
+    "precision_features": {
+      "tensor_cores": true,
+      "fp16_tensor_cores": true,
+      "bf16_tensor_cores": true,
+      "fp8_tensor_cores": false,
+      "int8_tensor_cores": true,
+      "nvfp4_tensor_cores": false
+    },
+    "execution_features": {
+      "cuda_graphs": true,
+      "async_copy": true,
+      "tensor_memory_accelerator": false
+    },
+    "versions": {
+      "cuda_driver": 13000,
+      "cuda_runtime": 12040,
+      "cublaslt": 120405,
+      "cudnn": 91002
+    },
+    "target_fingerprint": "744bbe90c8972af6b8d53e43cfe3d1ac3c896e91e7fe82a323497888ef794890"
+  },
+  "runtime_budget": {
+    "free_vram_bytes": 24067309568,
+    "reserved_vram_bytes": 268435456,
+    "usable_vram_bytes": 23798874112,
+    "total_host_memory_bytes": 67348082688,
+    "available_host_memory_bytes": 59170381824,
+    "host_memory_budget_bytes": 59170381824,
+    "pinned_host_memory_budget_bytes": 2147483648,
+    "workspace_budget_bytes": 67108864,
+    "staging_budget_bytes": 2147483648,
+    "budget_class": "device-usable-22gib_host-55gib_reserve-256mib_pinned-2048mib_workspace-64mib_staging-2048mib"
+  }
+}

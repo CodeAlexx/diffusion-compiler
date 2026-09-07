@@ -601,6 +601,12 @@ void write_tensor(const Tensor &tensor, const std::filesystem::path &path) {
   for (const auto dim : tensor.dims)
     append_u64(file, dim);
   append_u64(file, tensor.byte_size());
+  // Reserve the checksum too: appending 32 bytes to a full video-sized
+  // payload must not double the serialization buffer's capacity.
+  if (file.size() > file.max_size() - kDigestBytes ||
+      tensor.byte_size() > file.max_size() - file.size() - kDigestBytes)
+    fail("tensor file exceeds host size range");
+  file.reserve(file.size() + static_cast<std::size_t>(tensor.byte_size()) + kDigestBytes);
   file.insert(file.end(), tensor.data(), tensor.data() + tensor.byte_size());
   const auto digest = sha256(file);
   file.insert(file.end(), digest.begin(), digest.end());

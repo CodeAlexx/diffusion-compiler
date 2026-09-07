@@ -1,0 +1,23 @@
+[
+  {
+    "file": "output/h3-control-mojo-port-20260906/smoke-video.diftensor",
+    "shape": [
+      1,
+      24,
+      37,
+      30,
+      52
+    ],
+    "nonfinite": 0,
+    "sha256": "890a7d109d56c6fda34d302743ed6f8e1baf210baaa1e72baae3d6eb4de6784f"
+  },
+  {
+    "file": "output/h3-control-mojo-port-20260906/smoke-audio.diftensor",
+    "shape": [
+      414,
+      32
+    ],
+    "nonfinite": 0,
+    "sha256": "af762decb22eed4cb2b0a91c5a407c62c3727bfd291a7188d376d3714ba47a4c"
+  }
+]

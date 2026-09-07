@@ -65,6 +65,11 @@ struct Qwen3VlConditionerConfig {
   // QkNormPartialRope). Llama/Mistral towers have no QK-norm: RoPE is the
   // plain rotate-half RotaryApply and no q_norm/k_norm weights are bound.
   bool qk_norm{true};
+  // Eager Qwen3RMSNorm casts normalized values back to storage dtype BEFORE
+  // multiplying learned weights, including Q/K; RoPE products also round
+  // separately. Express these observable boundaries with shared IR.
+  // False preserves previously admitted conditioner program fingerprints.
+  bool eager_norm_rounding{false};
 };
 
 // One checkpoint tensor the program consumes. `name` is the literal
