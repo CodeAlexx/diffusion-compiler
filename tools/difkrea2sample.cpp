@@ -10,6 +10,7 @@
 #include "dif/runtime/scalar.hpp"
 #include "dif/runtime/tensor.hpp"
 #include "dif/support/error.hpp"
+#include "dif/support/torch_cpu_rng.hpp"
 #include "dif/support/sha256.hpp"
 #include "dif/weights/bundle.hpp"
 #include "dif/weights/safetensors.hpp"
@@ -42,6 +43,13 @@ struct Arguments {
   std::filesystem::path negative_conditioning;
   std::filesystem::path negative_tokenizer;
   std::filesystem::path initial_fixture;
+  // Production sampling: synthesise the initial latent from a seed instead of
+  // requiring a recorded parity fixture. --initial-fixture stays supported and
+  // still wins when both are given, so parity runs are unchanged.
+  std::uint64_t initial_seed{0U};
+  bool initial_seed_set{false};
+  std::uint64_t width{1024U};
+  std::uint64_t height{1024U};
   std::filesystem::path reference;
   std::filesystem::path output;
   std::filesystem::path report;
@@ -218,6 +226,12 @@ Arguments parse(int argc, char **argv) {
     else if (option == "--guidance") result.guidance = std::stof(value());
     else if (option == "--mu") result.fixed_mu = std::stod(value());
     else if (option == "--seed") result.seed = std::stoull(value());
+    else if (option == "--initial-seed") {
+      result.initial_seed = std::stoull(value());
+      result.initial_seed_set = true;
+    }
+    else if (option == "--width") result.width = std::stoull(value());
+    else if (option == "--height") result.height = std::stoull(value());
     else dif::fail("invalid difkrea2sample argument: " + option);
   }
   const auto cfg = result.guidance > 0.0F;
@@ -225,8 +239,10 @@ Arguments parse(int argc, char **argv) {
       result.positive_conditioning.empty() ||
       result.positive_tokenizer.empty() ||
       (cfg && (result.negative_conditioning.empty() ||
-               result.negative_tokenizer.empty())) || result.initial_fixture.empty() ||
-      result.reference.empty() || result.output.empty() ||
+               result.negative_tokenizer.empty())) ||
+      (result.initial_fixture.empty() && !result.initial_seed_set) ||
+      result.width == 0U || result.height == 0U ||
+      result.output.empty() ||
       result.report.empty() || result.diffir.empty() || result.steps == 0U ||
       result.guidance < 0.0F || !std::isfinite(result.guidance) ||
       (result.fixed_mu.has_value() && !std::isfinite(*result.fixed_mu)) ||
@@ -478,6 +494,8 @@ int main(int argc, char **argv) {
     dif::frontend::Krea2Config config;
     config.streamed_constants = true;
     config.text_tokens = arguments.text_token_cap;
+    config.width = arguments.width;
+    config.height = arguments.height;
     dif::frontend::Krea2ScheduleConfig schedule_config;
     schedule_config.steps = arguments.steps;
     schedule_config.fixed_mu = arguments.fixed_mu;
@@ -506,9 +524,12 @@ int main(int argc, char **argv) {
       negative_tokenizer_file.emplace(
           dif::weights::read_safetensors(arguments.negative_tokenizer));
     }
-    const auto initial_file =
-        dif::weights::read_safetensors(arguments.initial_fixture);
-    const auto reference_file = dif::weights::read_safetensors(arguments.reference);
+    std::optional<dif::weights::SafeTensorFile> initial_file;
+    if (!arguments.initial_fixture.empty())
+      initial_file.emplace(dif::weights::read_safetensors(arguments.initial_fixture));
+    std::optional<dif::weights::SafeTensorFile> reference_file;
+    if (!arguments.reference.empty())
+      reference_file.emplace(dif::weights::read_safetensors(arguments.reference));
     const auto input_open_ms = milliseconds_since(phase_start);
 
     phase_start = std::chrono::steady_clock::now();
@@ -530,19 +551,37 @@ int main(int argc, char **argv) {
     if (cfg_enabled)
       negative_mask.emplace(combined_mask(dif::weights::map_safetensor(
           *negative_tokenizer_file, "attention_mask"), config.text_tokens));
-    auto image =
-        dif::weights::map_safetensor(initial_file, "initial_image_tokens");
-    const auto reference_schedule =
-        dif::weights::map_safetensor(reference_file, "timesteps");
+    // A recorded fixture wins; otherwise draw the latent from the seed with the
+    // torch CPU generator, the convention the rest of the chain records against.
+    const auto krea2_architecture = dif::frontend::inspect_krea2_architecture(config);
+    auto image = initial_file.has_value()
+        ? dif::weights::map_safetensor(*initial_file, "initial_image_tokens")
+        : [&] {
+            const auto count = static_cast<std::size_t>(
+                config.batch * krea2_architecture.image_tokens *
+                krea2_architecture.patch_input_dim);
+            const auto noise =
+                dif::torch_cpu_normal(count, arguments.initial_seed);
+            return float_tensor(dif::ir::DType::BF16,
+                                {config.batch, krea2_architecture.image_tokens,
+                                 krea2_architecture.patch_input_dim},
+                                std::span<const float>(noise));
+          }();
     const auto native_schedule = float_tensor(
         dif::ir::DType::F32,
         {static_cast<std::uint64_t>(schedule.timesteps.size())},
         schedule.timesteps);
-    if (reference_schedule.dtype != native_schedule.dtype ||
+    // Only a parity run carries a reference; without one there is nothing to
+    // compare the schedule against and the native schedule stands on its own.
+    const auto reference_schedule = reference_file.has_value()
+        ? dif::weights::map_safetensor(*reference_file, "timesteps")
+        : native_schedule;
+    if (reference_file.has_value() &&
+        (reference_schedule.dtype != native_schedule.dtype ||
         reference_schedule.dims != native_schedule.dims ||
         reference_schedule.byte_size() != native_schedule.byte_size() ||
         std::memcmp(reference_schedule.data(), native_schedule.data(),
-                    native_schedule.byte_size()) != 0)
+                    native_schedule.byte_size()) != 0))
       dif::fail("native Krea schedule is not bit-exact to the creator fixture");
     const auto input_prepare_ms = milliseconds_since(phase_start);
 
@@ -1322,8 +1361,12 @@ int main(int argc, char **argv) {
     for (const auto &[name, tensor] : captures) {
       if (name == "timesteps")
         continue;
+      // Trajectory metrics compare against a recorded parity run. A production
+      // render has no reference, so there is nothing to score.
+      if (!reference_file.has_value())
+        continue;
       const auto reference =
-          dif::weights::map_safetensor(reference_file, name);
+          dif::weights::map_safetensor(*reference_file, name);
       const auto metric = measure(reference, tensor);
       if (!first_metric) report << ",\n";
       first_metric = false;

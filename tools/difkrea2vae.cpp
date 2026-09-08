@@ -71,11 +71,11 @@ Arguments parse(int argc, char **argv) {
       result.output.empty() ||
       result.report.empty() || result.diffir.empty() ||
       (!full && (result.fixture.empty() || result.checkpoint.empty())) ||
-      (full && (result.reference.empty() || result.config.empty() ||
-                result.png.empty())))
+      (full && (result.config.empty() || result.png.empty())))
     dif::fail("difkrea2vae requires exactly one of checkpoint or bundle; "
               "tile mode requires checkpoint/fixture/output/report/diffir; "
-              "full mode replaces fixture with sampler/reference/config/png");
+              "full mode replaces fixture with sampler/config/png "
+              "(reference optional: parity metrics only)");
   if (std::filesystem::exists(result.output) ||
       std::filesystem::exists(result.report) ||
       std::filesystem::exists(result.diffir) ||
@@ -404,7 +404,9 @@ int run_full(const Arguments &arguments) {
         dif::weights::load_weight_bundle(*bundle, canonical.program, false);
   }
   const auto sampler = dif::weights::read_safetensors(arguments.sampler);
-  const auto reference = dif::weights::read_safetensors(arguments.reference);
+  std::optional<dif::weights::SafeTensorFile> reference_file;
+  if (!arguments.reference.empty())
+    reference_file.emplace(dif::weights::read_safetensors(arguments.reference));
   const auto tokens =
       dif::weights::map_safetensor(sampler, "final_image_tokens");
   const auto latent = unpatch(tokens);
@@ -531,31 +533,47 @@ int run_full(const Arguments &arguments) {
                                       clamped.data(), clamped.byte_size()));
   (void)writer.finish();
 
-  std::vector<std::uint8_t> rgb(1024U * 1024U * 3U);
+  // Image size comes from the decoded tensor, not a constant. This assumed
+  // 1024x1024 in five places, so any other authored size would have been read
+  // out of the wrong offsets and written with the wrong header.
+  if (clamped.dims.size() < 2U)
+    dif::fail("Krea 2 VAE output has no spatial dimensions");
+  const auto image_height = clamped.dims[clamped.dims.size() - 2U];
+  const auto image_width = clamped.dims[clamped.dims.size() - 1U];
+  std::vector<std::uint8_t> rgb(
+      static_cast<std::size_t>(image_height * image_width * 3U));
   for (std::uint64_t channel = 0U; channel < 3U; ++channel)
-    for (std::uint64_t y = 0U; y < 1024U; ++y)
-      for (std::uint64_t x = 0U; x < 1024U; ++x) {
-        const auto tensor_index = (channel * 1024U + y) * 1024U + x;
+    for (std::uint64_t y = 0U; y < image_height; ++y)
+      for (std::uint64_t x = 0U; x < image_width; ++x) {
+        const auto tensor_index = (channel * image_height + y) * image_width + x;
         auto value = round_bf16(
             dif::runtime::load_float(clamped, tensor_index) * 0.5F);
         value = round_bf16(value + 0.5F);
         value = round_bf16(value * 255.0F);
-        const auto pixel_index = (y * 1024U + x) * 3U + channel;
+        const auto pixel_index = (y * image_width + x) * 3U + channel;
         rgb[pixel_index] = static_cast<std::uint8_t>(
             std::clamp(value, 0.0F, 255.0F));
       }
-  dif::write_png_rgb8(arguments.png, 1024U, 1024U, rgb);
+  dif::write_png_rgb8(arguments.png, static_cast<std::uint32_t>(image_width),
+                      static_cast<std::uint32_t>(image_height), rgb);
 
-  const auto raw_reference =
-      dif::weights::map_safetensor(reference, "raw_output");
-  const auto clamped_reference =
-      dif::weights::map_safetensor(reference, "clamped_output");
-  const auto raw_metrics = measure(raw_reference, raw);
-  const auto clamped_metrics = measure(clamped_reference, clamped);
-  const auto admitted = raw_metrics.nonfinite == 0U &&
-                        clamped_metrics.nonfinite == 0U &&
-                        clamped_metrics.cosine >= 0.9999 &&
-                        clamped_metrics.relative_l2 <= 0.02;
+  // Parity metrics need a recorded reference. A production render has none, so
+  // the decode stands on its own and is admitted on finiteness alone.
+  Metrics raw_metrics{};
+  Metrics clamped_metrics{};
+  bool admitted = true;
+  if (reference_file.has_value()) {
+    const auto raw_reference =
+        dif::weights::map_safetensor(*reference_file, "raw_output");
+    const auto clamped_reference =
+        dif::weights::map_safetensor(*reference_file, "clamped_output");
+    raw_metrics = measure(raw_reference, raw);
+    clamped_metrics = measure(clamped_reference, clamped);
+    admitted = raw_metrics.nonfinite == 0U &&
+               clamped_metrics.nonfinite == 0U &&
+               clamped_metrics.cosine >= 0.9999 &&
+               clamped_metrics.relative_l2 <= 0.02;
+  }
   std::ofstream report(arguments.report, std::ios::trunc);
   report << std::setprecision(17)
          << "{\n  \"source_commit\": \"db3984fbc6e13b34c0064990fc2d95ac64d00058\",\n"
